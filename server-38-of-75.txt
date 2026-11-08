@@ -1,0 +1,3478 @@
+DHWAJA CODE REVIEW — server — CHUNK 38 OF 75
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (analytics*), services/trust-core/src (anchoring*)
+Files in this chunk (3):
+  - services/trust-core/src/analytics-outbox.ts
+  - services/trust-core/src/analytics-read.ts
+  - services/trust-core/src/anchoring.ts
+
+
+===== BEGIN FILE: services/trust-core/src/analytics-outbox.ts =====
+/**
+ * THE OUTBOX PUBLISHER AND THE ANALYTICS TICK (ADR-0006 §2/§5/§8, S-9).
+ *
+ * `analytics-events.ts` puts the row in the authoritative batch; this file is
+ * everything that happens to that row afterwards. The split matters: the
+ * producer's half is the part that must be atomic with the fact, and this half
+ * is the part that is allowed to be at-least-once, because `processed_events`
+ * in the analytics store absorbs duplicates. Nothing here may lose a row
+ * silently — a row is published, or owed, or dead with a record (O-2).
+ *
+ * ---------------------------------------------------------------------------
+ * SEND, THEN MARK. Never mark, then send.
+ * ---------------------------------------------------------------------------
+ * The two orders fail in opposite directions and only one of them is
+ * recoverable. Mark-then-send loses the event when the send fails after the
+ * mark: the row says "published", the consumer never saw it, and nothing in
+ * either database records the gap. Send-then-mark duplicates the event when the
+ * mark fails after the send — and a duplicate is exactly what the idempotency
+ * ledger is for. So the failure mode is chosen to be the one the design already
+ * pays for.
+ *
+ * ---------------------------------------------------------------------------
+ * THE REPUBLISH RULE (pass-3 BREAK 7)
+ * ---------------------------------------------------------------------------
+ * Send-then-mark still leaves one hole: a message that the queue accepted and
+ * the consumer never received. The row is marked published, so the owed leg
+ * will never look at it again, and the consumer watermark — the highest
+ * CONTIGUOUS seq the ledger proves applied (`recomputeWatermark`) — stops
+ * below it forever. That gap is the signal. Rows ABOVE the watermark that were published more than 30 minutes ago
+ * are re-sent: 30 minutes is far above the queue's own delivery and retry
+ * window, so a row that is still above the watermark after it was not delayed,
+ * it was lost. The prune (below the watermark only) and this rule are the two
+ * halves of one promise: a row is pruned only once the consumer has accounted
+ * for it, and until then it keeps being offered.
+ *
+ * ---------------------------------------------------------------------------
+ * THE AGE GATE (ADR §2, S-16)
+ * ---------------------------------------------------------------------------
+ * The owed leg takes rows `created_at <= now − 60 s`: the request path's
+ * `publishAfterCommit` gets first refusal, so the cron is a REPAIR rather than
+ * the normal route and a healthy platform does not send everything twice. The
+ * age is the row's own commit instant (migration 0076 `created_at`, a column
+ * default so no producer binds it), which is the only reading of "age" that
+ * cannot be walked backwards by a prune or by a tick that failed to run.
+ * `minAgeMs: 0` (the request path, which IS the row's first offer) skips it.
+ *
+ * ---------------------------------------------------------------------------
+ * THE OPS PATH FOR A DEAD ROW
+ * ---------------------------------------------------------------------------
+ * `FROZEN_BUILD_REPORT_MARKER` and `FROZEN_CEILING_MARKER` retired with the F12
+ * builder (ADR §1, B7). What they were — a stable string on the log stream that
+ * an operator can grep and an alert can key on — is what survives, and it is
+ * what `BUILD_SWEEP_MARKER` (index.ts) uses today. A dead row is not a
+ * `trust_events` fact: nothing about a creator, a fan or a claim changed, so it
+ * does not belong in the ledger fans and creators can read. It is an operator
+ * fact, and it goes to the log stream under `ANALYTICS_OUTBOX_DEAD` with the
+ * seqs, which are the handles DEPLOY.md's replay uses.
+ */
+
+import { addDays, type OutboxMessage } from "./analytics-consumer.js";
+import { EVENT_KINDS, type EventKind, fanKey, outboxRedriveSql, shelvedErasureWhere } from "./analytics-events.js";
+import { drainErasures, type FanSecretVersion, liveFanSecrets } from "./analytics-erasure.js";
+import { type CronLeaseGuard, withCronLease } from "./cron-lease.js";
+import { logError, logInfo } from "./log.js";
+import { type DbLike, type DbStatement, inChunks } from "./db.js";
+import { isChangeGateRefusal } from "./review.js";
+
+/** ADR §8: rows per outbox tick. One `sendBatch` at the queue's own maximum. */
+export const PUBLISH_LIMIT = 100;
+
+/** I3-0279 (D-0920 option A): `runAnalyticsTick` repeats `publishOutbox` at most
+ * this many times per tick, and only while the previous batch came back FULL
+ * (the owed leg returned its whole limit), sent without a failure, and the
+ * caller's `withinBudget()` holds. 4 x `PUBLISH_LIMIT` rows per 5-minute tick. */
+export const OUTBOX_BATCHES_PER_TICK = 4;
+
+/** RJ550b-09b / I3-0465: the tick's owed-depth gauge counts at most this many
+ * owed rows. A reading of exactly this value is a FLOOR (`backlog_capped: true`
+ * on the marker line), never a depth: nothing is concluded about rows beyond it. */
+export const OWED_DEPTH_CAP = 10_000;
+
+/** ADR §5/§8: accounts per erasure tick. */
+const ERASURE_LIMIT = 20;
+
+/** ADR §2: the request path's head start before the cron repeats its work. */
+export const PUBLISH_MIN_AGE_MS = 60_000;
+
+/** ADR §2: how long a published row may sit above the watermark before it is
+ * treated as lost rather than late. */
+export const REPUBLISH_AFTER_MS = 30 * 60 * 1000;
+
+/** ADR §2: sends per row before the row is dead. `attempts` counts SENDS, not
+ * failures — a row that has been offered five times and is still not behind the
+ * watermark is not going to be, and the sixth send is a loop, not a retry. */
+export const MAX_PUBLISH_ATTEMPTS = 5;
+
+/** I3-0327: the repair leg's floor, out of one tick's `limit`. Before this,
+ * `selectStranded` got only `limit - owed.length`, so a backlog condition —
+ * >= `limit` rows owed in the SAME tick the repair leg exists to help with —
+ * gave the repair leg exactly zero rows, every tick, for as long as the
+ * backlog persisted: a truly lost row (above the watermark, past
+ * `REPUBLISH_AFTER_MS`) never got re-sent, its `attempts` never advanced, and
+ * `MAX_PUBLISH_ATTEMPTS` could never bury it. Reserving this many slots for
+ * `selectStranded` caps the owed leg's own share at `limit -
+ * STRANDED_RESERVE` but guarantees the repair leg is never fully starved.
+ * Small relative to `PUBLISH_LIMIT` (100) so a healthy, backlog-free tick's
+ * owed throughput is barely touched. */
+const STRANDED_RESERVE = 10;
+
+/**
+ * Rows the watermark recompute reads above the stored watermark, per tick
+ * (`recomputeWatermark`). The recompute is ANCHORED at that value, so this is
+ * the whole per-tick cost: at most this many live rows and this many dead rows
+ * from PRODUCTION, and one chunked ledger read of at most this many
+ * `event_key`s from ANALYTICS. Nothing rescans the history below the watermark.
+ *
+ * IT IS >= `PUBLISH_LIMIT` ON PURPOSE, and that is what makes the window right
+ * rather than merely cheap: the republish leg takes rows above the watermark in
+ * seq order, `limit` at a time, so `attempts` accumulate only on the LOWEST
+ * unaccounted seqs — every row that can reach `MAX_PUBLISH_ATTEMPTS` is inside
+ * the first `PUBLISH_LIMIT` rows above the watermark, and so inside this window.
+ *
+ * WHAT A CALLER MAY CONCLUDE ABOUT THE ROWS BEYOND THIS LIMIT: nothing. A read
+ * that returns exactly this many rows was truncated, and the watermark asserts
+ * only over what was read — `recomputeWatermark`'s walk carries `seqs[i]! <=
+ * bound` for that reason, and the advance is therefore bounded by `limit` AND
+ * by the last seq a full live read returned.
+ */
+export const WATERMARK_SCAN_LIMIT = 500;
+
+/** I3-1957: windows of `WATERMARK_SCAN_LIMIT` one tick may recompute while the
+ * previous window was truncated AND fully accounted. One window per 5-minute
+ * tick capped the watermark's advance at ~144k rows/day; four raise it to
+ * ~576k at 4 x (2 PRODUCTION + 6 ANALYTICS) reads. Above that the tick reports
+ * `lagging` and holds the `processed_events` prune (`runAnalyticsTick`). */
+export const RECOMPUTE_MAX_WINDOWS = 4;
+
+/** ADR §2/§3: published rows are kept 7 days, and only below the watermark. */
+export const OUTBOX_RETENTION_DAYS = 7;
+
+/** ADR §2 / migration 0076: dead rows are kept 30 days — shorter than the
+ * sentinel's 90, so an operator replay can never outlive the sentinel that
+ * would refuse it for an erased fan.
+ *
+ * THE SENTINEL IS TWO ROWS since docket #23 C-2: `analytics_erased`, which a
+ * creator's retraction deletes (`analytics-erasure.ts CREATOR_SCOPED_DELETES`),
+ * and `analytics_erasure_sentinels` (analytics/0003), which nothing
+ * creator-scoped names. The consumer's guard refuses on EITHER, so this
+ * 30-under-90 ordering bounds BOTH halves: `pruneAnalyticsRetention` ages the
+ * durable half on the same `erasedCut` as `analytics_erased` (docket #24 (a),
+ * Jason 2026-09-07) — a sentinel older than the longest possible late arrival
+ * guards nothing, and the two rows are one fact with one lifetime.
+ *
+ * I3-1948 (D-0829): the 30-day auto-delete stays; the operator sees the table
+ * BEFORE it ages out through the ops "Dead letters" panel (`deadLetterPanel`
+ * below — row count, rows added in the last 24 hours, newest row's instant). */
+export const DEAD_RETENTION_DAYS = 30;
+
+/** One dead-letter table on the ops "Dead letters" panel: counts and an instant, never a payload. */
+export interface DeadLetterCounts {
+  readonly rows: number;
+  readonly added_24h: number;
+  readonly newest_at: string | null;
+}
+
+/**
+ * THE OPS "DEAD LETTERS" PANEL (I3-1689, I3-1737, I3-1948; D-0829, the D-0709
+ * pattern: a signal that reaches only a log must reach an operator surface).
+ * COUNTS ONLY — no event key, passport id, fan key, summary or amount leaves
+ * this function (INV-051/INV-061).
+ *
+ * - `analytics_outbox_dead` (production, migration 0076): "added" is `dead_at`,
+ *   the instant the row was buried (`created_at` is carried over from the live
+ *   row and is its birth, not its death).
+ * - `alert_fanout_dead_letters` (production, migration 0090): the table has no
+ *   insert instant — `created_at` is frozen at the original event instant — so
+ *   "added in the last 24 hours" is read off `created_at`, i.e. dead letters
+ *   for events of the last 24 hours.
+ * - `amber` (I3-1737, the O-2 lost-message alert): any `analytics_outbox_dead`
+ *   row added in the last 24 hours (I3-0716: 'aged_unpublished' rows included).
+ *   `logError({ marker: OUTBOX_DEAD_MARKER, … })` in `deadLetter` stays for the logs.
+ */
+export async function deadLetterPanel(
+  prod: DbLike,
+  nowMs: number,
+): Promise<{ analytics_outbox_dead: DeadLetterCounts; alert_fanout_dead_letters: DeadLetterCounts; amber: boolean }> {
+  const since = new Date(nowMs - 86_400_000).toISOString();
+  const outbox = await prod
+    .prepare("SELECT COUNT(*) AS rows, COALESCE(SUM(dead_at >= ?), 0) AS added, MAX(dead_at) AS newest FROM analytics_outbox_dead")
+    .bind(since)
+    .first<{ rows: number; added: number; newest: string | null }>();
+  const fanout = await prod
+    .prepare("SELECT COUNT(*) AS rows, COALESCE(SUM(created_at >= ?), 0) AS added, MAX(created_at) AS newest FROM alert_fanout_dead_letters")
+    .bind(since)
+    .first<{ rows: number; added: number; newest: string | null }>();
+  const counts = (r: { rows: number; added: number; newest: string | null } | null): DeadLetterCounts => ({
+    rows: Number(r?.rows ?? 0),
+    added_24h: Number(r?.added ?? 0),
+    newest_at: r?.newest ?? null,
+  });
+  const analyticsOutboxDead = counts(outbox);
+  return { analytics_outbox_dead: analyticsOutboxDead, alert_fanout_dead_letters: counts(fanout), amber: analyticsOutboxDead.added_24h > 0 };
+}
+
+/** S-021 ERASURE (FAMILY-004/v2 (a)): the never-published row's bound. A row
+ * that never left `analytics_outbox` — `published_at IS NULL` and never spent
+ * its `MAX_PUBLISH_ATTEMPTS` (so `deadLetter` never buried it either) — had no
+ * age bound at all before this. Same number as `DEAD_RETENTION_DAYS`
+ * deliberately: both are "the row did not complete the normal path", both
+ * must stay under the sentinel's 90 for the same reason the dead table does,
+ * and a bound that outlived the sentinel would be exactly the gap this fixes. */
+export const NEVER_PUBLISHED_RETENTION_DAYS = DEAD_RETENTION_DAYS;
+
+/**
+ * THE SECOND STORE'S THREE RETENTIONS (INV-004 clause 3, ADR-0006 O-21,
+ * ratified 2026-09-06). Each number is `analytics/0001_rollups.sql`'s own —
+ * `:213-214` (membership), `:274-275` (the sentinel), `:298` (the ledger) —
+ * and each shipped its prune INDEX and no prune. Restated here rather than
+ * re-derived, so a change to either has to change both.
+ */
+export const MEMBERSHIP_RETENTION_DAYS = 91;
+export const ERASED_RETENTION_DAYS = 90;
+export const PROCESSED_RETENTION_DAYS = 7;
+/** I22-Q8 (Jason: "35 days, matching the analytics pool"): `analytics_follow_net` rows are aged out by `day`. */
+export const FOLLOW_NET_RETENTION_DAYS = 35;
+
+/** Rows per table per tick. The tick is every 5 minutes (`ANALYTICS_CRON`), so
+ * this is ~144k rows/table/day of catch-up — enough to drain a backlog and
+ * small enough that a retention sweep never spends the whole leg's subrequest
+ * budget or holds a long write on the store a creator's read is waiting on. */
+const RETENTION_PRUNE_LIMIT = 500;
+
+/**
+ * Lease TTL for one analytics tick, on the `alerts.ts` `DELIVERY_LEASE_TTL_MS`
+ * precedent and for its reason: `CRON_LEASE_TTL_MS` (30 min) is chosen against
+ * a 6-hour period, and against `ANALYTICS_CRON`'s 5-minute period it is the
+ * opposite of what the TTL is for — a tick evicted mid-run (the one case a
+ * `finally` cannot cover) would block six later ticks. Two minutes is
+ * comfortably above a 100-row drain and comfortably below the next tick.
+ */
+export const ANALYTICS_LEASE_TTL_MS = 2 * 60 * 1000;
+
+/** Lease names (S-9). Two, not one: a slow erasure drain must not stop the
+ * publisher, and the publisher's failure must not strand a fan's erasure. */
+export const OUTBOX_LEASE = "analytics-outbox";
+const ERASURE_LEASE = "analytics-erasure";
+/** #166: the creator purge leg's own lease, so a slow purge never holds the outbox or fan-erasure lease. */
+const CREATOR_PURGE_LEASE = "analytics-creator-purge";
+
+/** The greppable ops facts of one tick. See the header for why these are log
+ * markers and not ledger rows. */
+export const OUTBOX_DEAD_MARKER = "ANALYTICS_OUTBOX_DEAD";
+export const ANALYTICS_TICK_MARKER = "ANALYTICS_TICK";
+
+/** I3-0386: `ANALYTICS_CRON`'s period. A row owed longer than the age gate plus
+ * TWO periods has missed two ticks it was eligible for — the sync has stopped
+ * moving, whatever the counts say. */
+const ANALYTICS_TICK_PERIOD_MS = 5 * 60 * 1000;
+export const OUTBOX_STALL_AFTER_MS = PUBLISH_MIN_AGE_MS + 2 * ANALYTICS_TICK_PERIOD_MS;
+
+/** I3-0386: the age of the OLDEST owed outbox row (lowest seq on the partial
+ * `idx_outbox_unpublished` index — seq is commit order) and whether it is past
+ * OUTBOX_STALL_AFTER_MS. `null` age = nothing owed, which is never a stall. */
+export async function outboxBacklogAge(db: DbLike, nowMs: number): Promise<{ oldest_unpublished_age_s: number | null; stalled: boolean }> {
+  const row = await db.prepare("SELECT created_at FROM analytics_outbox WHERE published_at IS NULL ORDER BY seq LIMIT 1").first<{ created_at: string }>();
+  const born = row ? Date.parse(row.created_at) : Number.NaN;
+  if (!Number.isFinite(born)) return { oldest_unpublished_age_s: null, stalled: false };
+  const ageMs = Math.max(0, nowMs - born);
+  return { oldest_unpublished_age_s: Math.floor(ageMs / 1000), stalled: ageMs > OUTBOX_STALL_AFTER_MS };
+}
+
+/** JN-LAND I3-0386 residual (I15-FX4): a PUBLISHED row the consumer never
+ * applied. Normal path: published by MIN_AGE + one tick, consumed in seconds,
+ * under the watermark by the next tick (OUTBOX_STALL_AFTER_MS). A message the
+ * queue lost is re-sent by the repair leg once REPUBLISH_AFTER_MS has passed
+ * since `published_at`, and seen under the watermark a tick later — so a row
+ * still above the watermark past the sum of the three has outlived the repair
+ * that exists for it. */
+export const OUTBOX_CONSUME_STALL_AFTER_MS = OUTBOX_STALL_AFTER_MS + REPUBLISH_AFTER_MS + ANALYTICS_TICK_PERIOD_MS;
+
+/** JN-LAND I3-0386 residual (I15-FX4): the age of the LOWEST-seq published row
+ * above `watermark` (prune deletes only `seq <= watermark` rows, `pruneOutbox`,
+ * so that row is the one holding the watermark back), measured from
+ * `created_at` because the repair leg rewrites `published_at` on every re-send.
+ * `null` watermark = not read this tick, which claims nothing. */
+export async function outboxConsumeAge(db: DbLike, nowMs: number, watermark: number | null): Promise<{ oldest_unconsumed_age_s: number | null; stalled: boolean }> {
+  if (watermark === null) return { oldest_unconsumed_age_s: null, stalled: false };
+  const row = await db.prepare("SELECT created_at FROM analytics_outbox WHERE published_at IS NOT NULL AND seq > ? ORDER BY seq LIMIT 1").bind(watermark).first<{ created_at: string }>();
+  const born = row ? Date.parse(row.created_at) : Number.NaN;
+  if (!Number.isFinite(born)) return { oldest_unconsumed_age_s: null, stalled: false };
+  const ageMs = Math.max(0, nowMs - born);
+  return { oldest_unconsumed_age_s: Math.floor(ageMs / 1000), stalled: ageMs > OUTBOX_CONSUME_STALL_AFTER_MS };
+}
+
+/**
+ * The message body IS the outbox row (migration 0076's columns, minus the
+ * publisher's own bookkeeping). Built by `messageColumns` below, so the queue
+ * contract and the consumer's input are one declaration: a key here that
+ * `OutboxMessage` lacks, or an `OutboxMessage` key missing here, fails typecheck
+ * (I3-2012 — the free string this replaced linked nothing).
+ *
+ * `attempts` and `published_at` are deliberately NOT sent. They are facts about
+ * this publisher's own retries, they change between two deliveries of one row,
+ * and a consumer that could see them could branch on them — which would make
+ * the second delivery of a message different from the first.
+ */
+type MessageKey = Exclude<keyof OutboxMessage, "attempts">;
+/** I3-2012: the SELECT list is built from a key tuple the COMPILER checks against
+ * `OutboxMessage` in both directions — an unknown key fails the element type, a
+ * missing one fails the `missing` intersection. `attempts` is excluded because
+ * the runtime sets it on arrival (`OutboxMessage.attempts`), never the body. */
+function messageColumns<const K extends readonly MessageKey[]>(keys: K & ([Exclude<MessageKey, K[number]>] extends [never] ? unknown : { missing: Exclude<MessageKey, K[number]> })): string {
+  return keys.join(", ");
+}
+const MESSAGE_COLUMNS = messageColumns([
+  "seq",
+  "event_key",
+  "passport_id",
+  "event_type",
+  "occurred_day",
+  "fan_key",
+  "fan_key_v",
+  "scope_kind",
+  "scope_id",
+  "dims",
+  "amount_cents",
+]);
+
+const MESSAGE_COLUMN_LIST: readonly string[] = MESSAGE_COLUMNS.split(", ");
+
+/** Every column `analytics_outbox_dead` carries over from the live row —
+ * including `created_at`, so a dead row keeps the age it died at and an
+ * operator can tell a row that was never sent from one that was sent all day. */
+const DEAD_COLUMNS = `${MESSAGE_COLUMNS}, attempts, published_at, created_at`;
+
+/**
+ * Either shape of a Cloudflare queue producer. `sendBatch` is what a real
+ * `Queue` offers and what the budget in ADR §8 assumes (one subrequest per
+ * tick, not one per row); the single-send form is accepted so a caller holding
+ * a narrower binding is not forced to fabricate one.
+ */
+export type OutboxQueue = { sendBatch(messages: { body: unknown }[]): Promise<unknown> } | { send(body: unknown): Promise<unknown> };
+
+/** Cloudflare's per-`sendBatch` message ceiling. */
+const QUEUE_BATCH_MAX = 100;
+
+interface PublishOptions {
+  /** Rows per call (ADR §8). */
+  readonly limit?: number;
+  /** How old an owed row must be before the cron takes it. 0 disables the gate
+   * (the request path, which IS the row's first offer). */
+  readonly minAgeMs?: number;
+  /** The consumer watermark, read from `ANALYTICS_DB` by the caller — the two
+   * bindings never meet in one statement, let alone one batch. `null` means
+   * "not known": the republish leg does not run and no row is dead-lettered for
+   * sitting above a watermark nobody read. */
+  readonly watermark?: number | null;
+  /** Seqs above `watermark` that the idempotency ledger PROVES applied
+   * (`recomputeWatermark`). They are stranded above a real gap, not lost: the
+   * republish leg skips them and the dead-letter records them as
+   * `delivered_above_gap` instead of alerting them as `attempts`. Empty when the
+   * caller could not recompute — no row is then called delivered on no evidence. */
+  readonly appliedAbove?: readonly number[] | undefined;
+  /** Publish exactly these owed rows (the request path knows its own seqs).
+   * With it, the republish leg and the age gate do not run. */
+  readonly seqs?: readonly number[] | undefined;
+  /** `false` skips the dead-letter leg entirely (`deadLetter` is not called).
+   * The request path passes it: burial names a row LOST, and a caller with no
+   * ledger binding cannot know that (reconcile R-1 PROBE 1). Burial belongs to
+   * the tick, which holds both bindings. */
+  readonly bury?: boolean;
+  /** `ANALYTICS_DB`, for the dead-letter's own ledger read (`deadLetter`, the
+   * `applied` set): `appliedAbove` speaks only for seqs above the contiguous
+   * run, and a candidate BELOW the watermark needs the ledger asked about it
+   * directly (reconcile R-1 PROBE 2). Absent -> the leg has only the caller's
+   * evidence, which is why `bury: false` and not a bare omission is what the
+   * request path passes. */
+  readonly analytics?: DbLike | undefined;
+  /** I3-1957: the last seq the watermark recompute's TRUNCATED live read
+   * returned. The repair leg takes nothing above it: the recompute read no
+   * ledger evidence there, so a row above it is unknown, not lost. Absent ->
+   * the read was exhaustive and there is no ceiling. */
+  readonly strandedCeiling?: number | undefined;
+}
+
+interface PublishReport {
+  /** Rows handed to the queue and marked. */
+  readonly sent: number;
+  /** Rows whose send threw; their `attempts` moved, their `published_at` did not. */
+  readonly failed: number;
+  /** Seqs moved to `analytics_outbox_dead` by this call. */
+  readonly dead: number[];
+  /** I3-0465: how many owed rows this call's `selectOwed` actually found, BEFORE
+   * `sendAll` ran — the depth of the backlog this tick started with, not the
+   * count this tick managed to clear. Was computed and discarded every tick;
+   * it is now on the report so `runAnalyticsTick`'s `ANALYTICS_TICK_MARKER` log
+   * line (the only place a stalled drain is currently visible at all) carries
+   * it, and an operator tailing that marker can tell "small backlog, tick kept
+   * up" from "backlog is `PUBLISH_LIMIT`-sized every tick" without a query
+   * against PRODUCTION. */
+  readonly owed: number;
+  /** I3-0279: the owed leg returned its whole limit, so more owed rows may be
+   * waiting — the one condition under which `runAnalyticsTick` runs another batch. */
+  readonly full: boolean;
+}
+
+const DAY_MS = 86_400_000;
+
+function isoMinus(nowMs: number, ms: number): string {
+  return new Date(nowMs - ms).toISOString();
+}
+
+async function sendAll(queue: OutboxQueue, bodies: readonly OutboxMessage[]): Promise<void> {
+  if ("sendBatch" in queue) {
+    for (let i = 0; i < bodies.length; i += QUEUE_BATCH_MAX) {
+      await queue.sendBatch(bodies.slice(i, i + QUEUE_BATCH_MAX).map((body) => ({ body })));
+    }
+    return;
+  }
+  for (const body of bodies) await queue.send(body);
+}
+
+async function selectOwed(prod: DbLike, opts: { bornBefore: string | null; seqs?: readonly number[] | undefined; limit: number }): Promise<OutboxMessage[]> {
+  if (opts.seqs) {
+    if (opts.seqs.length === 0) return [];
+    const out: OutboxMessage[] = [];
+    // `inChunks(..., 2)` — `attempts` and `LIMIT` ride the same statement, and
+    // the chunk is bound FIRST so the house rule the census reads (`.bind(...chunk`)
+    // holds here as it does at every other IN(...) site.
+    for (const chunk of inChunks([...opts.seqs], 2)) {
+      const rows = await prod
+        .prepare(
+          `SELECT ${MESSAGE_COLUMNS} FROM analytics_outbox
+            WHERE seq IN (${chunk.map(() => "?").join(", ")}) AND published_at IS NULL AND attempts < ?
+            ORDER BY seq LIMIT ?`,
+        )
+        .bind(...chunk, MAX_PUBLISH_ATTEMPTS, opts.limit)
+        .all<OutboxMessage>();
+      out.push(...rows.results);
+    }
+    return out.slice(0, opts.limit);
+  }
+  const gate = opts.bornBefore === null ? "" : " AND created_at <= ?";
+  const params: unknown[] = opts.bornBefore === null ? [] : [opts.bornBefore];
+  const rows = await prod
+    .prepare(`SELECT ${MESSAGE_COLUMNS} FROM analytics_outbox WHERE published_at IS NULL AND attempts < ?${gate} ORDER BY seq LIMIT ?`)
+    .bind(MAX_PUBLISH_ATTEMPTS, ...params, opts.limit)
+    .all<OutboxMessage>();
+  return rows.results;
+}
+
+/** The repair leg. Published, above the watermark's first gap, older than 30
+ * minutes, still under the attempt ceiling — and NOT one of the rows the ledger
+ * proves applied (docket #17 A-2: re-sending a consumed row is the waste the
+ * ruling names, and it is what spends the attempts that then bury it).
+ *
+ * The applied rows are dropped AFTER the LIMIT, so a tick can send fewer than
+ * `limit`; the rows it skipped are still there and the ceiling is a ceiling. */
+async function selectStranded(prod: DbLike, watermark: number, cutoffIso: string, limit: number, applied: ReadonlySet<number>, ceiling: number | undefined): Promise<OutboxMessage[]> {
+  if (limit <= 0) return [];
+  const rows = await prod
+    .prepare(
+      `SELECT ${MESSAGE_COLUMNS} FROM analytics_outbox
+        WHERE published_at IS NOT NULL AND attempts < ? AND seq > ? AND seq <= ? AND published_at <= ?
+        ORDER BY seq LIMIT ?`,
+    )
+    .bind(MAX_PUBLISH_ATTEMPTS, watermark, ceiling ?? Number.MAX_SAFE_INTEGER, cutoffIso, limit)
+    .all<OutboxMessage>();
+  return rows.results.filter((r) => !applied.has(Number(r.seq)));
+}
+
+/** Both dispositions are one UPDATE over a seq list; only the SET differs.
+ *
+ * `inChunks(..., 1)` reserves the one SET parameter. The bind reads
+ * `...params, ...chunk` and not `...chunk, …` like every other chunked site
+ * here because an UPDATE's SET placeholders necessarily come before its WHERE
+ * placeholders — the ordering is SQL's, not a choice. */
+async function bump(prod: DbLike, seqs: readonly number[], publishedAt: string | null): Promise<void> {
+  for (const chunk of inChunks([...seqs], 1)) {
+    const set = publishedAt === null ? "attempts = attempts + 1" : "published_at = ?, attempts = attempts + 1";
+    const params = publishedAt === null ? [] : [publishedAt];
+    await prod
+      .prepare(`UPDATE analytics_outbox SET ${set} WHERE seq IN (${chunk.map(() => "?").join(", ")})`)
+      .bind(...params, ...chunk)
+      .run();
+  }
+}
+
+/** The ledger read, chunked, in the ONE shape this file uses (`recomputeWatermark`
+ * and `deadLetter` both ask it the same question). ANALYTICS_DB only: the
+ * caller holds the seq -> `event_key` map from PRODUCTION and joins the two
+ * itself, because `processed_events` carries no seq
+ * (`analytics/0001_rollups.sql:294`). */
+async function appliedKeys(analytics: DbLike, keys: readonly string[]): Promise<Set<string>> {
+  const applied = new Set<string>();
+  for (const chunk of inChunks([...keys])) {
+    const rows = await analytics
+      .prepare(`SELECT event_key FROM processed_events WHERE event_key IN (${chunk.map(() => "?").join(", ")})`)
+      .bind(...chunk)
+      .all<{ event_key: string }>();
+    for (const r of rows.results) applied.add(r.event_key);
+  }
+  return applied;
+}
+
+/** The row was delivered — the ledger holds its `event_key` — and the mark was
+ * lost with the batch that carried it (`publishOutbox`'s `catch` bumps every
+ * row in the batch, including the ones the queue accepted). `attempts` is NOT
+ * touched: it counts SENDS, and this is not one. Marking is what returns the
+ * row to `pruneOutbox`, which takes only `published_at IS NOT NULL`. */
+async function markPublished(prod: DbLike, seqs: readonly number[], nowIso: string): Promise<void> {
+  for (const chunk of inChunks([...seqs], 1)) {
+    await prod
+      .prepare(`UPDATE analytics_outbox SET published_at = ? WHERE seq IN (${chunk.map(() => "?").join(", ")})`)
+      .bind(nowIso, ...chunk)
+      .run();
+  }
+}
+
+/**
+ * `analytics_outbox_dead.reason`'s vocabulary from this file (docket #17 A-2,
+ * decision S3-6). `'dlq'` is the consumer's (`analytics-consumer.ts consumeDead`).
+ *
+ * `'attempts'` MEANS LOST, and it is the only one that alerts. A row that spent
+ * its attempts but whose `event_key` is in the idempotency ledger was applied —
+ * it was stranded above a gap, which is not the same fact and must not reach an
+ * operator's "never delivered" pile.
+ */
+type DeadReason = "attempts" | "delivered_above_gap" | "aged_unpublished";
+
+/** I3-0716 (D-0920 options A+B): the reason `pruneOutbox` buries a row that was
+ * never published and aged past NEVER_PUBLISHED_RETENTION_DAYS. */
+const AGED_UNPUBLISHED_REASON: DeadReason = "aged_unpublished";
+
+/**
+ * INSERT-then-DELETE in ONE batch. Split across two round-trips, a Worker death
+ * between them either loses the row (delete first) or duplicates it into an
+ * operator's replay queue (insert first, retried). D1's batch is atomic, so
+ * neither is reachable.
+ *
+ * The seq list is the one the caller already SELECTed, not the predicate re-run:
+ * two dispositions now share one candidate set, and a row must not be able to
+ * change groups between the read and the write.
+ */
+async function bury(prod: DbLike, seqs: readonly number[], reason: DeadReason, nowIso: string): Promise<void> {
+  // `inChunks(..., 2)` — `dead_at` and `reason` ride the INSERT's own statement.
+  for (const chunk of inChunks([...seqs], 2)) {
+    const holes = chunk.map(() => "?").join(", ");
+    await prod.batch([
+      prod
+        .prepare(
+          `INSERT OR IGNORE INTO analytics_outbox_dead (${DEAD_COLUMNS}, dead_at, reason)
+             SELECT ${DEAD_COLUMNS}, ?, ? FROM analytics_outbox WHERE seq IN (${holes})`,
+        )
+        .bind(nowIso, reason, ...chunk),
+      prod.prepare(`DELETE FROM analytics_outbox WHERE seq IN (${holes})`).bind(...chunk),
+    ]);
+  }
+}
+
+/**
+ * Move every row that has spent its attempts to `analytics_outbox_dead` and say
+ * so on the log stream.
+ *
+ * The predicate is "owed, or published but never accounted for": a row that IS
+ * behind the watermark has been consumed, and its `attempts` are then a record
+ * of how hard that was, not a reason to bury it.
+ *
+ * THE SPLIT (docket #17 A-2, widened by reconcile R-1). The same predicate also
+ * catches rows that ARE applied. `appliedAbove` is the ledger's answer for the
+ * seqs above the contiguous run (`recomputeWatermark`) and for no others, so it
+ * cannot speak for a candidate BELOW the watermark — the row whose mark was
+ * lost with its batch. Every candidate's own `event_key` is therefore put to
+ * the ledger (`appliedKeys`) when the caller supplied that binding, and the
+ * three dispositions are:
+ *   - applied, at or below the watermark: MARKED PUBLISHED, not buried. The
+ *     watermark has already crossed it, so `delivered_above_gap` would be a
+ *     false statement about where it sits, and a dead row is a replay handle
+ *     for something that needs no replay.
+ *   - applied, above the watermark: `delivered_above_gap`, no alert.
+ *   - unaccounted anywhere: `'attempts'`, and the one alert.
+ * `ANALYTICS_OUTBOX_DEAD` therefore fires only for rows the ledger has never
+ * seen.
+ *
+ * The candidate set is bounded by `WATERMARK_SCAN_LIMIT`, like every other
+ * per-tick read here, because this leg now costs one ledger read per candidate.
+ * A tick that hits the bound loses nothing: the rows it did not reach are still
+ * there, with their attempts spent, and the next tick's first rows are theirs.
+ */
+async function deadLetter(prod: DbLike, nowIso: string, watermark: number | null, appliedAbove: ReadonlySet<number>, analytics?: DbLike): Promise<number[]> {
+  const where = watermark === null ? "attempts >= ? AND published_at IS NULL" : "attempts >= ? AND (published_at IS NULL OR seq > ?)";
+  const params: unknown[] = watermark === null ? [MAX_PUBLISH_ATTEMPTS] : [MAX_PUBLISH_ATTEMPTS, watermark];
+  const doomed = await prod
+    .prepare(`SELECT seq, event_key FROM analytics_outbox WHERE ${where} ORDER BY seq LIMIT ?`)
+    .bind(...params, WATERMARK_SCAN_LIMIT)
+    .all<{ seq: number; event_key: string }>();
+  const candidates = doomed.results.map((r) => ({ seq: Number(r.seq), key: r.event_key }));
+  if (candidates.length === 0) return [];
+  const applied = analytics ? await appliedKeys(analytics, candidates.map((c) => c.key)) : new Set<string>();
+  const proven = (c: { seq: number; key: string }): boolean => appliedAbove.has(c.seq) || applied.has(c.key);
+  const settled = candidates.filter((c) => applied.has(c.key) && watermark !== null && c.seq <= watermark).map((c) => c.seq);
+  const seqs = candidates.filter((c) => !settled.includes(c.seq)).map((c) => c.seq);
+  if (settled.length > 0) await markPublished(prod, settled, nowIso);
+  if (seqs.length === 0) return [];
+  const lost = candidates.filter((c) => !proven(c)).map((c) => c.seq);
+  const delivered = seqs.filter((seq) => !lost.includes(seq));
+  if (lost.length > 0) await bury(prod, lost, "attempts", nowIso);
+  if (delivered.length > 0) await bury(prod, delivered, "delivered_above_gap", nowIso);
+  // The ops alert, for the lost rows only. Seqs only: a dead row's own columns
+  // are the analytics event, and the log stream is not a place a fan pseudonym
+  // or an amount belongs. O-2 (I3-1737): this line is the LOG half; the
+  // operator half is the ops "Dead letters" panel (`deadLetterPanel`, amber
+  // while any `analytics_outbox_dead` row was added in the last 24 hours).
+  // #812a: through log.ts; the seqs ride `detail` (truncated at 200 chars — the
+  // full set is the `analytics_outbox_dead` rows with this tick's `dead_at`).
+  if (lost.length > 0) logError({ cid: "analytics-tick", hop: "cron", msg: OUTBOX_DEAD_MARKER, marker: OUTBOX_DEAD_MARKER, reason: "attempts", count: lost.length, detail: `seqs=${lost.join(",")}` });
+  return seqs;
+}
+
+/**
+ * #936(b) I3-1126 (D-0954(4)), I19-W1D: THE ERASURE DECREMENTS ARE THE ROWS A FAN'S ERASURE CANNOT LOSE. Derived from the
+ * closed vocabulary (`EVENT_KINDS`, the ADR §3 `*_erased` creator-scoped decrements emitted by account erasure), never a
+ * hand list, so a new decrement kind is covered by the re-drive and the alarm the day it is added to the vocabulary.
+ */
+export const ERASURE_DECREMENT_KINDS: readonly EventKind[] = (Object.keys(EVENT_KINDS) as EventKind[]).filter((k) => k.endsWith("_erased")).sort();
+/** The alarm `runAnalyticsTick` logs on every tick while a shelved erasure row exists (level-triggered: it clears only
+ * when an operator re-drives the row, `redriveShelvedErasures`, or the dead table's retention removes it). */
+export const ANALYTICS_ERASURE_SHELVED_MARKER = "ANALYTICS_ERASURE_SHELVED";
+
+/**
+ * I23 (I3-0256 a, D-0993(1) census pick): ANALYTICS_FAN_SECRET changed WITHOUT a FAN_KEY_V bump. Every fan key
+ * is an HMAC of that secret, so a silent change re-keys every fan (cohorts count them as new) and strands every
+ * erasure keyed under the old one; the drain cannot tell. Per version in the live set, the first fingerprint
+ * seen is recorded (analytics/0010, first write wins) and a later tick whose secret for that version differs
+ * logs this marker with the version — level-triggered, every tick, until the operator restores the secret or
+ * bumps the version (DEPLOY.md rotation runbook: bump FAN_KEY_V and set ANALYTICS_FAN_SECRET_PREVIOUS together).
+ * A rotation done that way records a new version and never fires. The fingerprint is `fanKey` over a fixed
+ * sentinel, never the secret; the sentinel account id is no account's.
+ */
+export const ANALYTICS_FAN_SECRET_CHANGED_MARKER = "ANALYTICS_FAN_SECRET_CHANGED";
+const FINGERPRINT_ACCOUNT = "fingerprint:analytics-fan-secret";
+const FINGERPRINT_PASSPORT = "psp_0000000000000000";
+/** Returns the versions whose configured secret no longer matches the recorded fingerprint (each also logged). */
+export async function checkFanSecretFingerprints(analytics: DbLike, set: readonly FanSecretVersion[], nowIso: string): Promise<number[]> {
+  const changed: number[] = [];
+  for (const { v, secret } of set) {
+    const fp = await fanKey(secret, FINGERPRINT_ACCOUNT, FINGERPRINT_PASSPORT);
+    const [, row] = (await analytics.batch([
+      analytics.prepare("INSERT OR IGNORE INTO analytics_fan_secret_fingerprints (v, fingerprint, first_seen_at) VALUES (?, ?, ?)").bind(v, fp, nowIso),
+      analytics.prepare("SELECT fingerprint FROM analytics_fan_secret_fingerprints WHERE v = ?").bind(v),
+    ])) as Array<{ results?: Array<{ fingerprint?: string }> } | undefined>;
+    const recorded = row?.results?.[0]?.fingerprint;
+    if (recorded !== fp) {
+      changed.push(v);
+      logError({ cid: "analytics-tick", hop: "cron", msg: ANALYTICS_FAN_SECRET_CHANGED_MARKER, marker: ANALYTICS_FAN_SECRET_CHANGED_MARKER, detail: `v=${v}` });
+    }
+  }
+  return changed;
+}
+/**
+ * I32 (I3-0256, D-1082(5)): `ANALYTICS_FAN_SECRET_PREVIOUS` as a LIST. Split on `,` (the secrets are hex, DEPLOY.md
+ * `openssl rand -hex 32`), newest first: entry i is version `head.v - 1 - i`. A value with no comma is exactly the one
+ * previous version it always was, byte for byte (nothing is trimmed). An EMPTY entry throws: it would shift every older
+ * secret onto the wrong version, and an erasure under the wrong version matches no row. A version below 1 is refused
+ * by `liveFanSecrets` (drainErasures), loud, as before.
+ */
+export function previousFanSecrets(head: FanSecretVersion, raw: string | undefined): FanSecretVersion[] {
+  if (raw === undefined || raw === "") return [];
+  return raw.split(",").map((secret, i) => {
+    if (secret === "") throw new Error(`ANALYTICS_FAN_SECRET_PREVIOUS: entry ${i + 1} is empty`);
+    return { v: head.v - 1 - i, secret };
+  });
+}
+
+/**
+ * I32 (I3-0256, D-1082(5)): THE OTHER HALF OF THE SECRET-CHANGE ALARM. The versions that still hold a fan row inside the
+ * membership window (`cell_day >=` today − MEMBERSHIP_RETENTION_DAYS, the prune's own cut in `pruneAnalyticsRetention`)
+ * and have no secret in the live set: erasure computes no key for them, so their rows would outlive the fan's erasure.
+ * One statement. Each version found logs ANALYTICS_FAN_SECRET_CHANGED (reason `version without secret`); the tick then
+ * consumes no erasure order (`runAnalyticsTick`), level-triggered until the secret is listed again or the rows age out.
+ */
+export async function fanKeyVersionsWithoutSecret(analytics: DbLike, set: readonly FanSecretVersion[], nowIso: string): Promise<number[]> {
+  const cut = addDays(nowIso.slice(0, 10), -MEMBERSHIP_RETENTION_DAYS);
+  const { results } = await analytics
+    .prepare("SELECT DISTINCT fan_key_v AS v FROM analytics_membership WHERE cell_day >= ? AND fan_key_v NOT IN (SELECT value FROM json_each(?)) ORDER BY fan_key_v")
+    .bind(cut, JSON.stringify(set.map((s) => s.v)))
+    .all<{ v: number }>();
+  const missing = results.map((r) => Number(r.v));
+  for (const v of missing) {
+    logError({ cid: "analytics-tick", hop: "cron", msg: ANALYTICS_FAN_SECRET_CHANGED_MARKER, marker: ANALYTICS_FAN_SECRET_CHANGED_MARKER, reason: "version without secret", detail: `v=${v}` });
+  }
+  return missing;
+}
+/** Dead rows one re-drive call moves back. A call that hits it says so (`more: true`); the operator calls again. */
+const REDRIVE_LIMIT = 100;
+/** The kind set as ONE bound parameter (json_each, as admin.ts / agencies.ts / alerts.ts do), never a placeholder each. */
+const ERASURE_KINDS_JSON = JSON.stringify(ERASURE_DECREMENT_KINDS);
+
+/** #936(b): how many shelved erasure rows `analytics_outbox_dead` holds now (the alarm's input). */
+export async function countShelvedErasures(prod: DbLike): Promise<number> {
+  const row = await prod
+    .prepare(`SELECT COUNT(*) AS n FROM analytics_outbox_dead WHERE ${shelvedErasureWhere()}`)
+    .bind(ERASURE_KINDS_JSON)
+    .first<{ n: number }>();
+  return Number(row?.n ?? 0);
+}
+
+/**
+ * #936(b) I3-1126 (D-0954(4)): THE OPERATOR RE-DRIVE, module side. Moves up to `limit` shelved erasure rows from
+ * `analytics_outbox_dead` back to `analytics_outbox` as OWED (`attempts` 0, `published_at` NULL, `created_at` = now so
+ * the never-published prune does not re-bury it before the next publish), and the consumer applies it once — the
+ * ledger key (`event_key`) is unchanged, so a row that did land is absorbed as a duplicate.
+ * Per chunk, ONE atomic batch: (1) re-insert a row whose seq and event_key no live row holds; (2) re-offer a live twin
+ * (a consumer `'dlq'` dead row keeps its published live row); (3) delete the dead row ONLY where a live row with its seq
+ * and event_key now exists — so no row is ever in neither table. IDEMPOTENT: a second call finds no dead row to move.
+ * The caller owns authorisation and the audit row: `audit(chunk)` returns the caller's statements, which ride THAT
+ * chunk's batch, so a move is never committed without its record.
+ * I19-FXB (RG-MONEY-09, D-0956(1)): `redriveGateStmt` sits DIRECTLY after the dead-row DELETE, so a chunk's batch — the
+ * caller's audit rows included — commits only when THIS call's DELETE moved EVERY row of the chunk; a chunk a concurrent
+ * re-drive moved (all or part of) aborts (`isChangeGateRefusal`) and is retried one seq at a time, so each audit row
+ * and the reported `seqs` name exactly the rows this call moved, and a row that cannot move never strands its chunk.
+ * I19-FXB (RG-MONEY-08): a row that did land is absorbed only while `processed_events` holds its key, which
+ * `pruneAnalyticsRetention` keeps for every shelved or still-live erasure row (`heldLedgerKeys`).
+ */
+/** I19-FXB (RG-MONEY-09): review.ts `changeGateStmt` with the expected count bound — placed DIRECTLY after the re-drive's
+ * DELETE it inserts nothing when that DELETE changed exactly `n` rows and otherwise violates `audit_log.detail NOT NULL`,
+ * aborting the batch (review.ts `isChangeGateRefusal` recognises it). */
+function redriveGateStmt(prod: DbLike, n: number): DbStatement {
+  return prod
+    .prepare(
+      "INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT 'system:change-gate', 'change-gate', NULL, '', NULL, 'system' WHERE changes() <> ?",
+    )
+    .bind(n);
+}
+export async function redriveShelvedErasures(
+  prod: DbLike,
+  nowIso: string,
+  limit: number = REDRIVE_LIMIT,
+  audit: (seqs: readonly number[]) => DbStatement[] = () => [],
+): Promise<{ seqs: number[]; more: boolean }> {
+  const kinds = ERASURE_KINDS_JSON;
+  const picked = await prod
+    .prepare(`SELECT seq FROM analytics_outbox_dead WHERE ${shelvedErasureWhere()} ORDER BY seq LIMIT ?`)
+    .bind(kinds, limit + 1)
+    .all<{ seq: number }>();
+  const all = picked.results.map((r) => Number(r.seq));
+  const more = all.length > limit;
+  const seqs = all.slice(0, limit);
+  const moved: number[] = [];
+  // One batch per chunk of `group` (a group no larger than one inChunks chunk is one batch): true when every batch
+  // committed, false when the gate refused one.
+  const move = async (group: readonly number[]): Promise<boolean> => {
+    const batches = inChunks(group, 2).map((chunk) => async (): Promise<boolean> => {
+      const holes = chunk.map(() => "?").join(", ");
+      const live = "SELECT 1 FROM analytics_outbox o WHERE o.seq = analytics_outbox_dead.seq AND o.event_key = analytics_outbox_dead.event_key";
+      return prod.batch([
+        // #946(o): the live-outbox INSERT is built by the one emitter (analytics-events.ts `outboxRedriveSql`).
+        prod.prepare(outboxRedriveSql(MESSAGE_COLUMN_LIST)).bind(nowIso, JSON.stringify(chunk), kinds),
+        prod
+          .prepare(
+            `UPDATE analytics_outbox SET attempts = 0, published_at = NULL, created_at = ?
+              WHERE seq IN (${holes}) AND EXISTS (SELECT 1 FROM analytics_outbox_dead d
+                WHERE d.seq = analytics_outbox.seq AND d.event_key = analytics_outbox.event_key AND ${shelvedErasureWhere("d.")})`,
+          )
+          .bind(nowIso, ...chunk, kinds),
+        prod.prepare(`DELETE FROM analytics_outbox_dead WHERE seq IN (${holes}) AND ${shelvedErasureWhere()} AND EXISTS (${live})`).bind(...chunk, kinds),
+        redriveGateStmt(prod, chunk.length),
+        ...audit(chunk),
+      ]).then(
+        () => true,
+        (e: unknown) => {
+          if (!isChangeGateRefusal(e)) throw e;
+          return false;
+        },
+      );
+    });
+    let committed = true;
+    for (const batch of batches) committed = (await batch()) && committed;
+    return committed;
+  };
+  for (const group of inChunks(seqs, 2)) {
+    if (await move(group)) moved.push(...group);
+    else if (group.length > 1) for (const seq of group) if (await move([seq])) moved.push(seq);
+  }
+  return { seqs: moved, more };
+}
+
+/**
+ * Publish what is owed, re-publish what was stranded, bury what is spent.
+ *
+ * `queue` and `prod` are two different systems and the send is not in the
+ * batch — which is the whole reason the outbox exists. What IS guaranteed is
+ * that every row is in exactly one of three states after this returns:
+ * published (sent at least once), owed (attempts moved, will be retried), or
+ * dead (recorded, alerted, and the consumer watermark advanced past it by the
+ * caller so the prune below it is not blocked forever).
+ */
+export async function publishOutbox(prod: DbLike, queue: OutboxQueue, now: () => string, opts: PublishOptions = {}): Promise<PublishReport> {
+  const nowIso = now();
+  const nowMs = Date.parse(nowIso);
+  const limit = opts.limit ?? PUBLISH_LIMIT;
+  const minAgeMs = opts.minAgeMs ?? PUBLISH_MIN_AGE_MS;
+  const watermark = opts.watermark ?? null;
+
+  // The age gate, from the row's own commit instant. `minAgeMs: 0` and the
+  // seq-scoped request path skip it — both ARE the row's first offer.
+  const bornBefore = opts.seqs || minAgeMs <= 0 ? null : isoMinus(nowMs, minAgeMs);
+  const appliedAbove = new Set(opts.appliedAbove ?? []);
+  // I3-0327: reserve room for the repair leg BEFORE the owed leg spends the
+  // whole tick's limit — see STRANDED_RESERVE. No reservation when the
+  // republish leg will not run anyway (seq-scoped request path, or no
+  // watermark to repair against).
+  const strandedReserve = opts.seqs || watermark === null ? 0 : Math.min(limit, STRANDED_RESERVE);
+  const owedLimit = Math.max(0, limit - strandedReserve);
+  const owed = await selectOwed(prod, { bornBefore, seqs: opts.seqs, limit: owedLimit });
+  const stranded =
+    opts.seqs || watermark === null
+      ? []
+      : await selectStranded(prod, watermark, isoMinus(nowMs, REPUBLISH_AFTER_MS), Math.max(limit - owed.length, strandedReserve), appliedAbove, opts.strandedCeiling);
+  const batchRows = [...owed, ...stranded];
+
+  let sent = 0;
+  let failed = 0;
+  if (batchRows.length > 0) {
+    const seqs = batchRows.map((r) => Number(r.seq));
+    try {
+      await sendAll(queue, batchRows);
+      // SEND, THEN MARK. A throw above leaves `published_at` untouched.
+      await bump(prod, seqs, nowIso);
+      sent = seqs.length;
+    } catch (e) {
+      // I3-1011: a failed REQUEST-path send (`bury: false`, publishAfterCommit)
+      // spends none of the tick's MAX_PUBLISH_ATTEMPTS — the row stays owed at
+      // the attempts it had, and the tick offers it next; the marker below is
+      // the record. The tick's own failed sends still count.
+      if (opts.bury !== false) await bump(prod, seqs, null);
+      failed = seqs.length;
+      logError({ cid: "analytics-tick", hop: opts.bury === false ? "http" : "cron", msg: "analytics publish failed", marker: ANALYTICS_TICK_MARKER, leg: "publish", failed, err: e instanceof Error ? e.name : typeof e });
+    }
+  }
+
+  // `bury: false` — the request path, which may not name a loss (`PublishOptions.bury`).
+  const dead = opts.bury === false ? [] : await deadLetter(prod, nowIso, watermark, appliedAbove, opts.analytics);
+  return { sent, failed, dead, owed: owed.length, full: owedLimit > 0 && owed.length >= owedLimit };
+}
+
+/**
+ * The two prunes (ADR §2/§3).
+ *
+ * The outbox prune is gated on the watermark and NOT only on age: a row the
+ * consumer never processed is exactly the row the republish rule needs to still
+ * be there, and "it is a week old" is the property such a row is most likely to
+ * have. So age alone would delete precisely the evidence of the failure this
+ * design is built to survive.
+ *
+ * The dead prune is age alone, at 30 days, because a dead row's whole purpose
+ * is to be replayable by an operator and 30 days is the window DEPLOY.md gives
+ * them — bounded under `analytics_erased`'s 90 so a replay cannot outlive the
+ * sentinel that refuses it for an erased fan.
+ */
+export async function pruneOutbox(
+  prod: DbLike,
+  analyticsWatermark: number,
+  now: () => string,
+  // AF-05 (S-048): the dead prune used to run unconditionally, so a frozen
+  // watermark (the consumer stalled) still shredded the ONLY replayable
+  // corpus for the degraded lane on its ordinary 30-day clock. Default true
+  // so a direct caller (and every existing test) keeps today's behaviour —
+  // only `runAnalyticsTick`, which actually knows whether the watermark
+  // moved this tick, passes false.
+  watermarkAdvanced = true,
+): Promise<{ pruned: number; deadPruned: number }> {
+  const nowIso = now();
+  const nowMs = Date.parse(nowIso);
+  const neverPublishedCut = isoMinus(nowMs, NEVER_PUBLISHED_RETENTION_DAYS * DAY_MS);
+  // I3-0716 (D-0920 A): a never-published row is RECORDED before it is aged
+  // out — copied to `analytics_outbox_dead` as 'aged_unpublished' (amber on the
+  // ops "Dead letters" panel, replayable for DEAD_RETENTION_DAYS). The day flag
+  // (B) is `flagAgedUnpublished`, which `runAnalyticsTick` runs before this.
+  await prod
+    .prepare(
+      `INSERT OR IGNORE INTO analytics_outbox_dead (${DEAD_COLUMNS}, dead_at, reason)
+         SELECT ${DEAD_COLUMNS}, ?, ? FROM analytics_outbox WHERE published_at IS NULL AND created_at < ?`,
+    )
+    .bind(nowIso, AGED_UNPUBLISHED_REASON, neverPublishedCut)
+    .run();
+  // Two disjoint legs on one statement: the watermark-gated published leg
+  // (unchanged), and the never-published leg (S-021 ERASURE) — age alone,
+  // because a row that never got a `published_at` has no watermark relation
+  // to be gated on. I3-0716: that leg deletes only a row whose dead record
+  // EXISTS (bound to the record, not to the INSERT above having run), so no
+  // never-published row leaves without one.
+  const pruned = await prod
+    .prepare(
+      "DELETE FROM analytics_outbox WHERE " +
+        "(published_at IS NOT NULL AND seq <= ? AND published_at < ?) " +
+        "OR (published_at IS NULL AND created_at < ? AND seq IN (SELECT seq FROM analytics_outbox_dead))",
+    )
+    .bind(analyticsWatermark, isoMinus(nowMs, OUTBOX_RETENTION_DAYS * DAY_MS), neverPublishedCut)
+    .run();
+  // Gated on the SAME watermark advance the tick already computed: a stall
+  // in the consumer is exactly the state in which an operator would need to
+  // replay from this table, so a stall is the one time this DELETE must not
+  // run.
+  const deadPruned = watermarkAdvanced
+    ? await prod
+        .prepare("DELETE FROM analytics_outbox_dead WHERE dead_at < ?")
+        .bind(isoMinus(nowMs, DEAD_RETENTION_DAYS * DAY_MS))
+        .run()
+    : { changes: 0 };
+  return { pruned: pruned.changes, deadPruned: deadPruned.changes };
+}
+
+/**
+ * THE SECOND STORE'S RETENTION PRUNE (FINDING-0010-D-1).
+ *
+ * `analytics/0001_rollups.sql` states three retentions and ships an index for
+ * each (`idx_membership_prune`, `idx_erased_prune`, `idx_processed_prune`), and
+ * nothing implemented any of them: `analytics_membership` is a PER-FAN table
+ * and its retention limb of INV-004 clause 3 was a promise no code kept. These
+ * are those three DELETEs and nothing else — no policy is decided here, the
+ * numbers are the schema's.
+ *
+ * WHY NO READ CAN OBSERVE THE MEMBERSHIP PRUNE. Clause 3 does not only ask for
+ * a bound, it asks for "a purge no read can observe", so the cutoff has to sit
+ * outside every SERVING read's own predicate. It does: the three statements
+ * that read a membership row to produce a served value are `retention()`'s
+ * cohort insert, its `acquired_d30` attribution and its flag flip
+ * (`analytics-consumer.ts:435`, `:462-465`, `:482`), and all three carry
+ * `cell_day >= today − w` with `w ∈ {1, 7, 30}`. 91 > 30, so a row this prune
+ * removes could not have contributed to any of them. The served DENOMINATOR is
+ * further away still: ADR-0006 §5 serves `counter − #tombstones(scope,
+ * cell_day, erased_day < T)`, and this touches neither the counters
+ * (`creator_*_daily`, never per-fan) nor `analytics_tombstones` — an erasure
+ * after the prune adjusts fewer cells, which is O-21's stated consequence, not
+ * a change to any cell served before it.
+ *
+ * The ONE reader that is not day-bounded is `NOT_MEMBER`
+ * (`analytics-consumer.ts:225`), the "has this fan been counted in this scope
+ * yet" dedupe. It is a WRITE-side predicate about a future event, not a served
+ * value, and it is where O-21 bites: a fan whose last activity in a scope was
+ * over 91 days ago counts as new once more if they return. That is what "after
+ * which a fan's contribution survives only inside K-floored aggregates" means,
+ * and it is the price of not keeping a per-fan row forever.
+ *
+ * ORDERING, which the prune must not break: the sentinel (90 d) outlives the
+ * dead-letter table (30 d, `DEAD_RETENTION_DAYS`) and queue retention (14 d),
+ * so no message — live, dead-lettered or replayed by an operator — can arrive
+ * after the `analytics_erased` row that must refuse it. `analytics-outbox.ts`'s
+ * 90-over-30 argument was true but vacuous while nothing pruned; it is now
+ * load-bearing, and it is why the sentinel's 90 is NOT shortened to the
+ * outbox's 7.
+ *
+ * THE POPULATION THIS ENUMERATED (live / dead-lettered / replayed) OMITTED A
+ * FOURTH STATE (S-021 ERASURE, FAMILY-004/v2 (a)): a row that is neither —
+ * `published_at IS NULL` and never reached `MAX_PUBLISH_ATTEMPTS`, so
+ * `deadLetter` never moved it to `analytics_outbox_dead` either — had NO age
+ * bound, live in `analytics_outbox` past 90 days, and could reach the queue
+ * after the sentinel that must refuse it was gone. `pruneOutbox` below now
+ * ages such a row out at `NEVER_PUBLISHED_RETENTION_DAYS` (30, same as the
+ * dead table, same reasoning). A row ALREADY in `analytics_outbox_dead` is
+ * NOT touched by that new clause — different table, aged by its own
+ * statement two lines below, unchanged — kept there deliberately: it already
+ * carries a replay marker and fired the ops alert, which is not true of a row
+ * that simply never got that far.
+ *
+ * `analytics_tombstones` is deliberately absent: it carries no fan key, is the
+ * subtraction term of a served denominator for as long as that cell is served,
+ * and the schema declares no retention for it.
+ *
+ * D1 does not support `DELETE … LIMIT` (SQLITE_ENABLE_UPDATE_DELETE_LIMIT is
+ * not compiled in), so each statement bounds itself with `rowid IN (SELECT
+ * rowid … LIMIT ?)` — the portable spelling, and the one the double runs too.
+ */
+export async function pruneAnalyticsRetention(
+  analytics: DbLike,
+  now: () => string,
+  limit: number = RETENTION_PRUNE_LIMIT,
+  // I3-1957: true while the watermark lags its live table (`runAnalyticsTick`).
+  // A ledger row is the ONLY proof a seq above the watermark was applied; aged
+  // out before the watermark crosses it, the row reads as lost and is re-sent.
+  keepProcessed = false,
+  // I19-FXB (RG-MONEY-08): TRUST_DB, read for the ledger keys a re-drive may still need (`heldLedgerKeys`). Absent, or
+  // the keys unknowable, the processed_events prune does not run: a kept key costs a row, a dropped one a double apply.
+  prod: DbLike | null = null,
+): Promise<{ membership: number; erased: number; sentinels: number; processed: number; followNet: number }> {
+  const nowIso = now();
+  const today = nowIso.slice(0, 10);
+  const memberCut = addDays(today, -MEMBERSHIP_RETENTION_DAYS);
+  const erasedCut = addDays(today, -ERASED_RETENTION_DAYS);
+  const followNetCut = addDays(today, -FOLLOW_NET_RETENTION_DAYS);
+  const processedCut = isoMinus(Date.parse(nowIso), PROCESSED_RETENTION_DAYS * DAY_MS);
+
+  // Three day-keyed prunes and one instant-keyed one, in the schema's own units:
+  // `cell_day`/`erased_day` are 'YYYY-MM-DD' (lexicographic order IS
+  // chronological order), `processed_at` is a full ISO instant.
+  //
+  // EACH STATEMENT IS SPELLED OUT, not built from a table name and a column
+  // name. The three tables here are named by a GREP in `0001_rollups.sql`'s
+  // NO-READER headers and in the D room's harness ("no code in src/ deletes an
+  // aged row from any of them"), and a `DELETE FROM ${table} WHERE ${column}`
+  // is invisible to every one of those. A guard that cannot see its subject is
+  // not a guard.
+  const membership = await analytics
+    .prepare("DELETE FROM analytics_membership WHERE cell_day < ? AND rowid IN (SELECT rowid FROM analytics_membership WHERE cell_day < ? LIMIT ?)")
+    .bind(memberCut, memberCut, limit)
+    .run();
+  const erased = await analytics
+    .prepare("DELETE FROM analytics_erased WHERE erased_day < ? AND rowid IN (SELECT rowid FROM analytics_erased WHERE erased_day < ? LIMIT ?)")
+    .bind(erasedCut, erasedCut, limit)
+    .run();
+  // The durable half of the sentinel (analytics/0003), on the SAME cutoff and in
+  // the same spelled-out form. Same number deliberately: the two rows are one
+  // fact, and a table that aged off later than its twin would make the guard's
+  // effective retention a property of whichever row survived.
+  const sentinels = await analytics
+    .prepare(
+      "DELETE FROM analytics_erasure_sentinels WHERE erased_day < ? AND rowid IN (SELECT rowid FROM analytics_erasure_sentinels WHERE erased_day < ? LIMIT ?)",
+    )
+    .bind(erasedCut, erasedCut, limit)
+    .run();
+  const held = keepProcessed || prod === null ? null : await heldLedgerKeys(prod);
+  const processed =
+    held === null
+      ? { changes: 0 }
+      : await analytics
+          .prepare(
+            "DELETE FROM processed_events WHERE processed_at < ? AND rowid IN (SELECT rowid FROM processed_events WHERE processed_at < ? AND event_key NOT IN (SELECT value FROM json_each(?)) LIMIT ?)",
+          )
+          .bind(processedCut, processedCut, JSON.stringify(held), limit)
+          .run();
+  // I22-Q8: the consumer deletes a creator's earlier days only when a later follow lands for THAT creator
+  // (analytics-consumer.ts followNet), so an idle creator's per-fan rows were never aged out. An age-only
+  // DELETE on `day`, bounded the same way, on analytics/0009's `idx_follow_net_day`.
+  const followNet = await analytics
+    .prepare("DELETE FROM analytics_follow_net WHERE day < ? AND rowid IN (SELECT rowid FROM analytics_follow_net WHERE day < ? LIMIT ?)")
+    .bind(followNetCut, followNetCut, limit)
+    .run();
+  return { membership: membership.changes, erased: erased.changes, sentinels: sentinels.changes, processed: processed.changes, followNet: followNet.changes };
+}
+
+/** I19-FXB (RG-MONEY-08): ledger keys one prune may hold, read in ONE statement. Over it the prune does not run. */
+export const HELD_LEDGER_KEYS_CAP = 500;
+/**
+ * I19-FXB (RG-MONEY-08, D-0956(1)): the `processed_events` keys the prune must keep — every shelved erasure row's
+ * (`shelvedErasureWhere`, the re-drive's own predicate: it is re-drivable for DEAD_RETENTION_DAYS, longer than
+ * PROCESSED_RETENTION_DAYS) and every erasure row still in `analytics_outbox` (a re-driven row the consumer has not
+ * yet absorbed). `null` = unknowable (over HELD_LEDGER_KEYS_CAP, or the read failed, logged): the caller keeps all.
+ */
+export async function heldLedgerKeys(prod: DbLike): Promise<string[] | null> {
+  try {
+    const r = await prod
+      .prepare(
+        `SELECT event_key FROM analytics_outbox_dead WHERE ${shelvedErasureWhere()}
+          UNION SELECT event_key FROM analytics_outbox WHERE event_type IN (SELECT value FROM json_each(?)) LIMIT ?`,
+      )
+      .bind(ERASURE_KINDS_JSON, ERASURE_KINDS_JSON, HELD_LEDGER_KEYS_CAP + 1)
+      .all<{ event_key: string }>();
+    if (r.results.length > HELD_LEDGER_KEYS_CAP) {
+      logError({ cid: "analytics-tick", hop: "cron", msg: "analytics ledger prune held", marker: ANALYTICS_ERASURE_SHELVED_MARKER, count: r.results.length });
+      return null;
+    }
+    return r.results.map((x) => String(x.event_key));
+  } catch (e) {
+    logError({ cid: "analytics-tick", hop: "cron", msg: "analytics ledger hold read failed", marker: ANALYTICS_ERASURE_SHELVED_MARKER, err: e instanceof Error ? e.name : typeof e });
+    return null;
+  }
+}
+
+/** The bindings one analytics tick needs, resolved to `DbLike` by the caller —
+ * the shape every other module in this design takes (`drainErasures`,
+ * `consumeBatch`), and the reason this file needs no Worker types. */
+export interface AnalyticsTickEnv {
+  readonly prod: DbLike;
+  readonly analytics: DbLike;
+  readonly queue: OutboxQueue;
+  /** `ANALYTICS_FAN_SECRET`. Absent → the erasure leg cannot compute a fan key
+   * and is skipped loudly rather than draining a work order it cannot apply. */
+  readonly secret?: string | undefined;
+  /** D-0829(3) / I3-0256: `ANALYTICS_FAN_SECRET_PREVIOUS`, the secrets that keys were
+   * minted under before the current one. I32 (D-1082(5)): a comma-separated LIST,
+   * newest first — entry i is `fan_key_v = FAN_KEY_V - 1 - i` (`previousFanSecrets`);
+   * one value with no comma is the single previous version, as before. Erasure
+   * covers every listed version. */
+  readonly secretPrevious?: string | undefined;
+  /** #166 (D-0925(4), D-0933(3), D-0934(2)): the creator purge leg, WIRED IN BY THE CALLER like the prunes
+   * below — `scheduled()` (index.ts) passes `drainCreatorErasureOrder` bound to the frozen store `buildSweep`
+   * is given (`r2Store(env.REGISTRY_BUCKETS)`). Injected, not imported: analytics-build.ts reaches this file
+   * through agencies.ts -> releases.ts, so an import here is a cycle (`.dependency-cruiser.cjs` no-circular).
+   * Absent → the leg does not run and the `analytics_creator_erasures` orders wait for a tick that has it. */
+  readonly creatorPurge?: CreatorPurgeLeg | undefined;
+}
+
+/** One call drains at most ONE creator's purge order (`analytics-build.ts drainCreatorErasureOrder`). `leaseLost` is the
+ * tick's live read of this leg's lease (I40-DIGEST, RGOPS-03): the drain reads it before each of its writes. */
+type CreatorPurgeLeg = (leaseLost?: () => boolean) => Promise<{ passportId: string | null; removed: number }>;
+
+/** The stored consumer watermark (ANALYTICS_DB). #939d: the ONE spelling of this
+ * read — `admin.ts outboxConsumeLeg` calls it rather than re-typing the SELECT. */
+export async function readWatermark(analytics: DbLike): Promise<number | null> {
+  const row = await analytics.prepare("SELECT seq FROM consumer_watermark WHERE singleton = 1").first<{ seq: number }>();
+  return row ? Number(row.seq) : null;
+}
+
+/**
+ * I3-0716 (D-0920 B): the platform-wide incompleteness flag for every day that
+ * holds a never-published row old enough for `pruneOutbox` to age out — the
+ * row's own `occurred_day`, the day whose counts it is missing. Run BEFORE the
+ * prune (flag first, then delete), so a throw here leaves the rows in place for
+ * the next tick. `sinceIso` (optional) widens the read to the dead rows buried
+ * as 'aged_unpublished' at or after that instant, which closes the window
+ * between this call's cutoff and the prune's later one. Returns the days flagged.
+ */
+async function flagAgedUnpublished(prod: DbLike, analytics: DbLike, nowIso: string, sinceIso?: string): Promise<string[]> {
+  const cut = isoMinus(Date.parse(nowIso), NEVER_PUBLISHED_RETENTION_DAYS * DAY_MS);
+  const live = await prod
+    .prepare("SELECT DISTINCT occurred_day AS day FROM analytics_outbox WHERE published_at IS NULL AND created_at < ?")
+    .bind(cut)
+    .all<{ day: string }>();
+  const buried =
+    sinceIso === undefined
+      ? { results: [] as { day: string }[] }
+      : await prod
+          .prepare("SELECT DISTINCT occurred_day AS day FROM analytics_outbox_dead WHERE reason = ? AND dead_at >= ?")
+          .bind(AGED_UNPUBLISHED_REASON, sinceIso)
+          .all<{ day: string }>();
+  const days = [...new Set([...live.results, ...buried.results].map((r) => r.day))].sort();
+  if (days.length > 0) await analytics.batch(days.map((d) => analytics.prepare("INSERT OR IGNORE INTO platform_incomplete_days (day) VALUES (?)").bind(d)));
+  return days;
+}
+
+/** RJ550b-09b / I3-0465: the owed depth, counted to at most OWED_DEPTH_CAP rows. */
+async function owedDepth(prod: DbLike): Promise<{ backlog: number; backlog_capped: boolean }> {
+  const row = await prod
+    .prepare("SELECT COUNT(*) AS n FROM (SELECT 1 FROM analytics_outbox WHERE published_at IS NULL LIMIT ?)")
+    .bind(OWED_DEPTH_CAP)
+    .first<{ n: number }>();
+  const backlog = Number(row?.n ?? 0);
+  return { backlog, backlog_capped: backlog >= OWED_DEPTH_CAP };
+}
+
+/**
+ * THE ONLY WRITER LEFT (docket #17 A-2). `max(seq, ?)` keeps the row monotone
+ * under a concurrent tick; there is no arrival predicate to guard with, because
+ * the value written is already `recomputeWatermark`'s whole answer — a guard
+ * here could only refuse the recompute's own conclusion.
+ */
+async function writeWatermark(analytics: DbLike, seq: number): Promise<void> {
+  await analytics.prepare("UPDATE consumer_watermark SET seq = max(seq, ?) WHERE singleton = 1").bind(seq).run();
+}
+
+interface WatermarkRecompute {
+  /** The highest seq accounted for with no unaccounted seq still existing below it. */
+  readonly watermark: number;
+  /** Seqs ABOVE that value the ledger proves applied — the rows stranded above a
+   * real gap. Not a loss: the republish leg skips them and the dead-letter
+   * records them as `delivered_above_gap`. */
+  readonly appliedAbove: number[];
+  /** I3-1957: the live read came back full, so rows above `ceiling` were not read. */
+  readonly truncated: boolean;
+  /** The last seq a truncated live read returned; `undefined` when exhaustive. */
+  readonly ceiling: number | undefined;
+}
+
+/**
+ * THE WATERMARK IS THE LOSS LEDGER, AND NOTHING ELSE (docket #17 A-2, decision
+ * S3-6, INV-051's LOSS LEDGER clause).
+ *
+ * It is not a cursor and it is not advanced by arrival order. It is recomputed
+ * here, each tick, as the highest seq such that every seq below it that still
+ * EXISTS is accounted for. A seq is ACCOUNTED FOR when the idempotency ledger
+ * holds its `event_key` — the consumer applied it — or when its dead row exists,
+ * because a dead row IS that event's record (`consumeDead`, and the `'attempts'`
+ * branch above, both rely on nothing else). A seq in NEITHER production table
+ * never existed, or was withdrawn before it was published: rows leave
+ * `analytics_outbox` only by the below-watermark prune, by the dead-letter move,
+ * or by a producer undoing its OWN unpublished row (claimCode's I3-1261 undo,
+ * reverse-codes.ts:970, `DELETE ... WHERE event_key = ? AND published_at IS NULL`),
+ * so such a seq is not a gap and does not stall the ledger.
+ *
+ * TWO BINDINGS, THREE READS, NEVER ONE STATEMENT. `processed_events` carries no
+ * seq (`analytics/0001_rollups.sql:294`) and `event_key` is a nonce derived from
+ * nothing (`analytics-events.ts:292`), so the seq -> `event_key` map exists only
+ * in PRODUCTION while the ledger exists only in ANALYTICS. The join is done
+ * here, in the one place holding both, and each read is bounded by `limit`
+ * (`WATERMARK_SCAN_LIMIT`) from `previous` — the cost of a tick does not grow
+ * with the history behind it.
+ */
+export async function recomputeWatermark(
+  prod: DbLike,
+  analytics: DbLike,
+  previous: number,
+  limit: number = WATERMARK_SCAN_LIMIT,
+): Promise<WatermarkRecompute> {
+  const live = await prod
+    .prepare("SELECT seq, event_key FROM analytics_outbox WHERE seq > ? ORDER BY seq LIMIT ?")
+    .bind(previous, limit)
+    .all<{ seq: number; event_key: string }>();
+  const dead = await prod.prepare("SELECT seq FROM analytics_outbox_dead WHERE seq > ? ORDER BY seq LIMIT ?").bind(previous, limit).all<{ seq: number }>();
+  const recorded = new Set(dead.results.map((r) => Number(r.seq)));
+
+  // THE WALK IS BOUNDED BY THE READ (docket #23 A-1: "may not advance past the
+  // last seq a full live read returned"). A read that came back with exactly
+  // `limit` rows was TRUNCATED: it is evidence about seqs up to its own last
+  // row and about nothing above it, so that last seq is a ceiling on the walk.
+  // Only the LIVE read imposes one. A seq the walk crosses is either live —
+  // and then it is evidence the scan does not have — or dead, and a dead row IS
+  // that event's record; so once the live read is exhaustive (fewer than
+  // `limit` rows, i.e. the whole live table above `previous`), everything above
+  // a truncated DEAD read's last row is accounted by existing there.
+  const bound = live.results.length === limit && limit > 0 ? Number(live.results[live.results.length - 1]!.seq) : Infinity;
+
+  const applied = await appliedKeys(analytics, live.results.map((r) => r.event_key));
+
+  const keyOf = new Map(live.results.map((r) => [Number(r.seq), r.event_key] as const));
+  const seqs = [...new Set([...keyOf.keys(), ...recorded])].sort((a, b) => a - b);
+  const accounted = (seq: number): boolean => {
+    const key = keyOf.get(seq);
+    return recorded.has(seq) || (key !== undefined && applied.has(key));
+  };
+
+  let watermark = previous;
+  let i = 0;
+  for (; i < seqs.length && seqs[i]! <= bound && accounted(seqs[i]!); i++) watermark = seqs[i]!;
+  // NOT bounded: every seq here is one the scan READ and found accounted, which
+  // stays true above `bound`. It is a per-seq statement, not the contiguity
+  // claim, and it is what keeps an applied row from spending an attempt.
+  const appliedAbove: number[] = [];
+  for (; i < seqs.length; i++) if (accounted(seqs[i]!)) appliedAbove.push(seqs[i]!);
+  return { watermark, appliedAbove, truncated: bound !== Infinity, ceiling: bound === Infinity ? undefined : bound };
+}
+
+/**
+ * One `ANALYTICS_CRON` tick: the outbox leg and the erasure leg (ADR §2/§5/§8).
+ *
+ * TWO LEASES, TWO TRY/CATCHES. The legs share a trigger and nothing else: they
+ * touch different tables, have different budgets, and one is a repair while the
+ * other is a legal obligation. A single lease would let a slow drain block the
+ * publisher for a whole tick; a single try/catch would let either one's throw
+ * cancel the other, which is the same fault the `scheduled()` hygiene block was
+ * split into isolated steps to fix.
+ *
+ * Each leg takes the lease on PRODUCTION D1 (`cron_leases` lives there), and
+ * `withCronLease` returns without running if another tick holds it.
+ *
+ * THE PRUNE IS WIRED IN BY THE CALLER. `scheduled()` is the one place a reader
+ * — and `tests/invariants/i13-cron-reachability.test.ts`, the caller closure that exists because
+ * three sweeps once sat with no caller for a whole phase — can see every sweep
+ * a cron trigger runs, and every other sweep is named there in a `step(...)`.
+ * This one was two files away, invisible to both. It is defaulted, so a direct
+ * caller (the tests) still gets the production leg.
+ */
+type PruneOutboxLeg = (prod: DbLike, analyticsWatermark: number, now: () => string, watermarkAdvanced?: boolean) => Promise<{ pruned: number; deadPruned: number }>;
+/** The SECOND store's prune, wired in by `scheduled()` for the same reason —
+ * `pruneAnalyticsRetention` is the fourth `prune*` a cron trigger runs, and
+ * `tests/invariants/i13-cron-reachability.test.ts` looks for its name in `scheduled()` and nowhere
+ * else. Defaulted so a direct caller still gets the production leg. */
+type PruneRetentionLeg = (
+  analytics: DbLike,
+  now: () => string,
+  keepProcessed?: boolean,
+  prod?: DbLike,
+) => Promise<{ membership: number; erased: number; sentinels: number; processed: number; followNet?: number }>;
+
+/** I38-TICK-6: what a lease-guarded handle throws once the run's cron lease is lost (`CronLeaseGuard.lost`); `underLease`
+ * catches it, so the body stops at that statement and the run now holding the lease carries on (withCronLease has
+ * already written the CRON_LEASE_LOST warn line). Exported for its tests. */
+export class LeaseLostStop extends Error {
+  constructor() {
+    super("cron lease lost: this run stops before its next write");
+  }
+}
+/** A statement that cannot write: a SELECT or PRAGMA, or a WITH that names no INSERT/UPDATE/DELETE/REPLACE. */
+const isWriteSql = (sql: string): boolean => !/^\s*(?:SELECT|PRAGMA)\b/i.test(sql) && !(/^\s*WITH\b/i.test(sql) && !/\b(?:INSERT|UPDATE|DELETE|REPLACE)\b/i.test(sql));
+/** I38-TICK-6: `db` with the lease guard read before every WRITE statement — run, all and first of a writing statement, and
+ * any batch holding one — so a body handed it cannot write after its lease is lost. Reads pass through. Exported for its tests. */
+export function leaseGuardedDb(db: DbLike, guard: CronLeaseGuard): DbLike {
+  const inner = new WeakMap<DbStatement, { stmt: DbStatement; write: boolean }>();
+  const stop = (): Promise<never> => Promise.reject(new LeaseLostStop());
+  const wrap = (stmt: DbStatement, write: boolean): DbStatement => {
+    const s: DbStatement = {
+      bind: (...values: unknown[]) => wrap(stmt.bind(...values), write),
+      run: () => (write && guard.lost ? stop() : stmt.run()),
+      all: <T = Record<string, unknown>>() => (write && guard.lost ? stop() : stmt.all<T>()),
+      first: <T = Record<string, unknown>>() => (write && guard.lost ? stop() : stmt.first<T>()),
+    };
+    inner.set(s, { stmt, write });
+    return s;
+  };
+  return {
+    prepare: (sql: string) => wrap(db.prepare(sql), isWriteSql(sql)),
+    batch: (statements: DbStatement[]) => {
+      const raw = statements.map((s) => inner.get(s) ?? { stmt: s, write: true });
+      return raw.some((r) => r.write) && guard.lost ? stop() : db.batch(raw.map((r) => r.stmt));
+    },
+  };
+}
+/** I38-TICK-6: the queue with the lease guard read before every send. */
+function leaseGuardedQueue(queue: OutboxQueue, guard: CronLeaseGuard): OutboxQueue {
+  if ("sendBatch" in queue) return { sendBatch: (m: { body: unknown }[]) => (guard.lost ? Promise.reject(new LeaseLostStop()) : queue.sendBatch(m)) };
+  return { send: (b: unknown) => (guard.lost ? Promise.reject(new LeaseLostStop()) : queue.send(b)) };
+}
+/** I38-TICK-6: run a withCronLease body on the tick env with its three write handles lease-guarded; a LeaseLostStop ends it. */
+async function underLease(env: AnalyticsTickEnv, guard: CronLeaseGuard, body: (env: AnalyticsTickEnv) => Promise<void>): Promise<void> {
+  try {
+    await body({ ...env, prod: leaseGuardedDb(env.prod, guard), analytics: leaseGuardedDb(env.analytics, guard), queue: leaseGuardedQueue(env.queue, guard) });
+  } catch (e) {
+    if (!(e instanceof LeaseLostStop)) throw e;
+  }
+}
+
+/** I67-ALARM O4 (D-0537, D-1601): the stalled-WATERMARK page — `unconsumed.stalled` in `runAnalyticsTick` (outboxConsumeAge). On operator-alarm.ts OPERATOR_ALARM_MARKERS; a backlog-only stall pages nobody. */
+export const ANALYTICS_WATERMARK_STALLED_MARKER = "ANALYTICS_WATERMARK_STALLED";
+export async function runAnalyticsTick(
+  env: AnalyticsTickEnv,
+  now: () => string,
+  prune: PruneOutboxLeg = pruneOutbox,
+  pruneRetention: PruneRetentionLeg = (analytics, at, keepProcessed, prod) => pruneAnalyticsRetention(analytics, at, RETENTION_PRUNE_LIMIT, keepProcessed, prod ?? null),
+  // I3-0279: the caller's subrequest meter. Consulted before every batch after
+  // the first; the default (no meter) lets OUTBOX_BATCHES_PER_TICK bound the tick.
+  withinBudget: () => boolean = () => true,
+): Promise<void> {
+  try {
+    await withCronLease(
+      env.prod,
+      OUTBOX_LEASE,
+      // I38-TICK-6: the body's writes go through lease-guarded handles (`underLease`), so a lost lease stops it at its next write.
+      (lease) => underLease(env, lease, async (env) => {
+        // Read from ANALYTICS_DB, act on TRUST_DB. Two bindings, two round
+        // trips, never one batch.
+        // THE RECOMPUTE IS THE TICK'S FIRST ACT, and the publish's inputs are
+        // its outputs: the prune bound, the republish selection and the
+        // dead-letter's reason all derive from one value read from the ledger
+        // (docket #17 A-2), never from the order the queue happened to deliver.
+        const stored = await readWatermark(env.analytics);
+        // I3-1957: further windows only while the last one was truncated AND its
+        // walk advanced; a gap inside a window is not closed by reading past it.
+        let before = stored === null ? null : await recomputeWatermark(env.prod, env.analytics, stored);
+        for (let w = 1; before !== null && before.truncated && w < RECOMPUTE_MAX_WINDOWS; w++) {
+          const from: number = before.watermark;
+          if (from !== before.ceiling) break;
+          before = await recomputeWatermark(env.prod, env.analytics, from);
+        }
+        if (before !== null && stored !== null && before.watermark > stored) await writeWatermark(env.analytics, before.watermark);
+        const watermark = before === null ? null : before.watermark;
+        const lagging = before?.truncated === true;
+        const tickStartIso = now();
+        // I3-0279 (D-0920 A): up to OUTBOX_BATCHES_PER_TICK batches, the next one
+        // only while the last came back full, sent without a failure (a failing
+        // queue must not spend four attempts per tick) and the meter holds.
+        const publishOpts = { watermark, appliedAbove: before?.appliedAbove, analytics: env.analytics, strandedCeiling: before?.ceiling };
+        let last = await publishOutbox(env.prod, env.queue, now, publishOpts);
+        const report = { sent: last.sent, failed: last.failed, dead: [...last.dead], owed: last.owed };
+        let batches = 1;
+        while (batches < OUTBOX_BATCHES_PER_TICK && last.full && last.failed === 0 && withinBudget()) {
+          last = await publishOutbox(env.prod, env.queue, now, publishOpts);
+          batches++;
+          report.sent += last.sent;
+          report.failed += last.failed;
+          report.dead.push(...last.dead);
+          report.owed += last.owed;
+        }
+        // A dead row has LEFT the live table and gained a record, so the same
+        // recompute now crosses it — which is what the deleted
+        // `advanceWatermarkPast` did, by the one rule instead of a second one.
+        const healed = report.dead.length > 0 && watermark !== null ? await recomputeWatermark(env.prod, env.analytics, watermark) : null;
+        if (healed !== null && watermark !== null && healed.watermark > watermark) await writeWatermark(env.analytics, healed.watermark);
+        const after = healed !== null ? healed.watermark : watermark;
+        // AF-05: "advanced" is this tick's own before/after on the SAME
+        // variable the prune bound already uses — a stall is `after ===
+        // stored`, not a separate signal to keep in sync.
+        const advanced = stored !== null && after !== null && after > stored;
+        // I3-0716 (D-0920 B): flag first, then delete — and once more after the
+        // prune for the rows it buried past this call's cutoff (`flagAgedUnpublished`).
+        if (after !== null) await flagAgedUnpublished(env.prod, env.analytics, now());
+        const pruned = after === null ? { pruned: 0, deadPruned: 0 } : await prune(env.prod, after, now, advanced);
+        if (after !== null) await flagAgedUnpublished(env.prod, env.analytics, now(), tickStartIso);
+        // UNDER THE OUTBOX LEASE, LAST. It shares this leg rather than taking a
+        // third lease because it is the same kind of work on the same cadence
+        // and it must not race a second tick's DELETEs; it runs AFTER the
+        // publish and the outbox prune because those two are the tick's job and
+        // this one is hygiene that can wait a tick. It touches ANALYTICS_DB
+        // only, so it cannot interfere with either statement above.
+        const retained = await pruneRetention(env.analytics, now, lagging, env.prod);
+        const nowMs = Date.parse(now());
+        const backlog = await outboxBacklogAge(env.prod, nowMs);
+        const depth = await owedDepth(env.prod);
+        // #812a + RJ550b-09b-I3-0465b: one logger line per tick, carrying the owed
+        // depth left after the tick and the oldest owed row's age.
+        logInfo({
+          cid: "analytics-tick",
+          hop: "cron",
+          msg: "analytics outbox tick",
+          marker: ANALYTICS_TICK_MARKER,
+          leg: "outbox",
+          ...(after === null ? {} : { watermark: after }),
+          lagging,
+          batches,
+          sent: report.sent,
+          failed: report.failed,
+          dead: report.dead.length,
+          owed: report.owed,
+          pruned: pruned.pruned,
+          dead_pruned: pruned.deadPruned,
+          backlog: depth.backlog,
+          backlog_capped: depth.backlog_capped,
+          ...(backlog.oldest_unpublished_age_s === null ? {} : { oldest_owed_age_s: backlog.oldest_unpublished_age_s }),
+          detail: `retention=membership:${retained.membership},erased:${retained.erased},sentinels:${retained.sentinels},processed:${retained.processed},followNet:${retained.followNet ?? 0}`,
+        });
+        // I3-0386: one alarm line when the oldest owed row has sat through two
+        // eligible ticks — a sync that stopped moving, not merely a backlog —
+        // or (I15-FX4, JN-LAND residual) a PUBLISHED row has sat above the
+        // watermark past its repair. Through log.ts (JN-W2C c1: the raw
+        // console ratchet, log-no-raw-console.test.ts); every field is on its
+        // ALLOWED_KEYS, the ages and the watermark ride `detail`.
+        const unconsumed = await outboxConsumeAge(env.prod, nowMs, after);
+        if (backlog.stalled || unconsumed.stalled) {
+          logError({
+            cid: "analytics-tick",
+            hop: "cron",
+            msg: "analytics outbox stalled",
+            marker: ANALYTICS_TICK_MARKER,
+            stalled: true,
+            detail: `leg=outbox unpublished=${backlog.stalled} oldest_unpublished_age_s=${backlog.oldest_unpublished_age_s} unconsumed=${unconsumed.stalled} oldest_unconsumed_age_s=${unconsumed.oldest_unconsumed_age_s} watermark=${after} advanced=${advanced}`,
+          });
+        }
+        // I67-ALARM O4: the watermark limb alone pages (the line above stays the tick's record of both limbs).
+        if (unconsumed.stalled) logError({ cid: "analytics-tick", hop: "cron", msg: "analytics outbox watermark stalled", marker: ANALYTICS_WATERMARK_STALLED_MARKER, detail: `leg=outbox oldest_unconsumed_age_s=${unconsumed.oldest_unconsumed_age_s} watermark=${after}` });
+        // #936(b) I3-1126 (D-0954(4)): THE SHELVED-ERASURE ALARM. One COUNT a tick over the dead table — every door
+        // that shelves a row (this file's `deadLetter` and never-published prune, the consumer's `'dlq'` branch) is
+        // covered because the population is read from the table, not from the door. Level-triggered on purpose: it
+        // repeats each tick until the operator re-drives (`redriveShelvedErasures`). Own try: an alarm read that
+        // fails must not cost the tick its outbox leg, and says so itself.
+        try {
+          const shelved = await countShelvedErasures(env.prod);
+          if (shelved > 0) logError({ cid: "analytics-tick", hop: "cron", msg: ANALYTICS_ERASURE_SHELVED_MARKER, marker: ANALYTICS_ERASURE_SHELVED_MARKER, count: shelved });
+        } catch (e) {
+          logError({ cid: "analytics-tick", hop: "cron", msg: "analytics erasure shelved check failed", marker: ANALYTICS_ERASURE_SHELVED_MARKER, err: e instanceof Error ? e.name : typeof e });
+        }
+      }),
+      Date.parse(now()),
+      ANALYTICS_LEASE_TTL_MS,
+    );
+  } catch (e) {
+    logError({ cid: "analytics-tick", hop: "cron", msg: "analytics outbox leg failed", marker: ANALYTICS_TICK_MARKER, leg: "outbox", err: e instanceof Error ? e.name : typeof e });
+  }
+
+  try {
+    const current = env.secret;
+    if (!current) {
+      logError({ cid: "analytics-tick", hop: "cron", msg: "analytics erasure leg skipped", marker: ANALYTICS_TICK_MARKER, leg: "erasure", reason: "ANALYTICS_FAN_SECRET absent" });
+    } else {
+      // D-0829(3): the LIVE set. `liveFanSecrets(current)` is the current version
+      // (`FAN_KEY_V`, read there: importing analytics-events here is a cycle via
+      // codex.ts). Before any rotation FAN_KEY_V is 1 and a set previous secret
+      // names version 0, which `drainErasures` refuses — the leg then errors
+      // every tick and keeps its work orders (loud, not partial).
+      const [head] = liveFanSecrets(current);
+      // I32 (D-1082(5)): PREVIOUS is a list, newest first (`previousFanSecrets`).
+      const secret: FanSecretVersion[] = [head!, ...previousFanSecrets(head!, env.secretPrevious)];
+      // I23 (I3-0256 a): a secret changed without a FAN_KEY_V bump. Own try: a FAILED check never costs the drain.
+      // I3-0256 (D-0995(6)): a FIRED alarm does — under a changed secret the drain would match no rows and delete
+      // the work orders anyway, which no later restore of the secret can redo. That tick consumes no erasure order.
+      let secretChanged: number[] = [];
+      try {
+        secretChanged = await checkFanSecretFingerprints(env.analytics, secret, now());
+      } catch (e) {
+        logError({ cid: "analytics-tick", hop: "cron", msg: "analytics fan secret fingerprint check failed", marker: ANALYTICS_FAN_SECRET_CHANGED_MARKER, err: e instanceof Error ? e.name : typeof e });
+      }
+      // I32 (I3-0256, D-1082(5)): a version holding rows inside the window with no secret here. Own try, as above: a
+      // FAILED check never costs the drain; a FIRED one does, for the same reason — draining would delete work orders
+      // whose rows under that version no later listing of its secret could reach.
+      let unkeyed: number[] = [];
+      try {
+        unkeyed = await fanKeyVersionsWithoutSecret(env.analytics, secret, now());
+      } catch (e) {
+        logError({ cid: "analytics-tick", hop: "cron", msg: "analytics fan key version check failed", marker: ANALYTICS_FAN_SECRET_CHANGED_MARKER, err: e instanceof Error ? e.name : typeof e });
+      }
+      if (secretChanged.length > 0) {
+        logError({ cid: "analytics-tick", hop: "cron", msg: "analytics erasure leg skipped", marker: ANALYTICS_TICK_MARKER, leg: "erasure", reason: "fan secret changed", detail: `v=${secretChanged.join(",")}` });
+      } else if (unkeyed.length > 0) {
+        logError({ cid: "analytics-tick", hop: "cron", msg: "analytics erasure leg skipped", marker: ANALYTICS_TICK_MARKER, leg: "erasure", reason: "fan key version without secret", detail: `v=${unkeyed.join(",")}` });
+      } else await withCronLease(
+        env.prod,
+        ERASURE_LEASE,
+        // I38-TICK-6: drainErasures writes through the lease-guarded handles.
+        (lease) => underLease(env, lease, async (env) => {
+          const drained = await drainErasures(env.prod, env.analytics, secret, now, ERASURE_LIMIT);
+          logInfo({ cid: "analytics-tick", hop: "cron", msg: "analytics erasure tick", marker: ANALYTICS_TICK_MARKER, leg: "erasure", drained: drained.drained });
+        }),
+        // I3-1152: read AFTER the outbox leg, so this lease's TTL starts when it is granted.
+        Date.parse(now()),
+        ANALYTICS_LEASE_TTL_MS,
+      );
+    }
+  } catch (e) {
+    logError({ cid: "analytics-tick", hop: "cron", msg: "analytics erasure leg failed", marker: ANALYTICS_TICK_MARKER, leg: "erasure", err: e instanceof Error ? e.name : typeof e });
+  }
+
+  // #166 (D-0925(4), D-0933(3), D-0934(2)): the creator purge leg — at most ONE creator's order a tick
+  // (`drainCreatorErasureOrder`), last, inside the caller's budget, own lease, own try/catch. A throw keeps
+  // the order (the drain deletes it only after the purge returns).
+  const creatorPurge = env.creatorPurge;
+  if (creatorPurge !== undefined && withinBudget()) {
+    try {
+      await withCronLease(
+        env.prod,
+        CREATOR_PURGE_LEASE,
+        async (lease) => {
+          // I38-TICK-6: the guard is read before the call; I40-DIGEST (RGOPS-03): the call gets the live guard, which
+          // drainCreatorErasureOrder reads before each DELETE, the store purge and its bookkeeping UPDATE.
+          if (lease.lost) return;
+          const r = await creatorPurge(() => lease.lost);
+          if (r.passportId !== null) logInfo({ cid: "analytics-tick", hop: "cron", msg: "analytics creator purge tick", marker: ANALYTICS_TICK_MARKER, leg: "creator_purge", drained: 1 });
+        },
+        Date.parse(now()),
+        ANALYTICS_LEASE_TTL_MS,
+      );
+    } catch (e) {
+      logError({ cid: "analytics-tick", hop: "cron", msg: "analytics creator purge leg failed", marker: ANALYTICS_TICK_MARKER, leg: "creator_purge", err: e instanceof Error ? e.name : typeof e });
+    }
+  }
+}
+
+/**
+ * The request-path publish (ADR §2: "after the batch commits, `ctx.waitUntil`
+ * sends … then marks `published_at`").
+ *
+ * BEST EFFORT, AND ONLY THAT. The drain is the guaranteed path; this is the
+ * optimisation that keeps the median event's latency at one request instead of
+ * one cron period. So it takes no lease (it is not exclusive with anything —
+ * duplicates are absorbed), it never throws into the request (the fact is
+ * already committed and the response must not depend on the analytics send),
+ * and it passes `minAgeMs: 0` because these rows ARE the ones the age gate
+ * exists to hold back for it.
+ *
+ * WIRED BY THE TABLE, NOT BY THIS LIST (S-003 X4/A-4 docket #17; re-scoped by
+ * docket #23 E-1, decision S4-5). The wired set is every `src/*.ts` that CALLS
+ * either door of `analytics-events.ts` — `outboxStatements()` (prepared
+ * statements) or `outboxSelectSql()` (the conditional `INSERT … SELECT`) — and
+ * it is DERIVED, not enumerated: `test/s003-publish-wiring.test.ts` walks
+ * `src/` for door calls, finds each write-reaching function, and requires it to
+ * reach this function. Do not read a name list here as the authority; the
+ * previous one was a 16-file hand list that named the first door only, and the
+ * seven `outboxSelectSql(` writers (`account_data.ts`, `collectibles.ts`,
+ * `drop.ts`, `gifting.ts`, `refunds.ts`, `releases.ts` and `reverse-codes.ts`'s
+ * `markRedeemed`) wrote the table where no guard looked until E-1.
+ * `events.ts` appears in the derived set because it OWNS `outboxStatements(`
+ * SITES; it cannot import this module (that closes an import cycle), so the
+ * ledger door `appendEvents`/`tryAppendEvents` takes `publishHook(...)`'s
+ * result as its trailing `afterCommit` and runs it once after its batch
+ * commits (QUEUE #19, D-0441(4)), handing it the seqs THAT batch wrote
+ * (`events.ts outboxSpan`), so the hook sends those rows and no other request's
+ * (D-0871(7)). A caller that passes no `seqs` still selects every owed row —
+ * the direct `publishAfterCommit(pubEnv, pubCtx)` callers do, pending each
+ * passing its own span (I10-FX6 REAL — WRONG OWNER).
+ * ZERO sites (`events.ts foldEffects`, and the `handshake.ts`/`questions.ts`
+ * answer-statements committed through that door, are wired through its hook)
+ * stay unwired: every caller that commits their rows with a request context
+ * passes `publishHook(...analyticsPublishArgs(c))` — `claims.ts`,
+ * `domain-claims.ts`, `oauth-claims.ts`, `review.ts`, `warnings.ts`, and
+ * `passkeys.ts appendCreatorSigned` for `handshake-routes.ts`/`question-routes.ts`
+ * (QUEUE #19, I10-EVENTS2; `s003-publish-wiring.test.ts` HOOK arm).
+ * `console.ts`'s operator erasure IS wired (docket #54: `ConsoleEnv` declares
+ * the analytics bindings and the door threads `analyticsPublishArgs(c)`).
+ */
+export function publishAfterCommit(env: AnalyticsTickEnv, ctx: { waitUntil(p: Promise<unknown>): void }, seqs?: readonly number[]): void {
+  const sending = publishOutbox(env.prod, env.queue, () => new Date().toISOString(), { minAgeMs: 0, seqs, watermark: null, bury: false }).catch((e: unknown) => {
+    // Swallowed on purpose: the cron drain owns this row now.
+    logError({ cid: "analytics-tick", hop: "http", msg: "analytics request-path publish failed", marker: ANALYTICS_TICK_MARKER, leg: "request", err: e instanceof Error ? e.name : typeof e });
+  });
+  // D-0871(7): every caller runs this after its write committed, so a
+  // `waitUntil` that throws is logged (static message, no Error.message) and
+  // never reaches the request. The send itself still runs to completion.
+  try {
+    ctx.waitUntil(sending);
+  } catch {
+    logError({ cid: "unknown", hop: "http", msg: "publishAfterCommit: waitUntil threw after commit; cron drain owns the rows" });
+  }
+}
+
+/**
+ * The `afterCommit` argument for `events.ts appendEvents`/`tryAppendEvents`
+ * (QUEUE #19): a hook that calls `publishAfterCommit(pubEnv, pubCtx, ownSeqs)`
+ * with the seqs the committed batch wrote, or `undefined` when either half is
+ * missing, so a caller with no request context keeps the cron-drain path
+ * unchanged. Called with no seqs it publishes NOTHING (`?? []`), never the
+ * whole owed backlog (D-0871(7)).
+ */
+export function publishHook(pubEnv?: AnalyticsTickEnv, pubCtx?: { waitUntil(p: Promise<unknown>): void }): ((ownSeqs?: readonly number[]) => void) | undefined {
+  return pubEnv && pubCtx ? (ownSeqs?: readonly number[]) => publishAfterCommit(pubEnv, pubCtx, ownSeqs ?? []) : undefined;
+}
+===== END FILE: services/trust-core/src/analytics-outbox.ts =====
+
+===== BEGIN FILE: services/trust-core/src/analytics-read.ts =====
+import { backCatalog } from "./back-catalog.js";
+import { purgeCreatorAnalytics } from "./analytics-erasure.js";
+import { buildDayGraph, cellId, flowRelations, isCumulativeCell, relationMismatches, serveDay, type Cell, type DayCohortRow, type DayEventRow, type DayInput, type DayMetrics, type DayPoolRow, type DayRevenue, type EventPerfKind, type Relation, type ServedSet } from "./analytics-cells.js";
+import { conversionAttribution, type ConversionAttribution } from "./attribution.js";
+import { campaignTemplates, type CampaignPlan } from "./campaigns.js";
+import type { DbLike } from "./db.js";
+import { passportUnderLegalHold } from "./legal-holds.js";
+import { logError } from "./log.js";
+import { consumeRateLimit } from "./ratelimit.js";
+import { creatorIntelligence, K_ANONYMITY_FLOOR, type CreatorIntelligence } from "./intelligence.js";
+import { fanQualifiedAsOfExpr, qualifiedFanJoin } from "./fan-quality.js";
+import { nicheRank, type NicheRank } from "./rankings.js";
+import { bundleKey, creatorRoi, DAY_CELL, FROZEN_BUNDLE_KINDS, isWholeBundle, isWholeKind, protectionSummary, readFrozenBundle, type CreatorRoi, type DayBuildHook, type DayCells, type FrozenBundleKind, type LegacyFacts, type LegacyPool } from "./roi.js";
+
+/**
+ * THE DAY OBJECT: READ THE STORE, SERVE ONE SET, PROJECT FIVE KINDS.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT A DAY OBJECT IS (ADR-0006 section 1)
+ * ---------------------------------------------------------------------------
+ * The object for (creator, `T`) contains EXACTLY the cells whose SEAL DAY is
+ * `<= T`. The predicate is on the seal day and not on the row's day key
+ * (teachback T5): a day cell of `D` seals at `D + 1`, so the object for `T`
+ * carries day cells of `D = T - 1` and earlier; a window cell `d<w>` of cohort
+ * day `C` seals at `C + w + 1`, so `d30` reads thirty-one days behind. Nothing
+ * else is in it, and nothing in it can move afterwards: a sealed cell is never
+ * re-opened and there is no version.
+ *
+ * That is what makes two builds at two instants at or after the grace emit
+ * IDENTICAL BYTES. `generated_at` is `T 00:00:00.000Z` - derived from the day
+ * and never from the builder's clock - and every query below is ordered, so the
+ * JSON is a function of (creator, T) down to the byte. A consumer writing a
+ * `D + 1` cell between two reads of `T` changes nothing, because no read of `T`
+ * ever looks at a `D + 1` cell.
+ *
+ * ---------------------------------------------------------------------------
+ * THE BUILD GRACE, AND WHO BUILDS (ADR-0006 section 1, O-16/O-18)
+ * ---------------------------------------------------------------------------
+ * The object for `T` is buildable only from `T 00:30 UTC`. A sealed cell's
+ * value can change after midnight only through a writer that decided "not late"
+ * before it and committed after; the consumer path is bounded by the Queues
+ * consumer wall clock (15 min) and the request path by one D1 round-trip, so
+ * thirty minutes holds both with margin. BEFORE the grace the reader serves
+ * `T - 1` through the existing two-day lookback (`roi.ts readFrozenBundle`) -
+ * a sealed, frozen object, byte-identical to every other read of it. Only when
+ * nothing inside the lookback exists does the read refuse.
+ *
+ * Only the CREATOR'S OWN read builds. Agency routes and
+ * `POST /account/intelligence/explain` serve-or-refuse (C5/C6), and the
+ * six-hourly artifact cron pre-builds up to `BUILD_SWEEP_LIMIT` missing
+ * (creator, T-1) objects for agency-granted creators, round-robin by
+ * `last_built_at`.
+ *
+ * ---------------------------------------------------------------------------
+ * ONE SERVED SET, NOT FIVE (ADR-0006 section 0 P1)
+ * ---------------------------------------------------------------------------
+ * `serveDay` is called ONCE, over the WHOLE object, and all five kinds are
+ * projections of its output. Five calls - or a projector applying a floor of
+ * its own - is pass-3 BREAK 3 rebuilt: the rules would stop seeing each other
+ * and a cell withheld in one widget would be recoverable beside another. So the
+ * four legacy projectors take a `DayCells` and no database handle at all; the
+ * only floor in this file is `serveDay`'s.
+ */
+
+/** ADR section 1: the day object for `T` is buildable from `T 00:30 UTC`. */
+export const BUILD_GRACE_MS = 30 * 60 * 1000;
+/** ADR sections 1/8: how many (creator, T-1) objects one six-hourly sweep pre-builds. */
+export const BUILD_SWEEP_LIMIT = 40;
+/**
+ * ONE definition of the floor, imported and re-exported rather than restated
+ * (S-8). `serveDay`'s default is the same constant. CORRECTION (I3-1405,
+ * 2026-09-19): this used to claim `regions.ts` and `creator-ai.ts` reach the
+ * floor through this alias without a second literal — neither file imports
+ * `K` from here (verified: `grep -rn 'import.*{ *K *[,}]'` across `src/`
+ * matches nothing); `regions.ts` only mentions `K_ANONYMITY_FLOOR` in a
+ * comment and `creator-ai.ts` imports only a type from this file. The alias
+ * is currently unconsumed; kept for a future caller that wants the floor
+ * without importing `intelligence.ts` directly.
+ */
+export const K = K_ANONYMITY_FLOOR;
+
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/** UTC calendar arithmetic on a bare `YYYY-MM-DD`. */
+export function shiftDay(day: string, delta: number): string {
+  return new Date(Date.parse(`${day}T00:00:00.000Z`) + delta * 86_400_000).toISOString().slice(0, 10);
+}
+const startOfDayMs = (day: string): number => Date.parse(`${day}T00:00:00.000Z`);
+const dayOfMs = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
+
+// ---------------------------------------------------------------------------
+// READING THE STORE
+// ---------------------------------------------------------------------------
+
+/** `counter - #tombstones(scope, cell_day, erased_day < T)`, never below zero. */
+const net = (counter: number, tombstones: number): number => Math.max(0, counter - tombstones);
+
+async function rowsOf<T>(db: DbLike, sql: string, ...binds: unknown[]): Promise<T[]> {
+  const { results } = await db.prepare(sql).bind(...binds).all<T>();
+  return results;
+}
+
+const METRIC_COLUMNS: ReadonlyArray<keyof DayMetrics> = [
+  "new_supporters",
+  "unfollows",
+  "scouts",
+  "questions",
+  "answers",
+  "gifts_sent",
+  "handshakes_requested",
+  "handshakes_authenticated",
+  "handshakes_denied",
+  "war_joins",
+  "wars_completed",
+  "collectibles_acquired",
+  "packs_opened",
+  "linked_2plus_delta",
+  "linked_3plus_delta",
+];
+
+const REVENUE_COLUMNS: ReadonlyArray<keyof DayRevenue> = [
+  "gross_credits",
+  "creator_net_cents",
+  "platform_cut_cents",
+  "reversals_gross_cents",
+  "scheduled_clear_cents",
+  "scheduled_clear_reversals_cents",
+  "paid_cents",
+  "sales",
+  "buyers_new",
+];
+
+const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+
+/**
+ * The cells of the day object for `T`, read out of the two stores.
+ *
+ * `D = T - 1` - the served "yesterday", the newest day whose day cells have
+ * sealed. Geo comes from PRODUCTION (`audience_regions`, ADR section 2/O-17,
+ * the sole source of the day's active population); everything else from
+ * `ANALYTICS_DB`.
+ *
+ * WINDOW CELLS AND THE SEAL PREDICATE. A cohort row is included when
+ * `cohort_day <= D` (its `size` has sealed). Its `d<w>` is included only when
+ * `cohort_day + w + 1 <= T`; an UNSEALED window is emitted as `0`, which
+ * `serveDay` withholds unconditionally (`0 < K`), so an unsealed window can
+ * never be served and the row's `size` still can. That is the representation
+ * this file chose over dropping the row: dropping it would take a SEALED cell
+ * out of the object to hide an unsealed one. The same rule gives an event's
+ * `acquired_d30` (seal `join_day + 31`).
+ *
+ * MEMBERSHIP-DERIVED CELLS carry their tombstone subtraction here, on the
+ * cell's OWN day (`cell_day`) and against `erased_day < T` (ADR section 5, the
+ * 0075 direction): a fan who erases on day E is counted through E and drops at
+ * the next boundary, in every day object served from `E + 1` onward, and no
+ * value a day already served moves.
+ */
+export async function readDayInput(analytics: DbLike, prod: DbLike, passportId: string, T: string): Promise<DayInput> {
+  if (!PSP_RE.test(passportId)) throw new Error("bad passport id");
+  if (!DAY_RE.test(T)) throw new Error("bad day");
+  const D = shiftDay(T, -1);
+
+  const metricRow = await analytics
+    .prepare("SELECT * FROM creator_metrics_daily WHERE passport_id = ? AND day = ?")
+    .bind(passportId, D)
+    .first<Record<string, unknown>>();
+  const metrics = Object.fromEntries(METRIC_COLUMNS.map((c) => [c, num(metricRow?.[c])])) as unknown as DayMetrics;
+
+  const revenueRow = await analytics
+    .prepare("SELECT * FROM creator_revenue_daily WHERE passport_id = ? AND day = ?")
+    .bind(passportId, D)
+    .first<Record<string, unknown>>();
+  const buyerTombs = await tombstoneCounts(analytics, passportId, "buyer", T, D);
+  const revenue: DayRevenue = {
+    ...(Object.fromEntries(REVENUE_COLUMNS.map((c) => [c, num(revenueRow?.[c])])) as unknown as DayRevenue),
+    buyers_new: net(num(revenueRow?.buyers_new), buyerTombs.get(`buyer|${D}|`) ?? 0),
+  };
+
+  // GEO IS PRODUCTION-WRITTEN (O-17) and is the sole source of `active_fans`.
+  const geoRows = await rowsOf<{ country: string; fan_days: number }>(
+    prod,
+    "SELECT country, fan_days FROM audience_regions WHERE passport_id = ? AND day = ? ORDER BY country ASC",
+    passportId,
+    D,
+  );
+  const countries: Record<string, number> = {};
+  for (const r of geoRows) countries[r.country] = num(r.fan_days);
+
+  // ---- cohorts. `scope_kind = 'creator'`, `scope_id` = the passport, keyed by
+  // the cohort day and the source the membership row carries.
+  const cohortTombs = await tombstoneFlagCounts(analytics, passportId, "creator", T, D);
+  const cohortRows = await rowsOf<{ cohort_day: string; source: string; size: number; d1: number; d7: number; d30: number }>(
+    analytics,
+    "SELECT cohort_day, source, size, d1, d7, d30 FROM creator_cohort_daily WHERE passport_id = ? AND cohort_day <= ? ORDER BY cohort_day ASC, source ASC",
+    passportId,
+    D,
+  );
+  const cohorts: DayCohortRow[] = cohortRows.map((r) => {
+    const t = cohortTombs.get(`creator|${r.cohort_day}|${r.source}`);
+    // I3-1122: `size` loses every erased member; `d<w>` only the members whose r<w> flipped.
+    const sealed = (w: number, v: number, gone: number): number => (shiftDay(r.cohort_day, w + 1) <= T ? net(num(v), gone) : 0);
+    return {
+      cohort_day: r.cohort_day,
+      source: r.source,
+      size: net(num(r.size), t?.n ?? 0),
+      d1: sealed(1, r.d1, t?.r1 ?? 0),
+      d7: sealed(7, r.d7, t?.r7 ?? 0),
+      d30: sealed(30, r.d30, t?.r30 ?? 0),
+    };
+  });
+
+  // ---- events. `participants`/`new_fans`/`acquired_d30` are membership-derived
+  // on scope `event`; `dead_attempts` on scope `release_attempt`; `acquisitions`
+  // is an ordinary counter (one per acquisition, not one per fan) and takes no
+  // tombstone subtraction.
+  const eventTombs = await tombstoneFlagCounts(analytics, passportId, "event", T, D);
+  const attemptTombs = await tombstoneCounts(analytics, passportId, "release_attempt", T, D);
+  const eventRows = await rowsOf<{ event_kind: string; event_id: string; join_day: string; participants: number; new_fans: number; acquired_d30: number; acquisitions: number; dead_attempts: number; acquirers: number; new_supporters: number }>(
+    analytics,
+    "SELECT event_kind, event_id, join_day, participants, new_fans, acquired_d30, acquisitions, dead_attempts, acquirers, new_supporters " +
+      "FROM creator_event_performance WHERE passport_id = ? AND join_day <= ? ORDER BY event_kind ASC, event_id ASC, join_day ASC",
+    passportId,
+    D,
+  );
+  const events: DayEventRow[] = eventRows
+    .map((r) => {
+      const t = eventTombs.get(`event|${r.join_day}|${r.event_id}`);
+      const attemptGone = attemptTombs.get(`release_attempt|${r.join_day}|${r.event_id}`) ?? 0;
+      return {
+        kind: r.event_kind as EventPerfKind,
+        id: r.event_id,
+        join_day: r.join_day,
+        // I3-1122: `participants` loses every erased member; `new_fans` only the
+        // acquired ones; `acquired_d30` only those whose creator r30 flipped.
+        participants: net(num(r.participants), t?.n ?? 0),
+        new_fans: net(num(r.new_fans), t?.nw ?? 0),
+        // The d30 window of an event's join day seals at `join_day + 31`.
+        acquired_d30: shiftDay(r.join_day, 31) <= T ? net(num(r.acquired_d30), t?.acq30 ?? 0) : 0,
+        acquisitions: num(r.acquisitions),
+        // I3-0356: distinct acquirers (first acquisition per fan per release),
+        // net of their tombstones — `analytics-consumer.ts releaseAcquirerScope`.
+        acquirers: net(num(r.acquirers), eventTombs.get(`event|${r.join_day}|acq:${r.event_id}`)?.n ?? 0),
+        dead_attempts: net(num(r.dead_attempts), attemptGone),
+        // I21-Q164: the join day's war-new fans the day's `new_supporters` counted (analytics/0011). Unnetted like
+        // the ±1 counter it partitions (ADR §3), and VIRTUAL in the graph, so it is never served or floored.
+        new_supporters: num(r.new_supporters),
+      };
+    })
+    // THE PER-JOIN-DAY FLOOR (docket #17 C-3). A join day is the finest key an
+    // event's rows carry, and the same row is inside object `T` and object
+    // `T + 1`, so its own population is differenceable across the two objects -
+    // a cell `serveDay` withholds INSIDE one object is still handed over by the
+    // pair. The bound is on the join day itself and not on a lookback window:
+    // a day under `K` contributes to NO object, in either direction, and starts
+    // contributing to every object built after it clears.
+    .map((r) => ({
+      ...r,
+      participants: r.participants >= K_ANONYMITY_FLOOR ? r.participants : 0,
+      new_fans: r.new_fans >= K_ANONYMITY_FLOOR ? r.new_fans : 0,
+      acquired_d30: r.acquired_d30 >= K_ANONYMITY_FLOOR ? r.acquired_d30 : 0,
+      dead_attempts: r.dead_attempts >= K_ANONYMITY_FLOOR ? r.dead_attempts : 0,
+    }))
+    .filter((r) => r.participants > 0 || r.acquisitions > 0 || r.dead_attempts > 0);
+
+  const poolRows = await rowsOf<{ pool_id: string; claimed: number; redeemed: number }>(
+    analytics,
+    "SELECT pool_id, claimed, redeemed FROM creator_pool_daily WHERE passport_id = ? AND day = ? ORDER BY pool_id ASC",
+    passportId,
+    D,
+  );
+  const pools: DayPoolRow[] = poolRows.map((r) => ({ pool_id: r.pool_id, claimed: num(r.claimed), redeemed: num(r.redeemed) }));
+
+  // ---- stocks (ADR section 3). `supporters(T) := sum over d <= D of
+  // (new_supporters - unfollows)` across SEALED day cells; erasure's own
+  // creator-scoped decrement rides in `unfollows`, so a stock leaves at the next
+  // UTC boundary without any sealed day being revised. `linked_*` have no
+  // producer in Phase 1 (S-10), so they are 0 - which `serveDay` withholds, and
+  // a withheld cell is what "no writer yet" has to look like rather than a
+  // served zero.
+  const stockRow = await analytics
+    .prepare("SELECT COALESCE(SUM(new_supporters - unfollows), 0) AS n FROM creator_metrics_daily WHERE passport_id = ? AND day <= ?")
+    .bind(passportId, D)
+    .first<{ n: number }>();
+
+  return {
+    day: D,
+    metrics,
+    revenue,
+    countries,
+    cohorts,
+    events,
+    pools,
+    stocks: { supporters: Math.max(0, num(stockRow?.n)), linked_2plus: 0, linked_3plus: 0 },
+  };
+}
+
+/**
+ * `#tombstones` for one scope kind, with `erased_day < T` and
+ * `cell_day <= throughDay`, keyed `scope_kind|cell_day|<source or scope_id>`.
+ *
+ * The creator scope keys by SOURCE because that is what a cohort row is keyed by
+ * and what the tombstone carries; the event and release-attempt scopes key by
+ * `scope_id`; the buyer scope has one scope per creator, so its key ends empty.
+ */
+async function tombstoneCounts(
+  analytics: DbLike,
+  passportId: string,
+  scopeKind: "creator" | "event" | "buyer" | "release_attempt",
+  T: string,
+  throughDay: string,
+): Promise<Map<string, number>> {
+  return new Map([...(await tombstoneFlagCounts(analytics, passportId, scopeKind, T, throughDay))].map(([k, v]) => [k, v.n]));
+}
+
+/** Per-key tombstone counts, total `n` plus the nested-cell memberships each
+ * erased fan carried (analytics/0007 `in_*`, written by `eraseScopeVersion`).
+ * I3-1122: a nested cell (`d1/d7/d30`, `new_fans`, `acquired_d30`) is netted only
+ * by the tombstones of fans who were counted in THAT cell, never by `n`. */
+interface TombCounts {
+  n: number;
+  r1: number;
+  r7: number;
+  r30: number;
+  nw: number;
+  acq30: number;
+}
+async function tombstoneFlagCounts(
+  analytics: DbLike,
+  passportId: string,
+  scopeKind: "creator" | "event" | "buyer" | "release_attempt",
+  T: string,
+  throughDay: string,
+): Promise<Map<string, TombCounts>> {
+  const rows = await rowsOf<{ scope_id: string; cell_day: string; source: string | null; n: number; r1: number; r7: number; r30: number; nw: number; acq30: number }>(
+    analytics,
+    "SELECT scope_id, cell_day, source, COUNT(*) AS n, SUM(in_r1) AS r1, SUM(in_r7) AS r7, SUM(in_r30) AS r30, SUM(in_new) AS nw, SUM(in_acq30) AS acq30 FROM analytics_tombstones " +
+      "WHERE passport_id = ? AND scope_kind = ? AND cell_day <= ? AND erased_day < ? " +
+      "GROUP BY scope_id, cell_day, source",
+    passportId,
+    scopeKind,
+    throughDay,
+    T,
+  );
+  const out = new Map<string, TombCounts>();
+  for (const r of rows) {
+    const tail = scopeKind === "creator" ? (r.source ?? "") : scopeKind === "buyer" ? "" : r.scope_id;
+    const key = `${scopeKind}|${r.cell_day}|${tail}`;
+    const o = out.get(key) ?? { n: 0, r1: 0, r7: 0, r30: 0, nw: 0, acq30: 0 };
+    out.set(key, { n: o.n + num(r.n), r1: o.r1 + num(r.r1), r7: o.r7 + num(r.r7), r30: o.r30 + num(r.r30), nw: o.nw + num(r.nw), acq30: o.acq30 + num(r.acq30) });
+  }
+  return out;
+}
+
+/**
+ * THE S-1 LEGACY STOCKS, declared as cells of the SAME day object.
+ *
+ * They are not a second graph and they are not floored by a second rule: they
+ * are appended to `buildDayGraph`'s cells and relations and go through the one
+ * `serveDay` call with everything else. Each is a sum over SEALED day cells,
+ * the shape ADR section 3 gives `supporters`, so an erasure counts forward from
+ * its day and no sealed cell is revised.
+ */
+async function readLegacyCells(analytics: DbLike, passportId: string, T: string): Promise<{ cells: Cell[]; relations: Relation[] }> {
+  const D = shiftDay(T, -1);
+  const cells: Cell[] = [];
+  const relations: Relation[] = [];
+  const pop = (id: string, value: number): void => void cells.push({ id, kind: "population", value });
+  const virt = (id: string, value: number): void => void cells.push({ id, kind: "virtual", value });
+
+  // Card holders and acquisitions: summed over the sealed plus/minus-1
+  // counters. `cards_collected` has its departure counter beside it
+  // (`cards_uncollected`, fed by the fan's own removal AND by the erasure
+  // decrement), exactly as `unfollows` sits beside `new_supporters`.
+  const sums = await analytics
+    .prepare(
+      "SELECT COALESCE(SUM(cards_collected - cards_uncollected), 0) AS cards, " +
+        "COALESCE(SUM(collectibles_acquired), 0) AS acq, " +
+        "COALESCE(SUM(CASE WHEN day > ? THEN collectibles_acquired ELSE 0 END), 0) AS acq90 " +
+        "FROM creator_metrics_daily WHERE passport_id = ? AND day <= ?",
+    )
+    .bind(shiftDay(D, -90), passportId, D)
+    .first<{ cards: number; acq: number; acq90: number }>();
+  pop("legacy.stock.card_collectors", Math.max(0, num(sums?.cards)));
+  // D-0845(6) (I4-J-ANALYTICS ja-07): both acquisition figures are ACTION
+  // counts, so K acquisitions by ONE fan cleared a population floor. No
+  // creator-wide distinct-acquirer counter exists (`buyers_new` also counts pack
+  // openers), and the stock is cumulative, so any served value hands back the
+  // day's actions by differencing two objects. VIRTUAL, like the per-release
+  // count (analytics-cells.ts `virt(... "acquisitions")`, D-0843(8)).
+  virt("legacy.stock.acquisitions", num(sums?.acq));
+  virt("legacy.window.acquisitions_90d", num(sums?.acq90));
+  relations.push({ type: "subset", outer: "legacy.stock.acquisitions", inner: "legacy.window.acquisitions_90d" });
+
+  // The BUYER stock: a membership-derived day cell summed over sealed days,
+  // each day net of the tombstones that carry that day as their `cell_day`.
+  const buyerDays = await rowsOf<{ day: string; n: number }>(
+    analytics,
+    "SELECT day, buyers_new AS n FROM creator_revenue_daily WHERE passport_id = ? AND day <= ? ORDER BY day ASC",
+    passportId,
+    D,
+  );
+  const buyerTombs = await tombstoneCounts(analytics, passportId, "buyer", T, D);
+  let collectors = 0;
+  for (const r of buyerDays) collectors += net(num(r.n), buyerTombs.get(`buyer|${r.day}|`) ?? 0);
+  pop("legacy.stock.collectors", collectors);
+
+  // Reverse-code pools: creator-scoped counters, summed over sealed days. The
+  // per-pool cells PARTITION the creator-wide total, so `serveDay`'s
+  // complementary suppression applies - one withheld pool beside a served total
+  // is exactly the equation step (3) exists to break.
+  const poolTotals = await rowsOf<{ pool_id: string; claimed: number; redeemed: number }>(
+    analytics,
+    "SELECT pool_id, COALESCE(SUM(claimed), 0) AS claimed, COALESCE(SUM(redeemed), 0) AS redeemed " +
+      "FROM creator_pool_daily WHERE passport_id = ? AND day <= ? GROUP BY pool_id ORDER BY pool_id ASC",
+    passportId,
+    D,
+  );
+  let claims = 0;
+  let redemptions = 0;
+  const claimKids: string[] = [];
+  const redeemKids: string[] = [];
+  for (const r of poolTotals) {
+    pop(`legacy.pool.${r.pool_id}.claimed`, num(r.claimed));
+    pop(`legacy.pool.${r.pool_id}.redeemed`, num(r.redeemed));
+    // `redeemed ⊆ claimed` (docket #17 B-2): the difference is the population
+    // that claimed and did not redeem, so the pair is a nesting and
+    // `analytics-cells.ts:266` floors the gap. Declared at BOTH levels the
+    // object serves - the per-pool cells and the creator-wide stocks below -
+    // because both pairs are served side by side (`attribution.ts:109`).
+    relations.push({ type: "subset", outer: `legacy.pool.${r.pool_id}.claimed`, inner: `legacy.pool.${r.pool_id}.redeemed` });
+    claimKids.push(`legacy.pool.${r.pool_id}.claimed`);
+    redeemKids.push(`legacy.pool.${r.pool_id}.redeemed`);
+    claims += num(r.claimed);
+    redemptions += num(r.redeemed);
+  }
+  pop("legacy.stock.code_claims", claims);
+  pop("legacy.stock.redemptions", redemptions);
+  relations.push({ type: "subset", outer: "legacy.stock.code_claims", inner: "legacy.stock.redemptions" });
+  if (claimKids.length > 0) {
+    pop("legacy.pool.claims_other", 0);
+    pop("legacy.pool.redemptions_other", 0);
+    relations.push(
+      { type: "partition", parent: "legacy.stock.code_claims", children: claimKids, other: "legacy.pool.claims_other" },
+      { type: "partition", parent: "legacy.stock.redemptions", children: redeemKids, other: "legacy.pool.redemptions_other" },
+    );
+  }
+  return { cells, relations };
+}
+
+/**
+ * The two counts S-17 added to `LegacyFacts`, which is declared in `roi.ts` -
+ * not this item's file. Widening the interface and reading the fields is one
+ * three-line edit there (`creatorRoi`'s `requests` and `supporters_total`); the
+ * READERS are here, so the projector's edit is a field access and never a
+ * query. Until that edit lands the two numbers are computed and unread, which
+ * is the visible half of the ownership split and is reported as such.
+ */
+interface RoiPopulations {
+  /** `creator_requests` as of `created_at < T`, plus the 0080 tombstones. */
+  readonly requests: number;
+  /** Distinct claimers as of T under the day-pure Sybil gate, plus the 0080
+   * tombstones. `active`/`core` have no day-pure form - see below. */
+  readonly supporters_total: number;
+}
+
+/** The day-pure Sybil gate: an account counts on day T once it was created
+ * before the start of day `T - 7`, which is `supporter-status.ts`'s
+ * `SUPPORTER_MIN_ACCOUNT_AGE_DAYS` moved off the wall clock and onto the day
+ * boundary. Same constant, same direction, no instant inside T at which the
+ * answer changes. */
+const SUPPORTER_AGE_DAYS = 7;
+
+/**
+ * The day-pure PRODUCTION reads that stay (S-1), and the two that S-17 made
+ * day-pure rather than leaving withheld.
+ *
+ * Four sources and no others: the append-only `trust_events` ledger folded at
+ * `created_at < T`; the creator's OWN property - releases and reverse-code
+ * pools - read as of `created_at < T`; and the three LIVE-TABLE-plus-TOMBSTONE
+ * counts, each of which is `live(as of T) + tombstones(created_day < T AND
+ * erased_day >= T)`: `archive_requests` + 0075 (through `archiveDemand`),
+ * `creator_requests` + 0080, and `reverse_code_claims` + 0080. The tombstone
+ * term is what makes a live table day-pure: it holds an erased fan in the count
+ * for the whole UTC day of their erasure and drops them at the next boundary,
+ * so no count moves at an instant a creator can choose (FINDING-0013).
+ *
+ * `supporters_active` and `supporters_core` are NOT here and stay withheld.
+ * Their live halves can be made day-pure (both windows land on day boundaries
+ * relative to T), but their ERASED halves cannot: both are windowed
+ * populations, so counting an erased fan through their erasure day needs a
+ * recency day the tombstone deliberately does not carry (0080's header), and
+ * `core` additionally turns on `reverse_codes.redeemed_at` - an act the CREATOR
+ * performs, on their own clock, after the fan is gone. Half a fix would have
+ * put the mid-day delta back on the two counts that still had it.
+ */
+export async function readLegacyFacts(prod: DbLike, passportId: string, T: string, generatedAt: string): Promise<LegacyFacts & RoiPopulations> {
+  const protection = await protectionSummary(prod, passportId, T);
+  // `archiveDemand` takes a clock and lags itself by a day, so handing it
+  // `T 00:00Z` gives exactly "as of the start of T" - `created_at < T`, with the
+  // erasure tombstones counted through the erasure day. One helper, one number.
+  const bc = await backCatalog(prod, passportId, startOfDayMs(T), () => generatedAt);
+  // POOL STATUS AS OF `T` (docket #17 C-1(c)). `reverse_code_pools` has exactly
+  // ONE status transition and exactly one writer of it - `closePool`
+  // (`reverse-codes.ts:524`), `active` -> `closed`, stamping `updated_at` - and
+  // no other statement in `src/` updates the table, so `updated_at` on a closed
+  // pool IS that transition's instant rather than a general last-touch. The
+  // fold is therefore read off a recorded instant and not off a ledger this
+  // file invented: closed as of `T` iff it is closed now AND was closed before
+  // the start of `T`. `title` needs no bound - nothing updates it, so
+  // `created_at < ?` already makes it a function of (creator, T).
+  const poolRows = await rowsOf<{ pool_id: string; title: string; eligibility_kind: string; eligibility_ref: string | null; status: string; generated: number }>(
+    prod,
+    "SELECT p.pool_id AS pool_id, p.title AS title, p.eligibility_kind AS eligibility_kind, p.eligibility_ref AS eligibility_ref, " +
+      "CASE WHEN p.status = 'closed' AND p.updated_at < ? THEN 'closed' ELSE 'active' END AS status, " +
+      "(SELECT COUNT(*) FROM reverse_codes c WHERE c.pool_id = p.pool_id AND c.source = 'generated' AND c.created_at < ?) AS generated " +
+      "FROM reverse_code_pools p WHERE p.passport_id = ? AND p.created_at < ? ORDER BY p.created_at DESC, p.pool_id ASC",
+    T,
+    T,
+    passportId,
+    T,
+  );
+  const pools: LegacyPool[] = poolRows.map((p) => ({
+    pool_id: p.pool_id,
+    title: p.title,
+    eligibility_kind: p.eligibility_kind,
+    eligibility_ref: p.eligibility_ref ?? null,
+    status: p.status,
+    observable: num(p.generated) > 0,
+  }));
+  // I3-2132 (D-0858(1)): `published` is the status AS OF `T` - the latest
+  // `release_status_history` row with `at < T`, else 'registered' - the SAME
+  // predicate `back-catalog.ts:132` puts on this object's release list, never the
+  // live `releases.status` (a withdrawal after T must not lower T's count).
+  const rel = await prod
+    .prepare(
+      "SELECT COUNT(*) AS total, SUM(CASE WHEN COALESCE((SELECT h.status FROM release_status_history h WHERE h.release_id = r.release_id AND h.at < ? ORDER BY h.at DESC LIMIT 1), 'registered') = 'published' THEN 1 ELSE 0 END) AS published, " +
+        // I30 Q3: of those, the ones whose deciding row (the same latest-before-T row) was inferred by a backfill (0259).
+        "SUM(CASE WHEN COALESCE((SELECT h.status = 'published' AND h.inferred = 1 FROM release_status_history h WHERE h.release_id = r.release_id AND h.at < ? ORDER BY h.at DESC LIMIT 1), 0) = 1 THEN 1 ELSE 0 END) AS inferred " +
+        "FROM releases r WHERE r.passport_id = ? AND r.created_at < ?",
+    )
+    .bind(T, T, passportId, T)
+    .first<{ total: number; published: number; inferred: number }>();
+  // ONE STATEMENT PER POPULATION, live and tombstone in the same read: the two
+  // terms answer the same question about the same day and a pair of round trips
+  // would let a concurrent erasure land between them, counting the fan twice or
+  // not at all. Both binds are T, so there is one boundary and not two.
+  const req = await prod
+    .prepare(
+      "SELECT (SELECT COUNT(*) FROM creator_requests cr " +
+        qualifiedFanJoin("cr.account_id") +
+        " WHERE cr.passport_id = ? AND cr.created_at < ? AND " + fanQualifiedAsOfExpr("qf") + ") AS live, " +
+        "(SELECT COUNT(*) FROM creator_request_tombstones WHERE passport_id = ? AND created_day < ? AND erased_day >= ?) AS tomb",
+    )
+    .bind(passportId, T, T, passportId, T, T)
+    .first<{ live: number; tomb: number }>();
+  // The live half carries the Sybil gate the shipped `supporterStats` applies,
+  // on the day boundary; the tombstone half carries it already folded into
+  // `created_day` at erasure (migration 0080). The `JOIN accounts` is also what
+  // keeps a PSEUDONYMISED claim row out of the live count - erasure replaces the
+  // claimer with an id no account matches - so the two halves never overlap.
+  const sup = await prod
+    .prepare(
+      "SELECT (SELECT COUNT(DISTINCT k.account_id) FROM reverse_code_claims k " +
+        "JOIN reverse_code_pools p ON p.pool_id = k.pool_id JOIN accounts a ON a.account_id = k.account_id " +
+        "WHERE p.passport_id = ? AND k.claimed_at < ? AND a.created_at < ?) AS live, " +
+        "(SELECT COUNT(*) FROM reverse_code_claim_tombstones WHERE passport_id = ? AND created_day < ? AND erased_day >= ?) AS tomb",
+    )
+    .bind(passportId, T, shiftDay(T, -SUPPORTER_AGE_DAYS), passportId, T, T)
+    .first<{ live: number; tomb: number }>();
+  return {
+    protection,
+    back_catalog: bc,
+    pools,
+    releases_total: num(rel?.total),
+    releases_published: num(rel?.published),
+    releases_inferred: num(rel?.inferred),
+    requests: num(req?.live) + num(req?.tomb),
+    supporters_total: num(sup?.live) + num(sup?.tomb),
+  };
+}
+
+/**
+ * The 0080 hygiene step, in `scheduled()`'s chain beside
+ * `pruneArchiveTombstones`. I15-Q8 (I3-1151, Jason: "Two UTC days"): a
+ * tombstone is kept through the UTC day AFTER its erasure day — both deletes
+ * bind `erased_day < shiftDay(today, -1)`, so one erased yesterday survives and
+ * one erased two days ago goes. The reader above requires `erased_day >= T`;
+ * `analytics-build.ts:149` builds the sweep's day objects at
+ * `T = shiftDay(today, -1)` (yesterday), and with this cut the two predicates
+ * are disjoint for every `T >= yesterday`, so a late-on-`T` erasure no longer
+ * depends on this step running AFTER `buildSweep` (it still does, index.ts).
+ * These rows are mutually linkable by `(created_day, erased_day)` for one fan
+ * across creators (0075's header), so the tables hold at most two days of
+ * erasures.
+ */
+export async function pruneRoiTombstones(db: DbLike, nowMs: number): Promise<number> {
+  const cut = shiftDay(dayOfMs(nowMs), -1);
+  const a = await db.prepare("DELETE FROM creator_request_tombstones WHERE erased_day < ?").bind(cut).run();
+  const b = await db.prepare("DELETE FROM reverse_code_claim_tombstones WHERE erased_day < ?").bind(cut).run();
+  return (a.changes ?? 0) + (b.changes ?? 0);
+}
+
+// ---------------------------------------------------------------------------
+// BUILDING THE OBJECT
+// ---------------------------------------------------------------------------
+
+/** The Phase-1 metrics, floored by `serveDay` (S-4). Versioned by `v`. */
+export interface DaySummary {
+  readonly v: 1;
+  readonly passport_id: string;
+  /** `D` - the day these cells describe. */
+  readonly day: string;
+  /** `T` - the day object this is served under. */
+  readonly served_day: string;
+  /** ADR section 3: incompleteness is platform-wide, never a per-creator number. */
+  readonly platform_incomplete: boolean;
+  readonly metrics: Record<string, number | null>;
+  readonly revenue: Record<string, number | null>;
+  readonly geo: { active_fans: number | null; countries: Array<{ country: string; fan_days: number }>; other: number | null };
+  readonly cohorts: Array<{ cohort_day: string; source: string; size: number | null; d1: number | null; d7: number | null; d30: number | null }>;
+  readonly events: Array<{ kind: string; id: string; participants: number | null; new_fans: number | null; acquired_d30: number | null; acquisitions: number | null; dead_attempts: number | null }>;
+  readonly pools: Array<{ pool_id: string; claimed: number | null; redeemed: number | null }>;
+  readonly stocks: { supporters: number | null; linked_2plus: number | null; linked_3plus: number | null };
+}
+
+/** The five kinds of one (creator, UTC day), under one `generated_at`. */
+interface DayObject {
+  readonly v: 1;
+  readonly passport_id: string;
+  readonly day: string;
+  readonly generated_at: string;
+  readonly summary: DaySummary;
+  /** `niche` is sealed at build by `buildDayIfMissing` (I3-1125); absent when it was not read. */
+  readonly roi: CreatorRoi & { readonly niche?: NicheRank | null };
+  readonly attribution: ConversionAttribution;
+  readonly campaigns: CampaignPlan;
+  readonly intel: CreatorIntelligence;
+}
+
+/** Everything one day object is built from - read once, projected five ways. */
+interface DayBuildInput {
+  readonly day: DayInput;
+  readonly extra: { cells: Cell[]; relations: Relation[] };
+  readonly facts: LegacyFacts;
+  readonly platform_incomplete: boolean;
+}
+
+/** Read both stores for (creator, T). Pure I/O; no floor is applied here. */
+export async function readDayBuildInput(analytics: DbLike, prod: DbLike, passportId: string, T: string, generatedAt: string): Promise<DayBuildInput> {
+  const day = await readDayInput(analytics, prod, passportId, T);
+  const extra = await readLegacyCells(analytics, passportId, T);
+  const facts = await readLegacyFacts(prod, passportId, T, generatedAt);
+  // #851a: the distinct-claimer running total goes through the ONE `serveDay` as a
+  // population cell (floor + running-total delta), never served from `facts` raw.
+  extra.cells.push({ id: DAY_CELL.supportersTotal, kind: "population", value: facts.supporters_total });
+  // I31 B17: the requester running total goes the same way (a 5 then a 6 hands one fan's delta to a reader otherwise).
+  extra.cells.push({ id: DAY_CELL.requests, kind: "population", value: facts.requests });
+  const flag = await analytics.prepare("SELECT 1 AS x FROM platform_incomplete_days WHERE day = ?").bind(day.day).first<{ x: number }>();
+  return { day, extra, facts, platform_incomplete: flag !== null };
+}
+
+/**
+ * ONE `serveDay` OVER THE WHOLE OBJECT, then five projections of its output.
+ *
+ * The order matters and it is the ADR's: build the graph, append the S-1 legacy
+ * stocks to it, serve the set ONCE, and only then project. A projector that
+ * reached past `DayCells` for a raw value would be a second floor, which is the
+ * failure mode P1 exists to remove.
+ */
+export function buildDayObject(
+  passportId: string,
+  T: string,
+  generatedAt: string,
+  input: DayBuildInput,
+  niche?: NicheRank | null,
+  carried?: ReadonlyMap<string, string>,
+  priorServed?: ReadonlyMap<string, readonly number[]>,
+  forced?: ReadonlySet<string>,
+  priorDay?: ReadonlyMap<string, number | null>,
+): DayObject {
+  const { served, cells } = dayCellsFor(T, input, carried, priorServed, forced, priorDay);
+  const roi = creatorRoi(cells, input.facts, passportId, generatedAt);
+  return {
+    v: 1,
+    passport_id: passportId,
+    day: T,
+    generated_at: generatedAt,
+    summary: projectSummary(passportId, T, input, served),
+    roi: niche === undefined ? roi : { ...roi, niche },
+    attribution: conversionAttribution(cells, input.facts, passportId, generatedAt),
+    campaigns: campaignTemplates(cells, input.facts, passportId, generatedAt),
+    intel: creatorIntelligence(cells, input.facts, passportId, generatedAt),
+  };
+}
+
+/**
+ * THE ONE `serveDay` CALL of a day object, and the `DayCells` the projectors
+ * read. I3-2018: an unsealed window is carried as `0` (`readDayInput`), which
+ * `serveDay` withholds as `floor: below K` - a claim that it was MEASURED and
+ * small. `explain` here names it for what it is: not yet measured by this day
+ * object. The served set is untouched; only the reason string changes, and it
+ * names the rule and never a value (a seal day is a function of the cell id
+ * and T alone).
+ */
+const POOL_REDEMPTIONS_STOCK = "legacy.stock.redemptions";
+const POOL_CELL_RE = /^legacy\.pool\.[^.]+\.(claimed|redeemed)$/;
+
+export function dayCellsFor(
+  T: string,
+  input: DayBuildInput,
+  carried?: ReadonlyMap<string, string>,
+  priorServed?: ReadonlyMap<string, readonly number[]>,
+  forced?: ReadonlySet<string>,
+  priorDay?: ReadonlyMap<string, number | null>,
+): { served: ServedSet; cells: DayCells } {
+  const built = buildDayGraph(input.day);
+  const allCells = [...built.cells, ...input.extra.cells];
+  // I25 (#841): the flow-to-total relations span both halves (the day's pool flows are
+  // `buildDayGraph`'s, the legacy totals `readLegacyCells`'), so they are declared here.
+  const graph = { relations: [...built.graph.relations, ...input.extra.relations], flows: flowRelations(new Set(allCells.map((c) => c.id))) };
+  let served = serveDay(allCells, graph, undefined, carried, priorServed, forced, undefined, priorDay);
+  // I3-0325 — THE POOL GAP EQUATION. `serveDay` decides each partition alone,
+  // but the claims and redemptions partitions (readLegacyCells) are read
+  // TOGETHER with `redeemed <= claimed` per pool: with both creator-wide stocks
+  // served, (claims - redemptions) minus every fully served pool's gap is the
+  // unredeemed population of the pools that have a withheld cell, so two
+  // withheld pools at [2,2] and [3,3] beside a served [10,5] pin both gaps at 0
+  // (test/i12-pool-gap-inversion.test.ts). Without the redemptions stock that
+  // equation cannot be formed, so it goes whenever a per-pool cell is withheld.
+  if (served.served.has(POOL_REDEMPTIONS_STOCK) && allCells.some((c) => POOL_CELL_RE.test(c.id) && !served.served.has(c.id))) {
+    served = serveDay(allCells, graph, undefined, carried, priorServed, new Set([...(forced ?? []), POOL_REDEMPTIONS_STOCK]), undefined, priorDay);
+  }
+  const unsealed = unsealedWindowIds(T, input.day);
+  const cells: DayCells = {
+    get: (id: string): number | null => served.served.get(id) ?? null,
+    explain: (id: string): string => (unsealed.has(id) && !served.served.has(id) ? "withheld — not sealed: window not measured by this day object" : served.explain(id)),
+  };
+  return { served, cells };
+}
+
+/** The window cell ids whose seal day is after `T` (the same predicates `readDayInput` applies). */
+function unsealedWindowIds(T: string, day: DayInput): Set<string> {
+  const out = new Set<string>();
+  for (const c of day.cohorts) {
+    for (const w of [1, 7, 30] as const) if (shiftDay(c.cohort_day, w + 1) > T) out.add(cellId.cohort(c.cohort_day, c.source, `d${w}`));
+  }
+  const allUnsealed = new Map<string, { kind: EventPerfKind; id: string; all: boolean }>();
+  for (const e of day.events) {
+    const open = shiftDay(e.join_day, 31) > T;
+    if (open) out.add(cellId.eventDay(e.kind, e.id, e.join_day, "acquired_d30"));
+    const k = `${e.kind} ${e.id}`;
+    const prev = allUnsealed.get(k);
+    allUnsealed.set(k, { kind: e.kind, id: e.id, all: (prev?.all ?? true) && open });
+  }
+  for (const e of allUnsealed.values()) if (e.all) out.add(cellId.event(e.kind, e.id, "acquired_d30"));
+  return out;
+}
+
+/**
+ * THE ROW'S EXISTENCE IS ITSELF A CELL (INV-004 clause 4, `analytics-cells.ts`
+ * step (1)). A row every one of whose own cells came back withheld states that
+ * between 1 and K-1 of the thing happened on that named (cohort day, source),
+ * event or pool - the disclosure the floor withheld the numbers for. A row with
+ * nothing served is therefore DROPPED, so zero and sub-floor produce the same
+ * `[]`. The rule `countries` already applies below and `intelligence.ts:155`
+ * applies with `continue`.
+ */
+const anyServed = (...vs: Array<number | null>): boolean => vs.some((v) => v !== null);
+
+function projectSummary(passportId: string, T: string, input: DayBuildInput, served: ServedSet): DaySummary {
+  const g = (id: string): number | null => served.served.get(id) ?? null;
+  const countries: Array<{ country: string; fan_days: number }> = [];
+  for (const cc of Object.keys(input.day.countries).sort()) {
+    const v = g(cellId.country(cc));
+    if (v !== null) countries.push({ country: cc, fan_days: v });
+  }
+  return {
+    v: 1,
+    passport_id: passportId,
+    day: input.day.day,
+    served_day: T,
+    platform_incomplete: input.platform_incomplete,
+    metrics: Object.fromEntries(METRIC_COLUMNS.map((c) => [c, g(cellId.metric(c))])),
+    revenue: Object.fromEntries(REVENUE_COLUMNS.map((c) => [c, g(cellId.revenue(c))])),
+    geo: { active_fans: g(cellId.activeFans), countries, other: g(cellId.geoOther) },
+    cohorts: input.day.cohorts
+      .map((c) => ({
+        cohort_day: c.cohort_day,
+        source: c.source,
+        size: g(cellId.cohort(c.cohort_day, c.source, "size")),
+        d1: g(cellId.cohort(c.cohort_day, c.source, "d1")),
+        d7: g(cellId.cohort(c.cohort_day, c.source, "d7")),
+        d30: g(cellId.cohort(c.cohort_day, c.source, "d30")),
+      }))
+      .filter((c) => anyServed(c.size, c.d1, c.d7, c.d30)),
+    events: [...new Map(input.day.events.map((e) => [`${e.kind} ${e.id}`, e])).values()]
+      .map((e) => ({
+        kind: e.kind,
+        id: e.id,
+        participants: g(cellId.event(e.kind, e.id, "participants")),
+        new_fans: g(cellId.event(e.kind, e.id, "new_fans")),
+        acquired_d30: g(cellId.event(e.kind, e.id, "acquired_d30")),
+        acquisitions: e.kind === "release" ? g(cellId.event(e.kind, e.id, "acquisitions")) : null,
+        dead_attempts: e.kind === "release" ? g(cellId.event(e.kind, e.id, "dead_attempts")) : null,
+      }))
+      .filter((e) => anyServed(e.participants, e.new_fans, e.acquired_d30, e.acquisitions, e.dead_attempts)),
+    pools: input.day.pools
+      .map((p) => ({ pool_id: p.pool_id, claimed: g(cellId.pool(p.pool_id, "claimed")), redeemed: g(cellId.pool(p.pool_id, "redeemed")) }))
+      .filter((p) => anyServed(p.claimed, p.redeemed)),
+    stocks: { supporters: g(cellId.stock("supporters")), linked_2plus: g(cellId.stock("linked_2plus")), linked_3plus: g(cellId.stock("linked_3plus")) },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// BUILD-ON-READ
+// ---------------------------------------------------------------------------
+
+/** A store that can refuse to overwrite - the day's instant must not move. */
+interface DayStore {
+  get(key: string): Promise<string | null>;
+  putIfAbsent(key: string, value: string): Promise<boolean>;
+  /** I3-1958: the repair primitive. Used ONLY to replace bytes proven not whole; absent -> no repair. */
+  put?(key: string, value: string): Promise<void>;
+  /** I3-2183: removes a retracted creator's day object at the build's post-commit re-read; absent -> the re-filed order does. */
+  delete?(key: string): Promise<void>;
+}
+
+/** The two databases and the object store one build needs. */
+export interface DayBuildContext {
+  readonly analytics: DbLike;
+  readonly prod: DbLike;
+  readonly store: DayStore;
+  /**
+   * I3-1958: replace an object proven NOT whole. Set ONLY by the scheduled
+   * sweep (`analytics-build.ts`), never by a read: F12 / FINDING-0006 - the
+   * reader must not choose the instant, so the creator's own read still skips a
+   * corrupt day (`test/protected/f12-frozen-instant.test.ts`).
+   */
+  readonly repair?: boolean;
+  /**
+   * I3-1492: the build-on-read ceiling. Consulted immediately before a build's
+   * reads (never for a whole object the probe already found); `false` means
+   * "do not build" and the caller's lookback answers exactly as it does for a
+   * day the sweep has not built yet. Set ONLY by `dayBuilder` (the creator's own
+   * read); the sweep carries none.
+   */
+  readonly budget?: () => Promise<boolean>;
+  /**
+   * #925 B (D-0927(2)): the statements this build may still send. Set ONLY by the
+   * scheduled sweep (`analytics-build.ts`, from its subrequest meter). With it, the
+   * served-state writes go in per-cell groups that fit under it less
+   * `DAY_BUILD_TAIL_RESERVE`, and a build whose groups do not all fit returns BEFORE
+   * settling, writing the object or noting the build. T's own `analytics_served_state`
+   * rows are the per-day cursor (INSERT OR IGNORE, first build wins): the next turn
+   * re-reads, skips the cells that landed and continues. Absent (every read): one batch.
+   */
+  readonly allowance?: () => number;
+  /** #925 B: told the number of served-state statements still pending when a build stopped short. */
+  readonly onPartial?: (pending: number) => void;
+}
+
+/** #925 B: what a build sends after its served-state write when nothing needs re-settling —
+ * settle's re-read, the object probe and write (repair), `noteBuilt`, the #842 re-check — plus one. */
+export const DAY_BUILD_TAIL_RESERVE = 6;
+
+/** I3-1492 (D-0829): build-on-read builds per creator per UTC day. */
+export const BUILD_ON_READ_PER_DAY = 20;
+
+/** I3-1515: how long a `corrupt_day_events` row is kept (self-pruned at insert, and by `pruneCorruptDayEvents`). */
+export const CORRUPT_DAY_RETENTION_MS = 30 * 86_400_000;
+/** I21-Q98: rows one `pruneCorruptDayEvents` call deletes at most. */
+const CORRUPT_DAY_PRUNE_LIMIT = 500;
+
+/**
+ * I21-Q98 (I3-1515, Jason: "Ratify 30 days"): the AGE prune of `corrupt_day_events` on ANALYTICS_DB, a
+ * `scheduled()` step (wired by I29-INT, INV-049). The insert-batch prune in `recordCorruptDay` runs only when a
+ * later damaged day is found, so without this a row outlived 30 days whenever none was. Bounded with
+ * `rowid IN (SELECT rowid ... LIMIT ?)` (D1 has no DELETE ... LIMIT). Returns the rows deleted.
+ */
+export async function pruneCorruptDayEvents(analytics: DbLike, nowMs: number, limit: number = CORRUPT_DAY_PRUNE_LIMIT): Promise<number> {
+  const cut = new Date(nowMs - CORRUPT_DAY_RETENTION_MS).toISOString();
+  const r = await analytics
+    .prepare("DELETE FROM corrupt_day_events WHERE at < ? AND rowid IN (SELECT rowid FROM corrupt_day_events WHERE at < ? LIMIT ?)")
+    .bind(cut, cut, limit)
+    .run();
+  return r.changes ?? 0;
+}
+
+/**
+ * I3-1515 (D-0829): an operator-visible record that a stored day object was
+ * found NOT whole. It carries the DAY and the instant only — never the passport
+ * id (W3-10 item 1: erasure cannot reach an ops row naming the creator). Bounded
+ * by pruning rows older than `CORRUPT_DAY_RETENTION_MS` in the same batch. A
+ * failure to record is logged and never blocks the read or the repair.
+ */
+async function recordCorruptDay(analytics: DbLike, T: string, nowMs: number): Promise<void> {
+  try {
+    await analytics.batch([
+      analytics.prepare("INSERT INTO corrupt_day_events (day, at) VALUES (?, ?)").bind(T, new Date(nowMs).toISOString()),
+      analytics.prepare("DELETE FROM corrupt_day_events WHERE at < ?").bind(new Date(nowMs - CORRUPT_DAY_RETENTION_MS).toISOString()),
+    ]);
+  } catch (e) {
+    logError({ cid: "unknown", hop: "cron", msg: "corrupt_day_event_not_recorded", day: T, err: e instanceof Error ? e.name : "unknown" });
+  }
+}
+
+/** I3-1515: corrupt-day detections in the last 24 hours, for the ops "Dead letters" panel. A count only. */
+export async function corruptDaysLast24h(analytics: DbLike, nowMs: number): Promise<number> {
+  const r = await analytics
+    .prepare("SELECT COUNT(*) AS n FROM corrupt_day_events WHERE at >= ?")
+    .bind(new Date(nowMs - 86_400_000).toISOString())
+    .first<{ n: number }>();
+  return num(r?.n);
+}
+
+/** `T 00:00:00.000Z` - the object's `generated_at`, a function of the DAY. */
+export const generatedAtFor = (T: string): string => `${T}T00:00:00.000Z`;
+
+/**
+ * Build (creator, `T`) if it is buildable and absent.
+ *
+ * THE EXISTENCE PROBE IS A SKIP-READ (ADR-0003 section 11): its only purpose is
+ * to avoid the statements a build costs. It is guarded, and on failure the
+ * WRITE decides - `putIfAbsent` cannot overwrite a day somebody has already
+ * been served, so a failed probe costs work and never correctness. It does not
+ * propagate past this unit.
+ *
+ * THE LOSER WRITES NOTHING. Two concurrent reads both compute; the second
+ * `putIfAbsent` returns false and its bytes are dropped. They are the same
+ * bytes anyway - `generated_at` is derived from `T` - but the conditional write
+ * is what makes that a property of the store rather than of the arithmetic.
+ *
+ * A CORRUPT OBJECT IS REPAIRED ON THE SCHEDULE, NEVER ON A READ (I3-1958,
+ * DECIDED 2026-09-26). With `ctx.repair` (the cron sweep only) an existing value
+ * that fails the READER's predicate (`isWholeBundle`) is rebuilt as a missing
+ * key would be, and replaced with `put` only while the stored bytes are STILL
+ * not whole - a whole object is never overwritten. The instant is the
+ * schedule's, so F12 / FINDING-0006 (the reader must not choose it) holds: a
+ * read's build, which never sets `repair`, still logs and skips.
+ */
+export async function buildDayIfMissing(ctx: DayBuildContext, passportId: string, T: string): Promise<boolean> {
+  if (!PSP_RE.test(passportId)) return false;
+  const key = bundleKey(passportId, T);
+  const notWhole = (raw: string): boolean => {
+    try {
+      return !isWholeBundle(JSON.parse(raw) as Record<string, unknown>, passportId, T);
+    } catch {
+      return true;
+    }
+  };
+  let corrupt = false;
+  try {
+    const existing = await ctx.store.get(key);
+    if (existing !== null) {
+      if (!notWhole(existing)) {
+        await noteBuilt(ctx.analytics, passportId, T);
+        return false;
+      }
+      await recordCorruptDay(ctx.analytics, T, Date.now());
+      if (ctx.repair !== true || ctx.store.put === undefined) {
+        // THE SUBJECT DOES NOT GO TO THE LOG (W3-10 item 1). `key` is
+        // `frozen/day/<passport_id>/<T>.json` — logging it logs the creator, and
+        // erasure cannot reach a log line. The DAY is on `ALLOWED_KEYS` and is
+        // not per-entity, so the found-day stays findable.
+        logError({ cid: "unknown", hop: "cron", msg: "day_object_not_whole_not_repaired", day: T });
+        await noteBuilt(ctx.analytics, passportId, T);
+        return false;
+      }
+      corrupt = true;
+    }
+  } catch {
+    // I3-0463: a THROWING probe on a READ means storage is degraded; the read serves its lookback
+    // day and the scheduled sweep (`repair`) builds this one, so a read never spends a build on it.
+    // The sweep still falls through and lets the write decide.
+    if (ctx.repair !== true) {
+      logError({ cid: "unknown", hop: "http", msg: "day_probe_failed_build_deferred", day: T });
+      return false;
+    }
+  }
+  if (ctx.budget !== undefined && !(await ctx.budget())) return false;
+  // I25 (I3-0309 a): on the creator's own read (`budget` is `dayBuilder`'s alone), the nearest earlier
+  // day with nothing on record gets its served state FIRST, so T reads T-1's carried suppression
+  // instead of preceding it. The sweep builds yesterday and never runs ahead of it, so it keeps its
+  // metered per-creator spend (BUILD_SWEEP_CREATOR_MAX); QUEUE #734 covers any other order.
+  if (ctx.budget !== undefined && !(await recordEarlierDays(ctx, passportId, T))) return false;
+  const generatedAt = generatedAtFor(T);
+  const input = await readDayBuildInput(ctx.analytics, ctx.prod, passportId, T, generatedAt);
+  // I23 (I3-2181 a): the declared relations, checked against this day's numbers; a metric, never a throw.
+  try {
+    const g = buildDayGraph(input.day);
+    const broken = relationMismatches([...g.cells, ...input.extra.cells], { relations: [...g.graph.relations, ...input.extra.relations] }, unsealedWindowIds(T, input.day));
+    if (broken > 0) logError({ cid: "unknown", hop: "cron", msg: "analytics_day_relation_mismatch", day: T, count: broken });
+  } catch {
+    logError({ cid: "unknown", hop: "cron", msg: "analytics_day_relation_check_failed", day: T });
+  }
+  // I3-1125 (I4-06-R7 W2): the niche line is sealed with the day, read once
+  // here, so two rankings sweeps inside one UTC day cannot move it. A throwing
+  // read leaves it absent and the route falls back to its live read.
+  let niche: NicheRank | null | undefined;
+  try {
+    const rankingStore = { get: (k: string) => ctx.store.get(k), put: async (): Promise<void> => { throw new Error("read-only"); } };
+    niche = await nicheRank(rankingStore, ctx.prod, passportId);
+  } catch {
+    niche = undefined;
+  }
+  const recorded = await recordDayState(ctx, passportId, T, input);
+  if (recorded === null) return false;
+  const { carried, settled } = recorded;
+  const object = buildDayObject(passportId, T, generatedAt, input, niche, carried, settled.prior, settled.forced, settled.priorDay);
+  // THE READER'S PRECONDITION, ASSERTED AT THE WRITE: all five kinds or none,
+  // judged by the reader's own per-kind predicate (I3-1959, I4-03-R5 W-3).
+  const body = object as unknown as Record<string, unknown>;
+  const holes = FROZEN_BUNDLE_KINDS.filter((k) => !isWholeKind(body[k], passportId));
+  if (holes.length > 0) throw new Error(`day object would be missing ${holes.join(", ")}`);
+  const bytes = JSON.stringify(object);
+  let won: boolean;
+  if (corrupt && ctx.store.put !== undefined) {
+    const again = await ctx.store.get(key);
+    if (again === null) won = await ctx.store.putIfAbsent(key, bytes);
+    else if (notWhole(again)) {
+      await ctx.store.put(key, bytes);
+      logError({ cid: "unknown", hop: "cron", msg: "day_object_not_whole_repaired", day: T });
+      won = true;
+    } else won = false;
+  } else won = await ctx.store.putIfAbsent(key, bytes);
+  await noteBuilt(ctx.analytics, passportId, T);
+  // #842 (I16-W02I patch, landed by I16-L06 under D-0922(7) after BUILD_SWEEP_CREATOR_MAX
+  // was recalibrated to 56): a retraction that landed while this build ran has already
+  // purged what it could see; the three writes above came after it. Re-read the standing
+  // AFTER them and purge again, so no carry, served-state or built row outlives the
+  // creator; `retracted` is monotone (`events.ts` is its only writer). #166: purgeIfRetracted also
+  // re-files the creator's purge work order, and then (I3-2183) deletes this day's object itself unless a
+  // legal hold keeps it; a store with no `delete` leaves the object to that order's drain.
+  if (await purgeIfRetracted(ctx, passportId, T)) return false;
+  return won;
+}
+
+/**
+ * THE SERVED-STATE HALF OF A BUILD: the carry rows, the served-state rows and the settle, in that order,
+ * for a build of T (`buildDayIfMissing`) and for an earlier day recorded ahead of it (`recordEarlierDays`).
+ * `null` = a PARTIAL write (#925 B): nothing is published and the caller returns.
+ */
+async function recordDayState(
+  ctx: DayBuildContext,
+  passportId: string,
+  T: string,
+  input: DayBuildInput,
+): Promise<{ carried: Map<string, string>; settled: { prior: Map<string, number[]>; forced: ReadonlySet<string> | undefined; priorDay: Map<string, number | null> } } | null> {
+  const carried = await readCarriedSuppression(ctx.analytics, passportId, T);
+  const { prior: priorServed, rows: servedRows } = await readServedState(ctx.analytics, passportId, T);
+  // I3-0309 / RG-AN-02: the carry rows land BEFORE the object can be served. A
+  // failed insert throws here and nothing is served; a failed or lost object
+  // write leaves rows (INSERT OR IGNORE, since_day T) that a rebuild of T
+  // writes identically, and T's own rebuild never reads them (since_day < T).
+  const firstPriorDay = priorDayOf(servedRows, T);
+  const servedSet = dayCellsFor(T, input, carried, priorServed, undefined, firstPriorDay).served;
+  await noteCarriedSuppression(ctx.analytics, passportId, T, servedSet.complementary ?? new Map());
+  // QUEUE #734: the served value of every running total lands BEFORE the object
+  // can be served, on the same rule as the carry rows above — as a TENTATIVE
+  // row, then re-read (I8RG-PRIV-05): the object is built from what
+  // `settleServedState` decides, never from a view older than its own row.
+  const room = ctx.allowance === undefined ? undefined : Math.max(0, ctx.allowance() - DAY_BUILD_TAIL_RESERVE);
+  const pending = await noteServedState(ctx.analytics, passportId, T, servedSet, servedRows, room);
+  if (pending > 0) {
+    // #925 B: a PARTIAL build publishes nothing and notes nothing (FAMILY-001: the settle and
+    // the complementary suppression run over the whole day's cells, so only a whole build may).
+    await purgeIfRetracted(ctx, passportId, T);
+    ctx.onPartial?.(pending);
+    return null;
+  }
+  const settled = await settleServedState(ctx.analytics, passportId, T, input, carried, priorServed, servedSet, firstPriorDay);
+  return { carried, settled };
+}
+
+/**
+ * I25 (I3-0309 a): how many earlier days a build records ahead of T. One covers the
+ * shape the finding measured (the creator's read builds T at T 00:30, before the sweep
+ * builds T-1). I26: it is also the most any gap needs, because the only doors are the read
+ * (T = today, `dayBuilder`) and the sweep (today − 1, `analytics-build.ts runBuildSweep`): a day
+ * two or more back with nothing on record is never built after T, so it serves nothing a carry
+ * could protect (test/i26-analytics-gap.test.ts). A new door that builds older days voids this.
+ */
+export const BUILD_IN_ORDER_DAYS = 1;
+
+/**
+ * I25 (I3-0309 a): before a READ's build evaluates T, every day in T-1 .. T-BUILD_IN_ORDER_DAYS with
+ * nothing ON RECORD (no day object; I32: a partial set of served-state rows is not on record) gets the served-state half of a
+ * build (`recordDayState`), oldest first, so the suppression T-1 carries forward is on record
+ * when T reads it. NO OBJECT IS WRITTEN for the earlier day and it is not noted as built: a
+ * read must not create a day object the schedule did not (INV-005,
+ * `test/protected/run0001-frozen-stable-instant.test.ts`). The day's own build later reads
+ * these rows as its own (`settleServedState` forces a recorded NULL; the carry rows are
+ * first-wins), so it serves no more than T was told it served. `false` = partial, or (I32) an earlier
+ * day's probe threw; the caller builds nothing this turn.
+ */
+async function recordEarlierDays(ctx: DayBuildContext, passportId: string, T: string): Promise<boolean> {
+  const missing: string[] = [];
+  for (let back = 1; back <= BUILD_IN_ORDER_DAYS; back++) {
+    const d = shiftDay(T, -back);
+    const onRecord = await dayOnRecord(ctx, passportId, d);
+    // I32 (I3-0309, D-1082(16)): an UNKNOWN answer (the probe of d threw) defers T, as a throwing probe of T itself
+    // does (`buildDayIfMissing`, I3-0463): T is never built ahead of a d whose carry may not be on record.
+    if (onRecord === null) {
+      logError({ cid: "unknown", hop: "http", msg: "day_probe_failed_build_deferred", day: d });
+      return false;
+    }
+    if (onRecord) break;
+    missing.unshift(d);
+  }
+  for (const d of missing) {
+    const input = await readDayBuildInput(ctx.analytics, ctx.prod, passportId, d, generatedAtFor(d));
+    if ((await recordDayState(ctx, passportId, d, input)) === null) return false;
+  }
+  return true;
+}
+
+/**
+ * d's object in the store; `null` when the probe throws (unknown — I32, I3-0309, D-1082(16): the caller defers T rather than
+ * build it ahead of d; it was counted as on record, and one transient error on d's key let T precede d's carry).
+ * I32 (I3-0309, D-1078(12)): a served-state row alone is NOT on record. The sweep's build of d can stop after some of
+ * its rows (#925 B, its statement allowance), and T evaluated against that partial set, with d's resume then evaluated
+ * against T, gave two objects the in-order build never serves (test/i32-analytics-partial-order.test.ts). Recording d
+ * again is idempotent: its carry and served rows are INSERT OR IGNORE and the settle forces what is already recorded.
+ */
+async function dayOnRecord(ctx: DayBuildContext, passportId: string, d: string): Promise<boolean | null> {
+  try {
+    return (await ctx.store.get(bundleKey(passportId, d))) !== null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * #842: the standing re-read after a build's writes; purges and answers true for a retracted creator.
+ * I3-2183 (D-0653, "stamp it the moment it commits", the retraction seam): the re-read comes AFTER the object write
+ * committed, so a retraction that landed between the sweep's re-check (`analytics-build.ts`) and `putIfAbsent` is seen
+ * here, and the day object `day` is deleted HERE, after the order is re-filed (a throwing delete leaves the order).
+ * A retraction committing after this re-read files its own order, whose drain runs after this object exists.
+ */
+async function purgeIfRetracted(ctx: DayBuildContext, passportId: string, day: string): Promise<boolean> {
+  const gone = await ctx.prod.prepare("SELECT 1 AS x FROM passports WHERE passport_id = ? AND retracted = 1").bind(passportId).first<{ x: number }>();
+  if (gone === null) return false;
+  // I29-FX10 (D-1047(1)): an open legal hold on the passport keeps its analytics rows (the analytics DB has no
+  // legal_holds, so the shared predicate is read from prod); the order filed below is drained after release.
+  const held = await passportUnderLegalHold(ctx.prod, passportId);
+  if (!held) await purgeCreatorAnalytics(ctx.analytics, passportId);
+  // #166 (D-0933(3)): this build may have written a day object after the retraction's purge order was drained;
+  // re-file the order so the next analytics tick removes it, instead of the six-hourly sweep. An order still open
+  // moves forward, so a drain already past its purge deletes nothing (it binds the requested_at it read).
+  await ctx.prod
+    .prepare("INSERT INTO analytics_creator_erasures (passport_id, requested_at) VALUES (?, ?) ON CONFLICT(passport_id) DO UPDATE SET requested_at = excluded.requested_at")
+    .bind(passportId, new Date().toISOString())
+    .run();
+  if (!held && ctx.store.delete !== undefined) await ctx.store.delete(bundleKey(passportId, day));
+  return true;
+}
+
+/**
+ * I3-0309 (D-0829): the complementary suppressions of cumulative cells that
+ * earlier day objects of this creator applied, keyed cell -> the parent of the
+ * partition that forced it. `since_day < T` only: a day object reads what
+ * EARLIER objects withheld and never what a later build (or its own previous
+ * build) wrote, so a rebuild of `T` sees the same set its first build saw.
+ */
+async function readCarriedSuppression(analytics: DbLike, passportId: string, T: string): Promise<Map<string, string>> {
+  const rows = await rowsOf<{ cell_id: string; forced_by: string }>(
+    analytics,
+    "SELECT cell_id, forced_by FROM analytics_carried_suppression WHERE passport_id = ? AND since_day < ? ORDER BY cell_id ASC",
+    passportId,
+    T,
+  );
+  return new Map(rows.map((r) => [r.cell_id, r.forced_by]));
+}
+
+/** I3-0309: persist this build's cumulative complementary victims, before its object write; first day wins. */
+async function noteCarriedSuppression(analytics: DbLike, passportId: string, T: string, complementary: ReadonlyMap<string, string>): Promise<void> {
+  const stmts = [...complementary]
+    .filter(([id]) => isCumulativeCell(id))
+    .map(([id, parent]) =>
+      analytics
+        .prepare("INSERT OR IGNORE INTO analytics_carried_suppression (passport_id, cell_id, forced_by, since_day) VALUES (?, ?, ?, ?)")
+        .bind(passportId, id, parent, T),
+    );
+  if (stmts.length > 0) await analytics.batch(stmts);
+}
+
+/** One `analytics_served_state` row (analytics/0008); `served_value` NULL = withheld that day. */
+interface ServedRow {
+  readonly cell_id: string;
+  readonly day: string;
+  readonly served_value: number | null;
+}
+
+/**
+ * QUEUE #734 (D-0843(8)): per cumulative cell, the values this creator's OTHER
+ * day objects served (NULL rows are withheld days, never a neighbour). I23
+ * (#840, I3-0158 b / I3-0611, D-0993(1)): EVERY retained served value, not only
+ * the nearest before and after `T` — a reader holds every object it was served,
+ * so 20 -> 25 -> 19 hands over a change of 1 against the first even though each
+ * neighbour pair differs by K or more. `T`'s own rows are never a neighbour,
+ * so a rebuild of `T` sees what its first build saw (the INSERT OR IGNORE keeps
+ * the first). `rows` is every row, for the prune.
+ */
+async function readServedState(analytics: DbLike, passportId: string, T: string): Promise<{ prior: Map<string, number[]>; rows: ServedRow[] }> {
+  const rows = await rowsOf<ServedRow>(
+    analytics,
+    "SELECT cell_id, day, served_value FROM analytics_served_state WHERE passport_id = ? ORDER BY cell_id ASC, day ASC",
+    passportId,
+  );
+  const prior = new Map<string, number[]>();
+  for (const r of rows) {
+    if (r.day === T || r.served_value === null) continue;
+    prior.set(r.cell_id, [...(prior.get(r.cell_id) ?? []), num(r.served_value)]);
+  }
+  return { prior, rows };
+}
+
+/** I25 (#841): what the object before `T` recorded per running total: its served value, or `null` when it withheld it. */
+function priorDayOf(rows: readonly ServedRow[], T: string): Map<string, number | null> {
+  const D = shiftDay(T, -1);
+  return new Map(rows.filter((r) => r.day === D).map((r): [string, number | null] => [r.cell_id, r.served_value === null ? null : num(r.served_value)]));
+}
+
+/**
+ * I23 (#840): how many SERVED rows per cell the prune keeps — one per day object
+ * a reader can still be served (`SNAPSHOT_RETENTION_DAYS` = 30 in
+ * analytics-build.ts, not imported: that module imports this one). Count-based,
+ * never a time predicate (a time-based retention is Jason-reserved).
+ */
+export const SERVED_STATE_KEEP = 30;
+
+/**
+ * QUEUE #734: record what this build served for every running total (NULL when
+ * withheld), first build wins, then the COUNT-based prune: per cell keep the
+ * latest two rows and the latest `SERVED_STATE_KEEP` SERVED rows (I23 #840: every
+ * served value a reader can still hold is a neighbour, `readServedState`); no time
+ * predicate, a time-based retention is Jason-reserved. The prune is decided over
+ * the rows read at the start of this build plus this build's own: a row that is
+ * past the bound in that view is past it in any fuller view (a concurrent build
+ * only adds newer rows), so a stale view deletes nothing a fuller one keeps.
+ */
+async function noteServedState(analytics: DbLike, passportId: string, T: string, set: ServedSet, rows: readonly ServedRow[], room?: number): Promise<number> {
+  const ids = [...set.served.keys(), ...set.withheld].filter((id) => isCumulativeCell(id)).sort();
+  if (ids.length === 0) return 0;
+  if (room !== undefined) return await noteServedStateWithin(analytics, passportId, T, set, rows, ids, room);
+  const stmts = ids.map((id) =>
+    analytics
+      .prepare("INSERT OR IGNORE INTO analytics_served_state (passport_id, cell_id, day, served_value) VALUES (?, ?, ?, ?)")
+      .bind(passportId, id, T, set.served.get(id) ?? null),
+  );
+  const view = new Map<string, ServedRow[]>();
+  for (const r of rows) view.set(r.cell_id, [...(view.get(r.cell_id) ?? []), r]);
+  for (const id of ids) {
+    const mine = view.get(id) ?? [];
+    if (!mine.some((r) => r.day === T)) view.set(id, [...mine, { cell_id: id, day: T, served_value: set.served.get(id) ?? null }]);
+  }
+  for (const [id, list] of [...view].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))) {
+    let newer = 0;
+    let newerServed = 0;
+    for (const r of [...list].sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0))) {
+      if (newer >= 2 && (r.served_value === null || newerServed >= SERVED_STATE_KEEP)) {
+        stmts.push(analytics.prepare("DELETE FROM analytics_served_state WHERE passport_id = ? AND cell_id = ? AND day = ?").bind(passportId, id, r.day));
+      }
+      newer++;
+      if (r.served_value !== null) newerServed++;
+    }
+  }
+  await analytics.batch(stmts);
+  return 0;
+}
+
+/**
+ * #925 B: `noteServedState` under a statement allowance. The same rows and the same prune,
+ * per cell (its INSERT when T has no row for it yet, then its DELETEs), in cell order, at most
+ * `room` statements. Returns the statements left unsent (0 = every cell of T has its row and
+ * its prune). A cell whose T row already landed sends no INSERT: the
+ * table is the cursor, so a resumed build never re-sends what an earlier turn wrote.
+ */
+async function noteServedStateWithin(
+  analytics: DbLike,
+  passportId: string,
+  T: string,
+  set: ServedSet,
+  rows: readonly ServedRow[],
+  ids: readonly string[],
+  room: number,
+): Promise<number> {
+  const view = new Map<string, ServedRow[]>();
+  for (const r of rows) view.set(r.cell_id, [...(view.get(r.cell_id) ?? []), r]);
+  const groups = new Map<string, Array<ReturnType<DbLike["prepare"]>>>();
+  for (const id of ids) {
+    const mine = view.get(id) ?? [];
+    if (mine.some((r) => r.day === T)) continue;
+    groups.set(id, [
+      analytics
+        .prepare("INSERT OR IGNORE INTO analytics_served_state (passport_id, cell_id, day, served_value) VALUES (?, ?, ?, ?)")
+        .bind(passportId, id, T, set.served.get(id) ?? null),
+    ]);
+    view.set(id, [...mine, { cell_id: id, day: T, served_value: set.served.get(id) ?? null }]);
+  }
+  for (const [id, list] of view) {
+    let newer = 0;
+    let newerServed = 0;
+    for (const r of [...list].sort((a, b) => (a.day < b.day ? 1 : a.day > b.day ? -1 : 0))) {
+      if (newer >= 2 && (r.served_value === null || newerServed >= SERVED_STATE_KEEP)) {
+        groups.set(id, [...(groups.get(id) ?? []), analytics.prepare("DELETE FROM analytics_served_state WHERE passport_id = ? AND cell_id = ? AND day = ?").bind(passportId, id, r.day)]);
+      }
+      newer++;
+      if (r.served_value !== null) newerServed++;
+    }
+  }
+  // Flattened in cell order and cut at `room`: every statement is idempotent and none depends on
+  // another, so a cell cut mid-group re-derives its rest from the table next turn, and any room
+  // of at least one statement makes progress (no cell is too big to ever land).
+  const all = [...groups.keys()].sort().flatMap((id) => groups.get(id) ?? []);
+  const stmts = all.slice(0, Math.max(0, room));
+  if (stmts.length > 0) await analytics.batch(stmts);
+  return all.length - stmts.length;
+}
+
+/**
+ * I8RG-PRIV-05 (QUEUE #734): two builds of one creator — today's read-build and
+ * yesterday's sweep-build — can each read the served state before the other's
+ * row lands, and serve running totals fewer than K apart. Each build therefore
+ * writes its row FIRST (`noteServedState`, INSERT OR IGNORE) and only then
+ * re-reads. Of two overlapping builds the LATER re-read follows BOTH inserts
+ * (each insert precedes its own re-read), so at least one build sees the
+ * other's row and re-applies the delta rule to it. When the re-read shows a
+ * neighbour value or an own row the first evaluation did not use, the day is
+ * re-served with the union of neighbours, every cell whose own row is NULL or
+ * disagrees with the first evaluation forced withheld, and the own rows moved
+ * served -> NULL for every cell the re-served day withholds. Never NULL ->
+ * served: a row another build read as "no neighbour" stays that way. Returns the
+ * inputs the object must be built from.
+ */
+async function settleServedState(
+  analytics: DbLike,
+  passportId: string,
+  T: string,
+  input: DayBuildInput,
+  carried: ReadonlyMap<string, string>,
+  prior: Map<string, number[]>,
+  first: ServedSet,
+  firstPriorDay: Map<string, number | null>,
+): Promise<{ prior: Map<string, number[]>; forced: ReadonlySet<string> | undefined; priorDay: Map<string, number | null> }> {
+  const again = await readServedState(analytics, passportId, T);
+  const priorDay = priorDayOf(again.rows, T);
+  const own = again.rows.filter((r) => r.day === T);
+  const disagrees = (r: ServedRow): boolean => (r.served_value === null ? first.served.has(r.cell_id) : first.served.get(r.cell_id) !== num(r.served_value));
+  const forced = new Set(own.filter((r) => r.served_value === null || disagrees(r)).map((r) => r.cell_id));
+  const norm = (m: ReadonlyMap<string, readonly number[]>): Map<string, number[]> =>
+    new Map([...m].map(([id, vs]): [string, number[]] => [id, [...new Set(vs)].sort((a, b) => a - b)]).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)));
+  const merged = norm(new Map([...new Set([...prior.keys(), ...again.prior.keys()])].map((id) => [id, [...(prior.get(id) ?? []), ...(again.prior.get(id) ?? [])]])));
+  const sameDay = JSON.stringify([...priorDay].sort()) === JSON.stringify([...firstPriorDay].sort());
+  if (JSON.stringify([...merged]) === JSON.stringify([...norm(prior)]) && !own.some(disagrees) && sameDay) return { prior, forced: undefined, priorDay: firstPriorDay };
+  const second = dayCellsFor(T, input, carried, merged, forced, priorDay).served;
+  await noteCarriedSuppression(analytics, passportId, T, second.complementary ?? new Map());
+  const nulls = own
+    .filter((r) => r.served_value !== null && !second.served.has(r.cell_id))
+    .map((r) => analytics.prepare("UPDATE analytics_served_state SET served_value = NULL WHERE passport_id = ? AND cell_id = ? AND day = ?").bind(passportId, r.cell_id, T));
+  if (nulls.length > 0) await analytics.batch(nulls);
+  return { prior: merged, forced, priorDay };
+}
+
+/** The round-robin cursor the six-hourly sweep orders by (ADR section 1, A6). */
+async function noteBuilt(analytics: DbLike, passportId: string, T: string): Promise<void> {
+  await analytics
+    .prepare("INSERT OR REPLACE INTO frozen_builds (passport_id, last_built_at) VALUES (?, ?)")
+    .bind(passportId, generatedAtFor(T))
+    .run();
+}
+
+/**
+ * The hook `roi.ts readFrozenBundle` calls on the CREATOR'S OWN read.
+ *
+ * It builds TODAY's object and only today's: the grace bounds when, and
+ * `putIfAbsent` bounds how often. One build per (creator, UTC day), O(1) per
+ * request (ADR section 8). Before the grace it returns without touching either
+ * store, and the caller's lookback serves `T - 1`.
+ */
+export function dayBuilder(ctx: DayBuildContext): DayBuildHook {
+  return async (passportId: string, nowMs: number): Promise<void> => {
+    const T = dayOfMs(nowMs);
+    if (nowMs - startOfDayMs(T) < BUILD_GRACE_MS) return;
+    // I3-1492: `analyticsbuild:<passport_id>`, BUILD_ON_READ_PER_DAY per UTC day
+    // — the window handed to the primitive ends at this day's midnight, so its
+    // reset branch opens a new window at the first build of each UTC day.
+    const budget = (): Promise<boolean> =>
+      consumeRateLimit(ctx.prod, `analyticsbuild:${passportId}`, nowMs, BUILD_ON_READ_PER_DAY, nowMs - startOfDayMs(T));
+    await buildDayIfMissing({ ...ctx, budget }, passportId, T);
+  };
+}
+
+/**
+ * THE SEAM B11 READS `summary` THROUGH. One spelling of "give me kind K of the
+ * day object, building it when this is the creator's own read", so the summary
+ * route and the four dashboards cannot drift over the lookback or the grace.
+ * `ctx === null` is the serve-or-refuse form the agency routes and `explain`
+ * use; it is the argument they must PASS rather than the argument they may
+ * forget.
+ */
+export async function readDayKind<R>(
+  store: DayStore & { put(key: string, value: string): Promise<void> },
+  ctx: DayBuildContext | null,
+  passportId: string,
+  kind: FrozenBundleKind,
+  nowMs: number,
+): Promise<R> {
+  return await readFrozenBundle<R>(store, kind, passportId, nowMs, { build: ctx === null ? false : dayBuilder(ctx) });
+}
+===== END FILE: services/trust-core/src/analytics-read.ts =====
+
+===== BEGIN FILE: services/trust-core/src/anchoring.ts =====
+import { sha256Bytes, sha256Hex } from "@dhwaja/canonical";
+import type { R2Bucket } from "@cloudflare/workers-types";
+import type { DbLike } from "./db.js";
+import { chainHead } from "./events.js";
+import type { LedgerSeal, SealWitness } from "./witness.js";
+
+/**
+ * I3-0010 a, I3-0275 b, I3-1403 a (I22-W1-LEDGER; D-0977 / D-0978): THE EXTERNAL NOTARY for the seals.
+ *
+ * Once an hour (`anchorTick`, self-gated on ANCHOR_INTERVAL_MS so it rides the five-minute seal trigger) the digest
+ * of a canonical PREIMAGE -- the witness seals taken since the previous anchor, the ledger head, the operator
+ * audit-log seal head (`audit_log_seal`, 0167) and the previous anchor's digest -- is POSTed to public
+ * OpenTimestamps calendars over plain HTTPS through the injected `fetch`. Each calendar's answer is a PENDING
+ * OpenTimestamps proof; it is stored in D1 (`seal_anchor_receipts`, 0209) and, when a store is given, beside the
+ * seals in the witness bucket. Once a day per receipt (`upgradeTick`) the calendar is asked for the Bitcoin-attested
+ * continuation of the proof's commitment; a continuation that carries a Bitcoin block attestation completes it.
+ *
+ * WHAT THIS GIVES: a rewrite of the ledger under a sealed head, or of the audit-log seal chain (someone holding D1
+ * admin who drops the 0167 triggers), changes a value the preimage names, and the digest of the stored preimage is
+ * committed in Bitcoin by a party off this account. `verifyAnchor` recomputes the preimage's facts from the live
+ * tables. WHAT IT DOES NOT: it cannot stop a rewrite, it only makes one provable; the R2 bucket lock on the witness
+ * bucket (D-0977 (c)) is an operator dashboard step, because an R2 binding exposes no lock configuration
+ * (workers-types R2Bucket: head/get/put/delete/list/multipart only).
+ *
+ * SAFETY OF THE REMOTE INPUT: a calendar's answer is parsed by a bounded reader; the URI inside a pending
+ * attestation is only ever FOLLOWED when it names one of OTS_CALENDARS (no fetch of an attacker-chosen host), and no
+ * redirect is followed.
+ */
+
+/** The public OpenTimestamps calendars (the client's defaults). Three, so one calendar down still anchors. */
+export const OTS_CALENDARS = [
+  "https://alice.btc.calendar.opentimestamps.org",
+  "https://bob.btc.calendar.opentimestamps.org",
+  "https://finney.calendar.eternitywall.com",
+] as const;
+/** D-0978: one anchor per hour. */
+export const ANCHOR_INTERVAL_MS = 60 * 60 * 1000;
+/** A pending receipt is asked about once a day. */
+export const UPGRADE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+/** Receipts asked about per `upgradeTick` (one GET + one UPDATE each); 3 calendars x 24 anchors a day = 72 a day. */
+export const UPGRADE_BATCH = 6;
+/** A calendar answer is a few hundred bytes; anything past this is refused unread. */
+export const OTS_MAX_RESPONSE = 16 * 1024;
+export const ANCHOR_PREIMAGE_VERSION = "dhwaja-anchor-v1";
+const PENDING_TAG = "83dfe30d2ef90c8e";
+const BITCOIN_TAG = "0588960d73d71901";
+
+export interface AnchorStore {
+  putIfAbsent(key: string, value: string, meta: Record<string, string>): Promise<boolean>;
+}
+export interface AnchorPreimage {
+  v: typeof ANCHOR_PREIMAGE_VERSION;
+  created_at: string;
+  prev: string | null;
+  head: { seq: number; event_hash: string } | null;
+  audit_seal: { seal_id: number; seal_hash: string } | null;
+  seals: { seq: number; event_hash: string; taken_at: string }[];
+}
+export interface AnchorTickResult {
+  outcome: "not_due" | "nothing_new" | "anchored" | "failed";
+  anchor_id?: string;
+  digest?: string;
+  receipts: number;
+  failures: string[];
+}
+
+const hex = (b: Uint8Array): string => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+const unhex = (h: string): Uint8Array => new Uint8Array((h.match(/../g) ?? []).map((x) => parseInt(x, 16)));
+const b64 = (b: Uint8Array): string => btoa(String.fromCharCode(...b));
+const unb64 = (s: string): Uint8Array => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+/** Keys sorted at every depth, so the preimage has ONE byte form. */
+export function canonicalJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(canonicalJson).join(",")}]`;
+  if (v && typeof v === "object") {
+    const o = v as Record<string, unknown>;
+    return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(o[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(v);
+}
+
+async function readBounded(res: Response): Promise<Uint8Array | null> {
+  const len = Number(res.headers.get("content-length") ?? "0");
+  if (len > OTS_MAX_RESPONSE) return null;
+  const buf = new Uint8Array(await res.arrayBuffer());
+  return buf.length > OTS_MAX_RESPONSE || buf.length === 0 ? null : buf;
+}
+
+// ---------------------------------------------------------------------------
+// The OpenTimestamps proof format: a tree of operations (append/prepend/sha256/reverse) from a message down to
+// attestations. Only what a calendar answers is supported; anything else is a parse failure, never a guess.
+// ---------------------------------------------------------------------------
+export interface OtsLeaf {
+  kind: "pending" | "bitcoin" | "unknown";
+  /** The message the attestation commits to (what `/timestamp/<hex>` is keyed by). */
+  commitment: Uint8Array;
+  uri?: string;
+  height?: number;
+}
+
+class Reader {
+  i = 0;
+  constructor(readonly b: Uint8Array) {}
+  byte(): number {
+    if (this.i >= this.b.length) throw new Error("ots: truncated");
+    return this.b[this.i++]!;
+  }
+  bytes(n: number): Uint8Array {
+    if (n < 0 || this.i + n > this.b.length) throw new Error("ots: truncated");
+    const out = this.b.slice(this.i, this.i + n);
+    this.i += n;
+    return out;
+  }
+  varuint(): number {
+    let v = 0;
+    let shift = 0;
+    for (;;) {
+      const x = this.byte();
+      v += (x & 0x7f) * 2 ** shift;
+      if (!(x & 0x80)) return v;
+      shift += 7;
+      if (shift > 49) throw new Error("ots: varuint too long");
+    }
+  }
+  varbytes(max = 4096): Uint8Array {
+    const n = this.varuint();
+    if (n > max) throw new Error("ots: varbytes too long");
+    return this.bytes(n);
+  }
+}
+
+/** Every attestation leaf of the serialized timestamp `bytes`, applied from `msg`. Throws on anything malformed. */
+export async function otsLeaves(bytes: Uint8Array, msg: Uint8Array): Promise<OtsLeaf[]> {
+  const r = new Reader(bytes);
+  const leaves: OtsLeaf[] = [];
+  const walk = async (m: Uint8Array, depth: number): Promise<void> => {
+    if (depth > 256) throw new Error("ots: too deep");
+    const one = async (tag: number): Promise<void> => {
+      if (tag === 0x00) {
+        const t = hex(r.bytes(8));
+        const payload = new Reader(r.varbytes());
+        if (t === PENDING_TAG) leaves.push({ kind: "pending", commitment: m, uri: new TextDecoder().decode(payload.varbytes(1000)) });
+        else if (t === BITCOIN_TAG) leaves.push({ kind: "bitcoin", commitment: m, height: payload.varuint() });
+        else leaves.push({ kind: "unknown", commitment: m });
+        return;
+      }
+      let next: Uint8Array;
+      if (tag === 0x08) next = await sha256Bytes(m);
+      else if (tag === 0xf0) next = new Uint8Array([...m, ...r.varbytes()]);
+      else if (tag === 0xf1) next = new Uint8Array([...r.varbytes(), ...m]);
+      else if (tag === 0xf2) next = m.slice().reverse();
+      else throw new Error(`ots: unsupported op 0x${tag.toString(16)}`);
+      if (next.length > 4096) throw new Error("ots: message too long");
+      await walk(next, depth + 1);
+    };
+    let tag = r.byte();
+    while (tag === 0xff) {
+      await one(r.byte());
+      tag = r.byte();
+    }
+    await one(tag);
+  };
+  await walk(msg, 0);
+  if (r.i !== bytes.length) throw new Error("ots: trailing bytes");
+  return leaves;
+}
+
+// ---------------------------------------------------------------------------
+// The hourly anchor
+// ---------------------------------------------------------------------------
+async function lastAnchor(db: DbLike): Promise<{ digest: string; created_at: string; head_seq: number } | null> {
+  return (
+    (await db.prepare("SELECT digest, created_at, head_seq FROM seal_anchors ORDER BY created_at DESC, anchor_id DESC LIMIT 1").bind().first<{ digest: string; created_at: string; head_seq: number }>()) ?? null
+  );
+}
+async function auditSealHead(db: DbLike): Promise<{ seal_id: number; seal_hash: string } | null> {
+  return (await db.prepare("SELECT seal_id, seal_hash FROM audit_log_seal ORDER BY seal_id DESC LIMIT 1").bind().first<{ seal_id: number; seal_hash: string }>()) ?? null;
+}
+
+/** The preimage's facts as the database holds them now (the seals are the witness's, and are the caller's). */
+export async function buildPreimage(db: DbLike, seals: LedgerSeal[], createdAt: string, prev: string | null): Promise<AnchorPreimage> {
+  const head = await chainHead(db);
+  return {
+    v: ANCHOR_PREIMAGE_VERSION,
+    created_at: createdAt,
+    prev,
+    head: head ? { seq: head.seq, event_hash: head.event_hash } : null,
+    audit_seal: await auditSealHead(db),
+    seals: seals.map((s) => ({ seq: s.seq, event_hash: s.event_hash, taken_at: s.taken_at })).sort((a, b) => a.seq - b.seq || (a.taken_at < b.taken_at ? -1 : 1)),
+  };
+}
+
+/**
+ * One hourly anchor. NEVER THROWS on a calendar fault: a calendar that refuses, times out, redirects, or answers
+ * something unparseable is named in `failures` (the caller alerts); with no calendar accepting, nothing is written and
+ * the next tick retries (the interval is measured from the last STORED anchor). The anchor row and its receipts are
+ * written in one batch, after the calls.
+ */
+export async function anchorTick(
+  db: DbLike,
+  witness: SealWitness | null,
+  store: AnchorStore | null,
+  fetchImpl: typeof fetch,
+  now: () => string = () => new Date().toISOString(),
+): Promise<AnchorTickResult> {
+  const createdAt = now();
+  const nowMs = Date.parse(createdAt);
+  const last = await lastAnchor(db);
+  if (last && nowMs - Date.parse(last.created_at) < ANCHOR_INTERVAL_MS) return { outcome: "not_due", receipts: 0, failures: [] };
+  const days = [createdAt.slice(0, 10), new Date(nowMs - 86_400_000).toISOString().slice(0, 10)];
+  const win = witness ? await witness.window(days, 0) : { seals: [] as LedgerSeal[] };
+  const since = win.seals.filter((s) => !last || s.taken_at > last.created_at);
+  const pre = await buildPreimage(db, since, createdAt, last?.digest ?? null);
+  if (last && since.length === 0 && (pre.head?.seq ?? 0) === last.head_seq) {
+    const lastPre = await db.prepare("SELECT preimage FROM seal_anchors WHERE digest = ?").bind(last.digest).first<{ preimage: string }>();
+    const prevAudit = lastPre ? (JSON.parse(lastPre.preimage) as AnchorPreimage).audit_seal : null;
+    if ((prevAudit?.seal_id ?? null) === (pre.audit_seal?.seal_id ?? null)) return { outcome: "nothing_new", receipts: 0, failures: [] };
+  }
+  const preimage = canonicalJson(pre);
+  const digest = await sha256Hex(preimage);
+  const anchorId = `anc_${digest.slice(0, 32)}`;
+  const receipts: { calendar: string; receipt: string }[] = [];
+  const failures: string[] = [];
+  for (const cal of OTS_CALENDARS) {
+    try {
+      const res = await fetchImpl(`${cal}/digest`, {
+        method: "POST",
+        headers: { Accept: "application/vnd.opentimestamps.v1", "Content-Type": "application/x-www-form-urlencoded", "User-Agent": "dhwaja-anchor/1" },
+        body: unhex(digest),
+        redirect: "manual",
+      });
+      if (res.status !== 200) {
+        failures.push(`${cal}: HTTP ${res.status}`);
+        continue;
+      }
+      const body = await readBounded(res);
+      if (!body) {
+        failures.push(`${cal}: empty or oversized answer`);
+        continue;
+      }
+      const leaves = await otsLeaves(body, unhex(digest));
+      if (!leaves.some((l) => l.kind === "pending" || l.kind === "bitcoin")) {
+        failures.push(`${cal}: no attestation in the answer`);
+        continue;
+      }
+      receipts.push({ calendar: cal, receipt: b64(body) });
+    } catch (e) {
+      failures.push(`${cal}: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200));
+    }
+  }
+  if (receipts.length === 0) return { outcome: "failed", receipts: 0, failures };
+  await db.batch([
+    db.prepare("INSERT INTO seal_anchors (anchor_id, digest, preimage, head_seq, created_at) VALUES (?, ?, ?, ?, ?)").bind(anchorId, digest, preimage, pre.head?.seq ?? 0, createdAt),
+    ...receipts.map((r) =>
+      db.prepare("INSERT INTO seal_anchor_receipts (anchor_id, calendar, state, receipt, submitted_at) VALUES (?, ?, 'pending', ?, ?)").bind(anchorId, r.calendar, r.receipt, createdAt),
+    ),
+  ]);
+  if (store) {
+    // Beside the seals, create-if-absent. A failed copy is reported, never fatal: D1 holds the same bytes.
+    try {
+      await store.putIfAbsent(`anchors/${createdAt.slice(0, 10)}/${anchorId}/preimage.json`, preimage, { digest, created_at: createdAt });
+      for (const r of receipts) await store.putIfAbsent(`anchors/${createdAt.slice(0, 10)}/${anchorId}/${new URL(r.calendar).host}.pending.ots`, r.receipt, { digest, calendar: r.calendar });
+    } catch (e) {
+      failures.push(`store: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200));
+    }
+  }
+  return { outcome: "anchored", anchor_id: anchorId, digest, receipts: receipts.length, failures };
+}
+
+// ---------------------------------------------------------------------------
+// The daily upgrade
+// ---------------------------------------------------------------------------
+export interface UpgradeTickResult {
+  checked: number;
+  completed: number;
+  failures: string[];
+}
+
+/**
+ * Asks each calendar, at most once a day per receipt and UPGRADE_BATCH receipts per call, for the continuation of a
+ * pending proof. 404 = not yet in a block (checked_at advances). A continuation with a Bitcoin attestation is stored
+ * and the receipt flips to complete (and, given a store, the completed proof is copied beside the seals). A pending
+ * URI that is not one of OTS_CALENDARS is never fetched.
+ */
+export async function upgradeTick(db: DbLike, store: AnchorStore | null, fetchImpl: typeof fetch, now: () => string = () => new Date().toISOString()): Promise<UpgradeTickResult> {
+  const at = now();
+  const before = new Date(Date.parse(at) - UPGRADE_INTERVAL_MS).toISOString();
+  const { results } = await db
+    .prepare(
+      `SELECT r.anchor_id, r.calendar, r.receipt, a.digest, a.created_at FROM seal_anchor_receipts r JOIN seal_anchors a ON a.anchor_id = r.anchor_id
+        WHERE r.state = 'pending' AND (r.checked_at IS NULL OR r.checked_at <= ?) AND r.submitted_at <= ?
+        ORDER BY r.submitted_at, r.anchor_id, r.calendar LIMIT ?`,
+    )
+    .bind(before, new Date(Date.parse(at) - 2 * 60 * 60 * 1000).toISOString(), UPGRADE_BATCH)
+    .all<{ anchor_id: string; calendar: string; receipt: string; digest: string; created_at: string }>();
+  const failures: string[] = [];
+  let completed = 0;
+  for (const row of results ?? []) {
+    let upgrade: Uint8Array | null = null;
+    try {
+      const pend = (await otsLeaves(unb64(row.receipt), unhex(row.digest))).find((l) => l.kind === "pending");
+      const uri = pend?.uri ?? "";
+      if (!pend || !(OTS_CALENDARS as readonly string[]).includes(uri)) throw new Error(`pending attestation names no known calendar (${uri.slice(0, 80)})`);
+      const res = await fetchImpl(`${uri}/timestamp/${hex(pend.commitment)}`, { method: "GET", headers: { Accept: "application/vnd.opentimestamps.v1", "User-Agent": "dhwaja-anchor/1" }, redirect: "manual" });
+      if (res.status === 200) {
+        const body = await readBounded(res);
+        if (!body) throw new Error("empty or oversized answer");
+        const leaves = await otsLeaves(body, pend.commitment);
+        if (leaves.some((l) => l.kind === "bitcoin")) upgrade = body;
+      } else if (res.status !== 404) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+    } catch (e) {
+      failures.push(`${row.anchor_id} ${row.calendar}: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200));
+    }
+    if (upgrade) {
+      await db
+        .prepare("UPDATE seal_anchor_receipts SET state = 'complete', upgrade = ?, checked_at = ?, completed_at = ? WHERE anchor_id = ? AND calendar = ? AND state = 'pending'")
+        .bind(b64(upgrade), at, at, row.anchor_id, row.calendar)
+        .run();
+      completed++;
+      if (store) {
+        try {
+          await store.putIfAbsent(`anchors/${row.created_at.slice(0, 10)}/${row.anchor_id}/${new URL(row.calendar).host}.bitcoin.ots`, b64(upgrade), { digest: row.digest, calendar: row.calendar });
+        } catch (e) {
+          failures.push(`store: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200));
+        }
+      }
+    } else {
+      await db.prepare("UPDATE seal_anchor_receipts SET checked_at = ? WHERE anchor_id = ? AND calendar = ? AND state = 'pending'").bind(at, row.anchor_id, row.calendar).run();
+    }
+  }
+  return { checked: (results ?? []).length, completed, failures };
+}
+
+// ---------------------------------------------------------------------------
+// Verification
+// ---------------------------------------------------------------------------
+export interface AnchorVerdict {
+  ok: boolean;
+  digest_matches: boolean;
+  /** The ledger still holds every anchored seal's hash, and the head named, at their seqs. */
+  ledger_matches: boolean;
+  /** The audit-log seal named is still in `audit_log_seal` with the same hash. */
+  audit_matches: boolean;
+  receipts: number;
+  complete: number;
+}
+
+/** Re-derives one anchor's facts from the live tables and checks the stored digest is the preimage's. */
+export async function verifyAnchor(db: DbLike, anchorId: string): Promise<AnchorVerdict | null> {
+  const a = await db.prepare("SELECT digest, preimage FROM seal_anchors WHERE anchor_id = ?").bind(anchorId).first<{ digest: string; preimage: string }>();
+  if (!a) return null;
+  const digestMatches = (await sha256Hex(a.preimage)) === a.digest;
+  const pre = JSON.parse(a.preimage) as AnchorPreimage;
+  const want = [...pre.seals.map((s) => ({ seq: s.seq, h: s.event_hash })), ...(pre.head ? [{ seq: pre.head.seq, h: pre.head.event_hash }] : [])];
+  let ledger = true;
+  for (const w of want) {
+    const row = await db.prepare("SELECT event_hash FROM trust_events WHERE seq = ?").bind(w.seq).first<{ event_hash: string }>();
+    if (row?.event_hash !== w.h) ledger = false;
+  }
+  let audit = true;
+  if (pre.audit_seal) {
+    const s = await db.prepare("SELECT seal_hash FROM audit_log_seal WHERE seal_id = ?").bind(pre.audit_seal.seal_id).first<{ seal_hash: string }>();
+    audit = s?.seal_hash === pre.audit_seal.seal_hash;
+  }
+  const counts = await db
+    .prepare("SELECT COUNT(*) AS n, SUM(CASE WHEN state = 'complete' THEN 1 ELSE 0 END) AS c FROM seal_anchor_receipts WHERE anchor_id = ?")
+    .bind(anchorId)
+    .first<{ n: number; c: number | null }>();
+  const receipts = Number(counts?.n ?? 0);
+  return { ok: digestMatches && ledger && audit && receipts > 0, digest_matches: digestMatches, ledger_matches: ledger, audit_matches: audit, receipts, complete: Number(counts?.c ?? 0) };
+}
+
+// ---------------------------------------------------------------------------
+// The production check against the copy held outside D1 (I3-0010 / I3-0275 b / I3-1403 a; D-0982(4), I22-FX-HUB)
+// ---------------------------------------------------------------------------
+/** A preimage is a few KB an hour; a backlog of seals is bounded well under this. Anything larger is unverifiable. */
+export const ANCHOR_COPY_MAX_BYTES = 256 * 1024;
+/** Listing entries read per UTC day (24 anchors x (1 preimage + 3 pending + 3 bitcoin proofs) = 168 a day). */
+export const ANCHOR_COPY_LIST_LIMIT = 1000;
+export interface AnchorCopyStore {
+  list(prefix: string, limit: number): Promise<{ key: string; meta: Record<string, string> | null }[]>;
+  /** The object's text, or null when absent or over ANCHOR_COPY_MAX_BYTES. */
+  get(key: string): Promise<string | null>;
+}
+export function anchorCopyStoreFromR2(bucket: R2Bucket): AnchorCopyStore {
+  return {
+    async list(prefix, limit) {
+      const page = await bucket.list({ prefix, limit, include: ["customMetadata"] });
+      return page.objects.map((o) => ({ key: o.key, meta: o.customMetadata ?? null }));
+    },
+    async get(key) {
+      const obj = await bucket.get(key);
+      if (!obj || (typeof obj.size === "number" && obj.size > ANCHOR_COPY_MAX_BYTES)) return null;
+      const text = await obj.text();
+      return text.length > ANCHOR_COPY_MAX_BYTES ? null : text;
+    },
+  };
+}
+export interface AnchorCopyVerdict {
+  /** mismatch = D1 disagrees with the copy written outside it (STOP); unverifiable = the copy itself is unreadable or
+   * not what its name says (a fact about R2: ALARM, run); none = no copy in the window. */
+  outcome: "ok" | "mismatch" | "unverifiable" | "none";
+  anchor_id?: string;
+  reasons: string[];
+}
+
+/**
+ * THE ANCHOR CHECK THAT DOES NOT TRUST D1 (D-0982(4): "an anchor that nothing checks closes nothing"). `verifyAnchor`
+ * reads both sides from D1, so a D1 admin who rewrites the ledger, the audit-log seal chain AND `seal_anchors` passes
+ * it. This reads the side written at anchor time OUTSIDE D1 -- the newest `anchors/<day>/<id>/preimage.json` in the
+ * witness bucket, found by LISTING the bucket (today and yesterday), never by asking D1 which anchor is latest -- checks
+ * that its bytes hash to the digest its name and metadata carry, and then compares the live D1 facts against it: the
+ * ledger's event_hash at the anchored head and at every anchored seal, the audit-log seal row, and D1's own
+ * `seal_anchors` row for that anchor (absent or different = D1's anchor table was rewritten). Any difference is
+ * `mismatch`. Reads: 2 listings + 1 GET + 1 + seals + 1 + 1 D1 reads.
+ */
+export async function verifyAnchorCopy(db: DbLike, store: AnchorCopyStore, now: () => string = () => new Date().toISOString()): Promise<AnchorCopyVerdict> {
+  const at = now();
+  const days = [at.slice(0, 10), new Date(Date.parse(at) - 86_400_000).toISOString().slice(0, 10)];
+  let best: { key: string; digest: string; created_at: string } | null = null;
+  for (const day of days) {
+    for (const e of await store.list(`anchors/${day}/`, ANCHOR_COPY_LIST_LIMIT)) {
+      if (!e.key.endsWith("/preimage.json") || !e.meta?.digest || !e.meta.created_at) continue;
+      if (!best || e.meta.created_at > best.created_at) best = { key: e.key, digest: e.meta.digest, created_at: e.meta.created_at };
+    }
+  }
+  if (!best) return { outcome: "none", reasons: [] };
+  const anchorId = best.key.split("/")[2] ?? "";
+  const text = await store.get(best.key);
+  if (text === null) return { outcome: "unverifiable", anchor_id: anchorId, reasons: ["copy unreadable or oversized"] };
+  const digest = await sha256Hex(text);
+  if (digest !== best.digest || anchorId !== `anc_${digest.slice(0, 32)}`) return { outcome: "unverifiable", anchor_id: anchorId, reasons: ["copy bytes do not hash to the digest its name and metadata carry"] };
+  let pre: AnchorPreimage;
+  try {
+    pre = JSON.parse(text) as AnchorPreimage;
+  } catch {
+    return { outcome: "unverifiable", anchor_id: anchorId, reasons: ["copy is not JSON"] };
+  }
+  const reasons: string[] = [];
+  const want = [...(pre.seals ?? []).map((x) => ({ seq: x.seq, h: x.event_hash, what: "seal" })), ...(pre.head ? [{ seq: pre.head.seq, h: pre.head.event_hash, what: "head" }] : [])];
+  for (const w of want) {
+    const row = await db.prepare("SELECT event_hash FROM trust_events WHERE seq = ?").bind(w.seq).first<{ event_hash: string }>();
+    if (row?.event_hash !== w.h) reasons.push(`ledger ${w.what} seq ${w.seq} differs`);
+  }
+  if (pre.audit_seal) {
+    const row = await db.prepare("SELECT seal_hash FROM audit_log_seal WHERE seal_id = ?").bind(pre.audit_seal.seal_id).first<{ seal_hash: string }>();
+    if (row?.seal_hash !== pre.audit_seal.seal_hash) reasons.push(`audit seal ${pre.audit_seal.seal_id} differs`);
+  }
+  const d1Row = await db.prepare("SELECT digest, preimage FROM seal_anchors WHERE anchor_id = ?").bind(anchorId).first<{ digest: string; preimage: string }>();
+  if (!d1Row || d1Row.digest !== digest || d1Row.preimage !== text) reasons.push("seal_anchors row absent or different");
+  return { outcome: reasons.length > 0 ? "mismatch" : "ok", anchor_id: anchorId, reasons };
+}
+===== END FILE: services/trust-core/src/anchoring.ts =====
+
+===== END OF CHUNK 38 OF 75 =====

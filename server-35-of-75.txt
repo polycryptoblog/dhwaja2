@@ -1,0 +1,3122 @@
+DHWAJA CODE REVIEW — server — CHUNK 35 OF 75
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (affiliation*), services/trust-core/src (agencies*), services/trust-core/src (agency*), services/trust-core/src (agency_auth*), services/trust-core/src (agency_members*)
+Files in this chunk (8):
+  - services/trust-core/src/affiliation.ts
+  - services/trust-core/src/agencies.ts
+  - services/trust-core/src/agency-analytics-routes.ts
+  - services/trust-core/src/agency-domains.ts
+  - services/trust-core/src/agency-grant-read.ts
+  - services/trust-core/src/agency-routes.ts
+  - services/trust-core/src/agency_auth.ts
+  - services/trust-core/src/agency_members.ts
+
+
+===== BEGIN FILE: services/trust-core/src/affiliation.ts =====
+import type { DbLike } from "./db.js";
+
+/**
+ * AFFILIATION VISIBILITY — "you may list me on creator-owned public surfaces"
+ * (audit item #12, migration 0017).
+ *
+ * THE PROBLEM IT EXISTS FOR. A fan had exactly ONE lever over publication:
+ * `user_profiles.visibility`, a tri-state over the WHOLE profile. It gated the
+ * fan's own /u page, their collection display, their achievements, discovery —
+ * and, in the same breath, whether creators could name them on Fan of the Week
+ * and Top Fans. So the only way to stop appearing under somebody else's name was
+ * to stop existing publicly at all. Meanwhile the product already shipped two
+ * NARROW consent valves — broadcast mute and the email-alert opt-out — which is
+ * the proof that "one tri-state is all a fan gets" was never a constraint, just
+ * an omission.
+ *
+ * EXACT SEMANTICS, and they are deliberately narrow:
+ *   'public'  (default) — creator-owned public surfaces may list this fan:
+ *                         Fan of the Week (`recognition.ts` fanOfTheWeek) and the
+ *                         per-creator Top Fans board (`leaderboard.ts`
+ *                         publicTopFans).
+ *   'private'           — those surfaces skip this fan entirely, retroactively,
+ *                         for every creator at once.
+ *
+ * It does NOT touch: the fan's own /u/:handle page, their collection, their
+ * achievements, their follow graph, discovery, or any owner-scoped read. One
+ * axis, or it is just `visibility` again with more words.
+ *
+ * WITH ITEM #11'S PER-RECOGNITION CONSENT THIS IS BELT AND BRACES ON ONE SURFACE
+ * AND THE ONLY BELT ON THE OTHER. A spotlight is a row a fan can accept or
+ * decline individually; a Top Fans placement is computed from acquisitions and
+ * has no row to consent to, so this switch is the only consent that board can
+ * carry.
+ *
+ * WHY A COLUMN ON `user_profiles` AND NOT A SETTINGS TABLE. Both publication
+ * joins already fetch the profile row to get the handle and display name they
+ * publish. Putting the flag anywhere else would mean a second read on a path the
+ * suppression-oracle guard pins for statement-sequence identity; putting it here
+ * makes the gate a predicate on a row the statement was fetching anyway. It also
+ * means `rankable_profiles` (a `SELECT *` view, expanded at query time) inherits
+ * it, so the founder-exclusion guard keeps holding.
+ *
+ * NO PROFILE, NO SETTING. A fan with no profile cannot be listed anywhere by
+ * construction (both joins require the row), so the write refuses rather than
+ * inventing a profile — creating a public identity as a side effect of a privacy
+ * control would be exactly backwards.
+ */
+
+export class AffiliationError extends Error {
+  override name = "AffiliationError";
+  constructor(
+    message: string,
+    public readonly status: 400 | 404 = 400,
+  ) {
+    super(message);
+  }
+}
+
+export type AffiliationVisibility = "public" | "private";
+
+export function isAffiliationVisibility(v: unknown): v is AffiliationVisibility {
+  return v === "public" || v === "private";
+}
+
+/**
+ * Set the caller's own affiliation visibility. One guarded UPDATE keyed on the
+ * session's account id — `changes === 0` means there is no profile row, which is
+ * the only reachable failure and is reported as such (404) rather than as a
+ * silent success that would leave the fan believing they had opted out.
+ */
+export async function setAffiliationVisibility(db: DbLike, accountId: string, visibility: AffiliationVisibility, now: () => string = () => new Date().toISOString()): Promise<AffiliationVisibility> {
+  if (!isAffiliationVisibility(visibility)) throw new AffiliationError("affiliation_visibility must be public or private");
+  const res = await db.prepare("UPDATE user_profiles SET affiliation_visibility = ?, updated_at = ? WHERE account_id = ?").bind(visibility, now(), accountId).run();
+  if (res.changes === 0) throw new AffiliationError("create a profile first — there is nothing to list you as yet", 404);
+  return visibility;
+}
+===== END FILE: services/trust-core/src/affiliation.ts =====
+
+===== BEGIN FILE: services/trust-core/src/agencies.ts =====
+import { AGENCY_ID_RE, hasUnsafeText, hasVisibleText, stripInvisibleText, type ActorKind, type DraftEvent, type EventType, type TrustEventEnvelope } from "@dhwaja/schema";
+import { subjectForAccount } from "@dhwaja/canonical";
+import { ASSERTIONS_PER_DAY, MAX_OUTSTANDING_ASSERTIONS, assertionCeilingStatement } from "./assertions.js";
+import { shownClassSql, withInstantLiteral } from "./standing.js";
+import { consumeRateLimit, rateLimitCount, refundRateLimit, RL_DAY_MS } from "./ratelimit.js";
+import { inChunks, type DbLike, type DbStatement } from "./db.js";
+import { appendEvents, LedgerError } from "./events.js";
+import { accountIdKindProblem } from "./passkeys.js";
+import { labelSkeleton } from "./domain-match.js";
+import { listReleases } from "./releases.js";
+import { warOptState } from "./war-consent.js";
+import { CREATOR_CLOSED_SQL } from "./credits.js";
+
+/**
+ * Agencies — a roster manager acting on behalf of creators, with provenance
+ * that never overstates who touched an action.
+ *
+ * Trust model:
+ *  - A creator AUTHORIZES an agency for their passport with a passkey-signed
+ *    `agency_authorized` event (see appendCreatorSigned). The grant is derived
+ *    from the log; a matching `agency_revoked` (later) withdraws it.
+ *
+ *    WHERE THAT EVENT IS WRITTEN, because a review once concluded it never is:
+ *    `POST /account/creator-action` (index.ts). There is no `agency*` route and
+ *    no `appendAgencyGrant()` to grep for — the door is the GENERIC creator-
+ *    signed action route, and `agency_authorized`/`agency_revoked` are on its
+ *    `CREATOR_SIGNABLE` allowlist (passkeys.ts) precisely because handing a
+ *    third party control of a passport is the kind of decision the passkey
+ *    exists to gate. Everything in THIS file reads the grant back out of
+ *    `trust_events`, which is what made the writer look absent. The end-to-end
+ *    proof — session → passkey → assertion → 200 → one `agency_authorized` row
+ *    marked `creator_passkey` — is pinned in
+ *    `test/routes-passkey.test.ts` ("REGRESSION [D1]"), so if the subsystem
+ *    ever does become unreachable, that test says so.
+ *  - An agency then acts (add/revoke accounts) on a granted passport; those
+ *    events carry actor_kind='agency' — the "by authorized agency" mark.
+ *  - The creator mark ('creator_passkey') is UNforgeable by the agency: it
+ *    requires the creator's device key, which the agency never has. So a fan
+ *    can always tell an action the creator personally touched from one the
+ *    agency took. That distinction is the whole point.
+ */
+
+export const AGENCY_ACTIONABLE = new Set<EventType>(["account_added", "account_revoked", "war_opt_in", "war_opt_out"]);
+/** I3-0685: the per-passport day budget for the agency actions that are not
+ * `account_added` (which rides ASSERTIONS_PER_DAY): revokes and war opt-in/out.
+ * 3x the add budget; bucket `agencyact:<passportId>`. */
+export const AGENCY_ACTIONS_PER_DAY = 30;
+
+/** I3-0893: a passport delisted at its subject's request (request_suppressions)
+ * is, to every agency door, a passport the agency holds no grant on. */
+async function isDelisted(db: DbLike, passportId: string): Promise<boolean> {
+  return (await db.prepare("SELECT 1 AS x FROM request_suppressions WHERE passport_id = ?").bind(passportId).first()) !== null;
+}
+/** D-0960(2)/D-0964(D), TERMS 7.4 (I20-W2C, I20-L02 H-B): a creator who closed their creator account
+ * (credits.ts CREATOR_CLOSED_SQL, the one spelling) cannot act as its creator (route-helpers.ts
+ * creatorAdmissionForSubject); an agency ACTING for that passport is refused the same way, with the no-grant
+ * sentence. Read doors (creator view, analytics) are not decided here. */
+export async function creatorClosedForAgency(db: DbLike, passportId: string): Promise<boolean> {
+  return (await db.prepare(`SELECT ${CREATOR_CLOSED_SQL("?")} AS c`).bind(passportId).first<{ c: number }>())?.c === 1;
+}
+/** I20-Q9 (D-1030, Jason: "Keep read-only access for 90 days, then hide."): an agency's READ doors serve a creator who
+ * closed their creator account (creator_closures, 0205) until AGENCY_CLOSED_READ_DAYS after `closed_at`, then answer
+ * as if no grant were held. Acting doors refuse a closed creator from day 0 (creatorClosedForAgency). One predicate,
+ * interpolated at every read door: agencyGrantedCreators (GET /agency/creators), agencyCreatorView
+ * (GET /agency/creators/:id) and agency-analytics-routes.ts resolveAgencyGrantedRead (the four dashboards). */
+export const AGENCY_CLOSED_READ_DAYS = 90;
+export const CREATOR_CLOSED_READ_LAPSED_SQL = (passportExpr: string): string =>
+  `EXISTS (SELECT 1 FROM creator_closures cc WHERE cc.passport_id = ${passportExpr} AND cc.closed_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-${AGENCY_CLOSED_READ_DAYS} days'))`;
+export async function creatorClosedReadLapsed(db: DbLike, passportId: string): Promise<boolean> {
+  return (await db.prepare(`SELECT ${CREATOR_CLOSED_READ_LAPSED_SQL("?")} AS c`).bind(passportId).first<{ c: number }>())?.c === 1;
+}
+/** Which event types each grant scope authorizes. Enforced per action, so a
+ * future narrower scope can't be stretched to actions it didn't grant. */
+const SCOPE_ACTIONS: Record<string, Set<EventType>> = {
+  manage_accounts: new Set<EventType>(["account_added", "account_revoked"]),
+  manage_sales: new Set<EventType>(), // sales/code management is NOT a ledger action
+  // `manage_all` predates the game and deliberately does NOT gain the war
+  // actions: "manage everything" was consented to before cards-of-you-for-sale
+  // existed, so entering the game rides ONLY the explicit narrow scope below.
+  manage_all: new Set<EventType>(["account_added", "account_revoked"]),
+  // S-CW4: the narrow CREATOR WAR scope — these two actions and nothing else.
+  war: new Set<EventType>(["war_opt_in", "war_opt_out"]),
+};
+
+/** Scopes that authorize bundle code management (issue / export / tracker) — a
+ * NON-ledger capability, so it's checked here rather than in appendAgencyAction. */
+export const SALES_SCOPES: ReadonlySet<string> = new Set(["manage_sales", "manage_all"]);
+
+// Reporting / analytics reads (ROI, attribution funnel, back-catalog) expose the
+// creator's PRIVATE performance data, so a grant must be sales-capable to unlock
+// them. A pure `manage_accounts` grant (social-account protection only) must NOT
+// — otherwise a narrow "let us manage your linked accounts" grant would silently
+// also exfiltrate the creator's financial dashboards (scope-creep). Reporting
+// follows the sales scopes: whoever runs the campaigns may read their performance.
+const REPORTING_SCOPES = SALES_SCOPES;
+
+/**
+ * UI-AUDIT F-G5 — THE SAME SCOPE-CREEP THE PARAGRAPH ABOVE FORBIDS, ON THE READ
+ * THE AGENCY CONSOLE OPENS EVERY CREATOR WITH.
+ *
+ * `REPORTING_SCOPES` exists because "a narrow 'let us manage your linked
+ * accounts' grant would silently also exfiltrate the creator's financial
+ * dashboards". `agencyCreatorView` had no such split: past the `war`
+ * special-case it handed EVERY scope both the complete `passport_accounts`
+ * roster — every platform, handle, URL, status and relationship basis — and the
+ * complete release list including unreleased ones. So:
+ *
+ *   • a creator who granted `manage_sales` ("sell my codes") also handed over
+ *     their entire account roster, which is exactly the linked-account map the
+ *     accounts scope exists to gate; and
+ *   • a creator who granted `manage_accounts` ("look after my handles") also
+ *     received the unreleased catalogue — what is coming, and when.
+ *
+ * Neither is a write, which is why it survived: `appendAgencyAction` and
+ * `agencyCanManageSales` both gate correctly, and the READ beneath them gated on
+ * nothing but the grant's existence. A scope is a promise about what an agency
+ * can SEE as much as what it can do.
+ *
+ * Each half now follows the scope that authorizes acting on it. `manage_all`
+ * keeps both, which is what it means.
+ */
+const ACCOUNT_SCOPES = new Set(["manage_accounts", "manage_all"]);
+/** How long an agency apex stays gate-relevant on ONE proof. The TXT record is
+ * the agency's live statement that this apex is theirs; re-proving it monthly
+ * is what makes "drop the record and the authorization lapses" true within a
+ * bounded time rather than never. Read AND swept against the same number so a
+ * stalled cron cannot extend anybody's authorization. */
+export const AGENCY_DOMAIN_MAX_AGE_DAYS = 30;
+/** I3-0660: a CONFIRMED TXT absence older than this lapses an apex. Equal to
+ * `agency-domains.ts AGENCY_TXT_ABSENT_LAPSE_DAYS` (held equal by
+ * test/i4-17r3-agency-gate-absence.test.ts); declared here because
+ * agency-domains.ts imports this module and the reverse import is a cycle. */
+export const AGENCY_TXT_ABSENT_GATE_DAYS = 7;
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+
+/** True iff a grant `scope` string authorizes reading the creator's private
+ * reporting dashboards (ROI / attribution / back-catalog). null / a non-reporting
+ * scope (e.g. `manage_accounts`) → false. Pure predicate over an already-resolved
+ * scope, so the caller controls the agency-active + grant-existence checks. */
+export function scopeAllowsReports(scope: string | null): boolean {
+  return scope !== null && REPORTING_SCOPES.has(scope);
+}
+
+/**
+ * True iff `agencyId` currently holds a grant on `passportId` that authorizes
+ * sales/code management AND the agency is active. Fail-closed: any missing piece
+ * (no agency, suspended, no grant, wrong scope) returns false.
+ */
+export async function agencyCanManageSales(db: DbLike, agencyId: string, passportId: string): Promise<boolean> {
+  if (!AGENCY_ID_RE.test(agencyId) || !/^psp_[0-9a-f]{16}$/.test(passportId)) return false;
+  const agency = await db.prepare("SELECT status FROM agencies WHERE agency_id = ?").bind(agencyId).first<{ status: string }>();
+  if (!agency || agency.status !== "active") return false;
+  const scope = await activeGrantScope(db, agencyId, passportId);
+  if (scope === null || !SALES_SCOPES.has(scope)) return false;
+  // I20-RG-MONEY-02 (D-0960(2), TERMS 7.4): a closed creator's codes are not minted or tracked by an agency
+  // (credentials-routes.ts mint and tracker doors both ask this primitive).
+  return !(await creatorClosedForAgency(db, passportId));
+}
+
+/** D-0861(1), I6RGA-02: the ONE sentence every ledger refusal on the agency door
+ * answers (appendAgencyAction's LedgerError arm). The ledger's own sentence
+ * separates a key delisted at its subject's request from any other refusal, so
+ * it never reaches an agency. */
+export const AGENCY_LEDGER_REFUSAL = "the ledger refused this action — check each account's platform, id and url";
+
+export class AgencyError extends Error {
+  override name = "AgencyError";
+  constructor(message: string, public readonly status: 400 | 401 | 403 | 404 | 409 | 429 = 400) {
+    super(message);
+  }
+}
+
+/**
+ * I3-1416 (D-0920 option A): the confusable key of an agency display name — invisible characters stripped
+ * (`stripInvisibleText`), letters and digits only, lowercased, through `labelSkeleton` (homoglyph, accent and
+ * leet folds). `skeleton` is the fold of the FOLDABLE characters; `residue` is what the fold dropped (a CJK or
+ * other non-foldable letter). `null` when nothing foldable remains.
+ */
+function agencyNameKey(name: string): { skeleton: string; residue: string } | null {
+  const letters = stripInvisibleText(name).toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+  const s = labelSkeleton(letters);
+  if (s.skeleton === "") return null;
+  let residue = "";
+  if (s.dropped > 0) for (const ch of letters) if (labelSkeleton(ch).skeleton === "") residue += ch;
+  return { skeleton: s.skeleton, residue };
+}
+
+/**
+ * Two keys collide when their skeletons match and (I16-RG-AUTH:7/13) either side folds with nothing dropped —
+ * the impersonated Latin name, so one appended CJK letter does not make a duplicate distinct — or both dropped
+ * the SAME residue. Two names that each carry different non-foldable text ("東京タレント Co" / "大阪タレント Co")
+ * share a skeleton while reading differently, and are not refused.
+ */
+function agencyNamesCollide(a: { skeleton: string; residue: string }, b: { skeleton: string; residue: string }): boolean {
+  return a.skeleton === b.skeleton && (a.residue === "" || b.residue === "" || a.residue === b.residue);
+}
+
+/** QUEUE #940 (6-JA-21): the comparison key of a name `agencyNameKey` cannot fold (nothing foldable: a pure-CJK name) —
+ * invisible characters stripped (`stripInvisibleText`, as `agencyNameKey` does: W2IMG-940, a Hangul filler is a letter
+ * by category and invisible on screen), then NFKC, lowercased, letters and digits only. */
+function agencyNameBare(name: string): string {
+  return stripInvisibleText(name).normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+}
+
+/** QUEUE #940 residual (D-1119(9)): the comparison key of a name with no letter or digit at all (`agencyNameBare` is
+ * empty) — the whole name, invisible characters stripped, after NFKC. */
+function agencyNameSymbols(name: string): string {
+  return stripInvisibleText(name).normalize("NFKC");
+}
+
+/** Provision an agency identity (operator action). I18 #942(a) D09 (D-0946(1)): `extraStatements` (agency_auth.ts
+ * `provisionAgency`: the key hash, then the console's audit row) ride the INSERT's own batch, so the agency, its key
+ * and its record commit together or not at all. */
+export async function registerAgency(
+  db: DbLike,
+  agencyId: string,
+  displayName: string,
+  now: () => string = () => new Date().toISOString(),
+  extraStatements: DbStatement[] = [],
+): Promise<void> {
+  if (!AGENCY_ID_RE.test(agencyId)) throw new AgencyError("bad agency id");
+  const name = displayName.trim();
+  // I3-1774: the same Cc/Cf/Zl/Zp class every other stored display name is
+  // refused on (events.ts assertDisplayName) — bidi overrides, zero-width and
+  // control characters included, not just markup.
+  if (!name || !hasVisibleText(name) || name.length > 100 || name.includes("<") || name.includes(">") || hasUnsafeText(name)) throw new AgencyError("bad display name");
+  // I3-1416: creators see this name beside grant requests, so a name that folds to an existing OTHER
+  // agency's is refused (409) at this one door (console.ts POST /ops/agencies, the only caller).
+  const fold = agencyNameKey(name);
+  // I34-FX3-INSTANT (I34-RG-W3M AGENCY-RACE): the look-alike verdict is computed here, over the agencies one read
+  // returned (the folds are not SQL), so the INSERT is bound to exactly that read: its display_name is NULL when any
+  // other agency exists that the read did not return, and agencies.display_name is NOT NULL, so the whole batch —
+  // extraStatements included — aborts. A registration that landed in that window is read and judged on the next pass;
+  // `passes` bounds the loop, and the last lost race surfaces as itself (the door's 500).
+  const passes = 3;
+  for (let pass = 1; ; pass++) {
+    const { results } = await db.prepare("SELECT agency_id, display_name FROM agencies WHERE agency_id <> ?").bind(agencyId).all<{ agency_id: string; display_name: string }>();
+    if (fold !== null) {
+      if (results.some((r) => { const k = agencyNameKey(r.display_name); return k !== null && agencyNamesCollide(k, fold); })) throw new AgencyError("look-alike of an existing agency", 409);
+    } else {
+      // QUEUE #940 (6-JA-21): nothing folds, so the skeleton scan above cannot see a twin; the same 409 when another
+      // agency's name has the same bare letters, or (D-1119(9)) — a name with no letters or digits at all — is the same
+      // whole name after NFKC.
+      const bare = agencyNameBare(name);
+      if (bare !== "") {
+        if (results.some((r) => agencyNameBare(r.display_name) === bare)) throw new AgencyError("look-alike of an existing agency", 409);
+      } else {
+        const sym = agencyNameSymbols(name);
+        if (results.some((r) => agencyNameSymbols(r.display_name) === sym)) throw new AgencyError("look-alike of an existing agency", 409);
+      }
+    }
+    try {
+      await db.batch([
+        db
+          .prepare(
+            `INSERT INTO agencies (agency_id, display_name, status, created_at)
+             VALUES (?, CASE WHEN NOT EXISTS (SELECT 1 FROM agencies a WHERE a.agency_id <> ? AND a.agency_id NOT IN (SELECT value FROM json_each(?))) THEN ? END, 'active', ?)`,
+          )
+          .bind(agencyId, agencyId, JSON.stringify(results.map((r) => r.agency_id)), name, now()),
+        ...extraStatements,
+      ]);
+      return;
+    } catch (e) {
+      // I3-0765: only the primary-key collision is "already exists"; any other
+      // D1 failure (an outage) propagates to the door's 500, never a false 409.
+      if (e instanceof Error && /UNIQUE constraint failed:\s*agencies\.agency_id/i.test(e.message)) throw new AgencyError("agency already exists", 409);
+      if (pass < passes && e instanceof Error && /NOT NULL constraint failed:\s*agencies\.display_name/i.test(e.message)) continue;
+      throw e;
+    }
+  }
+}
+
+/** The active grant scope for (agency, passport), or null if none — derived
+ * from the log (latest agency_authorized/revoked for the pair wins). */
+/**
+ * F14 / HANDOFF §1.2 — the apexes this passport may sit UNDER.
+ *
+ * The narrow authorization `domainAddGate` accepts, computed here rather than
+ * handed in by a caller: the proven domains of every agency that currently
+ * holds an ACCOUNT-MANAGING grant on this passport. Empty for everybody who is
+ * not on a roster, which is what keeps "the gate is not widened" true — an
+ * empty set leaves the gate byte-for-byte the gate it was.
+ *
+ * FAIL-CLOSED AT EVERY JOIN. A suspended agency, a revoked grant, a
+ * sales-only scope, an unproven domain: any of them and the apex is not in the
+ * set. `ACCOUNT_SCOPES` is the right vocabulary rather than `REPORTING_SCOPES`
+ * because this authorizes an ACCOUNT to be added — a grant that says "manage my
+ * sales" does not say "put a domain on my passport".
+ *
+ * WHAT A REVOKED GRANT DOES: it empties this set, so no NEW account can be
+ * added under the apex. It does not touch accounts already listed, and that is
+ * deliberate. The artist proved control of that host and the agency authorized
+ * it at the time, so the account is theirs; unlisting it because a business
+ * relationship ended would let an agency take a proven account off a creator
+ * for leaving. The agency's remedy is DNS — stop pointing the subdomain at
+ * them, and the periodic re-proof lapses the apex for everyone.
+ */
+export async function agencyGatingApexes(db: DbLike, passportId: string, nowMs: number = Date.now()): Promise<string[]> {
+  if (!PSP_RE.test(passportId)) return [];
+  // START FROM THE PASSPORT'S OWN GRANTS, NOT FROM THE PLATFORM'S DOMAINS.
+  //
+  // The first cut read every `agency_domains` row on the platform and then asked,
+  // per row, whether this passport had granted that agency — an N+1 over a table
+  // nothing bounds in total (`AGENCY_DOMAIN_MAX_PER_AGENCY` bounds it per agency,
+  // and agencies are unbounded). An adversarial review measured 2,001 prepared
+  // statements for a passport with NO agency at all, at 100 agencies × 20 apexes,
+  // inside one Worker request — and this runs in `verifyDomainAdd` AFTER the DNS
+  // proof has been spent, so past the subrequest ceiling it breaks the domain-add
+  // door for EVERY creator, including the ones this feature does not touch. The
+  // grants are the small side: almost every passport has none.
+  const mine = (await liveGrantsForPassport(db, passportId)).filter((g) => ACCOUNT_SCOPES.has(g.scope)).map((g) => g.agency_id);
+  if (mine.length === 0) return [];
+  // STALENESS IS ENFORCED AT THE READ, not only by the sweep. The sweep is a
+  // cron, and a cron that stops running must not silently leave every
+  // authorization live forever — that is the failure mode where an agency that
+  // dropped its TXT record a year ago still widens a gate. The window is the
+  // same one the sweep uses, so a healthy deployment never notices the
+  // difference and a stalled one fails closed.
+  const cutoff = new Date(nowMs - AGENCY_DOMAIN_MAX_AGE_DAYS * 86_400_000).toISOString();
+  // CHUNKED, because nothing caps how many agencies one passport may authorize.
+  // `agency_authorized` validates the payload's SHAPE, not a count, so a
+  // passport with 120 live grants would build a 121-parameter statement and D1
+  // refuses anything over 100 — and it would throw inside `verifyDomainAdd`
+  // AFTER the DNS proof was spent and the day budget debited, which is the exact
+  // harm the N+1 fix above cites (fidelity-suite caught it here).
+  const out: string[] = [];
+  for (const chunk of inChunks(mine, 2)) {
+    const { results } = await db
+      .prepare(
+        // The chunk binds FIRST. `fidelity-suite` decides "chunked" by the
+        // bind — `.bind(...chunk` — rather than by proximity to an `inChunks`
+        // header, because twelve lines of lookback once let an unchunked
+        // builder inherit a chunked loop's verdict. Ordering the clause to suit
+        // the guard is the cheap half of agreeing with it.
+        `SELECT d.host AS host
+           FROM agency_domains d
+           JOIN agencies a ON a.agency_id = d.agency_id
+          WHERE d.agency_id IN (${chunk.map(() => "?").join(",")})
+            AND a.status = 'active' AND d.reproved_at >= ?
+            AND (d.txt_absent_since IS NULL OR d.txt_absent_since > ?)`,
+      )
+      // I3-0660: the sweep's 7-day confirmed-absence lapse, enforced at the read too.
+      .bind(...chunk, cutoff, new Date(nowMs - AGENCY_TXT_ABSENT_GATE_DAYS * 86_400_000).toISOString())
+      .all<{ host: string }>();
+    for (const r of results) out.push(r.host);
+  }
+  return out;
+}
+
+/**
+ * A-22 — THE GRANT, RE-CHECKED LIVE, INSIDE THE SAME ATOMIC WRITE.
+ *
+ * `appendAgencyAction` reads the grant scope ONCE, with `activeGrantScope`,
+ * before doing anything else. Everything between that read and the ledger
+ * write below is `await`ed I/O (agency status, the ceiling guard, the write
+ * itself) — a window a concurrent `agency_revoked` (or an operator suspending
+ * the agency) can land inside. `appendEvents`'s own retry loop widens the
+ * SAME window further: on a lost head race it rebuilds and re-attempts the
+ * IDENTICAL drafts and extraStatements without re-reading the grant, so the
+ * very write that revoked the agency can itself trigger the retry that lets
+ * the stale-authorized action land right after.
+ *
+ * This closes it the way `assertionCeilingStatement` closes the ceiling race:
+ * a statement that runs LIVE, inside the SAME `db.batch` as the ledger append
+ * (so it reruns, fresh, on every retry attempt too), and THROWS on failure —
+ * here by driving `agencies.status` (NOT NULL, `CHECK (status IN ('active',
+ * 'suspended'))`) to NULL, which the schema itself refuses. On success it
+ * writes `status` back to its own current value: a no-op.
+ *
+ * I3-1248: it also checks that the agency is still `active` and that the latest
+ * grant event carries the SAME scope read up front (bound by the caller), so a
+ * mid-flight suspension or narrowed RE-grant fails the batch like a revocation.
+ */
+function agencyStillGrantedStatement(db: DbLike, agencyId: string, passportId: string, scope: string): DbStatement {
+  // I3-1248: three more conjuncts, each re-asked live in the batch — the agency
+  // is still 'active' (an operator suspension mid-flight), and the latest grant
+  // event carries the SAME scope that was read up front (a narrowed re-grant).
+  // I3-0893: the passport carries no request_suppressions row (delisted at the
+  // subject's request mid-flight). I20-W2C (D-0964(D)): the creator has not closed their creator account
+  // (CREATOR_CLOSED_SQL) mid-flight. Any failure -> NULL -> the same 403.
+  return db
+    .prepare(
+      `UPDATE agencies SET status = CASE WHEN status = 'active' AND (
+         SELECT CASE WHEN event_type = 'agency_authorized' THEN json_extract(payload, '$.scope') END FROM trust_events
+          WHERE subject = ?
+            AND event_type IN ('agency_authorized','agency_revoked')
+            AND json_valid(payload) = 1 AND json_type(payload) = 'object'
+            AND json_extract(payload, '$.agency_id') = ?
+          ORDER BY seq DESC LIMIT 1
+       ) = ? AND NOT EXISTS (SELECT 1 FROM request_suppressions WHERE passport_id = ?) AND NOT ${CREATOR_CLOSED_SQL("?")} THEN status ELSE NULL END
+       WHERE agency_id = ?`,
+    )
+    .bind(passportId, agencyId, scope, passportId, passportId, agencyId);
+}
+
+/**
+ * I3-0335 — THE ACTOR, RE-CHECKED LIVE, INSIDE THE SAME ATOMIC WRITE.
+ *
+ * `agencyPrincipal` (route-helpers.ts:114) verifies the session's agency
+ * epoch, the member's role and (for a seat-key session) the seat's liveness
+ * and epoch ONCE, at admission. A member demoted or removed, a seat revoked,
+ * or an agency-wide logout between that read and the batch still landed the
+ * write. This statement rides the batch beside A-22's grant re-check and uses
+ * the same idiom: `agencies.status` (NOT NULL) is driven to NULL unless the
+ * acting member still holds a role in `capRoles`, the agency epoch is still
+ * the session's, and a seat session's seat is still live at its epoch.
+ * `capRoles` comes from the caller because the role table lives in
+ * `agency_members.ts`, which imports this module (no-circular).
+ */
+export interface AgencyActor {
+  memberId: string;
+  epoch: number;
+  seatId?: string;
+  seatEpoch?: number;
+  /** Roles that hold the capability this write needs (non-empty). */
+  capRoles: readonly string[];
+}
+
+export function agencyActorLiveSql(agencyId: string, actor: AgencyActor): { sql: string; params: (string | number)[] } {
+  if (actor.capRoles.length === 0) throw new AgencyError("no role may take this action", 403);
+  // ONE bound parameter (a JSON array), never a placeholder per role: the list
+  // binds 1 whatever its length (D1's 100-parameter ceiling; fidelity-suite).
+  const seat = actor.seatId === undefined ? "" : " AND EXISTS (SELECT 1 FROM agency_seats WHERE seat_id = ? AND agency_id = ? AND revoked_at IS NULL AND session_epoch = ?)";
+  return {
+    sql:
+      `(SELECT session_epoch FROM agencies WHERE agency_id = ?) = ?` +
+      ` AND EXISTS (SELECT 1 FROM agency_members WHERE agency_id = ? AND member_id = ? AND role IN (SELECT value FROM json_each(?)))` +
+      seat,
+    params: [agencyId, actor.epoch, agencyId, actor.memberId, JSON.stringify(actor.capRoles), ...(actor.seatId === undefined ? [] : [actor.seatId, agencyId, actor.seatEpoch ?? -1])],
+  };
+}
+
+function agencyActorLiveStatement(db: DbLike, agencyId: string, actor: AgencyActor): DbStatement {
+  const g = agencyActorLiveSql(agencyId, actor);
+  return db.prepare(`UPDATE agencies SET status = CASE WHEN ${g.sql} THEN status ELSE NULL END WHERE agency_id = ?`).bind(...g.params, agencyId);
+}
+
+/** Failure path only: did the batch lose to the ACTOR term (vs the grant)? */
+export async function agencyActorStillLive(db: DbLike, agencyId: string, actor: AgencyActor): Promise<boolean> {
+  const g = agencyActorLiveSql(agencyId, actor);
+  return (await db.prepare(`SELECT 1 AS x WHERE ${g.sql}`).bind(...g.params).first()) !== null;
+}
+
+export async function activeGrantScope(db: DbLike, agencyId: string, passportId: string): Promise<string | null> {
+  const { results } = await db
+    .prepare("SELECT event_type, payload FROM trust_events WHERE subject = ? AND event_type IN ('agency_authorized','agency_revoked') ORDER BY seq ASC")
+    .bind(passportId)
+    .all<{ event_type: string; payload: string }>();
+  let scope: string | null = null;
+  for (const r of results) {
+    let p: { agency_id?: unknown; scope?: unknown };
+    try {
+      p = JSON.parse(r.payload) as { agency_id?: unknown; scope?: unknown };
+    } catch {
+      continue;
+    }
+    if (String(p.agency_id) !== agencyId) continue;
+    scope = r.event_type === "agency_authorized" ? String(p.scope) : null; // later event wins
+  }
+  return scope;
+}
+
+/**
+ * EVERY agency that currently holds a live grant on ONE passport — the same
+ * "later event wins" fold as `activeGrantScope`, inverted: keyed by agency
+ * instead of asking about one.
+ *
+ * `activeGrantScope` answers "does THIS agency hold a grant", which is the
+ * question every read path has. Recovery has the other one: after a confirmed
+ * hijack, WHICH agencies did the attacker hand this passport to? There was no
+ * way to ask it per-passport (only `agencyGrantedCreators`, which scans the
+ * whole log for one agency), so a recovery could not revoke what it could not
+ * enumerate. Same statement shape as `activeGrantScope` — one read, subject
+ * equality on `idx_trust_events_subject`, seq ASC — so it costs what the
+ * existing per-agency read costs.
+ *
+ * Returned sorted by agency_id so the revocation batch a recovery appends is
+ * DETERMINISTIC (the ledger records the same order for the same state).
+ */
+export async function liveGrantsForPassport(db: DbLike, passportId: string): Promise<{ agency_id: string; scope: string }[]> {
+  if (!/^psp_[0-9a-f]{16}$/.test(passportId)) return [];
+  const { results } = await db
+    .prepare("SELECT event_type, payload FROM trust_events WHERE subject = ? AND event_type IN ('agency_authorized','agency_revoked') ORDER BY seq ASC")
+    .bind(passportId)
+    .all<{ event_type: string; payload: string }>();
+  const scopeByAgency = new Map<string, string | null>();
+  for (const r of results) {
+    let p: { agency_id?: unknown; scope?: unknown };
+    try {
+      p = JSON.parse(r.payload) as { agency_id?: unknown; scope?: unknown };
+    } catch {
+      continue;
+    }
+    const id = String(p.agency_id);
+    if (!AGENCY_ID_RE.test(id)) continue;
+    scopeByAgency.set(id, r.event_type === "agency_authorized" ? String(p.scope) : null); // later event wins
+  }
+  return [...scopeByAgency.entries()]
+    .filter(([, scope]) => scope !== null)
+    .map(([agency_id, scope]) => ({ agency_id, scope: String(scope) }))
+    .sort((a, b) => (a.agency_id < b.agency_id ? -1 : 1));
+}
+
+/**
+ * THE OPERATOR KILL-SWITCH FOR AN AGENCY, which the schema has allowed since
+ * 0009 and nothing could ever write.
+ *
+ * `agencies.status = 'suspended'` is READ in two places that matter — the
+ * agency action path (`appendAgencyAction`) and every granted dashboard read
+ * (`resolveAgencyGrantedRead`) — and the smoke-test document instructed the
+ * operator to set it BY EDITING D1 BY HAND. A kill-switch that only exists in
+ * a runbook is not a kill-switch.
+ *
+ * It is deliberately SEPARATE from grant revocation and does a different job.
+ * Revocation is per-passport and per-creator (the creator can reauthorize);
+ * suspension is per-AGENCY and operator-held: one flag that stops the whole
+ * roster acting while an incident is investigated, without touching anybody's
+ * grants. Reversible — `active` is the same call with `suspended: false` — and
+ * the caller audits it.
+ *
+ * RJ550b-W314-R2-9 (D-0920) made this the only status transition until Jason set an agency retention period; he
+ * did (I21-Q82, D-1030): `closeAgency` below suspends AND records an append-only `agency_closures` row, a closed
+ * agency is never set active again (refused here), and `sweepClosedAgencies` erases its member and domain rows 30 days
+ * on. Seats and grants are not swept. `agencies.status` still admits only 'active'/'suspended' (0009 CHECK).
+ */
+export async function setAgencyStatus(
+  db: DbLike,
+  agencyId: string,
+  suspended: boolean,
+  // I18 #942(a) D11 (D-0946(1)): the caller's rows join the UPDATE's batch behind `changeGateStmt`, so they commit
+  // only with the status change and a failing one rolls it back.
+  extraStatements: DbStatement[] = [],
+): Promise<{ agency_id: string; status: "active" | "suspended" }> {
+  if (!AGENCY_ID_RE.test(agencyId)) throw new AgencyError("bad agency id");
+  const status = suspended ? "suspended" : "active";
+  // I21-Q82 (I29-OPS): a CLOSED agency is never reactivated — its members and domains are erased 30 days on. Asked in
+  // the UPDATE itself, so a close landing between a read and this write still refuses.
+  if (!suspended && (await db.prepare("SELECT 1 AS x FROM agency_closures WHERE agency_id = ?").bind(agencyId).first()) !== null) throw new AgencyError(AGENCY_CLOSED_REFUSAL, 409);
+  const write = db
+    .prepare(`UPDATE agencies SET status = ? WHERE agency_id = ?${suspended ? "" : " AND NOT EXISTS (SELECT 1 FROM agency_closures WHERE agency_id = agencies.agency_id)"} RETURNING agency_id`)
+    .bind(status, agencyId);
+  let changed: number;
+  try {
+    const res = (await db.batch(extraStatements.length > 0 ? [write, changeGateStmt(db), ...extraStatements] : [write])) as { results?: unknown[] }[];
+    changed = res[0]?.results?.length ?? 0;
+  } catch (e) {
+    if (!isChangeGateRefusal(e)) throw e;
+    changed = 0;
+  }
+  if (changed !== 1) throw new AgencyError("no such agency", 404);
+  return { agency_id: agencyId, status };
+}
+
+/** I21-Q82: the refusal a closed agency's reactivation, member add or second close answers. */
+export const AGENCY_CLOSED_REFUSAL = "this agency is closed; a closed agency is not reopened and takes no new members";
+/** I21-Q82 (D-1030): days after closure that an agency's member rows and domain rows are erased. Jason's ruling, not a setting. */
+export const AGENCY_CLOSURE_ERASE_DAYS = 30;
+/** One sweep call's bound on agencies; `more` says rows remain past it. */
+export const AGENCY_CLOSURE_SWEEP_BATCH = 50;
+export const AGENCY_CLOSE_ACTION = "agency:close";
+export const AGENCY_CLOSURE_ERASED_ACTION = "agency:closure_erased";
+
+/**
+ * I21-Q82 (D-1030: "Erase member emails and domains 30 days after closure, keep the audit row"): CLOSE an agency — the
+ * suspension UPDATE, the append-only `agency_closures` row and the caller's rows (the console's `agency:close` audit row)
+ * in ONE batch behind `setAgencyStatus`'s change gate. A second close is a 409 (the closure's PRIMARY KEY aborts the
+ * batch, so it suspends nothing and audits nothing). The two-person door is console.ts POST /ops/agencies/:id/close.
+ */
+export async function closeAgency(db: DbLike, agencyId: string, operator: string, reason: string, ts: string, extraStatements: DbStatement[] = []): Promise<{ agency_id: string; status: "suspended"; closed_at: string }> {
+  if (!AGENCY_ID_RE.test(agencyId)) throw new AgencyError("bad agency id");
+  const why = typeof reason === "string" ? reason.trim() : "";
+  if (why.length < 3 || why.length > 200 || !hasVisibleText(why)) throw new AgencyError(AGENCY_CLOSE_REASON_REFUSAL);
+  try {
+    await setAgencyStatus(db, agencyId, true, [
+      db.prepare("INSERT INTO agency_closures (agency_id, closed_by, reason, closed_at) VALUES (?, ?, ?, ?)").bind(agencyId, operator, why, ts),
+      ...extraStatements,
+    ]);
+  } catch (e) {
+    if (e instanceof Error && /UNIQUE constraint failed:\s*agency_closures\.agency_id/i.test(e.message)) throw new AgencyError(AGENCY_CLOSED_REFUSAL, 409);
+    throw e;
+  }
+  return { agency_id: agencyId, status: "suspended", closed_at: ts };
+}
+export const AGENCY_CLOSE_REASON_REFUSAL = "closing an agency needs a reason (3-200 characters)";
+
+/**
+ * I21-Q82 (D-1030): ERASE each closed agency's `agency_members` rows (the enrolled emails and provider subjects) and
+ * `agency_domains` rows once its closure is AGENCY_CLOSURE_ERASE_DAYS old. audit_log rows are kept, and one
+ * `agency:closure_erased` row per agency (written FIRST in the batch, so its counts are the rows the deletes then take)
+ * records the erasure. Only agencies with an `agency_closures` row are read, so a suspended-only agency is never touched;
+ * an agency already erased has nothing left to match, so a re-run writes nothing. `scheduled()` step: I29-INT.
+ */
+export async function sweepClosedAgencies(db: DbLike, nowMs: number, limit: number = AGENCY_CLOSURE_SWEEP_BATCH): Promise<{ erased: number; more: boolean }> {
+  if (!Number.isInteger(limit) || limit < 1 || limit > 500) throw new AgencyError("bad limit");
+  const cutoff = new Date(nowMs - AGENCY_CLOSURE_ERASE_DAYS * 86_400_000).toISOString();
+  const { results } = await db
+    .prepare(
+      `SELECT c.agency_id FROM agency_closures c WHERE c.closed_at <= ?
+          AND (EXISTS (SELECT 1 FROM agency_members m WHERE m.agency_id = c.agency_id) OR EXISTS (SELECT 1 FROM agency_domains d WHERE d.agency_id = c.agency_id))
+        ORDER BY c.closed_at, c.agency_id LIMIT ?`,
+    )
+    .bind(cutoff, limit + 1)
+    .all<{ agency_id: string }>();
+  const page = results.slice(0, limit);
+  const at = new Date(nowMs).toISOString();
+  for (const r of page) {
+    await db.batch([
+      db
+        .prepare(
+          `INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind)
+           SELECT 'system:agency-closure-sweep', '${AGENCY_CLOSURE_ERASED_ACTION}', json_object('members', (SELECT COUNT(*) FROM agency_members WHERE agency_id = ?), 'domains', (SELECT COUNT(*) FROM agency_domains WHERE agency_id = ?)), ?, ?, 'system'`,
+        )
+        .bind(r.agency_id, r.agency_id, at, r.agency_id),
+      // No re-check of the closure here: agency_closures is append-only (0243 triggers), so the row the SELECT read
+      // cannot change or go away before these run.
+      db.prepare("DELETE FROM agency_members WHERE agency_id = ?").bind(r.agency_id),
+      db.prepare("DELETE FROM agency_domains WHERE agency_id = ?").bind(r.agency_id),
+    ]);
+  }
+  return { erased: page.length, more: results.length > limit };
+}
+
+/** I18 #942(a): inserts nothing when the write directly above it in the batch changed exactly one row (`changes()`)
+ * and otherwise violates `audit_log.detail NOT NULL`, aborting the batch — so a joined row never records a change
+ * that did not happen. Same shape as reports.ts `changeGateStmt` (two private copies). */
+function changeGateStmt(db: DbLike): DbStatement {
+  return db.prepare(
+    "INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT 'system:change-gate', 'change-gate', NULL, '', NULL, 'system' WHERE changes() <> 1",
+  );
+}
+function isChangeGateRefusal(e: unknown): boolean {
+  return e instanceof Error && /NOT NULL constraint failed:\s*audit_log\.detail\b/i.test(e.message);
+}
+
+/**
+ * Append agency-signed actions. Requires: the agency exists and is active, holds
+ * an active grant on the passport, and every draft is an allowed action on that
+ * passport with actor_kind='agency'. Only then does the ledger's privileged-actor
+ * gate accept the 'agency' mark.
+ * CALLER-GATING: invoke only for an authenticated agency session (the HTTP layer
+ * enforces `agencyId` is the session's agency).
+ */
+export async function appendAgencyAction(
+  db: DbLike,
+  agencyId: string,
+  passportId: string,
+  drafts: DraftEvent[],
+  now: () => string = () => new Date().toISOString(),
+  nowMs: number = Date.now(),
+  /** I3-0335: the acting seat, re-checked inside the batch. The HTTP door
+   * (agency-routes.ts `/agency/action`) always passes it. */
+  actor?: AgencyActor,
+  /** #863 (D-0923(6)): the seat's `agency:ledger_action` audit row, committed in the SAME batch as the events. */
+  audit?: DbStatement,
+): Promise<TrustEventEnvelope[]> {
+  if (!AGENCY_ID_RE.test(agencyId)) throw new AgencyError("bad agency id");
+  if (!/^psp_[0-9a-f]{16}$/.test(passportId)) throw new AgencyError("bad passport id");
+  if (drafts.length === 0) throw new AgencyError("no drafts");
+  if (drafts.length > 20) throw new AgencyError("too many drafts");
+
+  const agency = await db.prepare("SELECT status FROM agencies WHERE agency_id = ?").bind(agencyId).first<{ status: string }>();
+  if (!agency) throw new AgencyError("no such agency", 404);
+  if (agency.status !== "active") throw new AgencyError("agency suspended", 403);
+  const scope = await activeGrantScope(db, agencyId, passportId);
+  if (scope === null) throw new AgencyError("no active grant for this passport", 403);
+  // I3-0893: a passport delisted at its subject's request is treated as not
+  // granted — the SAME sentence, so the refusal is not a delisting oracle.
+  if (await isDelisted(db, passportId)) throw new AgencyError("no active grant for this passport", 403);
+  if (await creatorClosedForAgency(db, passportId)) throw new AgencyError("no active grant for this passport", 403);
+  const allowedForScope = SCOPE_ACTIONS[scope] ?? new Set<EventType>();
+
+  for (const d of drafts) {
+    if (d.subject !== passportId) throw new AgencyError("all actions must target the granted passport", 403);
+    if (d.actor_kind !== "agency") throw new AgencyError("agency drafts must be actor_kind agency");
+    if (!AGENCY_ACTIONABLE.has(d.event_type)) throw new AgencyError(`an agency may not emit ${d.event_type}`, 403);
+    if (!allowedForScope.has(d.event_type)) throw new AgencyError(`the grant scope '${scope}' does not authorize ${d.event_type}`, 403);
+    // #119 (D-0810(4)): the same id_kind refusal the creator-signed legs apply
+    // (passkeys.ts refuseMisKindedAccounts) — stored, a mis-kinded key is one no
+    // fan canonicalizer derives.
+    if (d.event_type === "account_added") {
+      const p = (d.payload ?? {}) as Record<string, unknown>;
+      const problem = accountIdKindProblem(String(p.platform ?? ""), String(p.id_kind ?? ""));
+      if (problem) throw new AgencyError(problem, 400);
+    }
+  }
+  // S-CW4: a creator's own war opt-out LOCKS the game state — only the
+  // creator's passkey may re-enter them (war-consent.ts). The derived read
+  // already ignores a locked agency opt-in, but refusing the append here keeps
+  // the ledger free of rows that LOOK like consent and aren't. Checked at the
+  // door (not inside appendEvents) because the rule is about who may act, not
+  // about ledger validity.
+  if (drafts.some((d) => d.event_type === "war_opt_in") && (await warOptState(db, passportId)).creator_locked) {
+    throw new AgencyError("the creator opted out of war themselves; only the creator can opt back in", 403);
+  }
+  const privileged: ActorKind[] = ["agency"];
+  // X1 — THE SAME ASSERTION CEILING, ON THE OTHER DOOR (review, HIGH).
+  //
+  // The fold stamps an agency add as `added_by = 'agency'`, and the ceiling's
+  // predicate counts creator AND agency rows — so this door was COUNTED by the
+  // bound and never GATED by it. An agency holding one `manage_accounts` grant
+  // could assert without limit on the granted passport, permanently squatting
+  // every key it named, and could push the creator's own count past the ceiling
+  // to lock them out of `/account/creator-action` as well. One predicate, both
+  // doors, or the bound is a suggestion on whichever door forgot it.
+  const adds = drafts.filter((d) => d.event_type === "account_added");
+  // F-07 — THE SAME DAY-RATE THE CREATOR DOOR CHARGES, ON THIS DOOR TOO.
+  //
+  // The ceiling above stops an agency from ever HOLDING more than
+  // MAX_OUTSTANDING_ASSERTIONS unproven rows (revoked rows still count — see
+  // assertions.ts — so cycling add/revoke doesn't launder slots). But the
+  // ceiling alone does not bound the RATE of new assertions a passport that
+  // legitimately proves accounts can rack up in one day, which is exactly
+  // what `ASSERTIONS_PER_DAY` exists to bound on `/account/creator-action`
+  // (creator-passkey-routes.ts). This door shares that passport-keyed bucket
+  // — deliberately, so an agency and the creator it serves draw from the SAME
+  // daily budget rather than each getting their own 10, which would double
+  // the real-world rate the ceiling's own review measured. This read is only an
+  // early refusal: #932a (I16-W06D) — the budget is the CHECKED claim taken
+  // before the batch below, one per `account_added` draft, as on the creator
+  // door (creator-passkey-routes.ts) and the action budget (RG-AUTH-06).
+  const assertBucket = `assert:${passportId}`;
+  if (adds.length > 0 && (await rateLimitCount(db, assertBucket, nowMs, RL_DAY_MS)) + adds.length > ASSERTIONS_PER_DAY) {
+    throw new AgencyError("too many new accounts today — prove the ones already on your passport, or try again tomorrow", 429);
+  }
+  // I3-0685: every OTHER agency action (revokes, war opt-in/out) draws on its
+  // own per-passport day budget. This read is only an early refusal; the budget
+  // is enforced by the checked claim taken just before the batch (RG-AUTH-06).
+  const others = drafts.filter((d) => d.event_type !== "account_added");
+  const actBucket = `agencyact:${passportId}`;
+  if (others.length > 0 && (await rateLimitCount(db, actBucket, nowMs, RL_DAY_MS)) + others.length > AGENCY_ACTIONS_PER_DAY) {
+    throw new AgencyError("too many account changes for this creator today — try again tomorrow", 429);
+  }
+  // X1 — THE SAME ASSERTION CEILING, ON THE OTHER DOOR (review, HIGH).
+  //
+  // The fold stamps an agency add as `added_by = 'agency'`, and the ceiling's
+  // predicate counts creator AND agency rows — so this door was COUNTED by the
+  // bound and never GATED by it. An agency holding one `manage_accounts` grant
+  // could assert without limit on the granted passport, permanently squatting
+  // every key it named, and could push the creator's own count past the ceiling
+  // to lock them out of `/account/creator-action` as well. One predicate, both
+  // doors, or the bound is a suggestion on whichever door forgot it.
+  const guards = adds.map((d) => {
+    const p = d.payload;
+    // I6RGA-03: an unmappable account (unknown platform, unrepresentable id) is
+    // the caller's input to fix — a 400, never an uncaught 500. subjectForAccount
+    // is pure (it reads no suppression table), so this refusal is not an oracle.
+    let key: string;
+    try {
+      key = subjectForAccount(String(p.platform), String(p.id_kind), String(p.id)).canonical;
+    } catch {
+      throw new AgencyError("unrecognised account — check its platform, id kind and id", 400);
+    }
+    return assertionCeilingStatement(db, passportId, key, nowMs);
+  });
+  // A-22 — the grant re-verified LIVE, inside the SAME batch as the write
+  // (see agencyStillGrantedStatement) — riding every action, not only adds.
+  guards.push(agencyStillGrantedStatement(db, agencyId, passportId, scope));
+  // I3-0335 — the actor re-verified LIVE in the same batch (agencyActorLiveStatement).
+  if (actor !== undefined) guards.push(agencyActorLiveStatement(db, agencyId, actor));
+  if (audit !== undefined) guards.push(audit);
+  // AGENCY_ACTIONABLE as the governed list: the war consent types (S-CW4) are
+  // deliberately NOT in APPEND_ALLOWED (general callers can't mint consent), so
+  // this authorized door must name what it opens — exactly the actions already
+  // checked against the grant's scope above, nothing wider.
+  // RG-AUTH-06 (I15-FX3): CLAIM the action budget, CHECKED, before the batch —
+  // `consumeRateLimit` is one atomic statement and its boolean is the verdict
+  // (broadcast.ts `claimBroadcastSlot`). A peek before the batch and an
+  // unchecked charge after it let N concurrent actions at cap-1 all land. A
+  // refused claim, or a batch that then fails, hands back what this call claimed.
+  let claimed = 0;
+  let claimedAdds = 0;
+  const refundClaimed = async () => {
+    for (; claimed > 0; claimed--) await refundRateLimit(db, actBucket, nowMs, RL_DAY_MS);
+    for (; claimedAdds > 0; claimedAdds--) await refundRateLimit(db, assertBucket, nowMs, RL_DAY_MS);
+  };
+  // #932a: the add budget is claimed the same way, one checked claim per add.
+  for (let i = 0; i < adds.length; i++) {
+    if (!(await consumeRateLimit(db, assertBucket, nowMs, ASSERTIONS_PER_DAY, RL_DAY_MS))) {
+      await refundClaimed();
+      throw new AgencyError("too many new accounts today — prove the ones already on your passport, or try again tomorrow", 429);
+    }
+    claimedAdds++;
+  }
+  for (let i = 0; i < others.length; i++) {
+    if (!(await consumeRateLimit(db, actBucket, nowMs, AGENCY_ACTIONS_PER_DAY, RL_DAY_MS))) {
+      await refundClaimed();
+      throw new AgencyError("too many account changes for this creator today — try again tomorrow", 429);
+    }
+    claimed++;
+  }
+  let events: TrustEventEnvelope[];
+  try {
+    events = await appendEvents(db, drafts, now, [...AGENCY_ACTIONABLE], guards, privileged);
+  } catch (e) {
+    await refundClaimed();
+    // THE CEILING'S REFUSAL IS A SENTENCE, NOT A CONSTRAINT NAME (mirrors
+    // creator-passkey-routes.ts's translation of the same NOT NULL failure —
+    // this door threw it as a raw D1 error into agency-routes.ts's generic
+    // `{"error":"error"}` catch-all, which is F-07's other half).
+    if (e instanceof Error && /NOT NULL/i.test(e.message) && /assertion_gate/.test(e.message)) {
+      throw new AgencyError(
+        `you can hold ${MAX_OUTSTANDING_ASSERTIONS} unproven accounts at a time — prove one of the accounts already on your passport to free a slot`,
+        409,
+      );
+    }
+    // A-22's live re-check fails the same way (agencies.status driven to
+    // NULL): report it as the same refusal the up-front check gives, not as
+    // a raw constraint name.
+    if (e instanceof Error && /NOT NULL/i.test(e.message) && /agencies/.test(e.message)) {
+      if (actor !== undefined && !(await agencyActorStillLive(db, agencyId, actor))) throw new AgencyError("your session or seat no longer authorizes this action", 403);
+      throw new AgencyError("no active grant for this passport", 403);
+    }
+    // I6-LEDGER hand-off 4 + D-0861(1): a ledger refusal is a 409 AgencyError
+    // carrying ONE fixed sentence, never e.message — the ledger's sentence would
+    // tell an agency that a key was delisted at its subject's request (I6RGA-02).
+    if (e instanceof LedgerError) throw new AgencyError(AGENCY_LEDGER_REFUSAL, 409);
+    throw e;
+  }
+  return events;
+}
+
+export interface AgencyActionInput {
+  event_type: EventType;
+  payload: Record<string, unknown>;
+  supersedes?: string[];
+}
+
+/** Build agency drafts (server fixes subject/actor_kind/actor_id). */
+export function buildAgencyDrafts(passportId: string, agencyId: string, actions: AgencyActionInput[]): DraftEvent[] {
+  return actions.map((a) => ({
+    event_type: a.event_type,
+    subject: passportId,
+    actor_kind: "agency" as ActorKind,
+    actor_id: agencyId,
+    payload: a.payload,
+    supersedes: a.supersedes ?? [],
+  }));
+}
+
+// --- Agency-facing reads (for the agency self-service dashboard) ---
+// These are scoped to ONE agency (the session's) and expose only what an
+// authorized agency may see about a granted creator — the roster (accounts) and
+// releases. They deliberately do NOT expose payout tags or the review queue,
+// which are operator-only (creatorDetail).
+
+export interface AgencyCreator {
+  passport_id: string;
+  display_name: string;
+  claim_state: string;
+  scope: string;
+}
+
+/** The creators that currently grant THIS agency a live scope, retracted
+ * passports excluded. I4-18-R3 sibling (I3-2167, D-0840(5)): read from the
+ * `agency_report_grants` projection (0139) that `events.ts` writes in the batch
+ * of every agency_authorized/agency_revoked append (later seq wins, scope NULL
+ * once revoked) — one row per pair, instead of folding the whole grant log.
+ * I66 P8 (D-1583, D-1082(1)): `claim_state` is the class a fan is shown at `nowMs` (standing.ts `shownClassSql`, as
+ * agencyCreatorView reads it): a `verified` row whose latest grant or renewal has lapsed reads `claimed`. The instant
+ * rides as a literal (`withInstantLiteral`), so each IN chunk keeps its IN_CHUNK binds. */
+export async function agencyGrantedCreators(db: DbLike, agencyId: string, limit?: number, nowMs: number = Date.now()): Promise<AgencyCreator[]> {
+  if (!AGENCY_ID_RE.test(agencyId)) return [];
+  const { results } = await db
+    .prepare(`SELECT passport_id, scope FROM agency_report_grants WHERE agency_id = ? AND scope IS NOT NULL ORDER BY updated_seq ASC${limit === undefined ? "" : " LIMIT ?"}`)
+    .bind(...(limit === undefined ? [agencyId] : [agencyId, limit]))
+    .all<{ passport_id: string; scope: string }>();
+  const live: [string, string][] = results.map((r) => [r.passport_id, r.scope]);
+  // S-04 — ONE SELECT PER CREATOR, on a roster nothing bounds the size of.
+  //
+  // The log scan above is already one statement; this loop used to spend a
+  // SECOND one per granted passport just to read display_name/claim_state/
+  // retracted — 401 statements for a 400-creator roster, inside one Worker
+  // request. Chunked the same way `agencyGatingApexes` chunks its own IN
+  // query: one statement per `IN_CHUNK`-sized batch of passport ids instead
+  // of one per id, so the statement count scales with the roster divided by
+  // the chunk size, not with the roster itself.
+  const rows = new Map<string, { display_name: string; claim_state: string; retracted: number }>();
+  for (const chunk of inChunks(live.map(([passportId]) => passportId))) {
+    const { results } = await db
+      // I3-0893: a delisted passport is left out exactly as a retracted one is.
+      .prepare(
+        `SELECT passport_id, display_name, ${withInstantLiteral(shownClassSql("p"), nowMs)} AS claim_state, retracted FROM passports p WHERE passport_id IN (${chunk.map(() => "?").join(",")}) AND NOT EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = p.passport_id) AND NOT ${CREATOR_CLOSED_READ_LAPSED_SQL("p.passport_id")}`,
+      )
+      .bind(...chunk)
+      .all<{ passport_id: string; display_name: string; claim_state: string; retracted: number }>();
+    for (const r of results) rows.set(r.passport_id, r);
+  }
+  const out: AgencyCreator[] = [];
+  for (const [passportId, scope] of live) {
+    const row = rows.get(passportId);
+    if (!row || row.retracted === 1) continue;
+    out.push({ passport_id: passportId, display_name: row.display_name, claim_state: row.claim_state, scope });
+  }
+  return out;
+}
+
+/** I3-0684 b (I22-W1-AUTH): the most grants GET /agency/creators returns in one answer. */
+export const AGENCY_ROSTER_MAX = 500;
+
+/**
+ * I3-0684 b: the roster read the route serves — at most AGENCY_ROSTER_MAX grants (in grant order), and
+ * `truncated: true` when the agency holds more, so the caller never reads a capped list as the whole roster.
+ * The grants are read with LIMIT max + 1; `creators` may be shorter than max because retracted and delisted
+ * passports are left out after the read, and `truncated` is about the GRANTS, not that filtered list.
+ */
+export async function agencyRoster(db: DbLike, agencyId: string, nowMs: number = Date.now()): Promise<{ creators: AgencyCreator[]; truncated: boolean }> {
+  const grants = await db
+    .prepare("SELECT COUNT(*) AS n FROM (SELECT 1 FROM agency_report_grants WHERE agency_id = ? AND scope IS NOT NULL LIMIT ?)")
+    .bind(agencyId, AGENCY_ROSTER_MAX + 1)
+    .first<{ n: number }>();
+  return { creators: await agencyGrantedCreators(db, agencyId, AGENCY_ROSTER_MAX, nowMs), truncated: (grants?.n ?? 0) > AGENCY_ROSTER_MAX };
+}
+
+/**
+ * I3-0752 (D-0920, option A) — THE AGENCY'S OWN ACTIVITY LOG, read-only.
+ *
+ * Every seat-attributed agency write lands one `audit_log` row (actor_kind
+ * 'agency', actor_id = the acting member) — agency-routes.ts and the batched
+ * roster writes in agency_members.ts. Only the operator console could read
+ * them. This is the agency's view of its OWN rows, and nothing more:
+ *  - SCOPE: rows whose actor is a CURRENT member of this agency (member ids are
+ *    minted globally unique, `agm_` + 16 hex). A removed member's own past rows
+ *    leave the view with them; the removal row itself, written by the admin who
+ *    removed them, stays.
+ *  - ACTION ALLOWLIST: only the seat actions below; any other action word the
+ *    table carries never leaves.
+ *  - NO DETAIL TEXT: `detail` carries free text (an enrolled email, a seat
+ *    label); the view returns the action word, the seat, the time and —
+ *  - ITEM ONLY FOR A PASSPORT THIS AGENCY HOLDS A LIVE GRANT ON NOW
+ *    (`agency_report_grants`, scope NOT NULL); every other item is null.
+ * Newest first, at most AGENCY_ACTIVITY_LIMIT rows (a LIMITed read: the caller
+ * may conclude nothing about older rows except that they exist or not).
+ */
+export const AGENCY_ACTIVITY_ACTIONS: readonly string[] = [
+  "agency:ledger_action",
+  "agency:member_added",
+  "agency:member_role_change",
+  "agency:member_removed",
+  "agency:seat_minted",
+  "agency:seat_revoked",
+  "agency:domain_start",
+  "agency:domain_verified",
+  "agency:creator_resigned",
+  // I38-AGCRED AGC-05: credentials.ts AGENCY_CREDENTIALS_ISSUED_ACTION / _REVOKED_ACTION (literals: credentials.ts imports this module).
+  "agency:credentials_issued",
+  "agency:credentials_revoked",
+];
+export const AGENCY_ACTIVITY_LIMIT = 100;
+
+export interface AgencyActivityRow {
+  at: string;
+  action: string;
+  seat: string;
+  passport_id: string | null;
+}
+
+export async function agencyActivity(db: DbLike, agencyId: string): Promise<AgencyActivityRow[]> {
+  if (!AGENCY_ID_RE.test(agencyId)) return [];
+  const { results } = await db
+    .prepare(
+      `SELECT a.created_at AS at, a.action AS action, a.actor_id AS seat,
+              CASE WHEN EXISTS (SELECT 1 FROM agency_report_grants g WHERE g.agency_id = ? AND g.passport_id = a.item_id AND g.scope IS NOT NULL)
+                   THEN a.item_id END AS passport_id
+         FROM audit_log a
+        WHERE a.actor_kind = 'agency' AND a.action IN (SELECT value FROM json_each(?))
+          AND a.actor_id IN (SELECT m.member_id FROM agency_members m WHERE m.agency_id = ?)
+        ORDER BY a.audit_id DESC
+        LIMIT ?`,
+    )
+    .bind(agencyId, JSON.stringify(AGENCY_ACTIVITY_ACTIONS), agencyId, AGENCY_ACTIVITY_LIMIT)
+    .all<AgencyActivityRow>();
+  return results.map((r) => ({ at: r.at, action: r.action, seat: r.seat, passport_id: r.passport_id ?? null }));
+}
+
+/**
+ * I3-0753 (D-0920, option A) — AN AGENCY MAY END ITS OWN GRANT.
+ *
+ * Appends `agency_revoked` for (this agency, this passport) through the same
+ * ledger door every grant event uses, marked actor_kind 'agency' (actor_id =
+ * the agency, as `buildAgencyDrafts` marks every agency event), so every reader
+ * that folds the grant log ("later event wins": activeGrantScope,
+ * liveGrantsForPassport, the agency_report_grants projection, credentials.ts)
+ * drops the grant with no reader change. The payload's agency is ALWAYS the
+ * caller's: an agency can only end a grant it holds, so a foreign or
+ * non-granted passport answers false (one 404 at the door). Exit is wider than
+ * entry, as for the creator and the operator: a resign is NOT refused for a
+ * delisted passport. The acting seat is re-checked live and its audit row
+ * written in the SAME batch as the append (I16 #863's rule for new doors).
+ *
+ * NEEDS packages/schema ACTOR_POLICY.agency_revoked to admit "agency"
+ * (I16-W03D hand-off); until then the ledger refuses the append (409).
+ */
+export async function resignAgencyGrant(
+  db: DbLike,
+  agencyId: string,
+  passportId: string,
+  seatMemberId: string,
+  actor?: AgencyActor,
+  now: () => string = () => new Date().toISOString(),
+): Promise<boolean> {
+  if (!AGENCY_ID_RE.test(agencyId)) throw new AgencyError("bad agency id");
+  if (!/^psp_[0-9a-f]{16}$/.test(passportId)) return false;
+  if ((await activeGrantScope(db, agencyId, passportId)) === null) return false;
+  const at = now();
+  const extra: DbStatement[] = [];
+  if (actor !== undefined) extra.push(agencyActorLiveStatement(db, agencyId, actor));
+  extra.push(
+    db
+      .prepare("INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) VALUES (?, 'agency:creator_resigned', ?, ?, ?, 'agency')")
+      .bind(seatMemberId, `agency ${agencyId} ended its grant`, at, passportId),
+  );
+  try {
+    await appendEvents(
+      db,
+      [{ event_type: "agency_revoked", subject: passportId, actor_kind: "agency", actor_id: agencyId, payload: { agency_id: agencyId } }],
+      () => at,
+      ["agency_revoked"],
+      extra,
+      ["agency"],
+    );
+  } catch (e) {
+    if (e instanceof Error && /NOT NULL/i.test(e.message) && /agencies/.test(e.message)) throw new AgencyError("your session or seat no longer authorizes this action", 403);
+    if (e instanceof LedgerError) throw new AgencyError(AGENCY_LEDGER_REFUSAL, 409);
+    throw e;
+  }
+  return true;
+}
+
+export interface AgencyCreatorView {
+  passport_id: string;
+  display_name: string;
+  claim_state: string;
+  scope: string;
+  accounts: { account_key: string; platform: string; id_kind: string; id: string; url: string | null; status: string; relationship_basis: string }[];
+  releases: { release_id: string; title: string; version: string; status: string; item_count: number }[];
+  /** F-G5: whether the grant's scope covers each half. An empty list with the
+   * flag FALSE is "not yours to see"; empty with the flag TRUE is "there is
+   * nothing". The console must be able to tell them apart — rendering the first
+   * as the second is how an agency concludes a creator has no accounts. */
+  accounts_in_scope: boolean;
+  releases_in_scope: boolean;
+}
+
+/** One granted creator's roster + releases, for the agency dashboard. Returns
+ * null when this agency holds no live grant on the passport (the caller turns
+ * that into a 404 — an agency can't probe passports it wasn't granted).
+ *
+ * S-CW4 (review F3): the narrow `war` scope is documented to creators as
+ * "exactly the two war actions and nothing else", so a war-only grant gets the
+ * grant CARD (name, claim state, its own scope) but NOT the management detail
+ * — roster and releases stay empty. Largely-public data or not, a scope's
+ * reads must match what the creator was told they granted. */
+export async function agencyCreatorView(db: DbLike, agencyId: string, passportId: string, nowMs: number = Date.now()): Promise<AgencyCreatorView | null> {
+  const scope = await activeGrantScope(db, agencyId, passportId);
+  if (scope === null) return null;
+  const p = await db.prepare(`SELECT display_name, ${shownClassSql("p")} AS claim_state, retracted FROM passports p WHERE passport_id = ?`).bind(new Date(nowMs).toISOString(), passportId).first<{ display_name: string; claim_state: string; retracted: number }>(); // I3-1768 (D-1084(1), I32-FX2-SERVER): the class a fan is shown — a lapsed grant (standing.ts grantLiveAtSql) reads claimed.
+  if (!p) return null;
+  // F-05 / AS-043 — a retracted creator vanishes from `agencyGrantedCreators`
+  // (the roster list, which already excludes `retracted === 1`) but this
+  // detail read had no such check: an agency that once held a grant on a
+  // creator who has since retracted their passport kept getting the FULL
+  // roster + catalogue back here, forever. Same fact, same table row, one
+  // read honored it and the other never asked.
+  if (p.retracted === 1) return null;
+  // I3-0893: delisted at the subject's request -> the same null (404) as no grant.
+  if (await isDelisted(db, passportId)) return null;
+  // I20-Q9: closed AGENCY_CLOSED_READ_DAYS ago or more -> the same null (404) as no grant.
+  if (await creatorClosedReadLapsed(db, passportId)) return null;
+  if (scope === "war") {
+    return { passport_id: passportId, display_name: p.display_name, claim_state: p.claim_state, scope, accounts: [], releases: [], accounts_in_scope: false, releases_in_scope: false };
+  }
+  // F-G5: each half follows the scope that authorizes acting on it. An empty
+  // list here means "your grant does not cover this", not "there is nothing" —
+  // the flags below let the console say which, instead of rendering an absence
+  // as a fact.
+  const accounts = ACCOUNT_SCOPES.has(scope)
+    ? (await db.prepare("SELECT account_key, platform, id_kind, id, url, status, relationship_basis FROM passport_accounts WHERE passport_id = ? ORDER BY platform, id").bind(passportId).all<AgencyCreatorView["accounts"][number]>()).results
+    : [];
+  const releases = SALES_SCOPES.has(scope) ? await listReleases(db, passportId) : [];
+  return {
+    passport_id: passportId,
+    display_name: p.display_name,
+    claim_state: p.claim_state,
+    scope,
+    accounts,
+    releases,
+    accounts_in_scope: ACCOUNT_SCOPES.has(scope),
+    releases_in_scope: SALES_SCOPES.has(scope),
+  };
+}
+===== END FILE: services/trust-core/src/agencies.ts =====
+
+===== BEGIN FILE: services/trust-core/src/agency-analytics-routes.ts =====
+import { Hono } from "hono";
+import { activeGrantScope, creatorClosedReadLapsed, scopeAllowsReports } from "./agencies.js";
+import { roleHasCap, type AgencyCap } from "./agency_members.js";
+import { backCatalog } from "./back-catalog.js";
+import { d1, type DbLike } from "./db.js";
+import { dailyIntelligence, IntelError, isVerifiedPassport } from "./intelligence.js";
+import { nicheRank } from "./rankings.js";
+import { FrozenNotReady, dailyRoi, frozenRead } from "./roi.js";
+import { agencyPrincipal, r2Store, errorBody } from "./route-helpers.js";
+import type { ConditionalObjectStore } from "@dhwaja/schema";
+import type { Env } from "./env.js";
+
+/**
+ * THE AGENCY MIRROR OF THE CREATOR DASHBOARDS — the same four private analytics,
+ * reached through a creator-granted scope instead of the creator's own session.
+ *
+ * BOUNDARY. `/agency/intelligence/:id`, `/agency/roi/:id`,
+ * `/agency/attribution/:id` and `/agency/back-catalog/:id`, plus the ONE gate
+ * they all pass through. That shared gate is the point of the module: this set
+ * used to disagree with itself — `/agency/intelligence` checked only that a
+ * grant EXISTED and never what it SAID, so a narrow `manage_accounts` grant
+ * bought a creator's audience intelligence while its three siblings correctly
+ * refused (review A2-HIGH). Keeping the four routes and their resolver in one
+ * bounded file is what makes that class of drift visible.
+ *
+ * The agency SESSION surface (login, roster, granted-creator list) is a
+ * different concern and lives in `agency-routes.ts`.
+ *
+ * AND THE DAY-FREEZE IS PART OF THE MIRROR. `/agency/roi/:id` and
+ * `/agency/attribution/:id` recomputed live while `/agency/intelligence/:id`
+ * served a frozen snapshot — so the narrower authorization gate was being held
+ * to a stricter standard than the privacy control underneath it, and a granted
+ * agency held a differencing primitive over somebody else's fanbase that the
+ * creator themself was denied. All three now read through the same freeze
+ * (`roi.ts frozenRead`), which also means an agency's reads never compute and
+ * therefore cannot burn any budget of the creator's at all.
+ */
+export function makeAgencyAnalyticsRoutes(): Hono<{ Bindings: Env }> {
+  const app = new Hono<{ Bindings: Env }>();
+
+  /** FAIL CLOSED (invariant 6) — see the identical helper in
+   * `intelligence-routes.ts`: with no snapshot store there is nowhere to freeze
+   * the day, and the only alternative is the live recomputation the freeze
+   * exists to remove. */
+  const frozenStore = (env: Env): ConditionalObjectStore | null => (env.REGISTRY_BUCKETS ? r2Store(env.REGISTRY_BUCKETS) : null);
+  const UNAVAILABLE = { error: "analytics_unavailable", detail: "the analytics snapshot store is not configured" };
+
+
+  // The creator's PRIVATE audience intelligence, read by an AUTHORIZED agency seat.
+  // Gated by `resolveAgencyGrantedRead` — the SAME gate stack as the three sibling
+  // dashboards below, and that is the fix (review A2-HIGH): this route used to
+  // check `hasActiveGrant` alone, which asks whether a grant EXISTS and never what
+  // it says. A creator who signed a narrow `manage_accounts` grant ("look after my
+  // linked accounts") thereby handed over their audience intelligence too, while
+  // /agency/roi, /agency/attribution and /agency/back-catalog — the same class of
+  // private performance data, resolved through `scopeAllowsReports` — correctly
+  // refused the same grant with `grant_scope_forbidden`. One route disagreeing with
+  // its three siblings is exactly the drift the shared helper exists to prevent, so
+  // the check is not repaired in place: the route is moved onto the helper.
+  app.get("/agency/intelligence/:id", async (c) => {
+    const g = await resolveAgencyGrantedRead(c, "analytics");
+    if ("status" in g) return c.json(g.body, g.status);
+    const store = frozenStore(c.env);
+    if (!store) return c.json(UNAVAILABLE, 503);
+    try {
+      return c.json(await dailyIntelligence(store, g.passportId, Date.now(), { build: false }));
+    } catch (e) {
+      // The dashboard is built on the cron, and this creator has no snapshot
+      // yet. A LIVE COMPUTE here would hand back exactly the differencing
+      // primitive the freeze exists to remove, so the answer is "not yet".
+      if (e instanceof FrozenNotReady) return c.json({ error: e.message, retry: "daily" }, 503);
+      if (e instanceof IntelError) return c.json(errorBody(e), e.status);
+      // I3-0971: an unexpected fault is a 500 via app.onError, never a 400.
+      throw e;
+    }
+  });
+
+  // Shared gate for an agency reading a GRANTED creator's PRIVATE dashboard. One
+  // implementation so every granted-read route is gated byte-identically to
+  // /agency/intelligence/:id (no drift across copies): a valid, non-rotated, active
+  // agency session → the required capability → the agency is not operator-suspended
+  // → an ACTIVE grant from THIS creator → the creator is verified. Returns the
+  // resolved {db, passportId} or a typed error to relay. The suspension + grant +
+  // verified checks all fail closed.
+  async function resolveAgencyGrantedRead(
+    c: { env: Env; req: { header: (k: string) => string | undefined; param: (k: string) => string } },
+    cap: AgencyCap,
+  ): Promise<{ db: DbLike; passportId: string } | { status: 401 | 403; body: Record<string, string> }> {
+    const principal = await agencyPrincipal(c);
+    if (!principal) return { status: 401, body: { error: "unauthorized" } };
+    if (!roleHasCap(principal.role, cap)) return { status: 403, body: { error: "role_forbidden", detail: `your role cannot view ${cap}` } };
+    const db = d1(c.env.TRUST_DB);
+    // Operator suspension is a kill-switch for this privacy-sensitive read (the
+    // grant alone survives suspension; the read path must re-check, like the write).
+    const agency = await db.prepare("SELECT status FROM agencies WHERE agency_id = ?").bind(principal.agencyId).first<{ status: string }>();
+    if (!agency || agency.status !== "active") return { status: 403, body: { error: "agency suspended" } };
+    const passportId = c.req.param("id");
+    // The grant must exist AND be sales-capable (manage_sales / manage_all). A pure
+    // manage_accounts grant does NOT unlock the creator's private financial
+    // dashboards (scope-creep guard) — a distinct 403 so a legit agency (which sees
+    // its own grant scope on /agency/creators) knows to ask for a broader grant.
+    const scope = await activeGrantScope(db, principal.agencyId, passportId);
+    if (scope === null) return { status: 403, body: { error: "no active grant" } };
+    // I20-Q9 (agencies.ts AGENCY_CLOSED_READ_DAYS): a creator closed that long ago answers as if no grant were held.
+    if (await creatorClosedReadLapsed(db, passportId)) return { status: 403, body: { error: "no active grant" } };
+    if (!scopeAllowsReports(scope)) return { status: 403, body: { error: "grant_scope_forbidden", detail: `the grant scope '${scope}' does not authorize reports` } };
+    if (!(await isVerifiedPassport(db, passportId))) return { status: 403, body: { error: "dashboards unlock at verified status" } };
+    // AN AGENCY READ NEVER BUILDS, AND NO LONGER MARKS ANYTHING (ADR-0006
+    // section 1, O-18/C5). A grant authorizes REPORTS: it does not authorize
+    // spending the creator's compute, and it does not authorize choosing the
+    // instant a day object is computed at on their behalf. The interest marker
+    // that used to be written here is gone with the mechanism it fed — it was
+    // also a day-resolution calendar of a client's private reading habits.
+    // The agency mirror stays answerable through `analytics-build.ts
+    // buildSweep`, the bounded round-robin pre-build on the artifact cron.
+    return { db, passportId };
+  }
+
+  // The creator's PRIVATE business dashboards, readable by an AUTHORIZED agency
+  // seat with the analytics capability (same cap + gate stack as
+  // /agency/intelligence/:id — admin/manager/analytics_only only; a read-only or
+  // sales/security seat is refused). These reuse the EXACT creator-side reads with
+  // the granted passport id: creatorRoi + nicheRank (S86), conversionAttribution
+  // (S87), and backCatalog (S88) — all already k-floored / fan-id-free at source.
+  // The back-catalog mirror is the one that is not frozen, and does not need to
+  // be: its archive-demand half is day-lagged and k-floored inside
+  // `requests.ts archiveDemand`, so an agency reader gets the same number at
+  // every hour of a UTC day, and nothing at all about a population below the
+  // floor.
+  app.get("/agency/roi/:id", async (c) => {
+    const g = await resolveAgencyGrantedRead(c, "analytics");
+    if ("status" in g) return c.json(g.body, g.status);
+    const store = frozenStore(c.env);
+    if (!store) return c.json(UNAVAILABLE, 503);
+    try {
+      // I3-1743: through `dailyRoi`, the frozen-only form roi.ts names as the
+      // one every route uses — not the generic `frozenRead` beneath it.
+      const roi: Awaited<ReturnType<typeof dailyRoi>> & { niche?: unknown } = await dailyRoi(store, g.passportId, Date.now(), { build: false });
+      // I3-1125 (I4-05-R8 F13, I4-10-R9 P-3): the niche line the day object
+      // sealed is served as-is, so the mirror moves with the day and not with
+      // a live ranking; a day built before the seal still reads it live.
+      const niche = roi.niche !== undefined ? roi.niche : await nicheRank(store, g.db, g.passportId);
+      return c.json({ ...roi, niche });
+    } catch (e) {
+      // The dashboard is built on the cron, and this creator has no snapshot
+      // yet. A LIVE COMPUTE here would hand back exactly the differencing
+      // primitive the freeze exists to remove, so the answer is "not yet".
+      if (e instanceof FrozenNotReady) return c.json({ error: e.message, retry: "daily" }, 503);
+      if (e instanceof IntelError) return c.json(errorBody(e), e.status);
+      // I3-0971: an unexpected fault is a 500 via app.onError, never a 400.
+      throw e;
+    }
+  });
+
+  app.get("/agency/attribution/:id", async (c) => {
+    const g = await resolveAgencyGrantedRead(c, "analytics");
+    if ("status" in g) return c.json(g.body, g.status);
+    const store = frozenStore(c.env);
+    if (!store) return c.json(UNAVAILABLE, 503);
+    try {
+      return c.json(await frozenRead(store, "attribution", g.passportId, Date.now(), { build: false }));
+    } catch (e) {
+      // The dashboard is built on the cron, and this creator has no snapshot
+      // yet. A LIVE COMPUTE here would hand back exactly the differencing
+      // primitive the freeze exists to remove, so the answer is "not yet".
+      if (e instanceof FrozenNotReady) return c.json({ error: e.message, retry: "daily" }, 503);
+      if (e instanceof IntelError) return c.json(errorBody(e), e.status);
+      // I3-0971: an unexpected fault is a 500 via app.onError, never a 400.
+      throw e;
+    }
+  });
+
+  app.get("/agency/back-catalog/:id", async (c) => {
+    const g = await resolveAgencyGrantedRead(c, "analytics");
+    if ("status" in g) return c.json(g.body, g.status);
+    try {
+      return c.json(await backCatalog(g.db, g.passportId, Date.now()));
+    } catch (e) {
+      // I3-0971: an unexpected fault is a 500 via app.onError, never a 400.
+      throw e;
+    }
+  });
+
+  return app;
+}
+===== END FILE: services/trust-core/src/agency-analytics-routes.ts =====
+
+===== BEGIN FILE: services/trust-core/src/agency-domains.ts =====
+import { canonicalAccount } from "@dhwaja/canonical";
+import { chargeAttempt } from "./claims.js";
+import type { DbLike } from "./db.js";
+import { DomainClaimError, issueDomainChallenge, lookupTxtUncharged, MAX_DOMAIN_VERIFY_ATTEMPTS, TXT_PREFIX, type DomainStartResult, type TxtLookup } from "./domain-claims.js";
+import { isRegistrableApex } from "./domain-match.js";
+import { AGENCY_DOMAIN_MAX_AGE_DAYS, agencyActorLiveSql, agencyActorStillLive, type AgencyActor } from "./agencies.js";
+import { consumeRateLimit } from "./ratelimit.js";
+import { auditStmt, auditStmtAfterWrite } from "./review.js";
+import { seatAuditStatement } from "./agency_members.js";
+
+/**
+ * F14 / HANDOFF §1.2 — AN AGENCY PROVES ITS OWN APEX.
+ *
+ * The ONE thing a row in `agency_domains` buys, stated here so the ceremony is
+ * read against it: `domainAddGate`'s SUBDOMAIN RULE steps aside for a STRICT
+ * subdomain of a proven apex, and only for a passport that has signed this
+ * agency an account-managing grant. Nothing else moves. Brands, edit distance,
+ * seam segmentation and confusables run against exactly the same rows as
+ * before, the artist still proves DNS control of their own subdomain through
+ * the ordinary `domain_add` ceremony, and the apex itself is never addable.
+ *
+ * WHY THE PROOF IS THE SAME DNS CEREMONY. `claim_challenges` with a new
+ * `purpose`, not a second proof system: one TXT flow in the product means one
+ * place where the DoH parser, the attempt debit, the live-slot rule and the
+ * expiry live. 0072 widened the table's subject CHECK by exactly one purpose
+ * and gave it an `agency_id` column, so the schema — not a convention — is what
+ * says an agency proof carries an agency and no passport.
+ *
+ * WHY APEX-ONLY, HERE, WHEN `startDomainAdd` DELIBERATELY REFUSED TO. That
+ * door's docblock explains at length why it accepts subdomains: `registrable()`
+ * splits on a CURATED suffix set rather than the PSL, so apex-only would refuse
+ * real registrants of private registries, and "a heuristic is not a licence to
+ * refuse people". THE DIRECTION OF THE ERROR IS OPPOSITE HERE. That door
+ * refuses somebody their OWN account; this one refuses an agency a PRIVILEGE
+ * over other people's, so the conservative answer is the cheap one: a curated
+ * list that is wrong about `nova.talentco.co.zz` costs an agency a support
+ * ticket. So: `isRegistrableApex(host)`, which refuses a subdomain
+ * and refuses a bare ccTLD-style suffix such as `co.uk`.
+ *
+ * WHAT IT DOES **NOT** DO, stated because an earlier draft of this docblock
+ * claimed it did. `publicSuffixLen` knows registry words, not PRIVATE
+ * registries, so `github.io`, `pages.dev`, `myshopify.com` and `blogspot.com`
+ * all read as ordinary apexes and are provable by whoever controls them (a
+ * review proved all four). Two things keep that from being a hole. The
+ * subdomain relaxation is anchored to the apex ROW — a nested tenant like
+ * `alice.github.io`, listed to somebody else, is still refused, which the same
+ * review confirmed — and the brand neutralisation is anchored to the apex
+ * HOLDER, so proving a platform's apex neutralises the platform's own brand and
+ * nobody else's. What a platform operator gains is authority over its own
+ * tenant namespace, which is what it already has in DNS.
+ *
+ * THE S-019 DIVERGENCE, STATED RATHER THAN LEFT SILENT (docket #37 (d)(ii),
+ * FAMILY-004/v2 (c)). `startDomainClaim` carried the identical refusal and
+ * DROPPED it: FINDING-0014-C-7 / INV-054 — a heuristic whose own contract
+ * declared its failure direction acceptable may not be the authorization at a
+ * door where the proof IS the authorization. It now issues the challenge for the
+ * name as given and routes an ambiguous PROVEN name to a human. This door keeps
+ * the refusal, and the decision is deliberate, not an oversight:
+ *
+ *   1. WHAT IS REFUSED IS NOT THE CALLER'S OWN ACCOUNT. The claim door's false
+ *      refusal cost `brand.com.co`'s owner her passport — her identity in the
+ *      product, with no other route to it. This door's false refusal costs an
+ *      agency ONE PRIVILEGE over other people's accounts: the subdomain
+ *      relaxation in `domainAddGate`. Every creator that agency manages can
+ *      still prove and add their own subdomain through the ordinary
+ *      `domain_add` ceremony, which is the paragraph above's point. The remedy
+ *      is a support ticket; at the claim door there was no remedy at all.
+ *
+ *   2. THE ERROR RUNS THE OTHER WAY. INV-054 is about a heuristic that REFUSES
+ *      an owner. Here the dangerous direction is ADMITTING a name that is not an
+ *      apex, because what the row buys is authority over a namespace. The claim
+ *      door's correction — issue the challenge, route the proof to review —
+ *      would, applied here, put an operator in front of every ambiguous agency
+ *      apex; that is not a bounded over-referral, it is the review queue paying
+ *      for a curated list's gaps on the grow-authority side of the product.
+ *
+ *   3. THE PREDICATE IS SHARED, SO THE DIVERGENCE IS VISIBLE. Both doors call
+ *      `isRegistrableApex` and `domain-match.ts` records which door refuses on
+ *      it and which only triages. A future edit of the curated set is still
+ *      editing a refusal — this one — and the split cannot drift between the two
+ *      doors, because there is only one copy of it.
+ *
+ * WHAT THIS LEAVES OPEN: INV-054 is `enforced` on the CLAIM limb and stays
+ * `open` on the AGENCY limb until Jason rules on it. The known false refusal is
+ * real here — a legitimate `agency.com.co` apex holder is refused — and it is
+ * written down rather than papered over, exactly as the claim door's was.
+ * FINDING-0014-C-7.
+ */
+
+/** Per-agency daily cap on proof starts. An agency listing its own apexes does
+ * this a handful of times ever; the cap exists so an authenticated seat is
+ * still not an unmetered source of outbound DoH lookups and challenge rows. */
+export const AGENCY_DOMAIN_CAP_PER_DAY = 10;
+
+/** The most apexes one agency may hold. An agency is a business with a handful
+ * of names, and every apex here is a standing relaxation of a gate — so the set
+ * is bounded rather than trusted to stay small. Counted at proof time, which is
+ * the only door that grows it. */
+export const AGENCY_DOMAIN_MAX_PER_AGENCY = 25;
+
+/** How many rows one sweep pass re-checks. Each one is an outbound DoH lookup
+ * inside a cron with a wall-clock budget, so the pass is bounded and the index
+ * `idx_agency_domain_reproved` makes it oldest-first: with a 30-day window and
+ * a daily sweep this clears a corpus of 30×BATCH before anything can go stale
+ * for want of being looked at. */
+export const AGENCY_REPROVE_BATCH = 50;
+
+/**
+ * I3-0660 (D-0829): a record CONFIRMED gone — a successful DoH answer that lacks
+ * the agency's `record_code` — ends the authorization after this many days,
+ * counted from `txt_absent_since` (the first such answer; cleared when the
+ * record is seen again). A lookup that FAILS is "unchecked": it neither stamps
+ * nor lapses. The 30-day `reproved_at` cut still applies, whichever comes first.
+ */
+export const AGENCY_TXT_ABSENT_LAPSE_DAYS = 7;
+
+/**
+ * The sweep's lookup. `null` (or a throw) means the resolver gave NO ANSWER —
+ * unchecked; `string[]` is an answer. `domain-claims.ts TxtLookup` (which folds
+ * a failure into `[]`) is assignable to this, so today's caller compiles
+ * unchanged; see the REAL — WRONG OWNER note in I4-13-R2's report for the
+ * `dohTxtLookup` half that lets a resolver failure reach this function as
+ * `null`.
+ */
+export type AgencyTxtLookup = (host: string) => Promise<string[] | null>;
+
+/** The one "confirmed gone for long enough" predicate, shared by the sweep and the console read. */
+const absentLapsed = (txtAbsentSince: string | null, nowMs: number): boolean =>
+  txtAbsentSince !== null && txtAbsentSince <= new Date(nowMs - AGENCY_TXT_ABSENT_LAPSE_DAYS * 86_400_000).toISOString();
+
+/**
+ * I3-1682 (D-0829): an operator releases one apex early (a known sale or
+ * transfer). Deletes the one `agency_domains` row and writes
+ * `agency_domain:released`, the same shape as the sweep's
+ * `agency_domain:lapsed`, only when a row was actually removed. The caller is
+ * the ops console route, which runs it inside `withDualControl` (every
+ * destructive operator action does); this function is the executor.
+ */
+export async function releaseAgencyDomain(
+  db: DbLike,
+  operator: string,
+  agencyId: string,
+  host: string,
+  nowMs: number = Date.now(),
+): Promise<{ released: boolean }> {
+  // QUEUE #942(a) (D26): the delete and its audit row in ONE batch; the row is gated `changes() = 1` on the
+  // delete (`host` is UNIQUE, migrations/0072_agency_domains.sql:71, so at most one row goes).
+  const [del] = (await db.batch([
+    db.prepare("DELETE FROM agency_domains WHERE agency_id = ? AND host = ? RETURNING host").bind(agencyId, host),
+    auditStmtAfterWrite(db, { actor: operator, action: "agency_domain:released", itemId: host, detail: agencyId, at: new Date(nowMs).toISOString() }),
+  ])) as { results?: unknown[] }[];
+  return { released: (del?.results?.length ?? 0) > 0 };
+}
+
+interface AgencyDomainRow {
+  host: string;
+  proven_at: string;
+  reproved_at: string;
+  /** True when this apex currently satisfies the read-side staleness cut, i.e.
+   * when it is actually doing anything. Shown to the agency so a lapsed record
+   * is visible in their own console rather than only as creators quietly
+   * failing to add subdomains. */
+  active: boolean;
+}
+
+/**
+ * START — mint a TXT challenge for an apex the agency says is theirs.
+ *
+ * The caller is an AUTHENTICATED agency admin (the `members` cap, checked at the
+ * route): this changes what the agency's whole roster can do, which is the same
+ * class of authority as adding a seat, not the analytics class.
+ */
+export async function startAgencyDomain(
+  db: DbLike,
+  agencyId: string,
+  rawHost: string,
+  now: () => string = () => new Date().toISOString(),
+  nowMs: number = Date.now(),
+  caller: string | null = null,
+  /** I12-FX7 (D-0884(5)): the acting seat as the route ADMITTED it. */
+  actor?: AgencyActor,
+  /** I16-W13S/W14S hand-off (W13S-start-agency-domains), landed by I16-L15: the acting seat's `agency:domain_start`
+   * audit row rides the challenge INSERT's batch (an audit fault rolls the start back); with an actor guard it is
+   * written only when the guarded INSERT wrote (`changes() = 1`), so a refused start leaves no seat row. */
+  seat?: { actorId: string },
+): Promise<DomainStartResult> {
+  // Malformed input is a 400 about the caller's OWN typing — no bit about
+  // anybody else, and it costs zero statements, so it may precede the throttle.
+  let accountKey: string;
+  let host: string;
+  try {
+    const canon = canonicalAccount("domain", "domain", rawHost);
+    accountKey = canon.canonical;
+    host = canon.id;
+  } catch {
+    throw new DomainClaimError("that is not a usable domain", 400);
+  }
+  // APEX ONLY — see the module docblock for why this door draws the line the
+  // self-serve add door deliberately does not, and § THE S-019 DIVERGENCE for
+  // why it KEEPS it after the claim door dropped it. The predicate is the one
+  // `domain-match.ts` declares, not a re-typing of it (FAMILY-004/v2 (c) P1).
+  if (!isRegistrableApex(host)) throw new DomainClaimError("an agency domain must be a registrable apex", 400);
+
+  // Keyed on the agency, not the seat: two admins share one budget.
+  if (!(await consumeRateLimit(db, `agencydom:${agencyId}`, nowMs, AGENCY_DOMAIN_CAP_PER_DAY))) {
+    throw new DomainClaimError("too many domain attempts today", 429);
+  }
+  // Suspension is a kill switch for the WRITE as well as the read. An agency
+  // the operator has stopped does not get to grow its authority in the meantime.
+  const agency = await db.prepare("SELECT status FROM agencies WHERE agency_id = ?").bind(agencyId).first<{ status: string }>();
+  if (!agency || agency.status !== "active") throw new DomainClaimError("agency suspended", 403 as 400);
+
+  // The slot scope is the AGENCY, for exactly the reason `startDomainAdd`
+  // passes a passport: `idx_claim_live` is per (account_key, caller) and
+  // `caller` is a masked IP — two agencies behind one NAT would otherwise share
+  // one live slot on a named apex.
+  // I12-FX7 (D-0884(5)) / I13-AUTHFIX (#896): THE ACTING SEAT IS RE-ASKED IN THE
+  // INSERT. `agencyActorLiveSql` rides into `issueDomainChallenge` as the INSERT's
+  // WHERE, so a logout, demotion or seat revoke that landed after the route admitted
+  // this request writes no challenge (no live slot, no token) and the caller gets 403.
+  const started = await issueDomainChallenge(
+    db, null, accountKey, host, caller, now, nowMs, "agency_domain", agencyId, agencyId,
+    actor === undefined ? null : agencyActorLiveSql(agencyId, actor),
+    seat ? [seatAuditStatement(db, seat.actorId, "agency:domain_start", host, `agency ${agencyId} started apex proof for ${host}`, now(), actor !== undefined)] : [],
+  );
+  return started;
+}
+
+/**
+ * VERIFY — spend the token, then record the apex.
+ *
+ * Order matches `verifyBrandEnrol`: nothing about who else holds this host is
+ * read until the TXT record has matched, so the only caller who can reach the
+ * "somebody else has it" answer is the one who controls the name — and that is
+ * not a secret from them.
+ */
+export async function verifyAgencyDomain(
+  db: DbLike,
+  agencyId: string,
+  challengeId: string,
+  lookupTxt: TxtLookup,
+  now: () => string = () => new Date().toISOString(),
+  nowMs: number = Date.now(),
+  /** I12-RG-AUTH-08 (D-0883(4)): the acting seat, re-asked in the proving INSERT. */
+  actor?: AgencyActor,
+  /** FXB-I16-W03D-12-domain (I16-W13S): the acting seat's `agency:domain_verified` audit row, committed IN the proving
+   * batch (an audit fault rolls the proof back) instead of best-effort after it (agency-routes.ts). */
+  seat?: { actorId: string },
+): Promise<{ ok: boolean; outcome: "verified" | "record_absent" | "expired"; host?: string; attempts_remaining?: number }> {
+  const chg = await db
+    .prepare("SELECT challenge_id, agency_id, account_key, handle, code, status, attempts, created_at, expires_at, purpose, platform_key FROM claim_challenges WHERE challenge_id = ?")
+    .bind(challengeId)
+    .first<{ challenge_id: string; agency_id: string | null; account_key: string; handle: string; code: string; status: string; attempts: number; created_at: string; expires_at: string; purpose: string; platform_key: string }>();
+  if (!chg) throw new DomainClaimError("no such challenge", 404);
+  // Purpose, platform and OWNING AGENCY all collapse into the same 404 that an
+  // unknown id gets — see CHALLENGE_PURPOSES: a distinguishable "wrong door" or
+  // "not yours" answer is an id oracle, and the agency check belongs in that set
+  // because a session is not authority over somebody else's ceremony.
+  if (chg.purpose !== "agency_domain" || chg.platform_key !== "domain" || chg.agency_id !== agencyId) throw new DomainClaimError("no such challenge", 404);
+  if (chg.status !== "issued") throw new DomainClaimError("challenge is not open", 409);
+  if (Date.parse(chg.expires_at) < nowMs) {
+    await db.prepare("UPDATE claim_challenges SET status = 'expired' WHERE challenge_id = ? AND status = 'issued'").bind(challengeId).run();
+    return { ok: false, outcome: "expired" };
+  }
+  await chargeAttempt(db, challengeId, MAX_DOMAIN_VERIFY_ATTEMPTS, (m) => new DomainClaimError(m, 409));
+  // The day budget is charged on the VERIFY half too (the MEDIUM that
+  // `verifyDomainAdd` and `verifyBrandEnrol` both fixed): ten verify attempts
+  // per challenge, each an outbound DoH lookup, is the real cost of this door.
+  // After `chargeAttempt`, so exhausting the day budget cannot dodge the debit.
+  if (!(await consumeRateLimit(db, `agencydom:${agencyId}`, nowMs, AGENCY_DOMAIN_CAP_PER_DAY))) {
+    throw new DomainClaimError("too many domain attempts today", 429);
+  }
+
+  const want = `${TXT_PREFIX}${chg.code}`;
+  // D-0932(2) / D-0933(2) (I16-W14S:7, landed by I16-L15): a lookup that itself fails is refunded and answers 503.
+  const records = await lookupTxtUncharged(db, challengeId, lookupTxt, chg.handle);
+  if (!records.includes(want)) {
+    const row = await db.prepare("SELECT attempts FROM claim_challenges WHERE challenge_id = ?").bind(challengeId).first<{ attempts: number }>();
+    return { ok: false, outcome: "record_absent", attempts_remaining: Math.max(0, MAX_DOMAIN_VERIFY_ATTEMPTS - (row?.attempts ?? MAX_DOMAIN_VERIFY_ATTEMPTS)) };
+  }
+
+  const ts = now();
+  const who = actor === undefined ? { sql: "", params: [] as (string | number)[] } : ((g) => ({ sql: ` AND ${g.sql}`, params: g.params }))(agencyActorLiveSql(agencyId, actor));
+  // ONE BATCH, and the challenge is spent in it. A verify that recorded the
+  // apex and then failed to close the challenge would leave a token good for
+  // nine more writes; a verify that closed the challenge and then failed to
+  // record would burn a proof.
+  //
+  // I3-0696 sibling (D-0983(1), I22-FX-INT): the spend is an UPSERT, as the
+  // creator doors write theirs (domain-claims.ts verifyDomainProof). A guarded
+  // `status = 'issued'` UPDATE lost a TXT record matched while the challenge was
+  // live whenever the cron (claims.ts pruneClaimChallenges) flipped the row to
+  // `expired` — or deleted it — during the lookup. Every value is `chg`'s own and
+  // the row is written `used`, so it mints nothing; a replay is still refused by
+  // the `status !== 'issued'` gate above. The DO UPDATE keeps ONE refusal: a row a
+  // concurrent verify already spent stays as that verify wrote it, so the
+  // admission gate's `proved_at = ts` term fails and THIS batch writes no apex.
+  //
+  // THE CAP IS A SUBQUERY IN THE INSERT, not a read-then-write. `agency_id`
+  // resolves to NULL — and the NOT NULL column refuses the row — when this
+  // agency is already at its ceiling, so two concurrent proofs cannot both pass
+  // a check-then-insert (the 0022 `write_admissions` shape).
+  try {
+    await db.batch([
+      db
+        .prepare(
+          `INSERT INTO claim_challenges (challenge_id, passport_id, agency_id, account_key, caller, platform_key, handle, code, status, attempts, created_at, expires_at, purpose, proved_at)
+           VALUES (?, NULL, ?, ?, '-', 'domain', ?, ?, 'used', ?, ?, ?, 'agency_domain', ?)
+           ON CONFLICT(challenge_id) DO UPDATE SET status = 'used', proved_at = excluded.proved_at WHERE claim_challenges.status <> 'used'`,
+        )
+        .bind(challengeId, agencyId, chg.account_key, chg.handle, chg.code, chg.attempts + 1, chg.created_at, chg.expires_at, ts),
+      db
+        .prepare(
+          // THE ADMISSION GATE ASKS BOTH QUESTIONS. `agency_id` resolves to NULL
+          // — and NOT NULL refuses the row — when the agency is not active, or
+          // when it is already at its ceiling on a host it does not already
+          // hold. The SUSPENSION half is here rather than at the top of the
+          // function because it has to be re-asked at the END of a ceremony that
+          // can sit open for 24 hours: a review verified an apex for an agency
+          // suspended after the start leg and the row was written (LOW — the
+          // route refuses a suspended session, so it was not reachable over
+          // HTTP, but the row survived un-suspension).
+          `INSERT INTO agency_domains (agency_id, host, proven_at, reproved_at, record_code)
+           VALUES ((SELECT ? WHERE (SELECT status FROM agencies WHERE agency_id = ?) = 'active'${who.sql}
+                        AND ((SELECT COUNT(*) FROM agency_domains WHERE agency_id = ?) < ?
+                             OR EXISTS(SELECT 1 FROM agency_domains WHERE agency_id = ? AND host = ?))
+                        AND EXISTS(SELECT 1 FROM claim_challenges WHERE challenge_id = ? AND status = 'used' AND proved_at = ?)), ?, ?, ?, ?)
+           ON CONFLICT(agency_id, host) DO UPDATE SET reproved_at = excluded.reproved_at, record_code = excluded.record_code`,
+        )
+        .bind(agencyId, agencyId, ...who.params, agencyId, AGENCY_DOMAIN_MAX_PER_AGENCY, agencyId, chg.handle, challengeId, ts, chg.handle, ts, ts, chg.code),
+      auditStmt(db, `agency:${agencyId}`, "agency_domain:proven", chg.handle, challengeId, ts),
+      ...(seat ? [seatAuditStatement(db, seat.actorId, "agency:domain_verified", chg.handle, `agency ${agencyId} proved apex ${chg.handle}`, ts, false)] : []),
+    ]);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : "";
+    // ONE APEX, ONE AGENCY (`idx_agency_domain_host`). Two agencies claiming a
+    // host is a dispute for an operator, not a pair of authorizations — and
+    // telling THIS caller is safe: they just proved they control the name.
+    if (/UNIQUE constraint failed:\s*agency_domains/i.test(msg)) {
+      throw new DomainClaimError("that domain is already proven to another agency", 409);
+    }
+    if (/NOT NULL constraint failed:\s*agency_domains\.agency_id/i.test(msg)) {
+      // The gate refuses for two reasons and the caller is owed the one that
+      // applies. A suspended agency is a fact about the CALLER'S OWN account, so
+      // there is nothing to protect by blurring it.
+      // I16-L02 (sibling of #609o): the gate's fourth question is THIS batch's
+      // spend. The batch rolled back whole; since the UPSERT (D-0983(1)) the spend
+      // fails only on a row a concurrent verify already spent (`used`), and that
+      // is the answer, not suspension or the cap. An `expired`/pruned row would
+      // have been spent, so it falls through to the questions below.
+      const live = await db.prepare("SELECT status FROM claim_challenges WHERE challenge_id = ?").bind(challengeId).first<{ status: string }>();
+      if (live?.status === "used") throw new DomainClaimError("challenge is not open", 409);
+      const a = await db.prepare("SELECT status FROM agencies WHERE agency_id = ?").bind(agencyId).first<{ status: string }>();
+      if (!a || a.status !== "active") throw new DomainClaimError("agency suspended", 403 as 400);
+      // I12-FX6: the acting-seat term is the third reason (a logout, demotion or
+      // seat revoke that landed after the route admitted this request).
+      if (actor !== undefined && !(await agencyActorStillLive(db, agencyId, actor))) throw new DomainClaimError("acting seat is no longer authorized", 403 as 400);
+      throw new DomainClaimError("this agency already holds the maximum number of domains", 409);
+    }
+    throw e;
+  }
+  return { ok: true, outcome: "verified", host: chg.handle };
+}
+
+/** The agency's own apexes, for its console. `active` is computed against the
+ * same cut `agencyGatingApexes` reads with, so what the console shows and what
+ * the gate believes cannot drift. */
+export async function agencyDomains(db: DbLike, agencyId: string, nowMs: number = Date.now()): Promise<AgencyDomainRow[]> {
+  const cutoff = new Date(nowMs - AGENCY_DOMAIN_MAX_AGE_DAYS * 86_400_000).toISOString();
+  const { results } = await db
+    .prepare("SELECT host, proven_at, reproved_at, txt_absent_since FROM agency_domains WHERE agency_id = ? ORDER BY host ASC")
+    .bind(agencyId)
+    .all<{ host: string; proven_at: string; reproved_at: string; txt_absent_since: string | null }>();
+  return results.map(({ txt_absent_since, ...r }) => ({ ...r, active: r.reproved_at >= cutoff && !absentLapsed(txt_absent_since, nowMs) }));
+}
+
+/**
+ * THE RE-PROOF SWEEP — the agency's remedy, and the reason the window is real.
+ *
+ * An agency drops the TXT record when it stops representing a roster; within
+ * `AGENCY_DOMAIN_MAX_AGE_DAYS` the apex stops relaxing anything for anyone.
+ * That is deliberately NOT a lever against an artist's EXISTING account: this
+ * only narrows what can be added NEXT (see `agencies.ts agencyGatingApexes`).
+ *
+ * A row whose record is gone is DELETED rather than left to age out, because a
+ * removed authorization should stop being one at the first pass that notices,
+ * and `agency_domains` is operational state, not ledger.
+ *
+ * FAIL-CLOSED ON LOOKUP FAILURE IS WRONG HERE, and this is the one place that
+ * argument runs the other way. `dohTxtLookup` returns [] on ANY resolver error
+ * or timeout, so treating [] as "record gone" would let one bad resolver day
+ * delete every agency's authorizations at once. So absence deletes only when the
+ * row is ALREADY past the window — by which point the gate has stopped honouring
+ * it anyway (the read-side cut), which means the conservative behaviour and the
+ * safe behaviour are the same thing: the authorization has already lapsed, and
+ * the delete is bookkeeping.
+ */
+export async function sweepAgencyDomains(
+  db: DbLike,
+  lookupTxt: AgencyTxtLookup,
+  nowMs: number = Date.now(),
+  batch: number = AGENCY_REPROVE_BATCH,
+): Promise<{ checked: number; reproved: number; lapsed: number; unchecked: number }> {
+  const cutoff = new Date(nowMs - AGENCY_DOMAIN_MAX_AGE_DAYS * 86_400_000).toISOString();
+  // ORDER BY `last_checked_at`, NOT `reproved_at` (S-13). `reproved_at` is the
+  // AUTHORIZATION fact -- it may move only when the record is actually seen --
+  // so a row that is looked at and neither re-proves nor lapses (record
+  // absent, still inside the window) has nothing else in this table allowed to
+  // advance. Ordering the queue by that same frozen fact means such a row
+  // stays oldest and is re-selected every pass: with `batch` rows
+  // simultaneously stuck this way, the sweep's progress on every OTHER row is
+  // zero until the stuck rows individually cross the cutoff on their own.
+  // `last_checked_at` (0087) is bumped in EVERY branch below, so the queue
+  // always advances past whatever it just looked at; the cutoff is still read
+  // off `reproved_at`, untouched.
+  const { results } = await db
+    .prepare("SELECT agency_id, host, reproved_at, last_checked_at, record_code, txt_absent_since FROM agency_domains ORDER BY last_checked_at ASC LIMIT ?")
+    .bind(batch)
+    .all<{ agency_id: string; host: string; reproved_at: string; last_checked_at: string; record_code: string; txt_absent_since: string | null }>();
+  const ts = new Date(nowMs).toISOString();
+  let reproved = 0;
+  let lapsed = 0;
+  let unchecked = 0;
+  for (const row of results) {
+    // I3-0660: `null` = UNCHECKED (the resolver gave no answer). It never
+    // stamps absence and never lapses anything by itself.
+    let records: string[] | null;
+    try {
+      records = await lookupTxt(row.host);
+    } catch {
+      records = null;
+    }
+    const seen = records !== null && records.includes(`${TXT_PREFIX}${row.record_code}`);
+    const confirmedAbsent = records !== null && !seen;
+    // THIS ROW'S OWN CODE, not any Dhwaja record. The published TXT is the
+    // agency's standing statement and it does not rotate — `record_code` is
+    // written at proof time and rewritten only when the agency re-runs the
+    // ceremony — so pinning to it lapses nobody honest. Matching the PREFIX
+    // alone was measured wrong: a review swept 400 days with only a FOREIGN
+    // Dhwaja code at the apex (an ordinary creator ceremony's, or the name's new
+    // owner after a sale) and the authorization never lapsed, which made "drop
+    // the record" not the agency's remedy but a third party's lever.
+    if (seen) {
+      // I3-1511: the stamp certifies THE CODE THE LOOKUP MATCHED. A ceremony
+      // that re-ran inside the DoH window rewrote `record_code` (and stamped its
+      // own, later `reproved_at`); an unguarded SET here overwrote that stamp
+      // with one taken for the superseded code, from a `ts` older than the
+      // ceremony's. So the stamp moves only while the row still holds the code
+      // that was seen, and only forwards; `last_checked_at` still advances.
+      await db
+        // I3-0660: seeing the record clears `txt_absent_since`, under the same
+        // record_code guard as the stamp.
+        .prepare(
+          "UPDATE agency_domains SET reproved_at = CASE WHEN record_code = ? AND reproved_at < ? THEN ? ELSE reproved_at END, " +
+            "txt_absent_since = CASE WHEN record_code = ? THEN NULL ELSE txt_absent_since END, last_checked_at = ? WHERE agency_id = ? AND host = ?",
+        )
+        .bind(row.record_code, ts, ts, row.record_code, ts, row.agency_id, row.host)
+        .run();
+      reproved++;
+    } else if (row.reproved_at < cutoff || (confirmedAbsent && absentLapsed(row.txt_absent_since, nowMs))) {
+      // THE DELETE IS GUARDED BY THE VALUE IT DECIDED ON. The branch above was
+      // chosen from `row.reproved_at`, read at the top of the pass; the DoH hop
+      // in between is a network round trip, and with `AGENCY_REPROVE_BATCH`
+      // sequential lookups a pass is seconds long. Pinning `record_code` makes
+      // the collision the NORMAL case rather than an exotic one: a lapsed
+      // agency's only remedy is to re-run the ceremony, which rewrites
+      // `reproved_at` AND `record_code` — and a review caught exactly that
+      // re-proof being deleted by the sweep it raced, with a false
+      // `agency_domain:lapsed` audit row written over it. Matching
+      // `reproved_at` makes the DELETE conditional on the world not having
+      // moved, and the audit row is written only if it actually did remove
+      // something, so two overlapping passes cannot both claim the same lapse.
+      // I18-FXA X-SWEEP-LAPSED (D-0949(1)): the delete and its `agency_domain:lapsed` row in ONE batch, the row
+      // gated `changes() = 1` on the delete (D26's shape, releaseAgencyDomain above): a failed row deletes nothing.
+      const [del] = (await db.batch([
+        db
+          // I3-0660: also pinned to the `txt_absent_since` it decided on (IS, so a
+          // NULL matches NULL), so a re-proof that cleared it in the window wins.
+          .prepare("DELETE FROM agency_domains WHERE agency_id = ? AND host = ? AND reproved_at = ? AND txt_absent_since IS ? RETURNING host")
+          .bind(row.agency_id, row.host, row.reproved_at, row.txt_absent_since),
+        auditStmtAfterWrite(db, { actor: "system", action: "agency_domain:lapsed", itemId: row.host, detail: row.agency_id, at: ts }),
+      ])) as { results?: unknown[] }[];
+      if ((del?.results?.length ?? 0) > 0) lapsed++;
+    } else {
+      // S-13's THIRD BRANCH: record absent, still inside the window. Nothing
+      // about the authorization changes -- `reproved_at` is untouched, exactly
+      // as before -- but `last_checked_at` still has to move, guarded the same
+      // idempotent way the delete above is, or this row (and every row like
+      // it) never leaves the head of the queue.
+      // I3-0660: a CONFIRMED absence stamps `txt_absent_since` the first time
+      // (COALESCE keeps the first stamp); an UNCHECKED pass stamps nothing.
+      if (!confirmedAbsent) unchecked++;
+      await db
+        .prepare(
+          "UPDATE agency_domains SET last_checked_at = ?, txt_absent_since = CASE WHEN ? = 1 THEN COALESCE(txt_absent_since, ?) ELSE txt_absent_since END " +
+            "WHERE agency_id = ? AND host = ? AND last_checked_at = ?",
+        )
+        .bind(ts, confirmedAbsent ? 1 : 0, ts, row.agency_id, row.host, row.last_checked_at)
+        .run();
+    }
+  }
+  return { checked: results.length, reproved, lapsed, unchecked };
+}
+===== END FILE: services/trust-core/src/agency-domains.ts =====
+
+===== BEGIN FILE: services/trust-core/src/agency-grant-read.ts =====
+import { AGENCY_ID_RE } from "@dhwaja/schema";
+import { inChunks, type DbLike } from "./db.js";
+
+/**
+ * I63-P3 R1 (D-1535, D-1539 (g), I63-W0 amendments 1 and 3): the passport's LIVE roster apexes, read without importing
+ * agencies.ts. review.ts asks this at approval, and agencies.ts reaches review.ts (agencies -> releases ->
+ * analytics-outbox -> review), so importing `agencyGatingApexes` there is a cycle i13-arch-cycles refuses.
+ *
+ * A SECOND COPY of agencies.ts `agencyGatingApexes` (its `liveGrantsForPassport` fold, `ACCOUNT_SCOPES` and the chunked
+ * `agency_domains` read with `AGENCY_DOMAIN_MAX_AGE_DAYS` and `AGENCY_TXT_ABSENT_GATE_DAYS`). The two are held equal by
+ * services/trust-core/test/i63-approve-recheck.test.ts, which runs both on one fixture (live grant, revoked grant,
+ * stale apex, absent TXT, suspended agency) and pins the constants as numbers.
+ */
+const ACCOUNT_SCOPES = new Set(["manage_accounts", "manage_all"]);
+export const ROSTER_APEX_MAX_AGE_DAYS = 30;
+export const ROSTER_TXT_ABSENT_GATE_DAYS = 7;
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+
+export async function liveRosterApexes(db: DbLike, passportId: string, nowMs: number): Promise<string[]> {
+  if (!PSP_RE.test(passportId)) return [];
+  const { results: events } = await db
+    .prepare("SELECT event_type, payload FROM trust_events WHERE subject = ? AND event_type IN ('agency_authorized','agency_revoked') ORDER BY seq ASC")
+    .bind(passportId)
+    .all<{ event_type: string; payload: string }>();
+  const scopeByAgency = new Map<string, string | null>();
+  for (const r of events) {
+    let p: { agency_id?: unknown; scope?: unknown };
+    try {
+      p = JSON.parse(r.payload) as { agency_id?: unknown; scope?: unknown };
+    } catch {
+      continue;
+    }
+    const id = String(p.agency_id);
+    if (!AGENCY_ID_RE.test(id)) continue;
+    scopeByAgency.set(id, r.event_type === "agency_authorized" ? String(p.scope) : null); // later event wins
+  }
+  const mine = [...scopeByAgency.entries()].filter(([, scope]) => scope !== null && ACCOUNT_SCOPES.has(scope)).map(([id]) => id);
+  if (mine.length === 0) return [];
+  const cutoff = new Date(nowMs - ROSTER_APEX_MAX_AGE_DAYS * 86_400_000).toISOString();
+  const absentCutoff = new Date(nowMs - ROSTER_TXT_ABSENT_GATE_DAYS * 86_400_000).toISOString();
+  const out: string[] = [];
+  for (const chunk of inChunks(mine, 2)) {
+    const { results } = await db
+      .prepare(
+        `SELECT d.host AS host
+           FROM agency_domains d
+           JOIN agencies a ON a.agency_id = d.agency_id
+          WHERE d.agency_id IN (${chunk.map(() => "?").join(",")})
+            AND a.status = 'active' AND d.reproved_at >= ?
+            AND (d.txt_absent_since IS NULL OR d.txt_absent_since > ?)`,
+      )
+      .bind(...chunk, cutoff, absentCutoff)
+      .all<{ host: string }>();
+    for (const r of results) out.push(r.host);
+  }
+  return out;
+}
+===== END FILE: services/trust-core/src/agency-grant-read.ts =====
+
+===== BEGIN FILE: services/trust-core/src/agency-routes.ts =====
+import { Hono, type Context } from "hono";
+import { unverifiedKid } from "./auth.js";
+import { agencyActivity, agencyCreatorView, AgencyError, agencyRoster, appendAgencyAction, buildAgencyDrafts, resignAgencyGrant, type AgencyActionInput, type AgencyActor } from "./agencies.js";
+import { bumpAgencyEpoch, listAgencySeats, mintAgencySeat, revokeAgencySeat, touchAgencySeat, verifyAgencyKey } from "./agency_auth.js";
+import { addAgencyMember, AGENCY_ROLES, authorizeAgencyMember, isAgencyRole, listAgencyMembers, removeMemberById, roleHasCap, seatLedgerActionAuditStatement, setMemberRole } from "./agency_members.js";
+import { d1 } from "./db.js";
+import { consumeRateLimit } from "./ratelimit.js";
+import { consumeNonce, issueNonce, NONCE_REFUSED, OIDC_NONCE_TTL_MS, OidcError, providerConfig, verifyIdToken, type OidcProvider } from "./oidc.js";
+import { agencyDomains, startAgencyDomain, verifyAgencyDomain } from "./agency-domains.js";
+import { dohTxtLookup, DomainClaimError } from "./domain-claims.js";
+import { dohResolverFromEnv } from "./env-config.js";
+import { agencyPrincipal, anonBodyLimit, callerPrefix, fanIpAllowed, HOUR_MS, oidcJwks, refusal, RATE_LIMIT_MESSAGE , errorBody } from "./route-helpers.js";
+import { AGENCY_ABSOLUTE_SECONDS, issueSession, SESSION_TTL_SECONDS, usableSessionSecret, verifySessionRotating } from "./sessions.js";
+import type { Env } from "./env.js";
+import { logError } from "./log.js";
+import { hasUnsafeDisplayText } from "@dhwaja/schema";
+
+/**
+ * I3-0764 (D-0833(4)) — the fallback for a throw no typed arm above it claimed:
+ * a storage fault, a bug, an outage is ours — logged, answered 500, never a 400
+ * that tells the caller their request was the problem.
+ */
+function serverFault(c: Context<{ Bindings: Env }>, route: string, e: unknown, code: string): Response {
+  // #859 sibling (I16-W04C hand-off, landed by I16-W05A): the ONE log line for a fault — no caller logs its own
+  // line first — and `code`, each door's literal failure name logged as `reason`, tells two faults apart. The
+  // error's CLASS only: a message can carry an address, a domain or an id (i9-848).
+  logError({ cid: crypto.randomUUID(), hop: "http", route, reason: code, msg: "unexpected route fault", err: e instanceof Error ? e.name : typeof e });
+  return c.json({ error: "internal" }, 500);
+}
+
+
+/** Per-IP throttle on the anonymous login attempt itself (key-guessing), same
+ * shape as fan-account-routes.ts's OTP-send cap — an anonymous credential
+ * endpoint gets a bucket, not an unlimited number of tries. */
+const AGENCY_LOGIN_ATTEMPTS_PER_IP_HOUR = 20;
+/** I3-0684 b: GET /agency/creators reads per agency per hour (a console refresh is one). */
+export const AGENCY_ROSTER_READS_PER_HOUR = 120;
+
+/**
+ * THE AGENCY CONSOLE'S OWN SURFACE — everything an agency principal calls with
+ * an agency session, and nothing else.
+ *
+ * BOUNDARY. This module owns `/agency/action` (the ledger write an agency makes
+ * on a granted passport), the two-factor `/agency/login` + `/agency/refresh` +
+ * `/agency/logout` session lifecycle, `/agency/whoami`, the S97 self-serve team
+ * roster (`/agency/members*`), and the granted-creator reads
+ * (`/agency/creators*`). It does NOT own the two agency surfaces that are
+ * really something else wearing an agency credential: the credential MINT
+ * (`/agency/releases/:id/credentials`) belongs with the release/credential
+ * machinery, and the four `/agency/<analytic>/:id` reads are the creator
+ * intelligence surface reached through a grant. Both stay where their
+ * non-agency twins are.
+ *
+ * WHY A FACTORY AND NOT A FILE OF `app.<verb>` CALLS. `tests/invariants/
+ * route-static.ts` refuses a router that leaves the file it is built in —
+ * `register(app)` and `import app from "./index.js"` are both in its attack
+ * corpus by name — so the only legal shape is the one `console.ts` already
+ * uses: build the router here, register on it here, return it, and let
+ * `index.ts` graft it on with `app.route("/", …)`. Hono's `route()` copies each
+ * sub-route into the parent in order, so `app.routes` — the table every
+ * route-surface guard reads — is byte-identical to what it was when these
+ * handlers sat in `index.ts`.
+ */
+/** I3-0335: the roles that may take ledger actions, derived from ROLE_CAPS. */
+const LEDGER_CAP_ROLES: readonly string[] = AGENCY_ROLES.filter((r) => roleHasCap(r, "ledger"));
+/** I12-RG-AUTH-08: the roles behind the seat (`members`) and logout (`security`) doors, derived the same way. */
+const MEMBERS_CAP_ROLES: readonly string[] = AGENCY_ROLES.filter((r) => roleHasCap(r, "members"));
+const SECURITY_CAP_ROLES: readonly string[] = AGENCY_ROLES.filter((r) => roleHasCap(r, "security"));
+/** The acting seat as the write re-asks it (agencies.ts agencyActorLiveSql). */
+function actingSeat(p: { memberId: string; epoch: number; seatId?: string; seatEpoch?: number }, capRoles: readonly string[]): AgencyActor {
+  return { memberId: p.memberId, epoch: p.epoch, capRoles, ...(p.seatId === undefined ? {} : { seatId: p.seatId, seatEpoch: p.seatEpoch }) };
+}
+
+export function makeAgencyRoutes(): Hono<{ Bindings: Env }> {
+  const app = new Hono<{ Bindings: Env }>();
+
+  // --- Agency actions (agency-session gated) ---
+  // An agency acts on a granted passport; the events carry the "by authorized
+  // agency" mark. The ledger only accepts that mark after appendAgencyAction
+  // verifies the agency is active AND holds a creator-granted authorization.
+  app.post("/agency/action", anonBodyLimit, async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "ledger")) return c.json({ error: "role_forbidden", detail: "your role cannot take ledger actions" }, 403);
+    const aid = p.agencyId;
+    const raw = await c.req.text();
+    if (raw.length > 32 * 1024) return c.json({ error: "too_large" }, 413);
+    const body = ((): { passport_id?: unknown; actions?: unknown } | null => {
+      try {
+        return JSON.parse(raw) as { passport_id?: unknown; actions?: unknown };
+      } catch {
+        return null;
+      }
+    })();
+    if (!body || typeof body.passport_id !== "string" || !Array.isArray(body.actions)) return c.json({ error: "passport_id and actions required" }, 400);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      const drafts = buildAgencyDrafts(body.passport_id, aid, body.actions as AgencyActionInput[]);
+      // I3-0335: the acting seat rides the batch (agencies.ts agencyActorLiveStatement).
+      const actor: AgencyActor = { memberId: p.memberId, epoch: p.epoch, capRoles: LEDGER_CAP_ROLES, ...(p.seatId === undefined ? {} : { seatId: p.seatId, seatEpoch: p.seatEpoch }) };
+      // A-20: the ledger event's actor_id is the AGENCY (agencies.ts buildAgencyDrafts) —
+      // record which SEAT triggered this batch, since a multi-seat agency's ledger
+      // writes are otherwise indistinguishable from each other. #863 (D-0923(6)), like the
+      // seat doors: the row rides the SAME batch as the events (appendAgencyAction `audit`),
+      // so there is no committed action without its record and no record of a refused one.
+      // I3-0988 e (I22-W1-AUTH): the row names the event ids it records (agency_members.ts seatLedgerActionAuditStatement).
+      const audit = seatLedgerActionAuditStatement(db, p.memberId ?? aid, aid, body.passport_id, drafts.length, new Date().toISOString());
+      const events = await appendAgencyAction(db, aid, body.passport_id, drafts, undefined, undefined, actor, audit);
+      return c.json({ ok: true, applied: events.length });
+    } catch (e) {
+      if (e instanceof AgencyError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/agency/action", e, "agency_action_failed");
+    }
+  });
+
+  // --- Agency auth: key + verified Apple/Google identity → session ---
+  // Login is TWO-FACTOR: the API key (possession) AND a verified OIDC identity
+  // (an Apple/Google account an operator authorized for this agency). A leaked key
+  // alone cannot sign in. The session carries the agency's current epoch; refresh
+  // slides the window and logout bumps the epoch to invalidate every session.
+  // I3-1778 (D-1080(5)): the nonce the console gives the provider is ISSUED here first, for the agency door only,
+  // expiring `OIDC_NONCE_TTL_MS` after issue. Metered per masked IP in its own bucket at the login door's number, so
+  // fetching a nonce never spends a login attempt and a flood of issues is capped.
+  app.post("/agency/login/nonce", anonBodyLimit, async (c) => {
+    if (!(await fanIpAllowed(c, "agencynonce", AGENCY_LOGIN_ATTEMPTS_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const { nonce } = await issueNonce(d1(c.env.TRUST_DB), "agency", Date.now());
+    return c.json({ nonce, expires_in: OIDC_NONCE_TTL_MS / 1000 });
+  });
+  app.post("/agency/login", anonBodyLimit, async (c) => {
+    // Anonymous, pre-auth entry point — same shape as /fan/otp/start: the IP
+    // gate runs before any parsing, so a key-guessing flood is capped even
+    // before the (now bounded, via anonBodyLimit) body read happens.
+    if (!(await fanIpAllowed(c, "agencylogin", AGENCY_LOGIN_ATTEMPTS_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const raw = await c.req.text();
+    if (raw.length > 16 * 1024) return c.json({ error: "too_large" }, 413); // belt-and-suspenders; anonBodyLimit is the real gate now
+    const body = ((): { key?: unknown; provider?: unknown; id_token?: unknown; nonce?: unknown } | null => { try { return JSON.parse(raw) as { key?: unknown; provider?: unknown; id_token?: unknown; nonce?: unknown }; } catch { return null; } })();
+    const key = typeof body?.key === "string" ? body.key.trim() : "";
+    const provider = body?.provider;
+    if (!key) return c.json({ error: "key required" }, 400);
+    if (provider !== "google" && provider !== "apple") return c.json({ error: "provider must be google or apple" }, 400);
+    if (typeof body?.id_token !== "string" || body.id_token.length === 0) return c.json({ error: "id_token required" }, 400);
+    if (typeof body?.nonce !== "string" || body.nonce.length === 0) return c.json({ error: "nonce required" }, 400);
+    const cfg = providerConfig(provider as OidcProvider, c.env as Record<string, unknown>);
+    if (!cfg) return c.json({ error: "provider_not_configured" }, 503); // fail closed
+    if (!usableSessionSecret(c.env.SESSION_SECRET)) return c.json({ error: "sessions_unavailable" }, 503);
+    const db = d1(c.env.TRUST_DB);
+    // Factor 1: the key. Uniform 401 (never reveal malformed vs unknown vs suspended).
+    const verified = await verifyAgencyKey(db, key);
+    if (!verified) return c.json({ error: "unauthorized" }, 401);
+    try {
+      const nowMs = Date.now();
+      // Factor 2: the provider-signed identity token (+ the nonce `/agency/login/nonce` issued, spent once — I3-1778).
+      // I3-0483: the presented token's kid, so a just-rotated provider key refreshes the cache early (bounded in JwksCache).
+      const jwks = await oidcJwks(cfg.jwksUrl, nowMs, unverifiedKid(body.id_token));
+      const claims = await verifyIdToken(body.id_token, cfg, jwks, Math.floor(nowMs / 1000), body.nonce);
+      if (!(await consumeNonce(db, body.nonce, "agency", nowMs))) return c.json({ error: NONCE_REFUSED }, 401);
+      // The identity must be an operator-authorized member of THIS agency.
+      const member = await authorizeAgencyMember(db, verified.agency_id, provider as OidcProvider, claims);
+      if (!member) {
+        return c.json({ error: "identity_not_authorized" }, 403);
+      }
+      // S97: the session is stamped with WHO signed in; their role is re-read from
+      // agency_members per request, so demotion/removal applies to live sessions.
+      // I3-1740 (D-0860(3)): a seat key's session names its seat and seat epoch,
+      // so revoking that seat ends it alone (agencyPrincipal).
+      const seat = verified.seat_id ? { seat: verified.seat_id, seatEp: verified.seat_epoch ?? 0 } : {};
+      const session = await issueSession(c.env.SESSION_SECRET, { kind: "agency", id: verified.agency_id, ep: verified.session_epoch, member: member.member_id, ...seat }, Math.floor(nowMs / 1000));
+      if (!session) return c.json({ error: "sessions_unavailable" }, 503);
+      // I3-1740: a seat key's last successful sign-in. Best-effort — the session
+      // above is already minted; a failed stamp must not turn it into a 401.
+      if (verified.seat_id) {
+        try {
+          await touchAgencySeat(db, verified.seat_id);
+        } catch (touchErr) {
+          logError({ cid: crypto.randomUUID(), hop: "http", route: "/agency/login", msg: "agency seat last_used_at stamp failed", err: touchErr instanceof Error ? touchErr.name : typeof touchErr });
+        }
+      }
+      const a = await db.prepare("SELECT display_name, status FROM agencies WHERE agency_id = ?").bind(verified.agency_id).first<{ display_name: string; status: string }>();
+      return c.json({ session, agency_id: verified.agency_id, member_id: member.member_id, role: member.role, display_name: a?.display_name ?? "", status: a?.status ?? "active", expires_in: SESSION_TTL_SECONDS });
+    } catch (e) {
+      if (e instanceof OidcError) return c.json(errorBody(e), e.status);
+      return c.json({ error: "unauthorized" }, 401);
+    }
+  });
+
+  app.post("/agency/refresh", async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    // A legacy (pre-S97, memberless) token is now rejected two layers earlier —
+    // `verifySession` drops an agency token with no `m` claim, and
+    // `agencyPrincipal` refuses one besides, so `p.memberId` is always a real
+    // seat here. This check is the LAST of the three and is kept deliberately:
+    // the reasoning it encodes is what must not be re-lost. Renewing a memberless
+    // token would mint a fresh 30-day admin session that names no seat, so no
+    // demotion and no removal could ever reach it — an undemotable, unremovable
+    // principal, forever, renewed by its own holder. Refusing here bounds any
+    // future re-introduction of the grace by the ORIGINAL TTL: the holder
+    // re-logs-in and comes back member-stamped.
+    if (!p.memberId) return c.json({ error: "please sign in again", detail: "this session predates team roles and cannot be renewed" }, 401);
+    // AG-02: RE-STAMP THE EPOCH THIS REQUEST WAS AUTHORIZED UNDER, NOT WHATEVER
+    // A SECOND READ NOW RETURNS.
+    //
+    // This used to be `ep: (await agencyAuthState(...))?.session_epoch ?? 0` — a
+    // fresh read of the agency row. `agencyPrincipal` had already read the epoch
+    // to authorize the caller; a rotation or an agency-wide logout landing
+    // between those two reads gave a session that was about to be revoked a
+    // replacement carrying the epoch that revoked it. Renewal is not a way into
+    // a newer generation: a new generation needs a fresh sign-in, which is the
+    // entire point of bumping the epoch.
+    //
+    // Re-stamp the SAME member too — refresh must never launder a member session
+    // into a memberless one (which, before the memberless path was closed, meant
+    // admin-by-default).
+    // I3-1740: re-stamp the SAME seat at the seat epoch that authorized this
+    // request — dropping it would launder a seat session into an agency-key one.
+    const seat = p.seatId ? { seat: p.seatId, seatEp: p.seatEpoch ?? 0 } : {};
+    // I3-0686 (D-0920): AN ABSOLUTE CEILING ON RENEWAL. Every refresh used to mint
+    // a fresh 30-day token from the old one alone, so a token stolen once could
+    // be renewed forever without the key or the identity. The session carries
+    // the instant of the SIGN-IN it descends from (`oiat`, stamped by
+    // `/agency/login` through `issueSession`; `iat` for a token minted before the
+    // claim existed), every renewal re-stamps that SAME instant, and renewal
+    // past AGENCY_ABSOLUTE_SECONDS is refused: the member signs in again.
+    // `agencyPrincipal` does not carry the claim, so the presented token is read
+    // again here; it has already verified, so a null is a race with expiry.
+    const nowSec = Math.floor(Date.now() / 1000);
+    // I7-Q4 (D-1053(4)): under every configured secret, as `agencyPrincipal` verified it — a token minted before a
+    // SESSION_SECRET rotation (the retired secret in SESSION_SECRET_PREVIOUS) renews; the new one is issued under the current.
+    const presented = (await verifySessionRotating(c.env, /^Bearer\s+(.+)$/.exec(c.req.header("Authorization") ?? "")?.[1] ?? "", nowSec))?.subject ?? null;
+    const oiat = presented?.oiat;
+    if (oiat === undefined || nowSec - oiat > AGENCY_ABSOLUTE_SECONDS) {
+      return c.json({ error: "please sign in again", detail: "this session was signed in more than 90 days ago and cannot be renewed; sign in again with your key and identity" }, 401);
+    }
+    const session = await issueSession(c.env.SESSION_SECRET, { kind: "agency", id: p.agencyId, ep: p.epoch, member: p.memberId, ...seat, oiat }, nowSec);
+    if (!session) return c.json({ error: "sessions_unavailable" }, 503);
+    return c.json({ session, expires_in: SESSION_TTL_SECONDS });
+  });
+
+  // Logout is the agency-wide kill switch: bumping the epoch invalidates EVERY
+  // session (all members). That's a security lever, so it takes the `security`
+  // cap; a role without it logs out locally by discarding its token.
+  app.post("/agency/logout", async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "security")) return c.json({ error: "role_forbidden", detail: "agency-wide logout requires a security or admin seat; discard your token to log out locally" }, 403);
+    try {
+      await bumpAgencyEpoch(d1(c.env.TRUST_DB), p.agencyId, actingSeat(p, SECURITY_CAP_ROLES));
+    } catch (e) {
+      if (e instanceof AgencyError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/agency/logout", e, "agency_logout_failed");
+    }
+    return c.json({ ok: true });
+  });
+
+  // --- Agency dashboard reads (agency-session gated) ---
+  // The agency's own view: who it identifies as, which creators grant it, and one
+  // granted creator's roster + releases. Everything is scoped to the SESSION's
+  // agency; an agency can never read a passport it wasn't granted.
+  app.get("/agency/whoami", async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    const a = await d1(c.env.TRUST_DB).prepare("SELECT display_name, status FROM agencies WHERE agency_id = ?").bind(p.agencyId).first<{ display_name: string; status: string }>();
+    if (!a) return c.json({ error: "unauthorized" }, 401);
+    return c.json({ agency_id: p.agencyId, member_id: p.memberId, role: p.role, display_name: a.display_name, status: a.status });
+  });
+
+  // --- S97: agency self-serve team management (members cap = admin) ---
+  // An agency admin manages their own roster without an operator: list seats,
+  // enroll a person with a ROLE, change a role, remove a seat. The last admin
+  // seat can never be removed or demoted (login REQUIRES an authorized identity,
+  // so an admin-less agency would be locked out until an operator intervenes) —
+  // the guard is folded into the DELETE/UPDATE, so concurrent calls can't race
+  // past it (the S94 last-passkey pattern).
+  app.get("/agency/members", async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "members")) return c.json({ error: "role_forbidden" }, 403);
+    return c.json({ members: await listAgencyMembers(d1(c.env.TRUST_DB), p.agencyId) });
+  });
+
+  app.post("/agency/members", anonBodyLimit, async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "members")) return c.json({ error: "role_forbidden" }, 403);
+    const raw = await c.req.text();
+    if (raw.length > 4 * 1024) return c.json({ error: "too_large" }, 413);
+    const body = ((): { provider?: unknown; email?: unknown; role?: unknown } | null => { try { return JSON.parse(raw) as { provider?: unknown; email?: unknown; role?: unknown }; } catch { return null; } })();
+    if (body?.provider !== "google" && body?.provider !== "apple") return c.json({ error: "provider must be google or apple" }, 400);
+    if (typeof body.email !== "string") return c.json({ error: "email required" }, 400);
+    if (!isAgencyRole(body.role)) return c.json({ error: "role must be one of admin, manager, security, campaign_operator, analytics_only, performer" }, 400);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      // AG-07: ENROLMENT IS THE ACT THAT GRANTS THE AUTHORITY, so it carries a
+      // security record naming the acting seat (`added_by` alone is deleted by a
+      // later removal). I16 #863 (D-0920): that record commits in the SAME batch
+      // as the INSERT, only if the INSERT landed (agency_members.ts SeatAudit) —
+      // no committed enrolment without its record, and no record of a refused one.
+      const r = await addAgencyMember(db, p.agencyId, body.provider, body.email, `agm:${p.memberId}`, body.role, undefined, actingSeat(p, MEMBERS_CAP_ROLES), { actorId: p.memberId, secret: c.env.SESSION_SECRET }); // I21-Q100: the member token's key (agency_members.ts memberAuditToken)
+      return c.json({ ok: true, ...r });
+    } catch (e) {
+      if (e instanceof AgencyError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/agency/members", e, "agency_member_add_failed");
+    }
+  });
+
+  app.post("/agency/members/:id/role", anonBodyLimit, async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "members")) return c.json({ error: "role_forbidden" }, 403);
+    const raw = await c.req.text();
+    if (raw.length > 1024) return c.json({ error: "too_large" }, 413);
+    const body = ((): { role?: unknown } | null => { try { return JSON.parse(raw) as { role?: unknown }; } catch { return null; } })();
+    if (!isAgencyRole(body?.role)) return c.json({ error: "role must be one of admin, manager, security, campaign_operator, analytics_only, performer" }, 400);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      const targetId = c.req.param("id");
+      // I3-0335 / I12-FX7 (D-0884(5)): the acting seat rides the UPDATE — role,
+      // agency epoch and a seat session's seat, as member add re-asks them.
+      // A-20 / AG-07: the audit row names the ACTING seat and the PREVIOUS role.
+      // I16 #863 (D-0920): it commits in the SAME batch as the UPDATE.
+      await setMemberRole(db, p.agencyId, targetId, body.role, `agm:${p.memberId}`, actingSeat(p, MEMBERS_CAP_ROLES), { actorId: p.memberId });
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof AgencyError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/agency/members/:id/role", e, "agency_member_role_failed");
+    }
+  });
+
+  app.post("/agency/members/:id/remove", async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "members")) return c.json({ error: "role_forbidden" }, 403);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      const targetId = c.req.param("id");
+      // I12-FX7 (D-0884(5)): the acting seat rides the DELETE (role, agency epoch, seat).
+      // A-20: the audit row names the ACTING seat. I16 #863 (D-0920): it commits
+      // in the SAME batch as the DELETE.
+      await removeMemberById(db, p.agencyId, targetId, `agm:${p.memberId}`, actingSeat(p, MEMBERS_CAP_ROLES), { actorId: p.memberId });
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof AgencyError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/agency/members/:id/remove", e, "agency_member_remove_failed");
+    }
+  });
+
+  // --- I3-1740 (QUEUE #777, D-0858(13)): per-seat agency keys ---------------
+  // Each seat holds its own `agk_` key (full agency scope; login stays
+  // two-factor), revocable alone while the agency key keeps working. Minting a
+  // credential is the `members` class of authority (admin-only), like adding a
+  // member. The raw key is in the mint answer ONCE and is never logged or
+  // returned again; the audit rows carry the seat id and label only.
+  app.get("/agency/seats", async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "members")) return c.json({ error: "role_forbidden" }, 403);
+    return c.json({ seats: await listAgencySeats(d1(c.env.TRUST_DB), p.agencyId) });
+  });
+
+  app.post("/agency/seats", anonBodyLimit, async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "members")) return c.json({ error: "role_forbidden" }, 403);
+    const raw = await c.req.text();
+    if (raw.length > 1024) return c.json({ error: "too_large" }, 413);
+    const body = ((): { label?: unknown } | null => { try { return JSON.parse(raw) as { label?: unknown }; } catch { return null; } })();
+    const label = typeof body?.label === "string" ? body.label.trim() : "";
+    if (label.length < 1 || label.length > 64) return c.json({ error: "label must be 1-64 printable characters" }, 400);
+    if (hasUnsafeDisplayText(label)) return c.json({ error: "label must be 1-64 printable characters, with no control characters or invisible formatting characters such as direction marks" }, 400);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      // #863 (I16-L04 hand-off): the seat's audit row rides the mint's own batch (agency_auth.ts `audit`), so a
+      // seat never exists without its record — no best-effort audit after the write.
+      const seat = await mintAgencySeat(db, p.agencyId, label, undefined, undefined, actingSeat(p, MEMBERS_CAP_ROLES), { actorId: p.memberId });
+      if (!seat) return c.json({ error: "seat_limit", detail: "this agency holds the maximum number of live seats; revoke one first" }, 409);
+      c.header("Cache-Control", "no-store");
+      return c.json({ ok: true, ...seat });
+    } catch (e) {
+      if (e instanceof AgencyError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/agency/seats", e, "agency_seat_mint_failed");
+    }
+  });
+
+  app.post("/agency/seats/:id/revoke", async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "members")) return c.json({ error: "role_forbidden" }, 403);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      const seatId = c.req.param("id");
+      // Unknown, foreign-agency and already-revoked seats answer the same 404.
+      // #863 (I16-L04 hand-off): the audit row rides the revoke's own batch (agency_auth.ts `audit`).
+      if (!(await revokeAgencySeat(db, p.agencyId, seatId, undefined, actingSeat(p, MEMBERS_CAP_ROLES), { actorId: p.memberId }))) return c.json({ error: "not_found" }, 404);
+      // D-0860(3): only the revoked seat's sessions end; the agency epoch is
+      // untouched, so every other live session (the caller's included) goes on.
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof AgencyError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/agency/seats/:id/revoke", e, "agency_seat_revoke_failed");
+    }
+  });
+
+  app.get("/agency/creators", async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p || !roleHasCap(p.role, "read")) return c.json({ error: "unauthorized" }, 401);
+    // I3-0684 b (I22-W1-AUTH): a per-agency hourly cap and a bounded read that says when it was cut.
+    const db = d1(c.env.TRUST_DB);
+    if (!(await consumeRateLimit(db, `agencyroster:${p.agencyId}`, Date.now(), AGENCY_ROSTER_READS_PER_HOUR, HOUR_MS))) return c.json(refusal("rate limit exceeded"), 429);
+    return c.json(await agencyRoster(db, p.agencyId));
+  });
+
+  app.get("/agency/creators/:id", async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p || !roleHasCap(p.role, "read")) return c.json({ error: "unauthorized" }, 401);
+    const view = await agencyCreatorView(d1(c.env.TRUST_DB), p.agencyId, c.req.param("id"));
+    if (!view) return c.json({ error: "not_found" }, 404);
+    return c.json({ creator: view });
+  });
+
+  // I3-0753 (D-0920, option A): the agency ends its OWN grant on a creator. An
+  // `agency_revoked` for (this agency, :id) through the ledger, marked
+  // actor_kind 'agency' (agencies.ts resignAgencyGrant). Changing which creators
+  // the agency represents is roster authority, so it takes the `members` cap
+  // (admin), like adding a seat. Unknown, foreign and not-granted passports all
+  // answer the same 404.
+  app.post("/agency/creators/:id/resign", async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "members")) return c.json({ error: "role_forbidden" }, 403);
+    try {
+      const ok = await resignAgencyGrant(d1(c.env.TRUST_DB), p.agencyId, c.req.param("id"), p.memberId, actingSeat(p, MEMBERS_CAP_ROLES));
+      if (!ok) return c.json({ error: "not_found" }, 404);
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof AgencyError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/agency/creators/:id/resign", e, "agency_resign_failed");
+    }
+  });
+
+  // I3-0752 (D-0920, option A): who on the team did what — the agency's own
+  // seat-attributed audit rows, read-only (agencies.ts agencyActivity: action
+  // allowlist, no detail text, passport ids only for live grants). Security
+  // review is the `security` cap (admin + security seats), the same lever as
+  // the agency-wide logout.
+  app.get("/agency/activity", async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "security")) return c.json({ error: "role_forbidden" }, 403);
+    c.header("Cache-Control", "no-store");
+    return c.json({ activity: await agencyActivity(d1(c.env.TRUST_DB), p.agencyId) });
+  });
+
+  // --- F14: the agency's own proven apexes (HANDOFF §1.2) ------------------
+  // GATED ON `members`, NOT `read` OR `analytics`, and the cap is the whole
+  // authorization argument. A proven apex relaxes `domainAddGate`'s subdomain
+  // rule for every creator who has granted this agency an account-managing
+  // scope — it changes what the agency's whole roster can do, which is the same
+  // class of authority as adding a seat, not the class of reading a dashboard.
+  // `members` is admin-only (`agency_members.ts ROLE_CAPS`).
+  app.get("/agency/domains", async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "members")) return c.json({ error: "role_forbidden" }, 403);
+    return c.json({ domains: await agencyDomains(d1(c.env.TRUST_DB), p.agencyId) });
+  });
+
+  app.post("/agency/domains/start", anonBodyLimit, async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "members")) return c.json({ error: "role_forbidden" }, 403);
+    const raw = await c.req.text();
+    if (raw.length > 1024) return c.json({ error: "too_large" }, 413);
+    const body = ((): { domain?: unknown } | null => { try { return JSON.parse(raw) as { domain?: unknown }; } catch { return null; } })();
+    if (typeof body?.domain !== "string") return c.json({ error: "domain required" }, 400);
+    // FAIL CLOSED BEFORE MINTING. With no resolver configured the ceremony can
+    // never be completed, and handing back a TXT record to publish for a proof
+    // that cannot be verified is worse than saying so (the `/brand/enrol/start`
+    // rule, same reason).
+    if (!dohResolverFromEnv(c.env as unknown as Record<string, unknown>)) return c.json({ error: "domain_verification_unavailable" }, 503);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      // I12-FX7 (D-0884(5)): the acting seat is re-asked before the token leaves.
+      // I3-0894 / I16-W13S:22 (D-0935(3)): this door relaxes domainAddGate for the agency's WHOLE granted roster — the
+      // same authority class as adding a seat — so the acting seat's `agency:domain_start` row commits IN the challenge
+      // batch (startAgencyDomain's `seat`): an audit fault rolls the start back (500), never a challenge with no seat row.
+      const result = await startAgencyDomain(db, p.agencyId, body.domain, undefined, undefined, callerPrefix(c), actingSeat(p, MEMBERS_CAP_ROLES), { actorId: p.memberId });
+      return c.json(result);
+    } catch (e) {
+      if (e instanceof DomainClaimError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/agency/domains/start", e, "agency_domain_start_failed");
+    }
+  });
+
+  app.post("/agency/domains/verify", anonBodyLimit, async (c) => {
+    const p = await agencyPrincipal(c);
+    if (!p) return c.json({ error: "unauthorized" }, 401);
+    if (!roleHasCap(p.role, "members")) return c.json({ error: "role_forbidden" }, 403);
+    const raw = await c.req.text();
+    if (raw.length > 1024) return c.json({ error: "too_large" }, 413);
+    const body = ((): { challenge_id?: unknown } | null => { try { return JSON.parse(raw) as { challenge_id?: unknown }; } catch { return null; } })();
+    if (typeof body?.challenge_id !== "string") return c.json({ error: "challenge_id required" }, 400);
+    const resolver = dohResolverFromEnv(c.env as unknown as Record<string, unknown>);
+    if (!resolver) return c.json({ error: "domain_verification_unavailable" }, 503);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      // I3-0894 / FXB-I16-W03D-12 (I16-W13S H4): the acting seat's `agency:domain_verified` row commits IN the proving
+      // batch (verifyAgencyDomain's `seat`), only on success — an audit fault rolls the proof back (500), never a
+      // committed proof with no seat record. A failed/expired attempt changes no authority and writes none.
+      const r = await verifyAgencyDomain(db, p.agencyId, body.challenge_id, dohTxtLookup(resolver), undefined, undefined, actingSeat(p, MEMBERS_CAP_ROLES), { actorId: p.memberId });
+      return c.json(r, r.ok ? 200 : 409);
+    } catch (e) {
+      if (e instanceof DomainClaimError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/agency/domains/verify", e, "agency_domain_verify_failed");
+    }
+  });
+  return app;
+}
+===== END FILE: services/trust-core/src/agency-routes.ts =====
+
+===== BEGIN FILE: services/trust-core/src/agency_auth.ts =====
+import { sha256Base64Url } from "@dhwaja/canonical";
+import type { DbLike, DbStatement } from "./db.js";
+import { agencyActorLiveSql, agencyActorStillLive, AgencyError, registerAgency, type AgencyActor } from "./agencies.js";
+import { seatAuditStatement, type SeatAudit } from "./agency_members.js";
+
+/** I12-RG-AUTH-08 (D-0883(4)): the acting member, re-asked INSIDE the seat/logout
+ * write (agencies.ts `agencyActorLiveSql`, the predicate `/agency/action` rides).
+ * Absent: no actor term (operator / test callers). A zero-row write whose actor
+ * is no longer live is refused 403, never reported as "not found" / "full". */
+function actorTerm(agencyId: string, actor: AgencyActor | undefined): { sql: string; params: (string | number)[] } {
+  if (actor === undefined) return { sql: "", params: [] };
+  const g = agencyActorLiveSql(agencyId, actor);
+  return { sql: ` AND ${g.sql}`, params: g.params };
+}
+async function refuseDeadActor(db: DbLike, agencyId: string, actor: AgencyActor | undefined): Promise<void> {
+  if (actor !== undefined && !(await agencyActorStillLive(db, agencyId, actor))) throw new AgencyError("your session or seat no longer authorizes this action", 403);
+}
+
+/**
+ * Agency API-key authentication + session revocation.
+ *
+ * An agency is issued a KEY once (at provisioning or on rotation) and exchanges
+ * it for short-lived Bearer sessions via /agency/login. We store only the key's
+ * HASH (never the raw key), and gate everything on the agency being active.
+ *
+ * `session_epoch` is the revocation lever, mirroring the fan logout-everywhere:
+ * a session carries the epoch it was minted under, and every agency-authed
+ * request checks the session's epoch is not stale. Rotating the key OR an
+ * explicit logout bumps the epoch, so old sessions stop verifying at once.
+ */
+
+const KEY_RE = /^agk_[0-9a-f]{64}$/;
+
+export function mkAgencyKey(rand: (n: number) => Uint8Array = (n) => crypto.getRandomValues(new Uint8Array(n))): string {
+  return "agk_" + [...rand(32)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Hash a key for storage/lookup via the single canonical hasher (base64url
+ * form — the hex form is reserved by the single-hasher invariant for the event
+ * chain, so agency auth uses base64url). */
+export async function hashAgencyKey(key: string): Promise<string> {
+  return sha256Base64Url(key);
+}
+
+export interface AgencyAuthState {
+  status: string;
+  session_epoch: number;
+}
+
+/** Status + current session epoch for an agency, or null if unknown. */
+export async function agencyAuthState(db: DbLike, agencyId: string): Promise<AgencyAuthState | null> {
+  const r = await db.prepare("SELECT status, session_epoch FROM agencies WHERE agency_id = ?").bind(agencyId).first<{ status: string; session_epoch: number }>();
+  return r ? { status: r.status, session_epoch: r.session_epoch } : null;
+}
+
+/** Issue/rotate an agency's key: store its hash and BUMP the epoch so any
+ * sessions minted under the previous key stop verifying. */
+export async function setAgencyKey(db: DbLike, agencyId: string, key: string, now: () => string = () => new Date().toISOString()): Promise<void> {
+  await (await agencyKeyStatement(db, agencyId, key, now)).run();
+}
+
+/** `setAgencyKey`'s write as a statement (the key is hashed here, before any batch: the hasher is async). */
+export async function agencyKeyStatement(db: DbLike, agencyId: string, key: string, now: () => string = () => new Date().toISOString()): Promise<DbStatement> {
+  const hash = await hashAgencyKey(key);
+  return db.prepare("UPDATE agencies SET key_hash = ?, key_rotated_at = ?, session_epoch = session_epoch + 1 WHERE agency_id = ?").bind(hash, now(), agencyId);
+}
+
+/** I18 #942(a) D09 (D-0946(1), census X05): provision an agency, set its key and write the caller's rows (the
+ * console's `agency:provision` audit) in ONE batch. It used to be three commits — `registerAgency`, `setAgencyKey`,
+ * then the audit — so a failure after the first left an agency with no key, and a failed audit left an unrecorded
+ * one. Refusals are `registerAgency`'s (400 bad id/name, 409 look-alike or existing). */
+export async function provisionAgency(
+  db: DbLike,
+  agencyId: string,
+  displayName: string,
+  key: string,
+  extraStatements: DbStatement[] = [],
+  now: () => string = () => new Date().toISOString(),
+): Promise<void> {
+  await registerAgency(db, agencyId, displayName, now, [await agencyKeyStatement(db, agencyId, key, now), ...extraStatements]);
+}
+
+/** Verify a presented key → the agency id + current epoch, or null. Fail-closed:
+ * malformed key, unknown/rotated key, no key set, or a suspended agency all
+ * return null (indistinguishable to the caller). */
+export async function verifyAgencyKey(db: DbLike, key: string): Promise<{ agency_id: string; session_epoch: number; seat_id?: string; seat_epoch?: number } | null> {
+  if (!KEY_RE.test(key)) return null;
+  const hash = await hashAgencyKey(key);
+  const r = await db.prepare("SELECT agency_id, status, session_epoch FROM agencies WHERE key_hash = ?").bind(hash).first<{ agency_id: string; status: string; session_epoch: number }>();
+  if (r) return r.status === "active" ? { agency_id: r.agency_id, session_epoch: r.session_epoch } : null;
+  // I3-1740: a SEAT key (agency_seats.key_hash, same format and hasher). Only a
+  // live seat (`revoked_at IS NULL`) of an active agency answers; the session it
+  // mints carries the AGENCY epoch (an agency-wide logout/rotation ends it too)
+  // AND the seat id + seat epoch (revoking the seat ends it alone).
+  const s = await db
+    .prepare("SELECT s.seat_id, s.session_epoch AS seat_epoch, a.agency_id, a.status, a.session_epoch FROM agency_seats s JOIN agencies a ON a.agency_id = s.agency_id WHERE s.key_hash = ? AND s.revoked_at IS NULL")
+    .bind(hash)
+    .first<{ seat_id: string; seat_epoch: number; agency_id: string; status: string; session_epoch: number }>();
+  if (!s || s.status !== "active") return null;
+  return { agency_id: s.agency_id, session_epoch: s.session_epoch, seat_id: s.seat_id, seat_epoch: s.seat_epoch };
+}
+
+// --- I3-1740 (QUEUE #777, D-0858(13)): per-seat agency keys -----------------
+// A seat holds its own server-minted `agk_` key; only its hash is stored
+// (agency_seats.key_hash, migration 0153). The raw key leaves this module
+// exactly once, in mintAgencySeat's return value.
+
+/** Live seats an agency may hold at once (DECIDED I6-SEATS). */
+export const MAX_LIVE_SEATS = 50;
+const SEAT_ID_RE = /^ags_[0-9a-f]{32}$/;
+
+export interface AgencySeat {
+  seat_id: string;
+  label: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
+/** Mint a seat: the insert itself refuses an inactive agency and a full
+ * agency (live seats >= MAX_LIVE_SEATS), so two concurrent mints cannot both
+ * pass a count read first. Returns null when refused.
+ * #863 (I16-W03D hand-off, D-0923(6)): given `audit`, the `agency:seat_minted` row is written in the
+ * SAME batch, conditioned on the insert (`changes() = 1`), so a seat never exists unaudited. */
+export async function mintAgencySeat(
+  db: DbLike,
+  agencyId: string,
+  label: string,
+  now: () => string = () => new Date().toISOString(),
+  rand: (n: number) => Uint8Array = (n) => crypto.getRandomValues(new Uint8Array(n)),
+  actor?: AgencyActor,
+  audit?: SeatAudit,
+): Promise<(AgencySeat & { key: string }) | null> {
+  const key = mkAgencyKey(rand);
+  const who = actorTerm(agencyId, actor);
+  const seatId = "ags_" + [...rand(16)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  const at = now();
+  const ins = db
+    .prepare(
+      `INSERT INTO agency_seats (seat_id, agency_id, label, key_hash, created_at) SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM agencies WHERE agency_id = ? AND status = 'active') AND (SELECT COUNT(*) FROM agency_seats WHERE agency_id = ? AND revoked_at IS NULL) < ?${who.sql} RETURNING seat_id`,
+    )
+    .bind(seatId, agencyId, label, await hashAgencyKey(key), at, agencyId, agencyId, MAX_LIVE_SEATS, ...who.params);
+  const res = (await db.batch(audit === undefined ? [ins] : [ins, seatAuditStatement(db, audit.actorId, "agency:seat_minted", seatId, `seat "${label}" minted`, (audit.now ?? now)(), true)])) as { results?: unknown[] }[];
+  if ((res[0]?.results?.length ?? 0) !== 1) {
+    await refuseDeadActor(db, agencyId, actor);
+    return null;
+  }
+  return { seat_id: seatId, label, created_at: at, last_used_at: null, key };
+}
+
+/** The agency's live seats — never a hash, never a key. */
+export async function listAgencySeats(db: DbLike, agencyId: string): Promise<AgencySeat[]> {
+  const r = await db
+    .prepare("SELECT seat_id, label, created_at, last_used_at FROM agency_seats WHERE agency_id = ? AND revoked_at IS NULL ORDER BY created_at, seat_id")
+    .bind(agencyId)
+    .all<AgencySeat>();
+  return r.results;
+}
+
+/** Revoke ONE seat of THIS agency: its revoked_at + own epoch, in one UPDATE.
+ * The agency epoch does NOT move (D-0860(3)): a seat session names its seat
+ * (packages/session `st`/`sep`) and `agencyPrincipal` refuses it once the seat
+ * is revoked, so every other seat and the agency key keep their live sessions.
+ * Returns false for an unknown, foreign or already-revoked seat.
+ * #863: given `audit`, `agency:seat_revoked` is written in the same batch, conditioned on the UPDATE. */
+export async function revokeAgencySeat(db: DbLike, agencyId: string, seatId: string, now: () => string = () => new Date().toISOString(), actor?: AgencyActor, audit?: SeatAudit): Promise<boolean> {
+  if (!SEAT_ID_RE.test(seatId)) return false;
+  const who = actorTerm(agencyId, actor);
+  const upd = db
+    .prepare(`UPDATE agency_seats SET revoked_at = ?, session_epoch = session_epoch + 1 WHERE seat_id = ? AND agency_id = ? AND revoked_at IS NULL${who.sql} RETURNING seat_id`)
+    .bind(now(), seatId, agencyId, ...who.params);
+  const res = (await db.batch(audit === undefined ? [upd] : [upd, seatAuditStatement(db, audit.actorId, "agency:seat_revoked", seatId, `seat revoked by ${audit.actorId}`, (audit.now ?? now)(), true)])) as { results?: unknown[] }[];
+  const ok = (res[0]?.results?.length ?? 0) === 1;
+  if (!ok) await refuseDeadActor(db, agencyId, actor);
+  return ok;
+}
+
+/** Stamp a live seat's last successful sign-in. */
+export async function touchAgencySeat(db: DbLike, seatId: string, now: () => string = () => new Date().toISOString()): Promise<void> {
+  await db.prepare("UPDATE agency_seats SET last_used_at = ? WHERE seat_id = ? AND revoked_at IS NULL").bind(now(), seatId).run();
+}
+
+/** Bump the epoch WITHOUT rotating the key — logout-everywhere. Returns the new
+ * epoch (which a fresh login/refresh will mint against). */
+export async function bumpAgencyEpoch(db: DbLike, agencyId: string, actor?: AgencyActor): Promise<number> {
+  const who = actorTerm(agencyId, actor);
+  const bumped = await db.prepare(`UPDATE agencies SET session_epoch = session_epoch + 1 WHERE agency_id = ?${who.sql}`).bind(agencyId, ...who.params).run();
+  if (bumped.changes !== 1) await refuseDeadActor(db, agencyId, actor);
+  const r = await db.prepare("SELECT session_epoch FROM agencies WHERE agency_id = ?").bind(agencyId).first<{ session_epoch: number }>();
+  return r?.session_epoch ?? 0;
+}
+===== END FILE: services/trust-core/src/agency_auth.ts =====
+
+===== BEGIN FILE: services/trust-core/src/agency_members.ts =====
+import { AGENCY_ID_RE } from "@dhwaja/schema";
+import type { DbLike, DbStatement } from "./db.js";
+import { AgencyError, agencyActorLiveSql, agencyActorStillLive, type AgencyActor } from "./agencies.js";
+import type { OidcClaims, OidcProvider } from "./oidc.js";
+import { usableSessionSecret } from "@dhwaja/session";
+import { DISPUTE_FINGERPRINT_SCOPE, scopedKeyedMac } from "./sessions.js";
+
+/** I21-Q100 (D-1030; I29-C05 TRIAGE "Store a hash of the member's email in the audit log, not the plain address"): the
+ * token an agency-member audit row names the member by, `member:<first 12 hex of a keyed hash of the lower-cased
+ * address>`. The keyed MAC is sessions.ts `scopedKeyedMac` (the one registered body: single-hasher KEYED_MAC_EXEMPTIONS,
+ * scripts/invariant-setup.mjs KEYED_MAC_ORIGINS) under the session secret, with its own message label so it joins no
+ * other use of that key (email.ts emailAddressHash, the dispute fingerprint). With no usable secret the row names
+ * `member:withheld` — never the address. Writers: console.ts member add and remove, addAgencyMember's seat row. */
+export const MEMBER_AUDIT_LABEL = "agency-member-audit:v1";
+export const MEMBER_AUDIT_WITHHELD = "member:withheld";
+export async function memberAuditToken(secret: unknown, email: string): Promise<string> {
+  if (!usableSessionSecret(secret)) return MEMBER_AUDIT_WITHHELD;
+  return `member:${(await scopedKeyedMac(secret, DISPUTE_FINGERPRINT_SCOPE, `${MEMBER_AUDIT_LABEL}\n${email.trim().toLowerCase()}`)).slice(0, 12)}`;
+}
+
+/**
+ * Agency member allowlist + ROLES (S53 + S97).
+ *
+ * An agency session requires the API key (possession) AND a verified Apple/Google
+ * identity that has been authorized here (an approved human). Enrollment is by
+ * verified email; the provider `sub` is bound on first successful sign-in and is
+ * authoritative from then on — email can be reassigned and Apple omits it on
+ * later logins, so the bound sub is the stable identity.
+ *
+ * S97 adds per-member ROLES → capabilities, enforced per-route:
+ *   admin             — everything, incl. managing the member roster
+ *   manager           — day-to-day: ledger actions, sales, analytics, reads
+ *   campaign_operator — sales/code distribution + reads
+ *   analytics_only    — analytics + reads
+ *   security          — the logout-everywhere lever + reads
+ *   performer         — reads only (a talent seat that can see, not touch)
+ * The session token carries the member_id; authority is re-read from this table
+ * on every request, so removing or demoting a member changes what their LIVE
+ * sessions can do immediately (no epoch bump needed).
+ */
+
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+const MEMBER_ID_RE = /^agm_[0-9a-f]{16}$/;
+
+export const AGENCY_ROLES = ["admin", "manager", "security", "campaign_operator", "analytics_only", "performer"] as const;
+export type AgencyRole = (typeof AGENCY_ROLES)[number];
+export type AgencyCap = "read" | "ledger" | "sales" | "analytics" | "security" | "members";
+
+/** Role → capabilities. Fail-closed: an unknown role has NO capabilities. */
+const ROLE_CAPS: Record<AgencyRole, readonly AgencyCap[]> = {
+  admin: ["read", "ledger", "sales", "analytics", "security", "members"],
+  manager: ["read", "ledger", "sales", "analytics"],
+  campaign_operator: ["read", "sales"],
+  analytics_only: ["read", "analytics"],
+  security: ["read", "security"],
+  performer: ["read"],
+};
+
+export function isAgencyRole(x: unknown): x is AgencyRole {
+  return typeof x === "string" && (AGENCY_ROLES as readonly string[]).includes(x);
+}
+
+export function roleHasCap(role: string, cap: AgencyCap): boolean {
+  if (!isAgencyRole(role)) return false; // unknown role → nothing
+  return ROLE_CAPS[role].includes(cap);
+}
+
+/**
+ * I3-0336 — THE ACTING SEAT IS RE-READ BY THE WRITE, NOT BY THE ROUTE.
+ *
+ * `agencyPrincipal()` reads the roster before the route body runs; the three
+ * roster mutations below then write with no term naming the actor at all. A
+ * seat removed or demoted between that read and this write still lands its
+ * mutation — a TOCTOU across a privilege boundary, and the window is exactly
+ * the one an off-boarding is racing.
+ *
+ * The population is DERIVED from `ROLE_CAPS`, never hand-listed: a role that
+ * gains the `members` cap tomorrow is admitted here without a second edit, and
+ * one that loses it is refused the same way (FAMILY-004 acceptance (a)).
+ */
+const MEMBERS_CAP_ROLES: readonly AgencyRole[] = AGENCY_ROLES.filter((r) => roleHasCap(r, "members"));
+
+/** The route stamps the acting seat as `agm:<member_id>` (agency-routes.ts:234);
+ * `console.ts` stamps an OPERATOR, who is not a seat and binds nothing here. */
+const ACTOR_SEAT_RE = /^agm:(agm_[0-9a-f]{16})$/;
+
+function actorLiveSql(agencyId: string, actor: string | undefined): { sql: string; params: (string | number)[] } {
+  const m = actor === undefined ? null : ACTOR_SEAT_RE.exec(actor);
+  if (!m) return { sql: "1 = 1", params: [] };
+  const holes = MEMBERS_CAP_ROLES.map(() => "?").join(", ");
+  return {
+    sql: `EXISTS (SELECT 1 FROM agency_members WHERE agency_id = ? AND member_id = ? AND role IN (${holes}))`,
+    params: [agencyId, m[1]!, ...MEMBERS_CAP_ROLES],
+  };
+}
+
+/** Did the write lose to the ACTOR term rather than to the last-admin term?
+ * Failure path only. */
+async function actorStillSeated(db: DbLike, agencyId: string, actor: string | undefined): Promise<boolean> {
+  const g = actorLiveSql(agencyId, actor);
+  if (g.params.length === 0) return true;
+  const row = await db.prepare(`SELECT 1 AS x WHERE ${g.sql}`).bind(...g.params).first();
+  return row !== null;
+}
+
+/** I12-FX7 (D-0884(5)): the role term (`actorLiveSql`) AND, when the route passes
+ * the acting seat as it admitted it, `agencyActorLiveSql` (agency epoch + a seat
+ * session's seat) — the composition `addAgencyMember` rides. */
+function rosterWriteGuard(agencyId: string, actor: string | undefined, liveActor: AgencyActor | undefined): { sql: string; params: (string | number)[] } {
+  const role0 = actorLiveSql(agencyId, actor);
+  if (liveActor === undefined) return role0;
+  const live = agencyActorLiveSql(agencyId, liveActor);
+  return { sql: `${role0.sql} AND ${live.sql}`, params: [...role0.params, ...live.params] };
+}
+
+/** Failure path only: did the roster write lose to EITHER actor term? */
+async function rosterActorDead(db: DbLike, agencyId: string, actor: string | undefined, liveActor: AgencyActor | undefined): Promise<boolean> {
+  if (!(await actorStillSeated(db, agencyId, actor))) return true;
+  return liveActor !== undefined && !(await agencyActorStillLive(db, agencyId, liveActor));
+}
+
+/**
+ * I16 #863 (D-0920, option A) — THE SEAT AUDIT ROW COMMITS WITH THE ROSTER WRITE
+ * OR NOT AT ALL. The member add, role change and removal used to commit first
+ * and write their `audit_log` row afterwards, best-effort: a failed audit insert
+ * left a committed change to who may act for the agency with no record of who
+ * made it. Passing `audit` puts the row in the SAME `db.batch` as the write,
+ * written only `WHERE changes() = 1` — the row count of the write directly
+ * above it in the same transaction (passkeys.ts revoke idiom) — so a refused
+ * write records nothing and a failed audit insert rolls the write back.
+ */
+export interface SeatAudit {
+  /** The acting seat's member id — `audit_log.actor_id`. */
+  actorId: string;
+  now?: () => string;
+  /** I21-Q100: the session secret `memberAuditToken` keys the member token with; absent, the row says `member:withheld`. */
+  secret?: unknown;
+}
+
+/** The per-seat audit INSERT (`audit_log`, actor_kind 'agency'). `afterWrite`
+ * conditions it on the statement directly before it in the batch. */
+export function seatAuditStatement(db: DbLike, actorId: string, action: string, itemId: string, detail: string, at: string, afterWrite: boolean): DbStatement {
+  return db
+    .prepare(`INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT ?, ?, ?, ?, ?, 'agency'${afterWrite ? " WHERE changes() = 1" : ""}`)
+    .bind(actorId, action, detail, at, itemId);
+}
+
+/**
+ * I3-0988 e (I22-W1-AUTH): the seat's `agency:ledger_action` row, NAMING the events it records. It must ride
+ * AFTER the ledger INSERTs in the same batch (`appendAgencyAction` passes it as an extra statement, which
+ * `appendEvents` runs after its own INSERTs): the sub-select reads the `count` newest events this agency
+ * appended on the passport, and inside the one transaction no other append can interleave, so those are
+ * exactly this batch's. Two concurrent seats' rows therefore partition the events between them.
+ */
+export function seatLedgerActionAuditStatement(db: DbLike, actorId: string, agencyId: string, passportId: string, count: number, at: string): DbStatement {
+  return db
+    .prepare(
+      `INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind)
+       SELECT ?, 'agency:ledger_action', ? || ' events ' || COALESCE((SELECT group_concat(event_id, ',') FROM (SELECT event_id FROM (SELECT event_id, seq FROM trust_events WHERE subject = ? AND actor_id = ? ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC)), ''), ?, ?, 'agency'`,
+    )
+    .bind(actorId, `${count} action(s), agency ${agencyId};`, passportId, agencyId, count, at, passportId);
+}
+
+/** Run `write` (which must end in `RETURNING`) and, when `audit` is given, its
+ * audit row in ONE batch. Returns whether the write changed exactly one row. */
+async function writeWithSeatAudit(db: DbLike, write: DbStatement, audit: { a: SeatAudit; action: string; itemId: string; detail: string } | undefined): Promise<boolean> {
+  const row = audit === undefined ? undefined : seatAuditStatement(db, audit.a.actorId, audit.action, audit.itemId, audit.detail, (audit.a.now ?? (() => new Date().toISOString()))(), true);
+  return (await writeWithAuditRow(db, write, row)) === 1;
+}
+
+/** `write` (ending in `RETURNING`) and `row` in ONE batch; the number of rows the write returned. */
+async function writeWithAuditRow(db: DbLike, write: DbStatement, row: DbStatement | undefined): Promise<number> {
+  const res = (await db.batch(row === undefined ? [write] : [write, row])) as { results?: unknown[] }[];
+  return res[0]?.results?.length ?? 0;
+}
+
+/**
+ * I17 #176 sibling (D-0941(2d)) — the OPERATOR CONSOLE's audit row for a roster
+ * write (`console.ts` POST /ops/agencies/:id/members and /members/remove). It
+ * used to be written after the write committed; it now rides the write's own
+ * batch (`writeWithAuditRow`), so a failed audit insert rolls the write back.
+ * The console keeps its own action, item, detail and actor_kind. `afterWrite`
+ * gates the row on `changes() = 1` of the write directly above it.
+ */
+export interface ConsoleRosterAudit {
+  actorId: string;
+  actorKind: "operator" | "agency" | "system";
+  action: string;
+  itemId: string | null;
+  detail: string;
+  at: string;
+}
+function consoleRosterAuditStatement(db: DbLike, a: ConsoleRosterAudit, afterWrite: boolean): DbStatement {
+  return db
+    .prepare(`INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT ?, ?, ?, ?, ?, ?${afterWrite ? " WHERE changes() = 1" : ""}`)
+    .bind(a.actorId, a.action, a.detail, a.at, a.itemId, a.actorKind);
+}
+
+function normEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+function mintMemberId(rand: (n: number) => Uint8Array = (n) => crypto.getRandomValues(new Uint8Array(n))): string {
+  return "agm_" + [...rand(8)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Authorize a person (by verified email) to sign in for an agency, with a role.
+ * Callers: the operator console, and an agency member holding the `members` cap. */
+export async function addAgencyMember(
+  db: DbLike,
+  agencyId: string,
+  provider: OidcProvider,
+  email: string,
+  actor: string,
+  /** The seat. REQUIRED — there is no default, for the same reason the column
+   * has none: a caller that forgets the role must fail loudly, not silently
+   * enroll an admin. */
+  role: AgencyRole,
+  now: () => string = () => new Date().toISOString(),
+  /** I12-RG-AUTH-08 (D-0883(4)): the acting seat as the route ADMITTED it — the
+   * agency epoch and a seat session's seat are re-asked in the INSERT too. */
+  liveActor?: AgencyActor,
+  /** I16 #863: the acting seat's audit row, committed with the INSERT. */
+  audit?: SeatAudit,
+  /** I17 #176 sibling: the operator console's audit row, committed with the INSERT. */
+  consoleAudit?: ConsoleRosterAudit,
+): Promise<{ member_id: string }> {
+  if (!AGENCY_ID_RE.test(agencyId)) throw new AgencyError("bad agency id");
+  if (provider !== "google" && provider !== "apple") throw new AgencyError("bad provider");
+  if (!isAgencyRole(role)) throw new AgencyError("bad role");
+  const e = normEmail(email);
+  if (!EMAIL_RE.test(e) || e.length > 320) throw new AgencyError("bad email");
+  // AG-04 — THE CHECK AND THE INSERT ARE TWO STATEMENTS, AND ONLY THE DATABASE
+  // CAN DECIDE A RACE BETWEEN THEM.
+  //
+  // Two admins pressing Authorize at the same moment both read "no such member"
+  // and both inserted, because `idx_agency_member_email` was a plain index. That
+  // leaves TWO invitations for one person, possibly at different roles; first
+  // login binds one and leaves the other unbound, and self-service removal
+  // deletes only the member id it was given — so the residual invitation
+  // re-authorizes the identity the agency believed it had removed. Migration
+  // 0092 makes (agency_id, provider, email) UNIQUE; this read stays because it
+  // is the cheap, specific answer in the ordinary sequential case, and the catch
+  // below turns the racing case into the SAME 409 rather than a 500.
+  const exists = await db.prepare("SELECT 1 AS x FROM agency_members WHERE agency_id = ? AND provider = ? AND email = ?").bind(agencyId, provider, e).first();
+  if (exists) throw new AgencyError("member already authorized", 409 as 400);
+  const member_id = mintMemberId();
+  // I3-0336: the acting seat rides the INSERT (see actorLiveSql). `INSERT …
+  // SELECT … WHERE` rather than VALUES, because a VALUES insert has nowhere to
+  // put a predicate and a second SELECT would be the TOCTOU one line down.
+  const role0 = actorLiveSql(agencyId, actor);
+  const live = liveActor === undefined ? null : agencyActorLiveSql(agencyId, liveActor);
+  const guard = live === null ? role0 : { sql: `${role0.sql} AND ${live.sql}`, params: [...role0.params, ...live.params] };
+  try {
+    if (audit !== undefined || consoleAudit !== undefined) {
+      const write = db
+        .prepare(
+          `INSERT INTO agency_members (agency_id, provider, email, sub, added_by, added_at, bound_at, member_id, role)
+           SELECT ?, ?, ?, NULL, ?, ?, NULL, ?, ? WHERE ${guard.sql} RETURNING member_id`,
+        )
+        .bind(agencyId, provider, e, actor, now(), member_id, role, ...guard.params);
+      const inserted = audit !== undefined
+        ? await writeWithSeatAudit(db, write, { a: audit, action: "agency:member_added", itemId: member_id, detail: `${provider} ${await memberAuditToken(audit.secret, e)} as ${role}` })
+        : // I3-0988 d (I23-W1-HUB H-5): the operator add row is filed under the MINTED member id, as the remove row is.
+          (await writeWithAuditRow(db, write, consoleRosterAuditStatement(db, { ...consoleAudit!, itemId: member_id }, true))) === 1;
+      if (!inserted) {
+        throw new AgencyError("acting seat is no longer authorized", 403);
+      }
+      return { member_id };
+    }
+    const r = await db
+      .prepare(
+        `INSERT INTO agency_members (agency_id, provider, email, sub, added_by, added_at, bound_at, member_id, role)
+         SELECT ?, ?, ?, NULL, ?, ?, NULL, ?, ? WHERE ${guard.sql}`,
+      )
+      .bind(agencyId, provider, e, actor, now(), member_id, role, ...guard.params)
+      .run();
+    if (r.changes !== 1) throw new AgencyError("acting seat is no longer authorized", 403);
+  } catch (err) {
+    if (err instanceof AgencyError) throw err;
+    const msg = err instanceof Error ? err.message : "";
+    if (/UNIQUE constraint failed:\s*agency_members\.(agency_id|provider|email)/i.test(msg)) {
+      throw new AgencyError("member already authorized", 409 as 400);
+    }
+    throw err;
+  }
+  return { member_id };
+}
+
+/** Remove a member by (provider, email) — the OPERATOR-console shape. No
+ * last-admin guard here, deliberately: the guard exists to stop an agency from
+ * locking ITSELF out, but an operator must be able to off-board a compromised
+ * sole admin at once (and can re-enroll a replacement anytime). The agency
+ * self-serve path (removeMemberById) keeps the guard. */
+export async function removeAgencyMember(db: DbLike, agencyId: string, provider: OidcProvider, email: string, consoleAudit?: ConsoleRosterAudit): Promise<number> {
+  const e = normEmail(email);
+  if (consoleAudit !== undefined) {
+    // I17 #176 sibling: the console's row lands with the DELETE or not at all; written whether or not a row matched,
+    // as the separate write before it was (an operator's removal attempt stays on the record).
+    const del = db.prepare("DELETE FROM agency_members WHERE agency_id = ? AND provider = ? AND email = ? RETURNING member_id").bind(agencyId, provider, e);
+    return writeWithAuditRow(db, del, consoleRosterAuditStatement(db, consoleAudit, false));
+  }
+  const r = await db.prepare("DELETE FROM agency_members WHERE agency_id = ? AND provider = ? AND email = ?").bind(agencyId, provider, e).run();
+  return r.changes;
+}
+
+/** Remove a member by id (agency self-serve). The last-admin guard is folded
+ * into the DELETE (mirrors S94's last-passkey guard), so two concurrent removals
+ * can't strip the final admin seat: login REQUIRES an authorized identity, so an
+ * agency with no admin member cannot manage itself again without an operator. */
+export async function removeMemberById(db: DbLike, agencyId: string, memberId: string, actor?: string, liveActor?: AgencyActor, audit?: SeatAudit): Promise<void> {
+  if (!MEMBER_ID_RE.test(memberId)) throw new AgencyError("bad member id");
+  const row = await db.prepare("SELECT role FROM agency_members WHERE agency_id = ? AND member_id = ?").bind(agencyId, memberId).first<{ role: string }>();
+  if (!row) throw new AgencyError("no such member", 404);
+  const guard = rosterWriteGuard(agencyId, actor, liveActor);
+  const del = db
+    .prepare(
+      `DELETE FROM agency_members WHERE agency_id = ? AND member_id = ?
+       AND (role != 'admin'
+            OR (SELECT COUNT(*) FROM agency_members
+                WHERE agency_id = ? AND role = 'admin' AND sub IS NOT NULL AND member_id != ?) > 0)
+       AND ${guard.sql}${audit !== undefined ? " RETURNING member_id" : ""}`,
+    )
+    .bind(agencyId, memberId, agencyId, memberId, ...guard.params);
+  const removed = audit !== undefined
+    ? await writeWithSeatAudit(db, del, { a: audit, action: "agency:member_removed", itemId: memberId, detail: `removed by ${audit.actorId}` })
+    : (await del.run()).changes === 1;
+  if (!removed) {
+    if (await rosterActorDead(db, agencyId, actor, liveActor)) throw new AgencyError("acting seat is no longer authorized", 403);
+    throw new AgencyError("cannot remove the last admin — add another admin first", 409 as 400);
+  }
+}
+
+/** Change a member's role. Demoting the last admin is refused, atomically. */
+export async function setMemberRole(db: DbLike, agencyId: string, memberId: string, role: AgencyRole, actor?: string, liveActor?: AgencyActor, audit?: SeatAudit): Promise<{ previous: string; changed: boolean }> {
+  if (!MEMBER_ID_RE.test(memberId)) throw new AgencyError("bad member id");
+  if (!isAgencyRole(role)) throw new AgencyError("bad role");
+  const row = await db.prepare("SELECT role FROM agency_members WHERE agency_id = ? AND member_id = ?").bind(agencyId, memberId).first<{ role: string }>();
+  if (!row) throw new AgencyError("no such member", 404);
+  // AG-07: the PREVIOUS role is the half of a disputed-promotion record that
+  // cannot be reconstructed afterwards — the row it lived in has been
+  // overwritten. Return it so the route can write it into the audit line.
+  if (row.role === role) return { previous: row.role, changed: false }; // no-op
+  const guard = rosterWriteGuard(agencyId, actor, liveActor);
+  const upd = db
+    .prepare(
+      `UPDATE agency_members SET role = ? WHERE agency_id = ? AND member_id = ?
+       AND role = ?
+       AND (role != 'admin'
+            OR ? = 'admin'
+            OR (SELECT COUNT(*) FROM agency_members
+                WHERE agency_id = ? AND role = 'admin' AND sub IS NOT NULL AND member_id != ?) > 0)
+       AND ${guard.sql}${audit !== undefined ? " RETURNING member_id" : ""}`,
+    )
+    // I3-0988 c (I22-W1-AUTH): `AND role = ?` binds the role read above (INV-058), so the `previous` this
+    // function returns and the audit line it writes are the transition that actually happened; a concurrent
+    // change in between makes this UPDATE match nothing and the caller gets the 409 below.
+    .bind(role, agencyId, memberId, row.role, role, agencyId, memberId, ...guard.params);
+  // AG-07: the audit line carries the PREVIOUS role, which this UPDATE overwrites.
+  const changed = audit !== undefined
+    ? await writeWithSeatAudit(db, upd, { a: audit, action: "agency:member_role_change", itemId: memberId, detail: `role ${row.role} -> ${role}` })
+    : (await upd.run()).changes === 1;
+  if (!changed) {
+    if (await rosterActorDead(db, agencyId, actor, liveActor)) throw new AgencyError("acting seat is no longer authorized", 403);
+    const now = await db.prepare("SELECT role FROM agency_members WHERE agency_id = ? AND member_id = ?").bind(agencyId, memberId).first<{ role: string }>();
+    if (!now || now.role !== row.role) throw new AgencyError("this member's role was changed by someone else — reload and try again", 409 as 400);
+    throw new AgencyError("cannot demote the last admin — add another admin first", 409 as 400);
+  }
+  return { previous: row.role, changed: true };
+}
+
+export interface AgencyMember {
+  member_id: string;
+  provider: string;
+  email: string | null;
+  role: string;
+  bound: boolean; // has this identity completed a first sign-in (sub bound)?
+  added_at: string;
+  bound_at: string | null;
+}
+
+export async function listAgencyMembers(db: DbLike, agencyId: string): Promise<AgencyMember[]> {
+  const { results } = await db
+    .prepare("SELECT member_id, provider, email, sub, role, added_at, bound_at FROM agency_members WHERE agency_id = ? ORDER BY added_at")
+    .bind(agencyId)
+    .all<{ member_id: string; provider: string; email: string | null; sub: string | null; role: string; added_at: string; bound_at: string | null }>();
+  return results.map((r) => ({ member_id: r.member_id, provider: r.provider, email: r.email, role: r.role, bound: r.sub !== null, added_at: r.added_at, bound_at: r.bound_at }));
+}
+
+/** A member's current role, verified to belong to the agency — the per-request
+ * authority lookup. null = no such member (removed → live sessions die). */
+export async function memberRole(db: DbLike, agencyId: string, memberId: string): Promise<AgencyRole | null> {
+  if (!MEMBER_ID_RE.test(memberId)) return null;
+  const r = await db.prepare("SELECT role FROM agency_members WHERE agency_id = ? AND member_id = ?").bind(agencyId, memberId).first<{ role: string }>();
+  return r && isAgencyRole(r.role) ? r.role : null;
+}
+
+/**
+ * AG-03 — BIND THE ENROLMENT, NOT THE ROW NUMBER.
+ *
+ * First sign-in selects an unbound invitation, then writes the provider subject
+ * onto it. That write used to be `WHERE rowid = ? AND sub IS NULL`, and
+ * `agency_members` has ordinary SQLite rowids, which are REALLOCATED after the
+ * row holding the highest one is deleted (sqlite.org/autoinc.html). So if the
+ * invitation is removed and a replacement enrolled while a login is pending —
+ * an ordinary off-boarding overlapping an in-flight sign-in — the pending bind
+ * could land on the REPLACEMENT's row and persist the previous claimant's
+ * identity against somebody else's seat and role. The immediate response still
+ * named the deleted member and its token died, so nothing looked wrong; the
+ * damage is the stored binding, which every later bound-subject lookup honours.
+ *
+ * The predicate is now the immutable `member_id` plus the agency, provider and
+ * enrolment email that were matched, and still `sub IS NULL`. `rowid` is kept
+ * in the predicate as well — it can only narrow, never widen — so an invitation
+ * that changed or vanished binds nothing and the login is refused. Extracted so
+ * the write itself, not the lookup around it, is what a test can drive.
+ */
+export async function bindMemberSubject(
+  db: DbLike,
+  o: { agencyId: string; provider: OidcProvider; email: string; memberId: string; rowid: number; sub: string; now: () => string },
+): Promise<number> {
+  const r = await db
+    .prepare(
+      `UPDATE agency_members SET sub = ?, bound_at = ?
+        WHERE member_id = ? AND agency_id = ? AND provider = ? AND email = ? AND rowid = ? AND sub IS NULL`,
+    )
+    .bind(o.sub, o.now(), o.memberId, o.agencyId, o.provider, o.email, o.rowid)
+    .run();
+  return r.changes;
+}
+
+/**
+ * Is this verified OIDC identity authorized to sign in for the agency?
+ *  1. A row already BOUND to (provider, sub) → yes (stable, email-independent).
+ *  2. First sign-in: a VERIFIED email matching an un-bound enrollment row → bind
+ *     the sub to it and allow.
+ *  3. Otherwise no. Fail-closed: an unverified email can never enroll.
+ * Returns the member's identity + role (S97) so login can stamp the session.
+ */
+export async function authorizeAgencyMember(
+  db: DbLike,
+  agencyId: string,
+  provider: OidcProvider,
+  claims: OidcClaims,
+  now: () => string = () => new Date().toISOString(),
+): Promise<{ member_id: string; role: AgencyRole } | null> {
+  const bound = await db
+    .prepare("SELECT member_id, role FROM agency_members WHERE agency_id = ? AND provider = ? AND sub = ?")
+    .bind(agencyId, provider, claims.sub)
+    .first<{ member_id: string; role: string }>();
+  if (bound) return isAgencyRole(bound.role) ? { member_id: bound.member_id, role: bound.role } : null;
+  if (claims.email_verified && claims.email) {
+    const row = await db
+      .prepare("SELECT rowid AS rid, member_id, role FROM agency_members WHERE agency_id = ? AND provider = ? AND email = ? AND sub IS NULL LIMIT 1")
+      .bind(agencyId, provider, claims.email)
+      .first<{ rid: number; member_id: string; role: string }>();
+    if (row) {
+      const changed = await bindMemberSubject(db, { agencyId, provider, email: claims.email, memberId: row.member_id, rowid: row.rid, sub: claims.sub, now });
+      if (changed === 1 && isAgencyRole(row.role)) return { member_id: row.member_id, role: row.role };
+    }
+  }
+  return null;
+}
+===== END FILE: services/trust-core/src/agency_members.ts =====
+
+===== END OF CHUNK 35 OF 75 =====

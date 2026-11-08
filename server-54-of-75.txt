@@ -1,0 +1,3296 @@
+DHWAJA CODE REVIEW — server — CHUNK 54 OF 75
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (fan*), services/trust-core/src (feed*), services/trust-core/src (fold*), services/trust-core/src (founder*)
+Files in this chunk (11):
+  - services/trust-core/src/fan-connections.ts
+  - services/trust-core/src/fan-identity-unlink.ts
+  - services/trust-core/src/fan-library-routes.ts
+  - services/trust-core/src/fan-quality.ts
+  - services/trust-core/src/fan-social-routes.ts
+  - services/trust-core/src/fan-spend-limits.ts
+  - services/trust-core/src/fan-spend-routes.ts
+  - services/trust-core/src/feed.ts
+  - services/trust-core/src/fold-rebuild.ts
+  - services/trust-core/src/fold.ts
+  - services/trust-core/src/founder.ts
+
+
+===== BEGIN FILE: services/trust-core/src/fan-connections.ts =====
+import type { DbLike } from "./db.js";
+import { sha256Base64Url } from "@dhwaja/canonical";
+import { FAN_PROVIDER_KEYS } from "./fan-connections-public.js";
+import { buildAuthorizeUrl, exchangeAndIdentify, oauthConfigFromEnv, PROVIDERS, type OAuthProvider } from "./oauth.js";
+
+/**
+ * CONNECTED FAN PASSPORT / CONSTELLATIONS — F8, master list #45.
+ *
+ * A fan proves by OAuth that they control an account on a platform. Dhwaja
+ * records THAT THEY DID and nothing else, and publishes a COUNT.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS EXISTS, IN ONE PARAGRAPH
+ * ---------------------------------------------------------------------------
+ * Every fan-quality signal this product has can be minted for free. The
+ * qualified-fan disjunction (`fan-quality.ts`) accepts a verified email, an
+ * active passkey or one acquisition — a mail domain and a software
+ * authenticator, neither of which is scarce — and the F6 adversarial review put
+ * the consequence plainly: *the floor is time, not identity.* A determined
+ * farmer waits seven days per account and owns the low ordinals on every
+ * passport in the registry.
+ *
+ * A CONSTELLATION is the identity half. Linking costs a real Twitch, YouTube,
+ * Discord or Instagram account PER DHWAJA ACCOUNT, because
+ * `UNIQUE (provider, sub)` says one external account backs one fan. That is the
+ * first thing here with a genuine per-account price, and it costs an honest fan
+ * two clicks.
+ *
+ * ---------------------------------------------------------------------------
+ * THE PRIVACY POSTURE IS THE DESIGN
+ * ---------------------------------------------------------------------------
+ * STORED: `provider` and `sub`. NOT STORED: the handle, the display name, the
+ * email, the avatar, the follower count, the granted scopes, the access token,
+ * the refresh token, the profile URL. Those columns do not exist (0066), so
+ * this is a promise the schema keeps rather than one a docblock makes.
+ *
+ * `exchangeAndIdentify` returns `{pid, handle}` and THIS MODULE THROWS THE
+ * HANDLE AWAY on the line it arrives. That is deliberate and it is the one
+ * place a future writer will be tempted: the handle is right there, it would
+ * make a nicer profile, and keeping it would quietly turn a vouching signal
+ * into a cross-platform identity graph about people who consented to neither.
+ *
+ * PUBLISHED: a count, and — only where the fan opted in, per link — a provider
+ * name. There is no endpoint that maps a fan to a provider account and none
+ * that maps a provider account to a fan.
+ *
+ * ---------------------------------------------------------------------------
+ * NOTHING IS READ FROM THE PROVIDER
+ * ---------------------------------------------------------------------------
+ * No follower counts, no subscription status, no "is this fan a subscriber of
+ * that creator". The token is used once to fetch an identity and discarded, the
+ * `oauth.ts` contract. The moment anything else is read, "provider+sub only"
+ * stops being true and this becomes a different product with a different
+ * consent conversation.
+ */
+
+export class ConnectionError extends Error {
+  override name = "ConnectionError";
+  constructor(
+    message: string,
+    public readonly status: 400 | 401 | 403 | 404 | 409 | 429 | 503 = 400,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * The four v1 providers, per the frozen list. Each is operator-registered —
+ * `OAUTH_<PLATFORM>_CLIENT_ID` / `_CLIENT_SECRET` / `_REDIRECT_URI`, the shape
+ * creator `x` already uses (`oauth.ts oauthConfigFromEnv`).
+ *
+ * A provider with no config is simply ABSENT from the offered list. Nothing
+ * degrades silently: the list a client renders is the list the server can
+ * actually complete, so a fan is never shown a button that cannot work.
+ *
+ * `parseIdentity` returns `{pid, handle}` because that is `oauth.ts`'s shape.
+ * Only `pid` survives this module.
+ */
+export const FAN_PROVIDERS: Record<string, OAuthProvider> = {
+  twitch: {
+    platform: "twitch",
+    authorizeUrl: "https://id.twitch.tv/oauth2/authorize",
+    tokenUrl: "https://id.twitch.tv/oauth2/token",
+    identityUrl: "https://api.twitch.tv/helix/users",
+    // NO SCOPE, and that is the fix rather than the shortcut. `helix/users`
+    // returns `id` and `login` on a bare user token; `user:read:email` — which
+    // an earlier draft asked for under a comment calling it "the narrowest
+    // scope that returns a stable id" — exists for exactly one purpose, which is
+    // to ADD THE FAN'S EMAIL to that response. Nothing stored it, but the
+    // consent screen would have told the fan "Dhwaja wants to read your email
+    // address", the grant would have persisted in their Twitch account, and the
+    // whole schema-enforced promise of this feature would have been one added
+    // field away. A permission you do not need is a permission you do not ask
+    // for.
+    scope: "",
+    parseIdentity: (body) => {
+      const d = (body as { data?: Array<{ id?: unknown; login?: unknown }> } | null)?.data?.[0];
+      const pid = typeof d?.id === "string" && d.id.length > 0 && d.id.length <= 128 ? d.id : null;
+      const handle = typeof d?.login === "string" && d.login.length > 0 && d.login.length <= 128 ? d.login : null;
+      return pid && handle ? { pid, handle } : null;
+    },
+  },
+  youtube: {
+    platform: "youtube",
+    authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+    tokenUrl: "https://oauth2.googleapis.com/token",
+    // THE IDENTITY IS THE GOOGLE ACCOUNT, NOT A YOUTUBE CHANNEL, and the
+    // difference is the whole anti-Sybil value of this provider. An earlier
+    // draft read `youtube/v3/channels?mine=true` and kept `items[0].id` — a
+    // CHANNEL id. One Google account can hold many brand channels and the
+    // consent screen lets the user pick which one to authorize, so that draft
+    // handed a farmer N distinct `sub` values from one login: the "a real
+    // account per Dhwaja account" price collapsed to "a free channel per Dhwaja
+    // account", which is no price at all.
+    //
+    // So it identifies through OIDC — `openid` and nothing more — and keeps the
+    // id_token/userinfo `sub`, which is the Google ACCOUNT and is exactly one
+    // per person-per-Google-login. The label a fan sees stays "YouTube",
+    // because that is the platform they are being asked about; the thing proved
+    // is the account behind it. `youtube.readonly` (read their subscriptions
+    // and playlists, to answer "are you a person") is gone with it.
+    identityUrl: "https://openidconnect.googleapis.com/v1/userinfo",
+    scope: "openid",
+    parseIdentity: (body) => {
+      const d = body as { sub?: unknown } | null;
+      const pid = typeof d?.sub === "string" && d.sub.length > 0 && d.sub.length <= 128 ? d.sub : null;
+      return pid ? { pid, handle: pid } : null;
+    },
+  },
+  discord: {
+    platform: "discord",
+    authorizeUrl: "https://discord.com/oauth2/authorize",
+    tokenUrl: "https://discord.com/api/oauth2/token",
+    identityUrl: "https://discord.com/api/users/@me",
+    scope: "identify",
+    parseIdentity: (body) => {
+      const d = body as { id?: unknown; username?: unknown } | null;
+      const pid = typeof d?.id === "string" && d.id.length > 0 && d.id.length <= 128 ? d.id : null;
+      const handle = typeof d?.username === "string" && d.username.length > 0 && d.username.length <= 128 ? d.username : null;
+      return pid && handle ? { pid, handle } : null;
+    },
+  },
+  instagram: {
+    platform: "instagram",
+    authorizeUrl: "https://api.instagram.com/oauth/authorize",
+    tokenUrl: "https://api.instagram.com/oauth/access_token",
+    identityUrl: "https://graph.instagram.com/me?fields=id",
+    scope: "user_profile",
+    parseIdentity: (body) => {
+      const d = body as { id?: unknown } | null;
+      const pid = typeof d?.id === "string" && d.id.length > 0 && d.id.length <= 128 ? d.id : null;
+      return pid ? { pid, handle: pid } : null;
+    },
+  },
+};
+
+// THE VOCABULARY LIVES IN THE PUBLIC HALF, and this is the assertion that the
+// two cannot drift: `eligibility.ts` bounds a `connected` rule against
+// `FAN_PROVIDER_KEYS` without importing any of the OAuth machinery below, so a
+// provider added here and not there would silently become unreachable by any
+// rule. A module-load-time throw is the right loudness for a two-line list.
+{
+  const declared = Object.keys(FAN_PROVIDERS).sort().join(",");
+  const published = [...FAN_PROVIDER_KEYS].sort().join(",");
+  if (declared !== published) throw new Error(`FAN_PROVIDERS (${declared}) and fan-connections-public FAN_PROVIDER_KEYS (${published}) disagree`);
+  // AND THE TWO PROVIDER MAPS MUST STAY DISJOINT. `oauth.ts PROVIDERS` is the
+  // CREATOR claim flow and this is the FAN link flow, and they share the
+  // `oauth_challenges` table. `oauth.ts` carries a standing note that
+  // Instagram is to be added "when the operator registers apps" — and Instagram
+  // is a fan provider below. On the day both maps name it, a creator callback
+  // could burn a fan's in-flight challenge row (`completeOAuthClaim` spends the
+  // row before it checks any identity), killing the link for no reason. There
+  // is no escalation in it — the identity check fails either way — but a
+  // feature that silently stops working is worse than one that fails loudly,
+  // and `completeOAuthClaim` now also filters on `account_key` besides.
+  const overlap = Object.keys(FAN_PROVIDERS).filter((p) => p in PROVIDERS);
+  if (overlap.length > 0) {
+    throw new Error(`a platform is in BOTH oauth.ts PROVIDERS (creator claims) and FAN_PROVIDERS (fan links): ${overlap.join(", ")} — they share oauth_challenges, so give the fan flow its own platform key`);
+  }
+}
+
+/** How long an unlinked external account stays reserved to the fan who
+ * unlinked it. Without a cooldown, one Twitch account walks a fleet of Dhwaja
+ * accounts up to "connected" one after another. */
+export const RELINK_COOLDOWN_DAYS = 30;
+/** How long a fan has to finish the provider's own dance. */
+export const CONNECT_TTL_MS = 15 * 60 * 1000;
+/** Link attempts one fan may start per day, across all providers. */
+export const MAX_CONNECT_STARTS_PER_DAY = 10;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const ACCOUNT_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/** CSPRNG hex, the `oauth-claims.ts` spelling. Never Math.random, never a
+ * time-derived value: `state` is a capability and `code_verifier` is a PKCE
+ * secret. */
+function randToken(bytes: number): string {
+  const b = new Uint8Array(bytes);
+  crypto.getRandomValues(b);
+  return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+/** Which providers this deployment can actually complete. A provider the
+ * operator has not registered is absent, not broken. */
+export function availableProviders(env: Record<string, unknown>): string[] {
+  return FAN_PROVIDER_KEYS.filter((p) => oauthConfigFromEnv(env, p) !== null);
+}
+
+export interface ConnectionView {
+  provider: string;
+  connected_at: string;
+  /** The fan's own per-link choice about naming this platform publicly. */
+  provider_public: boolean;
+}
+
+/**
+ * The fan's own connections. Owner-scoped, and it carries NO `sub` — not even
+ * to the person it belongs to. There is no product reason for a fan to read
+ * back an opaque provider id, and a value that is never served is a value that
+ * cannot leak through a client, a screenshot or a support ticket.
+ */
+export async function listOwnConnections(db: DbLike, accountId: string): Promise<ConnectionView[]> {
+  const { results } = await db
+    .prepare("SELECT provider, connected_at, provider_public FROM fan_connections WHERE account_id = ? ORDER BY connected_at")
+    .bind(accountId)
+    .all<{ provider: string; connected_at: string; provider_public: number }>();
+  return results.map((r) => ({ provider: r.provider, connected_at: r.connected_at, provider_public: r.provider_public === 1 }));
+}
+
+export interface ConnectStart {
+  authorize_url: string;
+  state: string;
+  expires_at: string;
+}
+
+/**
+ * Begin a link. Mints a PKCE challenge bound to (account, provider) and returns
+ * the provider's authorize URL.
+ *
+ * The row is written to `oauth_challenges`, the table `oauth-claims.ts` already
+ * owns, so this path inherits its cron hygiene for free: the verifier is
+ * blanked the moment the row leaves `issued`, and settled rows are dropped past
+ * the retention window. A second table would have meant a second sweep somebody
+ * had to remember to write.
+ *
+ * `passport_id` on that row carries the ACCOUNT id for this family of rows, and
+ * `platform_key` distinguishes them — a fan link is never mistaken for a
+ * creator claim, because `completeFanConnection` only ever reads rows whose
+ * `platform_key` names a FAN provider and whose `account_key` is the
+ * `fanconn:` sentinel.
+ */
+export const FAN_CONNECT_SENTINEL = "fanconn";
+
+export async function startFanConnection(
+  db: DbLike,
+  env: Record<string, unknown>,
+  accountId: string,
+  provider: string,
+  now: () => string = () => new Date().toISOString(),
+  nowMs: number = Date.now(),
+): Promise<ConnectStart> {
+  if (!ACCOUNT_RE.test(accountId)) throw new ConnectionError("no such account", 401);
+  const prov = FAN_PROVIDERS[provider];
+  const cfg = prov ? oauthConfigFromEnv(env, provider) : null;
+  // ONE refusal for "we do not support that" and "the operator has not
+  // registered it". Both mean the same thing to a fan — the button cannot work
+  // — and distinguishing them only tells a prober which apps this deployment
+  // holds.
+  if (!prov || !cfg) throw new ConnectionError("that platform is not available", 503);
+
+  const already = await db.prepare("SELECT 1 AS x FROM fan_connections WHERE account_id = ? AND provider = ?").bind(accountId, provider).first();
+  if (already) throw new ConnectionError("you have already connected that platform", 409);
+
+  const state = randToken(24);
+  const codeVerifier = randToken(48); // 96 hex chars — within PKCE 43..128
+  const codeChallenge = await sha256Base64Url(codeVerifier);
+  const expires = new Date(nowMs + CONNECT_TTL_MS).toISOString();
+  await db
+    .prepare(
+      `INSERT INTO oauth_challenges (state, passport_id, account_key, platform_key, code_verifier, status, created_at, expires_at)
+       SELECT ?, ?, ?, ?, ?, 'issued', ?, ?
+        WHERE (SELECT COUNT(*) FROM oauth_challenges WHERE passport_id = ? AND account_key = ? AND created_at >= ?) < ?`,
+    )
+    .bind(state, accountId, FAN_CONNECT_SENTINEL, provider, codeVerifier, now(), expires, accountId, FAN_CONNECT_SENTINEL, new Date(nowMs - DAY_MS).toISOString(), MAX_CONNECT_STARTS_PER_DAY)
+    .run()
+    .then((res) => {
+      // The daily ceiling rides INSIDE the INSERT (F6's lesson): a SELECT above
+      // it is not a ceiling, because N concurrent callers all read the same
+      // pre-state. It is keyed on the fan's OWN account, which is a session, so
+      // no stranger can spend it.
+      if (res.changes === 0) throw new ConnectionError("too many connection attempts today — try again tomorrow", 429);
+    });
+  return { authorize_url: buildAuthorizeUrl(prov, cfg, state, codeChallenge), state, expires_at: expires };
+}
+
+export interface ConnectResult {
+  ok: boolean;
+  outcome: "connected" | "already_connected" | "already_linked_elsewhere" | "held" | "exchange_failed" | "expired" | "bad_state";
+  provider?: string;
+}
+
+/**
+ * Finish a link.
+ *
+ * THE HANDLE IS DISCARDED ON THE LINE IT ARRIVES. `exchangeAndIdentify` returns
+ * `{pid, handle}`; only `pid` is ever bound to a statement below. This is the
+ * one line a future writer will be tempted by, so it is the one with a comment
+ * on it.
+ */
+export async function completeFanConnection(
+  db: DbLike,
+  env: Record<string, unknown>,
+  accountId: string,
+  state: unknown,
+  code: unknown,
+  fetchImpl: typeof fetch = fetch,
+  now: () => string = () => new Date().toISOString(),
+  nowMs: number = Date.now(),
+): Promise<ConnectResult> {
+  if (typeof state !== "string" || typeof code !== "string" || state.length === 0 || code.length === 0) return { ok: false, outcome: "bad_state" };
+  const chg = await db
+    .prepare("SELECT state, passport_id, platform_key, code_verifier, status, expires_at FROM oauth_challenges WHERE state = ? AND account_key = ?")
+    .bind(state, FAN_CONNECT_SENTINEL)
+    .first<{ state: string; passport_id: string; platform_key: string; code_verifier: string; status: string; expires_at: string }>();
+  // The challenge must be this caller's own. A state belonging to another fan
+  // reads exactly like one that never existed.
+  if (!chg || chg.passport_id !== accountId) return { ok: false, outcome: "bad_state" };
+  if (chg.status !== "issued") return { ok: false, outcome: "bad_state" };
+  if (Date.parse(chg.expires_at) <= nowMs) {
+    await db.prepare("UPDATE oauth_challenges SET status = 'expired' WHERE state = ? AND status = 'issued'").bind(state).run();
+    return { ok: false, outcome: "expired" };
+  }
+  const prov = FAN_PROVIDERS[chg.platform_key];
+  const cfg = prov ? oauthConfigFromEnv(env, chg.platform_key) : null;
+  if (!prov || !cfg) return { ok: false, outcome: "bad_state" };
+
+  // SPEND THE CHALLENGE BEFORE THE EXCHANGE, so a replayed callback cannot
+  // start a second exchange even if the first is still in flight.
+  const spent = await db.prepare("UPDATE oauth_challenges SET status = 'spent' WHERE state = ? AND status = 'issued'").bind(state).run();
+  if ((spent.changes ?? 0) === 0) return { ok: false, outcome: "bad_state" };
+
+  const identity = await exchangeAndIdentify(prov, cfg, code, chg.code_verifier, fetchImpl);
+  if (!identity) return { ok: false, outcome: "exchange_failed" };
+  // THE ONLY FIELD THAT SURVIVES. `identity.handle` is in scope, on this line,
+  // and is never read again — see the module docblock. Keeping it would turn a
+  // vouching signal into a cross-platform identity graph about people who
+  // consented to neither.
+  const sub = identity.pid;
+
+  // The cooldown: another fan's recently-unlinked account is reserved to them.
+  const hold = await db
+    .prepare("SELECT account_id, until FROM fan_connection_holds WHERE provider = ? AND sub = ?")
+    .bind(chg.platform_key, sub)
+    .first<{ account_id: string; until: string }>();
+  if (hold && hold.account_id !== accountId && Date.parse(hold.until) > nowMs) return { ok: false, outcome: "held" };
+
+  // I3-1312 — THE HOLD IS RE-DECIDED INSIDE THE LINK. The read above is only
+  // the fast path: an unlink by the other fan landing between it and this batch
+  // writes a fresh hold the read never saw. So the INSERT carries the same
+  // predicate as a NOT EXISTS and reports its own verdict through RETURNING; an
+  // empty RETURNING is `held`, and the batch's DELETE only ever touches the
+  // caller's own hold, so a refused link consumes nothing.
+  // I3-1298 (I4-08-R9) — the INSERT is also bound to the account's lifetime
+  // (`EXISTS accounts`): an erasure committing during the provider exchange
+  // leaves no row; the empty RETURNING reads as `held`.
+  const nowIso = new Date(nowMs).toISOString();
+  let linked: boolean;
+  try {
+    const [ins] = (await db.batch([
+      db
+        .prepare(
+          "INSERT INTO fan_connections (account_id, provider, sub, connected_at) SELECT ?, ?, ?, ? " +
+            "WHERE EXISTS (SELECT 1 FROM accounts WHERE account_id = ?) " +
+            "AND NOT EXISTS (SELECT 1 FROM fan_connection_holds WHERE provider = ? AND sub = ? AND account_id <> ? AND until > ?) RETURNING account_id",
+        )
+        .bind(accountId, chg.platform_key, sub, now(), accountId, chg.platform_key, sub, accountId, nowIso),
+      // The fan's own hold, if any, is consumed by the relink.
+      db.prepare("DELETE FROM fan_connection_holds WHERE provider = ? AND sub = ? AND account_id = ?").bind(chg.platform_key, sub, accountId),
+    ])) as [{ results?: unknown[] }, unknown];
+    linked = (ins?.results?.length ?? 0) > 0;
+  } catch (e) {
+    if (e instanceof Error && /UNIQUE constraint/i.test(e.message)) {
+      // TWO CONSTRAINTS LIVE ON THIS TABLE and they mean opposite things, so a
+      // bare `/UNIQUE/` match told a fan who had two tabs open that their own
+      // Twitch account "is already connected to a DIFFERENT Dhwaja account" —
+      // a sentence that would send a reasonable person looking for an account
+      // takeover. `idx_fanconn_sub` is the Sybil control; the PRIMARY KEY
+      // `(account_id, provider)` is just this fan racing themselves. Ask which.
+      const owner = await db.prepare("SELECT account_id FROM fan_connections WHERE provider = ? AND sub = ?").bind(chg.platform_key, sub).first<{ account_id: string }>();
+      if (owner?.account_id === accountId) return { ok: false, outcome: "already_connected", provider: chg.platform_key };
+      // Somebody else holds it. The refusal discloses nothing: the person
+      // reading it just proved they control that account.
+      return { ok: false, outcome: "already_linked_elsewhere" };
+    }
+    throw e;
+  }
+  if (!linked) return { ok: false, outcome: "held" };
+  return { ok: true, outcome: "connected", provider: chg.platform_key };
+}
+
+/**
+ * Unlink. Always allowed — a connection a fan cannot withdraw is a connection
+ * they did not really give — and it reserves the external account to them for
+ * `RELINK_COOLDOWN_DAYS`, so unlinking is not a way to walk one Twitch account
+ * up a fleet of Dhwaja accounts.
+ */
+/**
+ * ...AND THE ONE THING THE COOLDOWN DOES NOT PRICE, recorded rather than
+ * quietly left for a reader to find (F8 review, Sybil Farmer).
+ *
+ * `account_data.ts` deletes the holds with the account, so ERASE-then-relink
+ * frees the external account immediately: link → harvest whatever a `connected`
+ * rule gates → delete the account → link the same Twitch to a fresh one, with no
+ * wait. The cooldown prices the farmer who wants to KEEP the old account; it
+ * does not price the one who burns it.
+ *
+ * IT IS LEFT OPEN ON PURPOSE, and the alternatives are worse:
+ *  - keeping the hold means retaining a provider's identifier for a person who
+ *    asked to be erased, which is the opposite of this feature's whole posture;
+ *  - keeping it keyed to a deleted account locks a REAL person out of
+ *    reconnecting their own Twitch for thirty days after they close and reopen
+ *    an account, which is an ordinary thing to do.
+ * And the attack already costs the attacker an entire account — every ordinal,
+ * collectible, credit and achievement on it — while yielding only artifacts
+ * that carry their own per-account-lifetime caps (`reward_grants`,
+ * `reverse_code_claims`). A pepper-keyed hold that survives erasure without
+ * naming anybody is the shape that would close it, and it is recorded with the
+ * `sub`-hashing follow-up in 0066 rather than guessed at here.
+ */
+export async function unlinkFanConnection(db: DbLike, accountId: string, provider: string, nowMs: number = Date.now()): Promise<boolean> {
+  const row = await db.prepare("SELECT sub FROM fan_connections WHERE account_id = ? AND provider = ?").bind(accountId, provider).first<{ sub: string }>();
+  if (!row) return false;
+  const until = new Date(nowMs + RELINK_COOLDOWN_DAYS * DAY_MS).toISOString();
+  await db.batch([
+    db.prepare("DELETE FROM fan_connections WHERE account_id = ? AND provider = ?").bind(accountId, provider),
+    db
+      .prepare("INSERT INTO fan_connection_holds (provider, sub, account_id, until) VALUES (?, ?, ?, ?) ON CONFLICT(provider, sub) DO UPDATE SET account_id = excluded.account_id, until = excluded.until")
+      .bind(provider, row.sub, accountId, until),
+  ]);
+  return true;
+}
+
+/** The fan's per-link choice about naming a platform on their public profile. */
+export async function setProviderPublic(db: DbLike, accountId: string, provider: string, isPublic: boolean): Promise<boolean> {
+  const res = await db.prepare("UPDATE fan_connections SET provider_public = ? WHERE account_id = ? AND provider = ?").bind(isPublic ? 1 : 0, accountId, provider).run();
+  return (res.changes ?? 0) > 0;
+}
+
+/** Re-exported so a caller with the write half in hand does not need a second
+ * import for the read. The DEFINITION is in the public half — see its docblock
+ * for why that file may not import anything. */
+export { connectionCount, constellation, FAN_PROVIDER_KEYS, type Constellation } from "./fan-connections-public.js";
+
+/**
+ * Cron: drop lapsed relink holds.
+ *
+ * A hold that has expired is a row that decides nothing — `completeFanConnection`
+ * already ignores one past its `until` — so this is table hygiene, exactly like
+ * `pruneOAuthChallenges`, and never a decision.
+ */
+export async function sweepFanConnectionHolds(db: DbLike, nowMs: number = Date.now(), limit = 500): Promise<number> {
+  const res = await db
+    .prepare("DELETE FROM fan_connection_holds WHERE rowid IN (SELECT rowid FROM fan_connection_holds WHERE until <= ? LIMIT ?)")
+    .bind(new Date(nowMs).toISOString(), limit)
+    .run();
+  return res.changes ?? 0;
+}
+===== END FILE: services/trust-core/src/fan-connections.ts =====
+
+===== BEGIN FILE: services/trust-core/src/fan-identity-unlink.ts =====
+import type { DbLike } from "./db.js";
+import { FanAuthError } from "./fan-auth.js";
+import { currentSessionEpoch } from "./oidc.js";
+
+/**
+ * QUEUE #617 (D-0864(6)) — a fan unlinks ONE linked Google/Apple sign-in
+ * identity without erasing the account. Door: `DELETE /account/oauth/:provider`
+ * (fan-account-routes.ts).
+ *
+ * THE WAY-IN RULE IS fan-auth.ts's, FROM THE THIRD SIDE. `removeFanEmail` and
+ * `revokeFanPasskey` refuse to leave an account with zero sign-in methods, and
+ * a method is an active fan passkey, a VERIFIED fan email, or a Google/Apple
+ * identity (fan-auth.ts `OIDC_WAY_IN`, I3-1247). Unlinking provider P is
+ * allowed only while another method remains: a passkey, a verified email, or an
+ * identity of a provider OTHER than P (every row of P goes, so a second P row
+ * is not "another" method). The predicate is one const bound into every write
+ * of one batch, so two concurrent removals cannot each see the other's method.
+ *
+ * NO CROSS-ACCOUNT ORACLE. Every statement is scoped by the session's
+ * account_id; a provider this account has not linked answers the same 404
+ * whatever any other account holds. The 409 is a fact about the caller's own
+ * account, told to a caller who proved they hold it (revokeFanPasskey's rule).
+ *
+ * SEVERS SESSIONS, like the passkey revoke: a session minted through the
+ * identity being removed must not outlive it, and sessions carry no minting
+ * method, so the epoch moves in the same batch and the route re-mints the
+ * caller's own session.
+ *
+ * AUDIT: the link door writes no success row (oidc.ts notifyProviderLinked
+ * mails the owner and audits only an undeliverable notice), so this writes the
+ * J-54 idiom's row — account id only, never the sub or the email — under the
+ * identical predicate, so it exists exactly when the unlink does.
+ */
+export const UNLINKABLE_PROVIDERS = ["google", "apple"] as const;
+export type UnlinkableProvider = (typeof UNLINKABLE_PROVIDERS)[number];
+
+export interface FanUnlinkResult {
+  unlinked: UnlinkableProvider;
+  session_epoch: number;
+}
+
+const NOT_LINKED = "no such sign-in on this account";
+export const LAST_WAY_IN =
+  "that's the only way into this account — add a passkey, confirm an email, or link another sign-in before removing this one";
+
+/** Binds, in order: accountId, provider, accountId, accountId, accountId, provider. */
+const UNLINK_GUARD =
+  "EXISTS (SELECT 1 FROM oauth_identities WHERE account_id = ? AND provider = ?) AND (" +
+  "EXISTS (SELECT 1 FROM fan_passkeys WHERE account_id = ? AND status = 'active') " +
+  "OR EXISTS (SELECT 1 FROM fan_email WHERE account_id = ? AND verified_at IS NOT NULL) " +
+  "OR EXISTS (SELECT 1 FROM oauth_identities WHERE account_id = ? AND provider IN ('google', 'apple') AND provider <> ?))";
+
+export async function unlinkFanIdentity(
+  db: DbLike,
+  accountId: string,
+  provider: string,
+  now: () => string = () => new Date().toISOString(),
+  /** I3-0983 (I22-FX-AUTH): the epoch the route admitted the caller at; absent, it is read before the batch. */
+  admittedEpoch?: number,
+): Promise<FanUnlinkResult> {
+  if (!(UNLINKABLE_PROVIDERS as readonly string[]).includes(provider)) throw new FanAuthError(NOT_LINKED, 404);
+  const p = provider as UnlinkableProvider;
+  const g = [accountId, p, accountId, accountId, accountId, p] as const;
+  const held = await db.prepare("SELECT 1 AS x FROM oauth_identities WHERE account_id = ? AND provider = ?").bind(accountId, p).first();
+  if (!held) throw new FanAuthError(NOT_LINKED, 404);
+  const baseline = admittedEpoch ?? (await currentSessionEpoch(db, accountId)) ?? 0;
+  const res = await db.batch([
+    db
+      .prepare(
+        "INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) " +
+          `SELECT 'system:fan-auth', 'fan_auth:identity_unlinked', ?, ?, ?, 'system' WHERE ${UNLINK_GUARD}`,
+      )
+      .bind(`fan unlinked their ${p === "google" ? "Google" : "Apple"} sign-in; every session on this account was signed out`, now(), accountId, ...g),
+    db.prepare(`UPDATE accounts SET session_epoch = session_epoch + 1 WHERE account_id = ? AND ${UNLINK_GUARD} RETURNING session_epoch`).bind(accountId, ...g),
+    db.prepare(`DELETE FROM oauth_identities WHERE account_id = ? AND provider = ? AND ${UNLINK_GUARD} RETURNING sub`).bind(accountId, p, ...g),
+  ]);
+  // The DELETE's own rows are the verdict, not a read-back of the table.
+  const removed = (res[2] as { results?: unknown[] } | undefined)?.results ?? [];
+  if (removed.length === 0) {
+    const still = await db.prepare("SELECT 1 AS x FROM oauth_identities WHERE account_id = ? AND provider = ?").bind(accountId, p).first();
+    // Still there: the guard refused — it is the last way in. Gone: a concurrent
+    // unlink of the same provider got there first, which is what was asked.
+    if (still) throw new FanAuthError(LAST_WAY_IN, 409);
+  }
+  // I3-0983 (I22-FX-AUTH; fan-auth.ts revokeFanPasskey's rule): the replacement session gets the epoch THIS batch's
+  // bump produced, and only when that is baseline + 1. Anything else (a sign-out-everywhere between admission and
+  // the batch, or a racer's unlink that did the bump) gets the dead baseline: signed out with everyone else. No
+  // epoch is read after the batch, so a sign-out landing after it is never adopted.
+  const bumped = ((res[1] as { results?: { session_epoch?: number }[] } | undefined)?.results ?? [])[0]?.session_epoch;
+  return { unlinked: p, session_epoch: bumped === baseline + 1 ? bumped : baseline };
+}
+===== END FILE: services/trust-core/src/fan-identity-unlink.ts =====
+
+===== BEGIN FILE: services/trust-core/src/fan-library-routes.ts =====
+import { Hono, type Context } from "hono";
+import { AccountError, listNotifications, listSaves, saveCreator, unsaveCreator } from "./accounts.js";
+import { cardData } from "./cards.js";
+import { collectCard, listCollection, uncollectCard } from "./collections.js";
+import { d1 } from "./db.js";
+import { logError } from "./log.js";
+import { usableFanSecret } from "./analytics-events.js";
+import { analyticsPublishArgs, anonBodyLimit, fanId, fanIpAllowed, logEncounter, RANKING_WRITES_PER_IP_HOUR, errorBody, refusal, RATE_LIMIT_MESSAGE } from "./route-helpers.js";
+import type { Env } from "./env.js";
+
+/**
+ * I3-0764 — the fallback for a throw no domain class claimed. `accounts.ts` and
+ * `collections.ts` raise every CLIENT fault as `AccountError`, so anything else
+ * (a D1 outage, a storage fault, a bug) is ours: logged, and answered 500 —
+ * never a 400 that tells the caller their request was the problem.
+ */
+function serverFault(c: Context<{ Bindings: Env }>, route: string, e: unknown): Response {
+  logError({ cid: crypto.randomUUID(), hop: "http", route, msg: "unexpected route fault", err: e instanceof Error ? e.name : typeof e });
+  return c.json({ error: "internal" }, 500);
+}
+
+/**
+ * THE FAN'S OWN LIBRARY — the lists a fan builds about creators, and the reads
+ * that give them back.
+ *
+ * BOUNDARY. Saves (`/account/save`, `/account/unsave`, `/account/saves`), the
+ * notification feed, and the card collection (`/account/collect`,
+ * `/account/uncollect`, `/account/collection`) plus the public card read
+ * (`GET /card/:id`) the collect flow is built on.
+ *
+ * Every write here is a fan-session route whose answer must be identical for a
+ * SUPPRESSED creator and a never-listed one — `tests/invariants/
+ * suppression-oracles.test.ts` censuses `/account/*` off the router, so a route
+ * added here is swept whether or not anyone remembers to write it down.
+ */
+export function makeFanLibraryRoutes(): Hono<{ Bindings: Env }> {
+  const app = new Hono<{ Bindings: Env }>();
+
+  app.post("/account/save", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    // I3-0065 / D-0885(1): this door writes a fan-keyed analytics fact (`fanKey`), the
+    // same 503 gate as /account/handshakes (handshake-routes.ts), before any work.
+    if (!usableFanSecret(c.env.ANALYTICS_FAN_SECRET)) return c.json({ error: "analytics_unavailable", detail: "saving is temporarily unavailable" }, 503);
+    // A-24 — a save is also a VOTE: `ratings.ts` folds `saves` straight into the
+    // public `community` ranking dimension, the same way `card_collections`
+    // does for /account/collect below, which already carries this ceiling.
+    // Consumed AFTER the auth check and SUBJECT-INDEPENDENT for the same
+    // suppression-oracle reason as /account/collect (see the comment there).
+    if (!(await fanIpAllowed(c, "save", RANKING_WRITES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { passport_id?: unknown } | null;
+    if (!body || typeof body.passport_id !== "string") return c.json({ error: "passport_id required" }, 400);
+    try {
+      await saveCreator(d1(c.env.TRUST_DB), id, body.passport_id, undefined, c.env.ANALYTICS_FAN_SECRET, ...analyticsPublishArgs(c));
+      await logEncounter(c, body.passport_id, "save"); // Codex: a save is also a sighting
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof AccountError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/save", e);
+    }
+  });
+
+  app.post("/account/unsave", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    // I3-0065 / D-0885(1): this door writes a fan-keyed analytics fact (`fanKey`), the
+    // same 503 gate as /account/handshakes (handshake-routes.ts), before any work.
+    if (!usableFanSecret(c.env.ANALYTICS_FAN_SECRET)) return c.json({ error: "analytics_unavailable", detail: "unsaving is temporarily unavailable" }, 503);
+    const body = (await c.req.json().catch(() => null)) as { passport_id?: unknown } | null;
+    if (!body || typeof body.passport_id !== "string") return c.json({ error: "passport_id required" }, 400);
+    try {
+      await unsaveCreator(d1(c.env.TRUST_DB), id, body.passport_id, undefined, c.env.ANALYTICS_FAN_SECRET, ...analyticsPublishArgs(c));
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof AccountError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/unsave", e);
+    }
+  });
+
+  app.get("/account/saves", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    // I3-1754 — an erasure landing between the session read and the list makes
+    // `requireAccount` throw AccountError(401); answer it like every sibling.
+    try {
+      return c.json({ saves: await listSaves(d1(c.env.TRUST_DB), id) });
+    } catch (e) {
+      if (e instanceof AccountError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/saves", e);
+    }
+  });
+
+  app.get("/account/notifications", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    try {
+      return c.json({ notifications: await listNotifications(d1(c.env.TRUST_DB), id) });
+    } catch (e) {
+      if (e instanceof AccountError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/notifications", e);
+    }
+  });
+
+  // Public card data (derived from the fold — can't overclaim).
+  app.get("/card/:id", async (c) => {
+    const card = await cardData(d1(c.env.TRUST_DB), c.req.param("id"));
+    if (!card) return c.json({ error: "not_found" }, 404);
+    return c.json(card, 200, { "Cache-Control": "public, max-age=60" });
+  });
+
+  app.post("/account/collect", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    // I3-0065 / D-0885(1): this door writes a fan-keyed analytics fact (`fanKey`), the
+    // same 503 gate as /account/handshakes (handshake-routes.ts), before any work.
+    if (!usableFanSecret(c.env.ANALYTICS_FAN_SECRET)) return c.json({ error: "analytics_unavailable", detail: "collecting is temporarily unavailable" }, 503);
+    // Audit #17 — a collect is a VOTE on four public boards, and this route had no
+    // per-IP ceiling of any kind. The qualified-fan view is the primary defence
+    // (an unqualified account's collect carries no weight at all); this is the
+    // backstop that stops one address driving a farm of qualified accounts. It is
+    // consumed AFTER the auth check on purpose, so an anonymous flood cannot
+    // spend a shared NAT's budget on behalf of real fans, and it is
+    // SUBJECT-INDEPENDENT — the same statement runs whatever passport_id is in
+    // the body, so it adds no round trip a suppression oracle could measure.
+    if (!(await fanIpAllowed(c, "collect", RANKING_WRITES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { passport_id?: unknown } | null;
+    if (!body || typeof body.passport_id !== "string") return c.json({ error: "passport_id required" }, 400);
+    try {
+      await collectCard(d1(c.env.TRUST_DB), id, body.passport_id, undefined, c.env.ANALYTICS_FAN_SECRET, ...analyticsPublishArgs(c));
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof AccountError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/collect", e);
+    }
+  });
+
+  app.post("/account/uncollect", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    // I3-0065 / D-0885(1): this door writes a fan-keyed analytics fact (`fanKey`), the
+    // same 503 gate as /account/handshakes (handshake-routes.ts), before any work.
+    if (!usableFanSecret(c.env.ANALYTICS_FAN_SECRET)) return c.json({ error: "analytics_unavailable", detail: "uncollecting is temporarily unavailable" }, 503);
+    const body = (await c.req.json().catch(() => null)) as { passport_id?: unknown } | null;
+    if (!body || typeof body.passport_id !== "string") return c.json({ error: "passport_id required" }, 400);
+    try {
+      await uncollectCard(d1(c.env.TRUST_DB), id, body.passport_id, undefined, c.env.ANALYTICS_FAN_SECRET, ...analyticsPublishArgs(c));
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof AccountError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/uncollect", e);
+    }
+  });
+
+  app.get("/account/collection", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    // A-012: the cursor is the (created_at, passport_id) pair the previous
+    // page's `next` returned — a bare timestamp is not a total order over
+    // this table (see collections.ts listCollection). Malformed/partial query
+    // params are treated as "no cursor" (first page), never a 400: a client
+    // replaying a stale or hand-edited link gets page one, not an error.
+    const beforeCreated = c.req.query("before_created_at");
+    const beforePassport = c.req.query("before_passport_id");
+    const before = typeof beforeCreated === "string" && typeof beforePassport === "string" ? { created_at: beforeCreated, passport_id: beforePassport } : undefined;
+    const page = await listCollection(d1(c.env.TRUST_DB), id, before);
+    return c.json({ collection: page.cards, next: page.next });
+  });
+
+  return app;
+}
+===== END FILE: services/trust-core/src/fan-library-routes.ts =====
+
+===== BEGIN FILE: services/trust-core/src/fan-quality.ts =====
+import type { DbLike } from "./db.js";
+
+/**
+ * THE QUALIFIED FAN — one definition of "this account is a person", shared by
+ * every public board and every scarce fan ordinal. Audit items #17, #18, #19.
+ *
+ * ---------------------------------------------------------------------------
+ * THE PROBLEM
+ * ---------------------------------------------------------------------------
+ * Every board was a raw one-row-per-account count with zero weighting. The
+ * primary keys already made them distinct-per-account (`card_collections` and
+ * `creator_encounters` are both PK `(account_id, passport_id)`), so the
+ * exposure was never double-counting — it was that ONE THROWAWAY ACCOUNT WAS
+ * ONE FULL VOTE. `most_discovered` was the cheapest of all: merely VIEWING a
+ * passport writes an encounter row. And the Founding Fan ordinal was pure
+ * request order, so ten minted accounts took all ten permanent slots on any
+ * unclaimed passport before a real fan arrived.
+ *
+ * ---------------------------------------------------------------------------
+ * THE RULE, AND WHY
+ * ---------------------------------------------------------------------------
+ * There was no notion of a "qualified" fan account anywhere in the tree. The
+ * only earned-trust predicate that existed was `fanReporterBand` (reports.ts),
+ * which no ranking read and which belongs to the ACCUSATORY path — wiring a
+ * board to it would make filing reports a way to climb a leaderboard, which is
+ * the last incentive this product should create. So the predicate is new, and
+ * it is built out of the raw signals that already exist:
+ *
+ *   qualified  ≡  (provider-verified email
+ *                  OR OTP-proved self-added email
+ *                  OR an active passkey
+ *                  OR ≥ 1 acquisition)
+ *
+ * A DISJUNCTION, NEVER A REQUIRED COLUMN. An account can be born with no email
+ * at all (the passkey join path, `fan-auth.ts`), so requiring a verified email
+ * would disenfranchise the most security-conscious sign-up route we offer.
+ * COST IS UNEVEN ACROSS DISJUNCTS, and one of them is not a resource cost at
+ * all: an inbox the attacker controls or a one-time code a creator issued are
+ * each rate-limited (a real send, a real human on the other end), but a
+ * passkey costs nothing beyond generating an ES256 keypair — `fan-auth.ts`
+ * requests `attestation: "none"` and never reads `fmt`/`attStmt`
+ * (`webauthn.ts` states outright: only the key material inside `authData` is
+ * trusted, never the attestation statement), so a software authenticator with
+ * no hardware and no rate limit satisfies this disjunct for free (A-43). The
+ * disjunction still holds as an IDENTITY gate — see the weighting and the
+ * Founding Fan floor below for how the free disjunct is kept from being a free
+ * VOTE.
+ *
+ * RECORDED, NOT RE-DERIVED (0024_fan_qualification.sql). Every one of those
+ * four signals is MUTABLE — the pending-email swap re-stamps `verified_at`
+ * forward, `removeFanEmail` deletes the row, `revokeFanPasskey` leaves
+ * 'active', erasure deletes `acquisitions` — and `0020` computed the
+ * qualification instant live, on every read, out of all four. That made "was
+ * this fan qualified as of the claim?" an answer that changed with the
+ * question's timing, which cost a real requester a permanent Founding Fan slot
+ * (adversarial review D2). The disjunction is unchanged; what changed is WHEN
+ * it is evaluated. The first instant any disjunct becomes true is written into
+ * `fan_qualification` by a trigger on the evidence table itself, `min()`-upsert
+ * so it only ever moves EARLIER, and the view reads that. A signal releases
+ * nothing when it goes away: the spend already happened, and un-spending it was
+ * a lever an attacker could pull on somebody else's vote.
+ *
+ * NO PAYMENT SIGNAL, EVER. `accounts.tier` and `billing_entitlements` are
+ * absent and must stay absent — INVARIANT [protection-is-never-paywalled]
+ * (tests/invariants/paywall.test.ts). This module imports the `DbLike` TYPE and
+ * nothing else, the `recognition-public.ts` pattern, so the paywall guard's
+ * verdict closure can contain it with no exemption of any kind: it cannot reach
+ * a billing module even in principle.
+ *
+ * ---------------------------------------------------------------------------
+ * WEIGHTED, NOT CUT OFF — and where that flips
+ * ---------------------------------------------------------------------------
+ * AGE IS CONTINUOUS, so a cutoff on it is a lie in the other direction: a hard
+ * "≥ 30 days" bar tells a legitimate fan who joined yesterday that their
+ * collection does not exist, and it hands an attacker a precise date to wait
+ * out. Boards therefore use a RAMP:
+ *
+ *     score = Σ  min(1, days_since_qualified / FAN_WEIGHT_RAMP_DAYS)   (I3-1155)
+ *
+ * over qualified accounts only. A brand-new real fan still counts, just less;
+ * a fan who has been here a month counts fully; and a burst of accounts minted
+ * this morning is worth a rounding error however many of them there are. The
+ * ramp also degrades gracefully: there is no instant at which a board's
+ * numbers jump.
+ *
+ * IDENTITY IS NOT CONTINUOUS, so the disjunction above is binary. There is no
+ * such thing as a partial passkey.
+ *
+ * SCARCE ORDINALS ARE NOT CONTINUOUS EITHER, so they are the one place a hard
+ * floor is right: nobody can hold Founding Fan rank 7.4. Where the output is a
+ * permanent, publicly-numbered, economically-valuable integer, the ramp cannot
+ * express "counts less" and a floor is the only honest instrument.
+ * `FOUNDING_FAN_MIN_AGE_DAYS` is that floor, and it is 7 days on purpose: the
+ * same account age `fanReporterBand` already requires before a fan's report
+ * carries earned weight. One number for "old enough to be trusted with
+ * something permanent", not two.
+ *
+ * ---------------------------------------------------------------------------
+ * HOW TO USE IT
+ * ---------------------------------------------------------------------------
+ * The rule lives in a VIEW (`0020_fan_quality.sql`), following the
+ * `rankable_passports` / `rankable_profiles` precedent, so a future board
+ * inherits it by construction. The helpers below are the SQL fragments that
+ * compose with it. They interpolate WHOLE CLAUSES, never a bare identifier
+ * after FROM/JOIN — the paywall guard's SQL-construction rule forbids a dynamic
+ * table name inside `prepare(`, and it is right to.
+ *
+ * Each `?` a fragment contributes is documented on the fragment. Bind order is
+ * statement order: a `?` inside the SELECT list is bound BEFORE one in the
+ * WHERE clause.
+ */
+
+/** The view name. One definition; nothing else should spell it. */
+export const QUALIFIED_FAN_VIEW = "qualified_fan_accounts";
+
+/** Days over which a qualified fan's vote ramps from ~0 to a full 1. */
+export const FAN_WEIGHT_RAMP_DAYS = 30;
+
+/**
+ * The hard age floor for a SCARCE ORDINAL (Founding Fan rank). Seven days, the
+ * same floor `reports.ts` `fanReporterBand` already applies before an account's
+ * report carries earned weight — see the docblock above for why an ordinal gets
+ * a floor where a board gets a ramp.
+ */
+export const FOUNDING_FAN_MIN_AGE_DAYS = 7;
+
+/** I3-1064 (hand-off from I4-04-R6): every builder below INTERPOLATES its
+ * arguments, so each admits only a (qualified) SQL identifier and throws on
+ * anything else. */
+const SQL_IDENT_RE = /^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$/;
+function ident(v: string): string {
+  if (!SQL_IDENT_RE.test(v)) throw new Error(`fan-quality: not a SQL identifier: ${JSON.stringify(v)}`);
+  return v;
+}
+
+/**
+ * INNER JOIN to the qualified-fan view. Everything an unqualified account did
+ * simply is not in the aggregate — its rows still exist, they just carry no
+ * vote.
+ *
+ * `accountCol` is a COLUMN REFERENCE this module's callers write as a literal
+ * (`cc.account_id`), never caller data.
+ */
+export function qualifiedFanJoin(accountCol: string, alias = "qf"): string {
+  ident(accountCol);
+  ident(alias);
+  return `JOIN ${QUALIFIED_FAN_VIEW} ${alias} ON ${alias}.account_id = ${accountCol}`;
+}
+
+/**
+ * LEFT JOIN variant, for a board that must keep a creator with zero qualified
+ * fans on the list (Breakout publishes a just-verified creator at score 0 —
+ * "newly broken out" is itself the signal). Unmatched rows make the weight
+ * NULL, `SUM` skips NULLs, and the caller wraps it in COALESCE.
+ */
+export function qualifiedFanLeftJoin(accountCol: string, alias = "qf"): string {
+  return `LEFT ${qualifiedFanJoin(accountCol, alias)}`;
+}
+
+/**
+ * One qualified fan's vote: `min(1, qualified_days / RAMP)`, floored at 0 so a
+ * clock-skewed or hand-written future instant can never contribute a
+ * NEGATIVE vote (which would let an attacker push a rival DOWN).
+ *
+ * CONTRIBUTES ONE `?` — the ISO instant to measure age against. Bind it in
+ * statement position.
+ */
+export function fanWeightExpr(alias = "qf"): string {
+  ident(alias);
+  return `MAX(0.0, MIN(1.0, (julianday(?) - julianday(${alias}.qualified_at)) / ${FAN_WEIGHT_RAMP_DAYS}.0))`;
+}
+
+/**
+ * The board score: the ramped sum, rounded so an artifact does not carry
+ * float noise. CONTRIBUTES ONE `?` (see `fanWeightExpr`).
+ */
+export function fanWeightSum(alias = "qf"): string {
+  return `ROUND(COALESCE(SUM(${fanWeightExpr(alias)}), 0), 2)`;
+}
+
+/**
+ * I3-1155 — BOTH CLOCKS RUN FROM `qualified_at`, the recorded watermark
+ * (`0024_fan_qualification.sql`), never from `accounts.created_at`: an account
+ * row is the free half of a fan identity, so a batch of accounts minted early
+ * and qualified later would otherwise arrive at full weight — and past the
+ * Founding floor — the moment they qualify.
+ *
+ * The hard age floor, for the ordinal path only. CONTRIBUTES ONE `?` — the
+ * instant the ordinal is being frozen AS OF (the claim timestamp), so the
+ * answer is fixed forever rather than drifting with wall-clock time.
+ */
+export function fanAgedEnoughExpr(alias = "qf"): string {
+  ident(alias);
+  return `(julianday(?) - julianday(${alias}.qualified_at)) >= ${FOUNDING_FAN_MIN_AGE_DAYS}`;
+}
+
+/**
+ * "Was this account qualified AS OF this instant?" CONTRIBUTES ONE `?`.
+ *
+ * This is what makes the Founding Fan freeze stable: the request set freezes at
+ * claim, so evaluating qualification at the SAME instant makes the whole
+ * ordering a pure function of facts that can no longer change. Asking "is this
+ * fan qualified now?" instead would re-open exactly the drift the freeze
+ * exists to close.
+ *
+ * THAT ONLY BECAME TRUE WITH `0024_fan_qualification.sql`, and the distinction
+ * is the whole of adversarial-review D2. Until then the column this compares
+ * against was a LIVE recomputation over four mutable tables, so "as of the
+ * claim" was answered with today's evidence and moved whenever the evidence
+ * moved — a requester who changed their email address between the claim and
+ * the cron sweep dropped off the slate and forfeited a permanent slot. The
+ * column is now a recorded watermark that only ever moves EARLIER, so this
+ * predicate is genuinely a question about the past. Do not reintroduce a
+ * derived-on-read qualification behind it.
+ */
+export function fanQualifiedAsOfExpr(alias = "qf"): string {
+  ident(alias);
+  return `${alias}.qualified_at <= ?`;
+}
+
+/** The recorded COSTED qualification table (I3-0965; NEEDS-MIGRATION — the
+ * orchestrator lands it). Same shape and min()-upsert triggers as
+ * `fan_qualification` (0024), over the RATE-LIMITED disjuncts only:
+ * provider-verified email and OTP-proved email. An acquisition stopped being one
+ * at 0232 (I23-Q2, D-1030: no code is knowably paid); rows it wrote before stay.
+ * A passkey — free to mint (A-43) — never writes it. */
+export const FAN_COSTED_QUALIFICATION_TABLE = "fan_costed_qualification";
+
+/**
+ * I3-0965 — the extra gate for a SCARCE ORDINAL (Founding Fan rank), on top of
+ * `fanAgedEnoughExpr`: the account holds a costed qualification instant (the
+ * earliest of the three rate-limited signals, recorded and monotone) at or
+ * before the instant bound. A passkey-only account still requests and still
+ * counts on ramped boards; it is skipped for a Founding Fan slot until it adds
+ * one of those signals.
+ *
+ * CONTRIBUTES ONE `?` — the as-of instant (the claim instant for the slate).
+ */
+export function fanCostedQualifiedAsOfExpr(alias = "qf"): string {
+  ident(alias);
+  return `EXISTS (SELECT 1 FROM ${FAN_COSTED_QUALIFICATION_TABLE} fcq WHERE fcq.account_id = ${alias}.account_id AND fcq.first_costed_at <= ?)`;
+}
+
+/**
+ * D-0844(2) / RG2FR-02 — the Founding Fan AGE FLOOR measured from the COSTED
+ * instant (the first signal that qualifies under the current rules), never from
+ * a grandfathered passkey `qualified_at`. Implies `fanCostedQualifiedAsOfExpr`.
+ *
+ * CONTRIBUTES ONE `?` — the as-of instant (the claim instant for the slate).
+ */
+export function fanCostedAgedEnoughExpr(alias = "qf"): string {
+  ident(alias);
+  return `EXISTS (SELECT 1 FROM ${FAN_COSTED_QUALIFICATION_TABLE} fcq WHERE fcq.account_id = ${alias}.account_id AND (julianday(?) - julianday(fcq.first_costed_at)) >= ${FOUNDING_FAN_MIN_AGE_DAYS})`;
+}
+
+/**
+ * Is this ONE account a qualified fan (optionally, as of an instant)? The
+ * point-read form of the view, for a caller that has an account id rather than
+ * an aggregate — used by tests and by any future per-account gate. Returns
+ * false for an unknown account, which is the fail-closed answer.
+ */
+export async function isQualifiedFan(db: DbLike, accountId: string, asOfIso?: string): Promise<boolean> {
+  if (typeof accountId !== "string" || accountId.length === 0) return false;
+  const row = asOfIso
+    ? await db.prepare("SELECT 1 AS x FROM qualified_fan_accounts WHERE account_id = ? AND qualified_at <= ?").bind(accountId, asOfIso).first()
+    : await db.prepare("SELECT 1 AS x FROM qualified_fan_accounts WHERE account_id = ?").bind(accountId).first();
+  return row !== null;
+}
+===== END FILE: services/trust-core/src/fan-quality.ts =====
+
+===== BEGIN FILE: services/trust-core/src/fan-social-routes.ts =====
+import { Hono, type Context } from "hono";
+import { usableFanSecret } from "./analytics-events.js";
+import { clearCodex, CODEX_SOURCES, codexLoggingEnabled, codexStats, listCodex, recordEncounter, setCodexLogging } from "./codex.js";
+import { d1 } from "./db.js";
+import { logError } from "./log.js";
+import { consumeRateLimit } from "./ratelimit.js";
+import { analyticsPublishArgs, anonBodyLimit, callerPrefix, edgeCountry, ENCOUNTER_WRITES_PER_IP_HOUR, fanId, fanIpAllowed, privacySignalOptOut, RANKING_WRITES_PER_IP_HOUR, refusal, RATE_LIMIT_MESSAGE , errorBody } from "./route-helpers.js";
+import { achievementSweepAllowed, awardAchievements, discover, followByHandle, getOwnProfile, listAchievements, listFollowBlocks, listFollowers, listFollowing, profileReadGate, publicProfile, removeFollowerByHandle, setFeatured, SocialError, unblockFollowerByHandle, unfollowByHandle, upsertProfile, withFoundingRanks, type FeaturedInput, type ProfileInput } from "./social.js";
+import type { Env } from "./env.js";
+
+/**
+ * I3-0764 — the fallback for a throw no domain class claimed. `social.ts`
+ * raises every CLIENT fault as `SocialError`, so anything else (a D1 outage, a
+ * storage fault, a bug) is ours: logged, and answered 500 — never a 400 that
+ * tells the caller their request was the problem.
+ */
+function serverFault(c: Context<{ Bindings: Env }>, route: string, e: unknown): Response {
+  logError({ cid: crypto.randomUUID(), hop: "http", route, msg: "unexpected route fault", err: e instanceof Error ? e.name : typeof e });
+  return c.json({ error: "internal" }, 500);
+}
+
+/**
+ * THE FAN'S SOCIAL LAYER — the private Codex, the public handle, and the follow
+ * graph between them.
+ *
+ * BOUNDARY. The S34 Creator Codex (`/account/codex*`, the fan's own "seen" log,
+ * including its logging switch and its erasure), and the S22 social layer:
+ * profile upsert and read, follow/unfollow/remove-follower, the two roster
+ * reads, featured picks, achievements, personalized discovery, and the public
+ * `GET /u/:handle` a session merely personalizes.
+ *
+ * `GET /u/:handle` is an OPTIONAL VIEWER route — a refused credential gets the
+ * stranger's answer and writes nothing — and it is classified as one in the
+ * pinned audit, which now reads the whole service rather than index.ts alone.
+ */
+export function makeFanSocialRoutes(): Hono<{ Bindings: Env }> {
+  const app = new Hono<{ Bindings: Env }>();
+
+
+  // --- S34 Creator Codex (the fan's private "seen" log) ---
+
+  // The fan's Codex, most-recently-seen first (paginate with ?before=<last_seen>).
+  app.get("/account/codex", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    const limitRaw = Number(c.req.query("limit"));
+    const before = c.req.query("before");
+    const entries = await listCodex(d1(c.env.TRUST_DB), id, {
+      limit: Number.isInteger(limitRaw) && limitRaw > 0 ? limitRaw : 50,
+      ...(typeof before === "string" && before ? { beforeSeenAt: before } : {}),
+    });
+    return c.json({ entries });
+  });
+
+  // Headline numbers + the current logging state.
+  app.get("/account/codex/stats", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    const db = d1(c.env.TRUST_DB);
+    // Surface Codex/Scout badges when the fan looks at their Codex — best-effort,
+    // and throttled by the shared achievement-sweep cap so it can't be hammered.
+    let newAchievements: string[] = [];
+    try {
+      if (await achievementSweepAllowed(db, id, Date.now())) newAchievements = await awardAchievements(db, id, undefined, c.env.ANALYTICS_FAN_SECRET, ...analyticsPublishArgs(c));
+    } catch {
+      /* best-effort */
+    }
+    const stats = { ...(await codexStats(db, id)), logging: await codexLoggingEnabled(db, id) };
+    return c.json(newAchievements.length > 0 ? { ...stats, new_achievements: newAchievements } : stats);
+  });
+
+  // Explicit encounter log — used by the clients (e.g. a share-to-Dhwaja check
+  // that resolved to a known passport). Best-effort: a bad/unknown passport is a
+  // silent no-op (no existence oracle), still 200.
+  app.post("/account/codex/seen", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    // I3-0065 / D-0884(1): this door writes a fan-keyed analytics fact, which
+    // `fanKey` refuses without a usable ANALYTICS_FAN_SECRET; the SAME gate and
+    // words as /account/redeem (credentials-routes.ts), 503 before any work.
+    // Subject-independent: without it a live passport faulted (fanKey throws)
+    // where an unknown one answered 200, which is the existence oracle the
+    // silence below exists to close.
+    if (!usableFanSecret(c.env.ANALYTICS_FAN_SECRET)) return c.json({ error: "analytics_unavailable", detail: "the Codex is temporarily unavailable" }, 503);
+    const raw = await c.req.text();
+    if (raw.length > 4 * 1024) return c.json({ error: "too_large" }, 413);
+    const body = ((): { passport_id?: unknown; source?: unknown } | null => {
+      try {
+        return JSON.parse(raw) as { passport_id?: unknown; source?: unknown };
+      } catch {
+        return null;
+      }
+    })();
+    if (!body || typeof body.passport_id !== "string") return c.json({ error: "passport_id required" }, 400);
+    const source = typeof body.source === "string" && CODEX_SOURCES.has(body.source) ? body.source : "check";
+    // THE ENCOUNTER CEILING IS A PROPERTY OF THE WRITE, NOT OF ONE DOOR
+    // (FINDING-0010-F-2). `route-helpers.ts logEncounter` has carried
+    // `ENCOUNTER_WRITES_PER_IP_HOUR` since F11; this door called
+    // `recordEncounter` directly and had no ceiling at all, so the cheapest
+    // write in the product was one route over from the one that was capped.
+    // Same shared "enc" bucket, so it is ONE ceiling on how much an address can
+    // write through the encounter path and not one per door. A refused write is
+    // SILENT and still 200, exactly as it is in `logEncounter`: this endpoint is
+    // already best-effort by contract (a bad or unknown passport is a silent
+    // no-op), and a distinguishable 429 here would tell a caller which of its
+    // writes landed, which is the same oracle the silence exists to close.
+    // I21-Q161 (D-1053(4)): Sec-GPC: 1 / DNT: 1 records no sighting and spends no ceiling unit, as in logEncounter.
+    if (!privacySignalOptOut(c.req) && (await fanIpAllowed(c, "enc", ENCOUNTER_WRITES_PER_IP_HOUR))) {
+      await recordEncounter(d1(c.env.TRUST_DB), id, body.passport_id, source, undefined, edgeCountry(c), c.env.ANALYTICS_FAN_SECRET, ...analyticsPublishArgs(c));
+    }
+    return c.json({ ok: true });
+  });
+
+  // Pause / resume logging (default ON).
+  app.post("/account/codex/settings", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    const raw = await c.req.text();
+    if (raw.length > 4 * 1024) return c.json({ error: "too_large" }, 413);
+    const body = ((): { logging?: unknown } | null => {
+      try {
+        return JSON.parse(raw) as { logging?: unknown };
+      } catch {
+        return null;
+      }
+    })();
+    if (!body || typeof body.logging !== "boolean") return c.json({ error: "logging (boolean) required" }, 400);
+    await setCodexLogging(d1(c.env.TRUST_DB), id, body.logging);
+    return c.json({ ok: true, logging: body.logging });
+  });
+
+  // One-tap clear of the whole Codex (keeps the logging setting).
+  app.delete("/account/codex", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    const removed = await clearCodex(d1(c.env.TRUST_DB), id);
+    return c.json({ ok: true, removed });
+  });
+
+  // --- S22 user social layer (fan-session gated writes; public reads are
+  // capability- or handle-addressed and respect profile visibility) ---
+
+  app.post("/account/profile", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    if (!(await fanIpAllowed(c, "social", RANKING_WRITES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const raw = await c.req.text();
+    if (raw.length > 4 * 1024) return c.json({ error: "too_large" }, 413);
+    const body = ((): Record<string, unknown> | null => {
+      try {
+        return JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        return null;
+      }
+    })();
+    if (!body) return c.json({ error: "bad json" }, 400);
+    try {
+      const profile = await upsertProfile(d1(c.env.TRUST_DB), id, body as unknown as ProfileInput);
+      return c.json({ ok: true, profile });
+    } catch (e) {
+      // M12: carry the safe reason CODE so the client can tell a display-name
+      // refusal from a handle collision; the message stays server-only.
+      if (e instanceof SocialError) return c.json({ ...errorBody(e), ...(e.code ? { code: e.code } : {}) }, e.status);
+      return serverFault(c, "/account/profile", e);
+    }
+  });
+
+  app.get("/account/profile", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    const profile = await getOwnProfile(d1(c.env.TRUST_DB), id);
+    // `founder_disclosure` used to ride this response. It disclosed the founder
+    // auto-follow, which no longer happens (audit item #24), so it is gone rather
+    // than reworded — creating a profile now creates a profile and nothing else.
+    return c.json({ profile }); // profile null = none yet (socially invisible)
+  });
+
+  app.post("/account/follow", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    if (!(await fanIpAllowed(c, "social", RANKING_WRITES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { handle?: unknown } | null;
+    if (!body || typeof body.handle !== "string") return c.json({ error: "handle required" }, 400);
+    try {
+      await followByHandle(d1(c.env.TRUST_DB), id, body.handle);
+      return c.json({ ok: true });
+    } catch (e) {
+      // I3-1055: the reviewed `code` (e.g. `follow_refused`) lets the client word a block without reading `error`.
+      if (e instanceof SocialError) return c.json({ ...errorBody(e), ...(e.code ? { code: e.code } : {}) }, e.status);
+      return serverFault(c, "/account/follow", e);
+    }
+  });
+
+  app.post("/account/unfollow", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    if (!(await fanIpAllowed(c, "social", RANKING_WRITES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { handle?: unknown } | null;
+    if (!body || typeof body.handle !== "string") return c.json({ error: "handle required" }, 400);
+    try {
+      await unfollowByHandle(d1(c.env.TRUST_DB), id, body.handle);
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof SocialError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/unfollow", e);
+    }
+  });
+
+  // AUDIT ITEM #25 — remove a FOLLOWER (them → me), the direction
+  // `POST /account/unfollow` cannot reach. Without it a follower relationship was
+  // permanent by construction for every account, not just for the founder's
+  // auto-created one. Same fan session, same body shape, same idempotent silence
+  // as unfollow: an unknown handle is a 200 no-op, never a probe. Since I3-1055
+  // (D-0829) it IS a block: the removed follower cannot re-follow until the
+  // owner lifts it at DELETE /account/follow-blocks/:handle (see
+  // `removeFollowerByHandle`).
+  app.post("/account/remove-follower", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    if (!(await fanIpAllowed(c, "social", RANKING_WRITES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { handle?: unknown } | null;
+    if (!body || typeof body.handle !== "string") return c.json({ error: "handle required" }, 400);
+    try {
+      await removeFollowerByHandle(d1(c.env.TRUST_DB), id, body.handle);
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof SocialError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/remove-follower", e);
+    }
+  });
+
+  app.get("/account/following", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    return c.json({ following: await listFollowing(d1(c.env.TRUST_DB), id) });
+  });
+
+  app.get("/account/followers", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    return c.json({ followers: await listFollowers(d1(c.env.TRUST_DB), id) });
+  });
+
+  // I3-1055 (D-0829): the owner's own "Removed followers" list, and the unblock.
+  // Fan session only; the unblock is a write, so it shares the social IP bucket,
+  // and an unknown handle is the same silent 200 as no block (no probe).
+  app.get("/account/follow-blocks", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    return c.json({ blocks: await listFollowBlocks(d1(c.env.TRUST_DB), id) });
+  });
+
+  app.delete("/account/follow-blocks/:handle", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    if (!(await fanIpAllowed(c, "social", RANKING_WRITES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    try {
+      await unblockFollowerByHandle(d1(c.env.TRUST_DB), id, c.req.param("handle"));
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof SocialError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/follow-blocks/:handle", e);
+    }
+  });
+
+  app.post("/account/featured", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    if (!(await fanIpAllowed(c, "social", RANKING_WRITES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const raw = await c.req.text();
+    if (raw.length > 8 * 1024) return c.json({ error: "too_large" }, 413);
+    const body = ((): { items?: unknown } | null => {
+      try {
+        return JSON.parse(raw) as { items?: unknown };
+      } catch {
+        return null;
+      }
+    })();
+    if (!body || !Array.isArray(body.items)) return c.json({ error: "items array required" }, 400);
+    try {
+      await setFeatured(d1(c.env.TRUST_DB), id, body.items as FeaturedInput[]);
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof SocialError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/featured", e);
+    }
+  });
+
+  app.get("/account/achievements", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    // I3-0065 / D-0884(1): the lazy sweep below writes a fan-keyed fact for a
+    // fresh creator badge (social.ts awardAchievements -> fanKey), which faulted
+    // as a 500 without the secret; the same 503 gate as /account/redeem.
+    if (!usableFanSecret(c.env.ANALYTICS_FAN_SECRET)) return c.json({ error: "analytics_unavailable", detail: "achievements are temporarily unavailable" }, 503);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      // Lazy sweep first so collectors who acquired before S22 get their badges —
+      // capped per account/day so this can't be used as a query amplifier; past
+      // the cap the existing awards are simply listed.
+      if (await achievementSweepAllowed(db, id)) await awardAchievements(db, id, undefined, c.env.ANALYTICS_FAN_SECRET, ...analyticsPublishArgs(c));
+      return c.json({ achievements: await withFoundingRanks(db, id, await listAchievements(db, id)) });
+    } catch (e) {
+      if (e instanceof SocialError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/achievements", e);
+    }
+  });
+
+  app.get("/account/discover", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    try {
+      return c.json({ suggestions: await discover(d1(c.env.TRUST_DB), id) });
+    } catch (e) {
+      if (e instanceof SocialError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/discover", e);
+    }
+  });
+
+  // Public profile page by handle. An optional fan session unlocks friends-only
+  // collections (mutual follow); visibility is enforced inside publicProfile.
+  //
+  // METERED BEFORE THE LOOKUP AND BEFORE THE SESSION READ, for the two reasons
+  // at `profileReadGate` (`social.ts`): the bucket must not be derivable from
+  // anything the database says about the subject, or the ceiling becomes an
+  // existence oracle on a surface whose privacy model is that an account
+  // without a profile is invisible; and spending it first bounds the work an
+  // anonymous caller can buy on the most expensive read in the anonymous group.
+  // The door names no number — the key, the cap and the window all come from
+  // the gate (I3-0761, QUEUE #522).
+  app.get("/u/:handle", async (c) => {
+    const db = d1(c.env.TRUST_DB);
+    const handle = c.req.param("handle");
+    const caller = callerPrefix(c);
+    const gate = profileReadGate(caller, handle);
+    if (!(await consumeRateLimit(db, gate.key, Date.now(), gate.cap, gate.windowMs))) {
+      // D-1004(1): the per-network sentence only on the caller's network bucket; a headerless caller is metered per
+      // HANDLE (`profreadh:`), which is not "this network", so it answers no `message` (I24-RJ-02, I25).
+      return c.json(refusal("rate limit exceeded", caller ? RATE_LIMIT_MESSAGE : undefined), 429);
+    }
+    const viewer = await fanId(c); // OPTIONAL VIEWER — a stale credential gets the public view, exactly like a stranger
+    const view = await publicProfile(db, handle, viewer ?? undefined);
+    if (!view) return c.json({ error: "not_found" }, 404);
+    return c.json(view, 200, viewer ? {} : { "Cache-Control": "public, max-age=60" });
+  });
+
+  return app;
+}
+===== END FILE: services/trust-core/src/fan-social-routes.ts =====
+
+===== BEGIN FILE: services/trust-core/src/fan-spend-limits.ts =====
+import type { DbLike } from "./db.js";
+import { refusal } from "./route-helpers.js";
+import { getSetting } from "./settings.js";
+import { retrieveCheckoutSession, type StripeConfig, TRANSFER_TIMEOUT_MS } from "./stripe.js";
+
+/**
+ * I21-Q50 (D-1030): a fan's self-set monthly spending cap and pause (table fan_spend_limits, migration 0249).
+ *
+ * `spendLimitVerdict` is asked by the two doors that open a checkout, BEFORE the money moves (the web card and crypto
+ * checkout, index.ts, wired by I30-INT). A checkout that settles over the cap is granted as before (JASON-QUESTIONS 39;
+ * D-1059(3)): its checkout asked. I54 M1 a (D-1399, W0 ruling J1): a store (Apple, Google) purchase has no checkout, so
+ * its grant asks the CAP (not the pause) inside its own purchase INSERT (`spendLimitCapOnlyGate`, credits.ts
+ * grantCredits `monthlyCapGate`). The month is the UTC calendar month (`monthBounds`, the one month function); what counts
+ * is the money paid in, `credit_purchases.gross_cents`, on every rail, each purchase in the month `PURCHASE_MONTH_AT_SQL`
+ * gives it (I54 M7 a).
+ *
+ * Tightening is immediate and loosening waits: lowering the cap or starting/extending a pause applies at once; raising
+ * or removing the cap, or ending a pause early, takes effect `spend_limit_raise_delay_hours` later.
+ */
+
+/** ops_settings key for the loosening delay; registered on the two-person limits door (console.ts OPS_LIMIT_SETTINGS). */
+export const SPEND_LIMIT_RAISE_DELAY_HOURS_KEY = "spend_limit_raise_delay_hours";
+export const SPEND_LIMIT_RAISE_DELAY_HOURS_DEFAULT = 24;
+/** The limits door's bounds for that key (console.ts OPS_LIMIT_SETTINGS row: min 1, max 720). */
+export const SPEND_LIMIT_RAISE_DELAY_HOURS_MIN = 1;
+export const SPEND_LIMIT_RAISE_DELAY_HOURS_MAX = 720;
+/** D-1059(3): how long an opened card checkout can still be paid — a Stripe Checkout Session lives 24 h (stripe.ts
+ * CREDIT_CHECKOUT_RECONCILE_AFTER_MS docblock). An `open` credit_checkout_pending row younger than this counts. */
+export const OPEN_CHECKOUT_LIFETIME_MS = 24 * 3_600_000;
+/** D-1158(2) (I39-CHECKOUT): ops_settings key for how long an identical open card checkout is answered with the session
+ * it already opened (same fan, same bucket, card door) instead of a second one. Read by `checkoutReuseWindowMinutes`. */
+export const CHECKOUT_REUSE_WINDOW_MINUTES_KEY = "checkout_reuse_window_minutes";
+export const CHECKOUT_REUSE_WINDOW_MINUTES_DEFAULT = 10;
+export const CHECKOUT_REUSE_WINDOW_MINUTES_MIN = 1;
+/** Below 1440 minutes: both the Stripe Checkout Session's own life (createCreditCheckoutSession sets no expires_at, so
+ * Stripe's 24 h default applies) and OPEN_CHECKOUT_LIFETIME_MS (24 h). */
+export const CHECKOUT_REUSE_WINDOW_MINUTES_MAX = 1439;
+/** The answer to a repeat of a checkout whose session is still being opened. */
+export const CHECKOUT_IN_PROGRESS_REFUSAL = "This checkout is still being set up. Try again in a moment.";
+/** D-1169(3) (W0-CHK-02): wall clock for one checkout attempt's Stripe asks (`askOpenCheckouts`), checked BEFORE each
+ * call as stripe.ts CREDIT_CHECKOUT_RECONCILE_BUDGET_MS is, so the worst overshoot is one TRANSFER_TIMEOUT_MS. */
+export const OPEN_CHECKOUT_ASK_BUDGET_MS = 10_000;
+/** The largest cap a fan may set (cents). */
+export const SPEND_CAP_MAX_CENTS = 99_999_999;
+/** The longest single pause a fan may start, in days. */
+export const SPEND_PAUSE_MAX_DAYS = 365;
+
+/** The sentences a refused purchase answers (approved, sheet-2 W60, D-1365). */
+export const SPEND_CAP_REFUSAL = "This purchase would go over the monthly spending limit you set. You can change the limit in your wallet.";
+export const SPEND_PAUSED_REFUSAL = "You've paused spending on this account. Purchases are turned off until the pause ends.";
+
+const HOUR_MS = 3_600_000;
+const iso = (ms: number): string => new Date(ms).toISOString();
+
+/** I54 M7 a (INV-078, W0-M-07): the instant a `credit_purchases` row (alias `p`) counts in for the monthly cap. A card
+ * purchase counts in the UTC month its checkout was OPENED: the `created_at` of the card checkout row whose `session_id`
+ * is the purchase's `external_txn_id` (the join PAID_OPEN_SQL uses), so a webhook or dispute-win grant landing after the
+ * month turned counts where the fan committed the money. Any other purchase (a store or crypto grant, or a card purchase
+ * with no checkout row) counts at `p.at`, its grant instant: no store purchase time is carried (iap-credits.ts
+ * CreditPurchaseVerified). `credit_purchases.at` itself is never rewritten. */
+export const PURCHASE_MONTH_AT_SQL =
+  "COALESCE((SELECT q.created_at FROM credit_checkout_pending q WHERE p.rail = 'stripe' AND q.rail = 'stripe' AND q.account_id = p.account_id AND q.session_id = p.external_txn_id ORDER BY q.created_at LIMIT 1), p.at)";
+
+export class SpendLimitError extends Error {
+  override name = "SpendLimitError";
+  readonly status = 400 as const;
+}
+
+/** The delay in hours. D-1059(15) (RGM-N5): only a value inside the limits door's bounds is used; anything else
+ * (0, past 720, not plain digits) reads as the default — the rule console.ts opsLimitSettings reports as in effect. */
+export async function spendLimitRaiseDelayHours(db: DbLike): Promise<number> {
+  const v = (await getSetting(db, SPEND_LIMIT_RAISE_DELAY_HOURS_KEY))?.trim() ?? null;
+  const n = v !== null && /^[0-9]{1,9}$/.test(v) ? Number(v) : NaN;
+  return n >= SPEND_LIMIT_RAISE_DELAY_HOURS_MIN && n <= SPEND_LIMIT_RAISE_DELAY_HOURS_MAX ? n : SPEND_LIMIT_RAISE_DELAY_HOURS_DEFAULT;
+}
+
+/** The reuse window in minutes: only plain digits inside [MIN, MAX] are used; anything else reads as the default. */
+export async function checkoutReuseWindowMinutes(db: DbLike): Promise<number> {
+  const v = (await getSetting(db, CHECKOUT_REUSE_WINDOW_MINUTES_KEY))?.trim() ?? null;
+  const n = v !== null && /^[0-9]{1,9}$/.test(v) ? Number(v) : NaN;
+  return n >= CHECKOUT_REUSE_WINDOW_MINUTES_MIN && n <= CHECKOUT_REUSE_WINDOW_MINUTES_MAX ? n : CHECKOUT_REUSE_WINDOW_MINUTES_DEFAULT;
+}
+
+interface Row {
+  monthly_cap_cents: number | null;
+  paused_until: string | null;
+  pending_cap_cents: number | null;
+  pending_at: string | null;
+}
+
+export interface SpendLimits {
+  /** The cap in force now (a matured pending raise included); null = no cap. */
+  monthlyCapCents: number | null;
+  /** The pause in force now; null = not paused. */
+  pausedUntil: string | null;
+  /** A raise not yet in force. `capCents` null = removing the cap. */
+  pending: { capCents: number | null; at: string } | null;
+  /** Money paid in this UTC calendar month, every rail. */
+  spentThisMonthCents: number;
+}
+
+async function readRow(db: DbLike, accountId: string): Promise<Row | null> {
+  return db.prepare("SELECT monthly_cap_cents, paused_until, pending_cap_cents, pending_at FROM fan_spend_limits WHERE account_id = ?").bind(accountId).first<Row>();
+}
+
+/** The cap and pending raise in force at `nowMs`: a pending raise whose instant has passed is the cap. */
+function effective(row: Row | null, nowMs: number): { cap: number | null; pending: SpendLimits["pending"]; pausedUntil: string | null } {
+  if (!row) return { cap: null, pending: null, pausedUntil: null };
+  const pausedUntil = row.paused_until !== null && Date.parse(row.paused_until) > nowMs ? row.paused_until : null;
+  if (row.pending_at !== null && Date.parse(row.pending_at) <= nowMs) return { cap: row.pending_cap_cents, pending: null, pausedUntil };
+  return { cap: row.monthly_cap_cents, pending: row.pending_at !== null ? { capCents: row.pending_cap_cents, at: row.pending_at } : null, pausedUntil };
+}
+
+/** Money paid in during the UTC calendar month holding `nowMs` (`monthBounds`): SUM(credit_purchases.gross_cents), every
+ * rail, each purchase in the month PURCHASE_MONTH_AT_SQL gives it. */
+export async function spentThisMonthCents(db: DbLike, accountId: string, nowMs: number): Promise<number> {
+  const [start, end] = monthBounds(nowMs);
+  const r = await db
+    .prepare(`SELECT COALESCE(SUM(p.gross_cents), 0) AS cents FROM credit_purchases p WHERE p.account_id = ? AND ${PURCHASE_MONTH_AT_SQL} >= ? AND ${PURCHASE_MONTH_AT_SQL} < ?`)
+    .bind(accountId, start, end)
+    .first<{ cents: number }>();
+  return Number(r?.cents ?? 0);
+}
+
+export async function readSpendLimits(db: DbLike, accountId: string, nowMs: number): Promise<SpendLimits> {
+  const e = effective(await readRow(db, accountId), nowMs);
+  return { monthlyCapCents: e.cap, pausedUntil: e.pausedUntil, pending: e.pending, spentThisMonthCents: await spentThisMonthCents(db, accountId, nowMs) };
+}
+
+export type SpendLimitVerdict =
+  | { ok: true }
+  | { ok: false; reason: "paused" | "cap"; status: 403; body: { error: string; message?: string } };
+
+/** The UTC calendar month holding `nowMs`, as the [start, end) ISO pair `spentThisMonthCents` reads. */
+function monthBounds(nowMs: number): [string, string] {
+  const d = new Date(nowMs);
+  return [iso(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1)), iso(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1))];
+}
+
+/** D-1158(2) (I39-CHECKOUT): only paid money counts, so an `open` (unpaid) card checkout adds nothing. What this adds to
+ * `credit_purchases` is the `reconciled` rows opened this UTC month (I30 B10 limb b) — paid at Stripe, never granted
+ * (stripe.ts `sweepCreditCheckoutPending`), so no `credit_purchases` row counts them. A late webhook grant writes the
+ * purchase row and then, best effort, moves this row to `granted` (index.ts), after which only the purchase row counts it. */
+export async function openCheckoutCents(db: DbLike, accountId: string, nowMs: number): Promise<number> {
+  const [start, end] = monthBounds(nowMs);
+  const r = await db
+    .prepare(
+      "SELECT COALESCE(SUM(unit_amount_cents), 0) AS cents FROM credit_checkout_pending WHERE account_id = ? AND state = 'reconciled' AND created_at >= ? AND created_at < ?",
+    )
+    .bind(accountId, start, end)
+    .first<{ cents: number }>();
+  return Number(r?.cents ?? 0);
+}
+
+/** D-1169(3) (W0-CHK-01): the cents of the open card rows Stripe reported paid (`paidOpenNonces`, a JSON array bound
+ * as ONE parameter), each counted only while it is still `open` and no `credit_purchases` row (rail stripe,
+ * external_txn_id = its session_id) carries it, so a webhook grant or a reconcile landing meanwhile is counted once.
+ * Binds: account id, nonces JSON. */
+const PAID_OPEN_SQL = `(SELECT COALESCE(SUM(q.unit_amount_cents), 0) FROM credit_checkout_pending q WHERE q.account_id = ?
+  AND q.nonce IN (SELECT value FROM json_each(?)) AND q.state = 'open' AND q.rail = 'stripe'
+  AND NOT EXISTS (SELECT 1 FROM credit_purchases cp WHERE cp.rail = 'stripe' AND cp.external_txn_id = q.session_id))`;
+
+/** The cap arm, correlated on `l` (a fan_spend_limits alias): the cap in force at `?` (a matured pending raise is the cap,
+ * as `effective()` reads it) is below `?` (this payment's cents) plus the month's purchases (PURCHASE_MONTH_AT_SQL in
+ * [start, end)), the month's reconciled card checkouts (by created_at) and the open card rows Stripe reported paid
+ * (PAID_OPEN_SQL). A NULL cap compares to NULL: never passed. ONE spelling for the card door's conditional INSERT
+ * (`recordOpenCheckoutWithinLimit`) and the store grant (`spendLimitCapOnlyGate`). Binds: now, cents, start, end, start,
+ * end, account id, paid nonces JSON. */
+const CAP_PASSED_SQL = `(CASE WHEN l.pending_at IS NOT NULL AND julianday(l.pending_at) <= julianday(?) THEN l.pending_cap_cents ELSE l.monthly_cap_cents END)
+               < ? + (SELECT COALESCE(SUM(p.gross_cents), 0) FROM credit_purchases p WHERE p.account_id = l.account_id AND ${PURCHASE_MONTH_AT_SQL} >= ? AND ${PURCHASE_MONTH_AT_SQL} < ?)
+                   + (SELECT COALESCE(SUM(o.unit_amount_cents), 0) FROM credit_checkout_pending o WHERE o.account_id = l.account_id
+                       AND o.state = 'reconciled' AND o.created_at >= ? AND o.created_at < ?)
+                   + ${PAID_OPEN_SQL}`;
+
+/** I54 M1 a (INV-072; W0-M-03, W0 ruling J1, Rule 22(a) 4): the store grant's CAP-ONLY verdict, as SQL its purchase
+ * INSERT asks in its own WHERE (credits.ts grantCredits `monthlyCapGate`), so the verdict and the grant are one
+ * conditional write and two receipts posted together cannot both pass a separate read. True when the fan has a cap in
+ * force at `nowMs` and the month's paid-in money plus `grossCents` passes it (CAP_PASSED_SQL, the card door's arm; no
+ * open card row is asked about here). No pause arm: a store purchase during a pause is credited as before (J1). */
+export function spendLimitCapOnlyGate(accountId: string, grossCents: number, nowMs: number): { sql: string; binds: (string | number)[] } {
+  const [start, end] = monthBounds(nowMs);
+  return { sql: `EXISTS (SELECT 1 FROM fan_spend_limits l WHERE l.account_id = ? AND ${CAP_PASSED_SQL})`, binds: [accountId, iso(nowMs), grossCents, start, end, start, end, accountId, "[]"] };
+}
+
+/** What asking Stripe about the fan's open card checkouts answered: the nonces Stripe reports complete and paid, or
+ * unknown (`ok: false`), which the door refuses with its temporary-failure answer and never reads as unpaid. */
+export type OpenCheckoutAsk = { ok: true; paidNonces: string[] } | { ok: false };
+
+/**
+ * D-1169(3) (W0-CHK-02): ask Stripe once per `open` card row of `accountId` opened this UTC month that has a session
+ * id. No such row: no call. Each call is preceded by a wall-clock check (OPEN_CHECKOUT_ASK_BUDGET_MS); a row not asked
+ * inside it, a null answer (stripe.ts retrieveCheckoutSession: unreachable, malformed, timed out) or no Stripe config
+ * is unknown. `complete` + `paid` -> counted (its nonce returned; the row stays `open`, never `reconciled`).
+ * `expired` -> the row is `expired` (guarded on `open`, as the sweep does) and not counted. Anything else is unpaid.
+ */
+export async function askOpenCheckouts(
+  db: DbLike,
+  cfg: StripeConfig | null,
+  accountId: string,
+  nowMs: number,
+  fetchImpl: typeof fetch = fetch,
+  clock: () => number = Date.now,
+): Promise<OpenCheckoutAsk> {
+  const [start, end] = monthBounds(nowMs);
+  const { results } = await db
+    .prepare("SELECT nonce, session_id FROM credit_checkout_pending WHERE account_id = ? AND rail = 'stripe' AND state = 'open' AND session_id IS NOT NULL AND created_at >= ? AND created_at < ? ORDER BY created_at, nonce")
+    .bind(accountId, start, end)
+    .all<{ nonce: string; session_id: string }>();
+  const paidNonces: string[] = [];
+  if (!results?.length) return { ok: true, paidNonces };
+  if (!cfg) return { ok: false };
+  const deadline = clock() + OPEN_CHECKOUT_ASK_BUDGET_MS;
+  for (const row of results) {
+    if (clock() >= deadline) return { ok: false };
+    const s = await retrieveCheckoutSession(cfg, row.session_id, fetchImpl);
+    if (!s) return { ok: false };
+    if (s.status === "complete" && s.paymentStatus === "paid") paidNonces.push(row.nonce);
+    else if (s.status === "expired") {
+      await db.prepare("UPDATE credit_checkout_pending SET state = 'expired', resolved_at = ? WHERE nonce = ? AND state = 'open'").bind(iso(nowMs), row.nonce).run();
+    }
+  }
+  return { ok: true, paidNonces };
+}
+
+/** May `accountId` pay `grossCents` more at `nowMs`? Refused while paused, or when this month's paid-in money (purchases
+ * plus reconciled checkouts, `openCheckoutCents`; D-1158(2)) plus `grossCents` would pass the cap (reaching it exactly is allowed). Asked when a
+ * checkout opens; a payment that settles is not asked here (JASON-QUESTIONS 1, 39). The caller answers
+ * `c.json(v.body, v.status)`. */
+export async function spendLimitVerdict(db: DbLike, accountId: string, grossCents: number, nowMs: number, paidOpenNonces: readonly string[] = []): Promise<SpendLimitVerdict> {
+  const e = effective(await readRow(db, accountId), nowMs);
+  if (e.pausedUntil !== null) return { ok: false, reason: "paused", status: 403, body: refusal("spending_paused", SPEND_PAUSED_REFUSAL) };
+  if (e.cap === null) return { ok: true };
+  let spent = (await spentThisMonthCents(db, accountId, nowMs)) + (await openCheckoutCents(db, accountId, nowMs));
+  // D-1169(3): plus the open card rows Stripe reported paid (askOpenCheckouts), guarded as the record's INSERT guards them.
+  if (paidOpenNonces.length > 0) spent += Number((await db.prepare(`SELECT ${PAID_OPEN_SQL} AS cents`).bind(accountId, JSON.stringify(paidOpenNonces)).first<{ cents: number }>())?.cents ?? 0);
+  if (spent + grossCents > e.cap) return { ok: false, reason: "cap", status: 403, body: refusal("spend_limit_reached", SPEND_CAP_REFUSAL) };
+  return { ok: true };
+}
+
+/** What recording a card checkout answers: admitted, a refusal, or (reuse on) the open session's own URL, 200 like a
+ * first answer, or 409 while that session is still being created. The caller answers `c.json(v.body, v.status)`. */
+export type CheckoutRecord =
+  | SpendLimitVerdict
+  | { ok: false; reason: "reuse"; status: 200; body: { url: string } }
+  | { ok: false; reason: "in_progress"; status: 409; body: { error: string; message?: string } };
+
+/**
+ * D-1064(4) (I30-RJ-03 c1): the cap check and the open-checkout record are ONE conditional write. The
+ * `credit_checkout_pending` INSERT carries the verdict in its own WHERE: it lands only if, at `nowMs`, the fan is not
+ * paused and this checkout plus the month's `credit_purchases` plus this month's reconciled checkouts (paid, not
+ * granted: I30 B10 limb b, as `openCheckoutCents`; an `open` row adds nothing, D-1158(2)) stays within the cap in force
+ * (a matured pending raise is the cap, as `effective()` reads it; no row or a NULL cap admits).
+ * D-1158(2) reuse, when `c.reuseWindowMs` is given: the same INSERT also refuses while an `open` card row of the same
+ * account and the same `credits` is younger than the window, so of two identical requests at once one row lands.
+ * Not written -> the refusal `spendLimitVerdict` gives now, first, so a refused fan never gets a URL; then, reuse on,
+ * the youngest such open row's `checkout_url` (200), or 409 `checkout_in_progress` while it has none yet (or no longer
+ * qualifies); reuse off, the cap refusal.
+ */
+export async function recordOpenCheckoutWithinLimit(db: DbLike, c: { nonce: string; accountId: string; credits: number; unitAmountCents: number; paidOpenNonces?: readonly string[] }, nowMs: number): Promise<SpendLimitVerdict>;
+export async function recordOpenCheckoutWithinLimit(
+  db: DbLike,
+  c: { nonce: string; accountId: string; credits: number; unitAmountCents: number; reuseWindowMs: number; paidOpenNonces?: readonly string[] },
+  nowMs: number,
+): Promise<CheckoutRecord>;
+export async function recordOpenCheckoutWithinLimit(
+  db: DbLike,
+  c: { nonce: string; accountId: string; credits: number; unitAmountCents: number; reuseWindowMs?: number; paidOpenNonces?: readonly string[] },
+  nowMs: number,
+): Promise<CheckoutRecord> {
+  // I59 S6-22 (INV-084): the amounts are stored as given, so each must be a whole positive number of credits and cents;
+  // anything else throws here, before the INSERT, and writes nothing.
+  if (!Number.isSafeInteger(c.credits) || c.credits <= 0 || !Number.isSafeInteger(c.unitAmountCents) || c.unitAmountCents <= 0) throw new SpendLimitError("bad_checkout_amounts");
+  const [start, end] = monthBounds(nowMs);
+  // D-1169(3) (W0-CHK-01, edge 5): the open rows Stripe reported paid count in the cap arm and are never reused.
+  const paid = c.paidOpenNonces ?? [];
+  const paidJson = JSON.stringify(paid);
+  const now = iso(nowMs);
+  const reuse = c.reuseWindowMs !== undefined;
+  const reuseFrom = iso(nowMs - (c.reuseWindowMs ?? 0));
+  const r = await db
+    .prepare(
+      `INSERT INTO credit_checkout_pending (nonce, account_id, credits, unit_amount_cents, rail, state, created_at)
+       SELECT ?, ?, ?, ?, 'stripe', 'open', ?
+        WHERE NOT EXISTS (SELECT 1 FROM fan_spend_limits l WHERE l.account_id = ?
+          AND ((l.paused_until IS NOT NULL AND julianday(l.paused_until) > julianday(?))
+            OR ${CAP_PASSED_SQL}))
+          AND NOT (? = 1 AND EXISTS (SELECT 1 FROM credit_checkout_pending u WHERE u.account_id = ? AND u.credits = ?
+            AND u.rail = 'stripe' AND u.state = 'open' AND u.created_at > ? AND u.nonce NOT IN (SELECT value FROM json_each(?))))`,
+    )
+    .bind(c.nonce, c.accountId, c.credits, c.unitAmountCents, now, c.accountId, now, now, c.unitAmountCents, start, end, start, end, c.accountId, paidJson, reuse ? 1 : 0, c.accountId, c.credits, reuseFrom, paidJson)
+    .run();
+  if (r.changes === 1) return { ok: true }; // credit_checkout_pending carries no trigger or FK action (db.ts INFLATING_WRITES)
+  const v = await spendLimitVerdict(db, c.accountId, c.unitAmountCents, nowMs, paid);
+  if (!v.ok) return v;
+  if (reuse) {
+    const open = await db
+      .prepare("SELECT checkout_url FROM credit_checkout_pending WHERE account_id = ? AND credits = ? AND rail = 'stripe' AND state = 'open' AND created_at > ? AND nonce NOT IN (SELECT value FROM json_each(?)) ORDER BY created_at DESC, nonce DESC LIMIT 1")
+      .bind(c.accountId, c.credits, reuseFrom, paidJson)
+      .first<{ checkout_url: string | null }>();
+    if (open?.checkout_url) return { ok: false, reason: "reuse", status: 200, body: { url: open.checkout_url } };
+    // No URL yet (the session is being created), or the row the INSERT met resolved since: a retry decides.
+    return { ok: false, reason: "in_progress", status: 409, body: refusal("checkout_in_progress", CHECKOUT_IN_PROGRESS_REFUSAL) };
+  }
+  return { ok: false, reason: "cap", status: 403, body: refusal("spend_limit_reached", SPEND_CAP_REFUSAL) };
+}
+
+function upsert(db: DbLike, accountId: string, r: Row, nowMs: number) {
+  return db
+    .prepare(
+      "INSERT INTO fan_spend_limits (account_id, monthly_cap_cents, paused_until, pending_cap_cents, pending_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(account_id) DO UPDATE SET monthly_cap_cents = excluded.monthly_cap_cents, paused_until = excluded.paused_until, pending_cap_cents = excluded.pending_cap_cents, pending_at = excluded.pending_at, updated_at = excluded.updated_at",
+    )
+    .bind(accountId, r.monthly_cap_cents, r.paused_until, r.pending_cap_cents, r.pending_at, iso(nowMs))
+    .run();
+}
+
+/** Set the monthly cap (null = no cap). A cap at or below the one in force applies at once and drops any pending
+ * raise; a higher cap (or removing it) is recorded as pending, in force `spend_limit_raise_delay_hours` from now. */
+export async function setSpendLimit(db: DbLike, accountId: string, capCents: number | null, nowMs: number): Promise<SpendLimits> {
+  if (capCents !== null && (!Number.isSafeInteger(capCents) || capCents < 0 || capCents > SPEND_CAP_MAX_CENTS)) throw new SpendLimitError("bad_cap");
+  const row = await readRow(db, accountId);
+  const e = effective(row, nowMs);
+  const tighter = capCents !== null && (e.cap === null || capCents <= e.cap);
+  const next: Row = tighter
+    ? { monthly_cap_cents: capCents, paused_until: e.pausedUntil, pending_cap_cents: null, pending_at: null }
+    : { monthly_cap_cents: e.cap, paused_until: e.pausedUntil, pending_cap_cents: capCents, pending_at: iso(nowMs + (await spendLimitRaiseDelayHours(db)) * HOUR_MS) };
+  if (!tighter && e.cap === null) return readSpendLimits(db, accountId, nowMs); // no cap in force: removing it again changes nothing
+  await upsert(db, accountId, next, nowMs);
+  return readSpendLimits(db, accountId, nowMs);
+}
+
+/** Pause until `untilMs`, or end the pause (null). Starting or extending a pause applies at once; ending it early
+ * (or shortening it) moves its end to no sooner than `spend_limit_raise_delay_hours` from now. */
+export async function pauseSpending(db: DbLike, accountId: string, untilMs: number | null, nowMs: number): Promise<SpendLimits> {
+  if (untilMs !== null && (!Number.isSafeInteger(untilMs) || untilMs <= nowMs || untilMs > nowMs + SPEND_PAUSE_MAX_DAYS * 24 * HOUR_MS)) throw new SpendLimitError("bad_pause");
+  const row = await readRow(db, accountId);
+  const e = effective(row, nowMs);
+  const currentEnd = e.pausedUntil !== null ? Date.parse(e.pausedUntil) : null;
+  let end: number | null;
+  if (currentEnd === null) end = untilMs; // starting a pause (or ending none)
+  else if (untilMs !== null && untilMs >= currentEnd) end = untilMs; // extending
+  else end = Math.min(currentEnd, Math.max(untilMs ?? nowMs, nowMs + (await spendLimitRaiseDelayHours(db)) * HOUR_MS)); // ending early waits
+  if (end === null && !row) return readSpendLimits(db, accountId, nowMs);
+  await upsert(db, accountId, { monthly_cap_cents: e.cap, paused_until: end === null ? null : iso(end), pending_cap_cents: e.pending?.capCents ?? null, pending_at: e.pending?.at ?? null }, nowMs);
+  return readSpendLimits(db, accountId, nowMs);
+}
+
+/**
+ * D-1059(3): pausing spending cancels the fan's open card checkouts. Each `open` row younger than
+ * OPEN_CHECKOUT_LIFETIME_MS with a Stripe session is expired AT STRIPE (POST /v1/checkout/sessions/<id>/expire, under
+ * the module's TRANSFER_TIMEOUT_MS deadline), and the row turns `expired` only when Stripe answers that the session is
+ * expired. Any other answer (already paid, unreachable, timed out) leaves the row `open`, which adds nothing to the cap
+ * (D-1158(2): openCheckoutCents and the record's INSERT count only `reconciled` rows and purchases), and its settlement
+ * is what JASON-QUESTIONS 39 decides. A row with no session id yet is left as it is. A Stripe fault
+ * never throws; a database fault does (fan-spend-routes.ts logs it after the pause is already recorded).
+ */
+export async function expireOpenCheckouts(db: DbLike, cfg: Pick<StripeConfig, "secretKey" | "apiBase">, accountId: string, nowMs: number, fetchImpl: typeof fetch = fetch): Promise<{ expired: number; left_open: number }> {
+  const { results } = await db
+    .prepare("SELECT nonce, session_id FROM credit_checkout_pending WHERE account_id = ? AND state = 'open' AND rail = 'stripe' AND session_id IS NOT NULL AND created_at > ? ORDER BY created_at, nonce")
+    .bind(accountId, iso(nowMs - OPEN_CHECKOUT_LIFETIME_MS))
+    .all<{ nonce: string; session_id: string }>();
+  const out = { expired: 0, left_open: 0 };
+  for (const row of results ?? []) {
+    let expired = false;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), TRANSFER_TIMEOUT_MS);
+    try {
+      const res = await fetchImpl(`${cfg.apiBase}/v1/checkout/sessions/${encodeURIComponent(row.session_id)}/expire`, {
+        method: "POST",
+        redirect: "manual",
+        headers: { authorization: `Bearer ${cfg.secretKey}`, "content-type": "application/x-www-form-urlencoded" },
+        signal: ctl.signal,
+      });
+      expired = res.ok && ((await res.json().catch(() => null)) as { status?: unknown } | null)?.status === "expired";
+    } catch {
+      expired = false;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!expired) {
+      out.left_open += 1;
+      continue;
+    }
+    try {
+      await db.prepare("UPDATE credit_checkout_pending SET state = 'expired', resolved_at = ? WHERE nonce = ? AND state = 'open'").bind(iso(nowMs), row.nonce).run();
+      out.expired += 1;
+    } catch {
+      out.left_open += 1;
+    }
+  }
+  return out;
+}
+===== END FILE: services/trust-core/src/fan-spend-limits.ts =====
+
+===== BEGIN FILE: services/trust-core/src/fan-spend-routes.ts =====
+import { Hono } from "hono";
+import { d1 } from "./db.js";
+import type { Env } from "./env.js";
+import { expireOpenCheckouts, pauseSpending, readSpendLimits, SpendLimitError, setSpendLimit, type SpendLimits } from "./fan-spend-limits.js";
+import { logError } from "./log.js";
+import { anonBodyLimit, fanId } from "./route-helpers.js";
+import { stripeConfigFromEnv } from "./stripe.js";
+
+/**
+ * I21-Q50 (D-1030): the fan's own spending cap and pause. Fan-session gated and self-scoped; a cookie session is
+ * admitted only under its CSRF handle by the global `admitSessionRequest` (index.ts), as for every fan POST.
+ * Mounted at "/" by index.ts (I30-INT).
+ *
+ * POST body, one change per request:
+ *   { "monthly_cap_cents": <integer 0..99999999> | null }   set or remove the cap
+ *   { "pause_days": <integer 1..365> }                       pause (or extend a pause) for that many days
+ *   { "end_pause": true }                                    end the pause (after the loosening delay)
+ *
+ * D-1059(3): a pause also cancels the fan's open card checkouts at Stripe (fan-spend-limits.ts expireOpenCheckouts),
+ * after the pause is recorded; with no Stripe configuration no checkout could have been opened, so there is none.
+ */
+const DAY_MS = 86_400_000;
+
+function dto(s: SpendLimits) {
+  return {
+    monthly_cap_cents: s.monthlyCapCents,
+    paused_until: s.pausedUntil,
+    pending: s.pending ? { monthly_cap_cents: s.pending.capCents, at: s.pending.at } : null,
+    spent_this_month_cents: s.spentThisMonthCents,
+  };
+}
+
+export function makeFanSpendRoutes(now: () => number = Date.now, fetchImpl: typeof fetch = fetch): Hono<{ Bindings: Env }> {
+  const app = new Hono<{ Bindings: Env }>();
+
+  app.get("/account/spend-limits", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    return c.json(dto(await readSpendLimits(d1(c.env.TRUST_DB), id, now())));
+  });
+
+  app.post("/account/spend-limits", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null;
+    if (!body || typeof body !== "object" || Array.isArray(body) || Object.keys(body).length !== 1) return c.json({ error: "bad_request" }, 400);
+    const db = d1(c.env.TRUST_DB);
+    const t = now();
+    try {
+      if ("monthly_cap_cents" in body) {
+        // setSpendLimit refuses (bad_cap, 400) anything but null or a safe integer in range, a string included.
+        return c.json(dto(await setSpendLimit(db, id, body.monthly_cap_cents as number | null, t)));
+      }
+      if ("pause_days" in body) {
+        const n = body.pause_days;
+        if (typeof n !== "number" || !Number.isInteger(n)) return c.json({ error: "bad_pause" }, 400); // the 1..SPEND_PAUSE_MAX_DAYS bound is pauseSpending's
+        const limits = await pauseSpending(db, id, t + n * DAY_MS, t);
+        const cfg = stripeConfigFromEnv(c.env as unknown as Record<string, unknown>);
+        if (cfg) {
+          try {
+            await expireOpenCheckouts(db, cfg, id, t, fetchImpl);
+          } catch (e) {
+            logError({ cid: crypto.randomUUID(), hop: "http", route: "/account/spend-limits", msg: "open_checkout_expiry_failed", err: e instanceof Error ? e.name : typeof e });
+          }
+        }
+        return c.json(dto(limits));
+      }
+      if (body.end_pause === true) return c.json(dto(await pauseSpending(db, id, null, t)));
+      return c.json({ error: "bad_request" }, 400);
+    } catch (e) {
+      if (e instanceof SpendLimitError) return c.json({ error: e.message }, e.status);
+      logError({ cid: crypto.randomUUID(), hop: "http", route: "/account/spend-limits", msg: "unexpected route fault", err: e instanceof Error ? e.name : typeof e });
+      return c.json({ error: "internal" }, 500);
+    }
+  });
+
+  return app;
+}
+===== END FILE: services/trust-core/src/fan-spend-routes.ts =====
+
+===== BEGIN FILE: services/trust-core/src/feed.ts =====
+// broadcast-audience.ts, NOT broadcast.ts: the audience vocabulary is pure
+// payload logic with no imports, while broadcast.ts reads the creator's
+// billing tier for the Pro frequency cap. Importing the narrow module keeps
+// this serving path structurally unable to reach billing (paywall invariant).
+import { audienceOf } from "./broadcast-audience.js";
+import type { DbLike } from "./db.js";
+import { livePassport } from "./passport-view.js";
+
+/**
+ * flag 2 — the PUBLIC signed feed for a passport (GET /p/:id/feed).
+ *
+ * The product claim this exists to make true is "if it isn't here, treat it as
+ * fake": a fan in the scam-check moment, with NO account and no session, must
+ * be able to read what the creator has actually said and actually dropped. So
+ * the feed is public by default and account-less by construction.
+ *
+ * Three hard rules:
+ *  1. FOLLOWERS-ONLY BROADCASTS NEVER APPEAR. The filter is at READ time, on
+ *     every request, from the signed payload itself — there is no cached
+ *     projection that could go stale into a leak, and an unparseable audience
+ *     fails closed (excluded).
+ *  2. ZERO fan data. No saves, no acquisitions, no credentials, no counts of
+ *     any of them — nothing on this route is derived from any table keyed by an
+ *     account. A drop item is release metadata only.
+ *  3. Bounded. Two per-passport indexed queries with LIMITs and an id-scoped
+ *     art lookup; never a live aggregate, never an unbounded scan.
+ *
+ * Derived from the SAME source the alerts fold reads (`trust_events`, the
+ * creator's own `creator_broadcast` rows) plus the published releases the public
+ * archive already serves — so the feed can never say more than the ledger does.
+ */
+
+export interface FeedBroadcastItem {
+  kind: "broadcast";
+  ts: string;
+  broadcast_id: string;
+  /** The creator's sanitized message, served as JSON. Angle brackets and
+   * control characters were stripped before signing (broadcast.ts) and clients
+   * escape at render (the SPA's views.ts) — two independent layers. */
+  message: string;
+}
+
+export interface FeedDropItem {
+  kind: "drop";
+  ts: string;
+  release_id: string;
+  name: string;
+  /** Content hash of Dhwaja-STORED signed art, when this release has any
+   * (→ GET /media/<hash>). Same derivation as the public archive. */
+  art_hash: string | null;
+}
+
+export type FeedItem = FeedBroadcastItem | FeedDropItem;
+
+export interface PublicFeed {
+  passport_id: string;
+  items: FeedItem[];
+}
+
+/** How many items the feed serves. Locked small: this is a trust surface, not a
+ * timeline — the newest handful is what answers "is this real right now". */
+export const FEED_LIMIT = 20;
+
+/**
+ * How many of the creator's most recent broadcast events we look at to fill the
+ * window. Followers-only items are filtered AFTER the read (the audience lives
+ * inside the signed payload), so the scan window is deliberately wider than the
+ * served limit — otherwise a run of gated perk drops would empty the public
+ * feed. Still a hard bound: one indexed, passport-scoped query.
+ */
+const BROADCAST_SCAN = 60;
+
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+const REL_RE = /^rel_[0-9a-f]{16}$/;
+const SHA256_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * The public feed for one passport, or null when the passport must not have a
+ * public feed at all. Callers turn null into a 404 that is byte-identical for
+ * "never existed", "retracted", and "suppressed" — a removal request must not
+ * be distinguishable from a typo (the same stance as the request counter and
+ * the demand card).
+ */
+export async function publicFeed(db: DbLike, passportId: string): Promise<PublicFeed | null> {
+  if (!PSP_RE.test(passportId)) return null;
+
+  // Listed + live + UNSUPPRESSED, on ONE statement (`passport-view.ts`
+  // livePassport). A removal-request suppression always wins (flag 5 stance):
+  // the creator asked not to be a public surface, so the feed 404s exactly like
+  // a nonexistent one. It used to be a second statement after the `passports`
+  // read, which made a suppressed subject cost two D1 round trips to a
+  // never-listed subject's one behind identical 404 bytes (review MEDIUM 5).
+  if (!(await livePassport(db, passportId))) return null;
+
+  const items: FeedItem[] = [...(await publicBroadcasts(db, passportId)), ...(await publishedDrops(db, passportId))];
+  // Reverse-chronological across both sources, then clamp. `seq`/`created_at`
+  // are already descending within each source; the merge re-sorts on the shared
+  // timestamp with the id as a stable tie-break (two events can share an ISO
+  // millisecond, and an unstable order would make the served bytes wobble).
+  items.sort((a, b) => (a.ts === b.ts ? idOf(b).localeCompare(idOf(a)) : a.ts < b.ts ? 1 : -1));
+  return { passport_id: passportId, items: items.slice(0, FEED_LIMIT) };
+}
+
+function idOf(i: FeedItem): string {
+  return i.kind === "broadcast" ? i.broadcast_id : i.release_id;
+}
+
+/** The creator's own PUBLIC broadcasts, newest first, read straight off the log. */
+async function publicBroadcasts(db: DbLike, passportId: string): Promise<FeedBroadcastItem[]> {
+  const { results } = await db
+    // D-1064(5) (I30-RJ-03 c5): a self-closed creator's broadcasts leave the feed as their releases do (publishedDrops).
+    .prepare(
+      `SELECT created_at, payload FROM trust_events WHERE subject = ? AND event_type = 'creator_broadcast'
+         AND NOT EXISTS (SELECT 1 FROM creator_closures cc WHERE cc.passport_id = trust_events.subject)
+       ORDER BY seq DESC LIMIT ?`,
+    )
+    .bind(passportId, BROADCAST_SCAN)
+    .all<{ created_at: string; payload: string }>();
+
+  const out: FeedBroadcastItem[] = [];
+  for (const r of results) {
+    if (out.length >= FEED_LIMIT) break;
+    let payload: { broadcast_id?: unknown; message?: unknown; audience?: unknown };
+    try {
+      payload = JSON.parse(r.payload) as typeof payload;
+    } catch {
+      continue; // unparseable row → not served (fail closed)
+    }
+    // THE gate. Only an EXPLICIT "public" renders here: the audience field is
+    // required on the payload (window item 3), and `audienceOf` no longer has a
+    // default-at-read branch, so an absent audience is "unknown" and excluded
+    // exactly like "followers" or an unrecognized value.
+    if (audienceOf(payload) !== "public") continue;
+    if (typeof payload.broadcast_id !== "string" || typeof payload.message !== "string") continue;
+    out.push({ kind: "broadcast", ts: r.created_at, broadcast_id: payload.broadcast_id, message: payload.message });
+  }
+  return out;
+}
+
+/** Published releases as drop items — the same set the public archive serves. */
+async function publishedDrops(db: DbLike, passportId: string): Promise<FeedDropItem[]> {
+  // Ordered by created_at (when the release appeared on Dhwaja), NOT the
+  // creator-asserted `released_at`: a back-catalog registration of a 2011 album
+  // is news TODAY, and letting a creator-supplied date sort the feed would let
+  // a future date pin an item to the top forever.
+  const { results } = await db
+    // I30-FX-SAFETY H3 (D-1060(6)): a self-closed creator's releases leave the feed as they leave the archive (releases.ts:596).
+    .prepare(
+      `SELECT release_id, title, created_at FROM releases WHERE passport_id = ? AND status = 'published'
+         AND NOT EXISTS (SELECT 1 FROM creator_closures cc WHERE cc.passport_id = releases.passport_id)
+       ORDER BY created_at DESC, release_id DESC LIMIT ?`,
+    )
+    .bind(passportId, FEED_LIMIT)
+    .all<{ release_id: string; title: string; created_at: string }>();
+  if (results.length === 0) return [];
+
+  const art = await storedArt(db, passportId, results.map((r) => r.release_id));
+  return results.map((r) => ({ kind: "drop" as const, ts: r.created_at, release_id: r.release_id, name: r.title, art_hash: art.get(r.release_id) ?? null }));
+}
+
+/**
+ * release_id → the content hash of its Dhwaja-stored signed art, if any. Same
+ * derivation as publicArchive (primary = lowest-ord image fingerprint, kept only
+ * when a media_assets row for THIS passport holds it), but scoped to the ≤20
+ * ids in the feed window instead of the creator's whole catalog. Ids are
+ * shape-checked before they reach the IN() list, so the bound is structural.
+ */
+async function storedArt(db: DbLike, passportId: string, releaseIds: string[]): Promise<Map<string, string>> {
+  const ids = releaseIds.filter((id) => REL_RE.test(id)).slice(0, FEED_LIMIT);
+  const primary = new Map<string, string>();
+  if (ids.length === 0) return primary;
+  const holes = ids.map(() => "?").join(",");
+  const { results: fps } = await db
+    .prepare(
+      `SELECT f.release_id AS release_id, f.exact_hash AS exact_hash FROM media_fingerprints f
+         JOIN releases r ON r.release_id = f.release_id
+        WHERE r.passport_id = ? AND f.media_kind = 'image' AND f.release_id IN (${holes})
+        ORDER BY f.release_id, f.ord`,
+    )
+    .bind(passportId, ...ids)
+    .all<{ release_id: string; exact_hash: string }>();
+  for (const f of fps) if (!primary.has(f.release_id)) primary.set(f.release_id, f.exact_hash);
+  if (primary.size === 0) return primary;
+
+  // BOUNDED (review FIX 4): ask only about the ≤20 hashes we actually need, not
+  // the passport's whole asset table — a creator with thousands of stored assets
+  // would otherwise make this unauthenticated route read all of them to answer a
+  // ≤20-row question, contradicting rule 3 above. Hashes are shape-checked before
+  // they reach the IN() list (structural bound), and the total parameter count is
+  // 1 + ≤FEED_LIMIT, comfortably under D1's cap — no chunking needed at this size.
+  const wanted = [...new Set(primary.values())].filter((h) => SHA256_RE.test(h)).slice(0, FEED_LIMIT);
+  const stored = new Set<string>();
+  if (wanted.length > 0) {
+    const { results: assets } = await db
+      .prepare(`SELECT content_hash FROM media_assets WHERE passport_id = ? AND content_hash IN (${wanted.map(() => "?").join(",")})`)
+      .bind(passportId, ...wanted)
+      .all<{ content_hash: string }>();
+    for (const a of assets) stored.add(a.content_hash);
+  }
+  for (const [rel, hash] of [...primary]) if (!stored.has(hash)) primary.delete(rel);
+  return primary;
+}
+===== END FILE: services/trust-core/src/feed.ts =====
+
+===== BEGIN FILE: services/trust-core/src/fold-rebuild.ts =====
+import type { DbLike, DbStatement } from "./db.js";
+import { verifyChain, chainHead, lapseControlProofs, nameCommitment, type ChainHead } from "./events.js";
+import { REPLAY_PAGE, replayFromLog, snapshotState, type StateSnapshot } from "./fold.js";
+import { displayNameSkeleton } from "./name-fold.js";
+import { faceRevokeOwedStatement, imageConsentOwedOnRemovalStatement } from "./likeness.js";
+import { brandIndexErasureStmt } from "./brand-index.js";
+import { PASSPORT_LEGAL_HOLD_SQL } from "./legal-hold-sql.js";
+/**
+ * Rebuild the fold (passports + passport_accounts) from the trust_events log.
+ *
+ * WHY THIS EXISTS. passports/passport_accounts are a FOLD of the append-only
+ * ledger — the live writer (events.ts foldEffects) projects each event into
+ * these tables as it appends. That projection is exact on a greenfield deploy
+ * (the fold populates from the first event). But when a migration ADDS or
+ * CHANGES a fold column on a table that already has rows (e.g. 0050's nullable
+ * `added_by` with no backfill), the pre-existing rows carry a stale/NULL value
+ * that the live path never revisits. That drifts the fold away from what the
+ * log says — breaking Invariant #2 (the two reducers must agree byte-for-byte)
+ * and silently dropping derived state. The deploy runbook's answer is: rebuild
+ * the fold from the log before serving. This is that tool.
+ *
+ * OPERATIONAL CONTRACT — READ THIS. It is a MAINTENANCE op, meant to run while
+ * the ledger is QUIESCENT (no appends), BEFORE serving a populated deploy of a
+ * new fold column. It does not — cannot, on D1 — take a lock over the whole
+ * ledger. If it reports `ledger_advanced`, an append landed during the rebuild
+ * — re-run it once appends are stopped.
+ *
+ * THE HEAD CHECKS ARE NOT WHAT MAKES THAT SAFE. They cannot be: the pre-write
+ * head read and the write are two round trips, and an append that lands between
+ * them is invisible to the first and too late for the second. An attack round
+ * measured exactly that — a `claim_proven` injected into the gap was reverted by
+ * the stale replay, the post-write refusal fired with nothing to roll back, and
+ * the passport went back to `unclaimed` on a ledger that says `claimed`. That
+ * re-opened the claim door (`claim_proven` is gated on `claim_state` READ FROM
+ * THE FOLD), and a second, unrelated claimant proved a claim on the same
+ * passport. The same window reverted an operator takedown
+ * (`account_revoked` → back to `active`).
+ *
+ * WHAT MAKES IT SAFE IS THAT THE WRITE CANNOT MOVE A ROW BACKWARDS. Every
+ * ledger writer of these two tables sets `updated_seq` to the appending event's
+ * seq (events.ts: passport_created, passport_renamed, statePassport, the
+ * account_* effects, correctionEffects), and seq only increases — so
+ * `updated_seq` is monotonic non-decreasing per row, and a row that a racing
+ * append touched carries a STRICTLY GREATER seq than this replay's target for
+ * it. Each UPSERT therefore re-asserts `excluded.updated_seq >=
+ * <table>.updated_seq` INSIDE the statement, and yields NULL into a NOT NULL
+ * column when it does not hold — which aborts the batch, and with it the whole
+ * write (D1 batches are all-or-nothing). So a rebuild that loses the race
+ * writes NOTHING: the fold is left CORRECT (the racing append's own fold effect
+ * stands) rather than half-rewound, and the caller still gets `ledger_advanced`
+ * — now as a true statement. The head checks remain, as the cheap outer refusal
+ * that stops most races before the write is attempted.
+ *
+ * THE SECOND INPUT NEEDS THE SAME TREATMENT, AND NOW HAS IT. `updated_seq`
+ * guards the LOG. It cannot guard the other input, because the one writer that
+ * touches `passports` without advancing `updated_seq` is `erasePassportNames`
+ * (deliberately: erasure is not a ledger event). It deletes the passport's rows
+ * from `passport_names`, sets `display_name = ''`, appends nothing, and moves no
+ * seq — so it was invisible to the monotonic guard AND to the head checks, and a
+ * rebuild whose replay had already read the name table wrote the pre-erasure
+ * string straight back over the erasure. Measured, at the rebuild's own write
+ * barrier: erase a deadname, release a parked rebuild, and `passports
+ * .display_name` reads the deadname again while `passport_names` is empty and
+ * the ledger — correctly — commits to nothing but a `name_ref`. The rebuild
+ * returned SUCCESS: `target` was computed before the erasure, so the post-write
+ * self-check compared the restored string against itself and agreed.
+ *
+ * That is a right-to-be-forgotten failure, and it defeats the entire point of
+ * the name indirection (the per-name salt lives in the deletable row precisely
+ * so that erasing leaves no attackable commitment in an append-only log). A
+ * routine operator maintenance op must not be able to undo it.
+ *
+ * So the name input gets the guard the log input has, in the same place and for
+ * the same reason: FOLDED INTO THE WRITE STATEMENT, where no window is left.
+ * Each passport UPSERT re-asserts that the string it is about to write STILL
+ * EXISTS in `passport_names` for that passport, and yields NULL into a NOT NULL
+ * column when it does not — aborting the batch, and with it the whole write. A
+ * rebuild that loses this race writes NOTHING, so the erasure stands and the
+ * fold is left correct (`erasePassportNames` set the column itself, in its own
+ * atomic batch). The caller gets `names_erased`, and re-runs quiescent.
+ *
+ * HOW IT STAYS CORRECT.
+ *  - THE REPLAY HAS TWO INPUTS, NOT ONE. Since the display name moved behind a
+ *    reference (window item 4), `passport_names` is an input to the replay
+ *    exactly as `trust_events` is: the log holds the ref, that table holds the
+ *    string, and the rule both reducers apply is `names[name_ref] ?? ""`. So a
+ *    rebuild reproduces the CURRENT names, and a name erased since the event was
+ *    appended rebuilds to "" — which is the correct, intended outcome, not drift.
+ *    Anything that deletes a name row must pair the delete with the fold update
+ *    (events.ts `erasePassportNames` does); otherwise `verifyFold` will report
+ *    the divergence, which is exactly what it is for. Because it is an INPUT, it
+ *    is read at one instant and written back at another — which is why the write
+ *    re-asserts it (see THE SECOND INPUT above). NOTHING about the fold RULE
+ *    changes here: `names[ref] ?? ""` is untouched in both reducers, and fold.ts
+ *    needs no edit. What changes is only whether a STALE read of that table may
+ *    reach the disk.
+ *  - It NEVER rebuilds from a broken/unreadable chain: verifyChain must pass
+ *    first, or it refuses — a tampered/torn log must not be projected as truth.
+ *  - The target state is the pure reducer (fold.ts replayFromLog), which the
+ *    determinism tests pin byte-for-byte to the live writer (events.ts). The
+ *    INDEPENDENT proof that this reproduces the LIVE projection is the rebuild
+ *    test (build via appendEvents → corrupt the fold → rebuild → byte-match the
+ *    live-built snapshot). NOTE: the post-write self-check below and verifyFold
+ *    both compare the tables against that same reducer, so they confirm STORAGE
+ *    fidelity (no coercion/NULL drift on write) — NOT reducer equivalence. Do
+ *    not read a post-rebuild `matches:true` as independent evidence that the
+ *    reducers agree; that guarantee comes only from the offline determinism
+ *    tests.
+ *  - It is FK-SAFE and NON-DESTRUCTIVE to identities: `passports` is referenced
+ *    by many tables, so it is reconciled by idempotent UPSERT (never truncated).
+ *    A valid fold's PK set already equals the log's projected set, so only the
+ *    derived columns move; an orphan (a fold row absent from the log) is
+ *    detected BEFORE any write and the rebuild refuses — it never deletes an
+ *    FK-referenced row.
+ *  - The whole projection is written in ONE atomic batch, so a reader can never
+ *    observe a half-rebuilt fold (no cross-chunk tear). The trade-off is a
+ *    ledger-size ceiling: a fold too large for a single D1 batch will fail the
+ *    write (fail closed) — see the known-gap note; such a ledger must be rebuilt
+ *    offline. It is IDEMPOTENT: re-running converges to the same state.
+ */
+
+export class FoldRebuildError extends Error {
+  override name = "FoldRebuildError";
+  constructor(
+    message: string,
+    public readonly code: string,
+  ) {
+    super(message);
+  }
+}
+
+export interface FoldRebuildResult {
+  events: number; // ledger length (from verifyChain)
+  passports: number; // rows reconciled
+  accounts: number; // rows reconciled
+}
+
+export interface FoldVerifyResult {
+  chain_ok: boolean;
+  matches: boolean; // live fold == replay?
+  events: number;
+  live: { passports: number; accounts: number };
+  replay: { passports: number; accounts: number };
+  // Present only on a mismatch — the FIRST divergent keys per table (bounded).
+  drift?: { passports: string[]; accounts: string[] };
+  // I3-0870 — present only when the check could not complete: the reason, so an
+  // operator can tell a read/resource fault from a tampered ledger.
+  error?: string;
+}
+
+// Canonical per-row tuples in FIXED column order, so equality is independent of
+// object key order (snapshotState and replayState build their objects in
+// different orders). Used for the post-rebuild self-check and for verify().
+function passportTuple(p: StateSnapshot["passports"][number]): string {
+  // `subject_kind` and `operated_by` are IN THE TUPLE, and leaving them out was
+  // the defect review found: `/ops/fold/verify` and the post-rebuild self-check
+  // both project through here, so a live table saying `person` while the log
+  // says `ai_character` reported `matches: true` with no drift — the invariant-2
+  // DETECTION surface blind to exactly the two columns a fan-facing disclosure
+  // and a claim gate read. A fold column that nothing compares is a fold column
+  // that can be edited out from under the ledger.
+  return JSON.stringify([p.passport_id, p.display_name, p.claim_state, p.subject_kind, p.operated_by, p.retracted, p.created_seq, p.updated_seq]);
+}
+function accountTuple(a: StateSnapshot["accounts"][number]): string {
+  return JSON.stringify([a.account_key, a.passport_id, a.platform, a.id_kind, a.id, a.url, a.relationship_basis, a.status, a.observed_at, a.updated_seq, a.added_by]);
+}
+
+/** First N keys whose projected row differs between two snapshots (bounded). */
+function driftKeys(
+  live: StateSnapshot,
+  replay: StateSnapshot,
+): { passports: string[]; accounts: string[] } {
+  const limit = 20;
+  const lp = new Map(live.passports.map((p) => [p.passport_id, passportTuple(p)]));
+  const rp = new Map(replay.passports.map((p) => [p.passport_id, passportTuple(p)]));
+  const la = new Map(live.accounts.map((a) => [a.account_key, accountTuple(a)]));
+  const ra = new Map(replay.accounts.map((a) => [a.account_key, accountTuple(a)]));
+  const diff = (a: Map<string, string>, b: Map<string, string>): string[] => {
+    const out: string[] = [];
+    for (const k of new Set([...a.keys(), ...b.keys()])) {
+      if (a.get(k) !== b.get(k)) out.push(k);
+      if (out.length >= limit) break;
+    }
+    return out.sort();
+  };
+  return { passports: diff(lp, rp), accounts: diff(la, ra) };
+}
+
+function snapshotsEqual(a: StateSnapshot, b: StateSnapshot): boolean {
+  if (a.passports.length !== b.passports.length || a.accounts.length !== b.accounts.length) return false;
+  for (let i = 0; i < a.passports.length; i++) {
+    if (passportTuple(a.passports[i]!) !== passportTuple(b.passports[i]!)) return false;
+  }
+  for (let i = 0; i < a.accounts.length; i++) {
+    if (accountTuple(a.accounts[i]!) !== accountTuple(b.accounts[i]!)) return false;
+  }
+  return true;
+}
+
+function sameHead(a: ChainHead | null, b: ChainHead | null): boolean {
+  return a?.seq === b?.seq && a?.event_hash === b?.event_hash;
+}
+
+/**
+ * Read the fold's own PK set and each row's `updated_seq`, cheaply — used to
+ * detect orphans (fold rows with no backing event) and rows AHEAD of the log
+ * BEFORE any write, so a refused rebuild leaves the tables untouched.
+ */
+async function foldRows(db: DbLike): Promise<{ passports: Map<string, number>; accounts: Map<string, number> }> {
+  const p = (await db.prepare("SELECT passport_id, updated_seq FROM passports").bind().all<{ passport_id: string; updated_seq: number }>()).results;
+  const a = (await db.prepare("SELECT account_key, updated_seq FROM passport_accounts").bind().all<{ account_key: string; updated_seq: number }>()).results;
+  return {
+    passports: new Map(p.map((r) => [r.passport_id, r.updated_seq])),
+    accounts: new Map(a.map((r) => [r.account_key, r.updated_seq])),
+  };
+}
+
+/**
+ * Which of the replay's non-empty display names no longer exist in
+ * `passport_names` — i.e. which passports had a name ERASED since the replay
+ * read that table. Used only to explain a refused write; the refusal itself is
+ * enforced by the guard inside each statement, which is what closes the window.
+ *
+ * Reads the whole table (the replay already does) rather than binding the target
+ * pairs, so there is no parameter ceiling to chunk around on the error path.
+ */
+async function erasedTargetNames(db: DbLike, target: StateSnapshot): Promise<string[]> {
+  const named = target.passports.filter((p) => p.display_name !== "");
+  if (named.length === 0) return [];
+  const { results } = await db
+    .prepare("SELECT passport_id, display_name FROM passport_names")
+    .bind()
+    .all<{ passport_id: string; display_name: string }>();
+  const live = new Set(results.map((r) => `${r.passport_id}\u0000${r.display_name}`));
+  return named.filter((p) => !live.has(`${p.passport_id}\u0000${p.display_name}`)).map((p) => p.passport_id);
+}
+
+/**
+ * I3-1278 — THE NAME TABLE IS CHECKED AGAINST THE LEDGER BEFORE IT IS TRUSTED.
+ * The replay resolves every `name_ref` through the MUTABLE `passport_names`
+ * table; the ledger itself commits only `name_hash` = nameCommitment(salt,
+ * string) (events.ts). A row edited in place — a string or salt swapped with no
+ * event — would otherwise be projected into the fold as truth. Every live row a
+ * `passport_created`/`passport_renamed` event references must re-derive that
+ * event's `name_hash`; an ERASED row (absent) is the erasure case and passes.
+ * Paged over the name events only (REPLAY_PAGE, the I3-0870 shape).
+ */
+export async function assertNamesCommitted(db: DbLike): Promise<void> {
+  const { results: rows } = await db
+    .prepare("SELECT name_ref, display_name, name_salt FROM passport_names")
+    .bind()
+    .all<{ name_ref: string; display_name: string; name_salt: string }>();
+  if (rows.length === 0) return;
+  const byRef = new Map(rows.map((r) => [r.name_ref, r]));
+  let cursor = 0;
+  for (;;) {
+    const { results } = await db
+      .prepare("SELECT seq, subject, payload FROM trust_events WHERE event_type IN ('passport_created', 'passport_renamed') AND seq > ? ORDER BY seq ASC LIMIT ?")
+      .bind(cursor, REPLAY_PAGE)
+      .all<{ seq: number; subject: string; payload: string }>();
+    for (const e of results) {
+      const p = JSON.parse(e.payload) as { name_ref?: unknown; name_hash?: unknown };
+      if (typeof p.name_ref !== "string") continue;
+      const row = byRef.get(p.name_ref);
+      if (!row) continue; // erased: nothing to project, nothing to check
+      if ((await nameCommitment(row.name_salt, row.display_name)) !== p.name_hash) {
+        throw new FoldRebuildError(
+          `passport ${e.subject}: the name row for event seq ${e.seq} does not match the ledger's name_hash — the mutable name table was edited without an event; refusing to project it`,
+          "name_uncommitted",
+        );
+      }
+    }
+    if (results.length < REPLAY_PAGE) break;
+    cursor = results[results.length - 1]?.seq ?? cursor;
+  }
+}
+
+/**
+ * Read-only divergence check: does the live fold match a fresh replay of the
+ * log? Never writes. Use it to decide whether a rebuild is needed (and to
+ * confirm after). A broken OR UNREADABLE chain reports `chain_ok:false` /
+ * `matches:false` instead of throwing — this path exists precisely for a
+ * tampered ledger.
+ */
+export async function verifyFold(db: DbLike): Promise<FoldVerifyResult> {
+  try {
+    const chain = await verifyChain(db);
+    await assertNamesCommitted(db);
+    const [live, replay] = [await snapshotState(db), await replayFromLog(db)]; for (const p of replay.passports) if (p.retracted && (await retractionNamesKept(db, p.passport_id))) p.display_name = ""; // I64-FOLD V1: blank only names kept on purpose (retractionNamesKept, end of file)
+    const matches = chain.ok && snapshotsEqual(live, replay);
+    const result: FoldVerifyResult = {
+      chain_ok: chain.ok,
+      matches,
+      events: chain.events,
+      live: { passports: live.passports.length, accounts: live.accounts.length },
+      replay: { passports: replay.passports.length, accounts: replay.accounts.length },
+    };
+    if (!matches) result.drift = driftKeys(live, replay);
+    return result;
+  } catch (e) {
+    // A malformed row (e.g. non-JSON payload written by a tamper) makes
+    // verifyChain/replay throw — report it as an unreadable, non-matching
+    // ledger rather than surfacing a 500. Fail closed, but SAY WHY (I3-0870):
+    // a read or resource fault is not a tamper, and the operator must see which.
+    const error = e instanceof Error ? `${e.name}: ${e.message}` : String(e);
+    return { chain_ok: false, matches: false, events: 0, live: { passports: 0, accounts: 0 }, replay: { passports: 0, accounts: 0 }, error };
+  }
+}
+
+/**
+ * Rebuild the fold tables from the log. Refuses on a broken/unreadable chain,
+ * on a racing append, and on orphan rows. Reconciles every projected row via
+ * idempotent UPSERT (passports first — the FK parent) in ONE atomic batch, and
+ * self-verifies storage fidelity before returning.
+ */
+/**
+ * I20-FX3A (I20-JN-FXB FXC-L2-SIBLING): what the live retraction (events.ts retract_passport) erases beside the
+ * `retracted` flag, for a rebuild that writes or re-asserts one, AFTER the passport upsert in the same batch: the
+ * plaintext names (`passport_names`), the brand_index name/domain entries (brand-index.ts brandIndexErasureStmt), the
+ * live control proofs (events.ts `lapseControlProofs`, the live path's own statements — QUEUE #947 d-lapse-export).
+ * Idempotent: a second rebuild deletes nothing more and lapses nothing more (`valid_until > at` is false once
+ * lapsed). The analytics purge work order rides BEFORE the upsert (`analyticsErasureOwedStatement`).
+ */
+function retractionErasureStatements(db: DbLike, passportId: string, at: string | undefined, rebuiltAt: string): DbStatement[] {
+  // The proofs lapse at the retraction's own `created_at`, as the live retraction stamps them (events.ts retract_passport
+  // `lapseControlProofs(db, e.subject, e.created_at)`); `rebuiltAt` only when the log names no retraction instant.
+  return [db.prepare(`DELETE FROM passport_names WHERE passport_id = ? AND NOT ${PASSPORT_LEGAL_HOLD_SQL}`).bind(passportId, passportId), brandIndexErasureStmt(db, passportId), ...lapseControlProofs(db, passportId, at ?? rebuiltAt, at !== undefined)];
+}
+
+/**
+ * QUEUE #947 d-downgrade (I34-W2-EXPIRY-B; EXPB-12, I34-FX2-EXPIRY): the live `downgrade_claim` and `retract_passport`
+ * corrections each lapse the control proofs that existed then at their own `created_at` (events.ts,
+ * `lapseControlProofs`). A rebuild replays EVERY one of them, in seq order, at that instant, over the proofs proved at or
+ * before it (`existedBy`), whatever the passport's final claim state, so a passport downgraded and re-claimed, or
+ * downgraded twice, carries each proof's lapse as the live path stamped it. Idempotent: a lapse only ever lowers
+ * `valid_until` to an instant it already passed. Keyed by passport id; each list is in seq order.
+ */
+async function proofLapseCorrections(db: DbLike): Promise<Map<string, { action: string; at: string }[]>> {
+  const { results } = await db
+    .prepare(
+      `SELECT t.subject AS subject, t.created_at AS at, json_extract(t.payload, '$.action') AS action FROM trust_events t
+        WHERE t.event_type = 'correction' AND CASE WHEN json_valid(t.payload) THEN json_extract(t.payload, '$.action') END IN ('downgrade_claim', 'retract_passport')
+        ORDER BY t.seq ASC`,
+    )
+    .bind()
+    .all<{ subject: string; at: string; action: string }>();
+  const out = new Map<string, { action: string; at: string }[]>();
+  for (const r of results) out.set(r.subject, [...(out.get(r.subject) ?? []), { action: r.action, at: r.at }]);
+  return out;
+}
+
+/** I20-FX3A: the live retraction's analytics purge work order (events.ts retract_passport, #166), BEFORE the upsert and
+ * guarded on D1 not already holding the retraction, as the image-consent statement: a rebuild over a live retraction
+ * (which queued its own, possibly already drained) or a repeated rebuild queues nothing. */
+function analyticsErasureOwedStatement(db: DbLike, passportId: string, at: string): DbStatement {
+  return db
+    .prepare(
+      "INSERT INTO analytics_creator_erasures (passport_id, requested_at) SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM passports r WHERE r.passport_id = ? AND r.retracted = 1) ON CONFLICT(passport_id) DO NOTHING",
+    )
+    .bind(passportId, at, passportId);
+}
+
+export async function rebuildFold(
+  db: DbLike,
+  // QUEUE #942(a) D23 (D-0946(1)): the caller's audit rows, built from the result this call returns (every count is
+  // known before the write) and joined to the ONE projection batch, so a failed audit insert rolls the rebuild back.
+  audit?: (ctx: FoldRebuildResult) => DbStatement[],
+): Promise<FoldRebuildResult> {
+  // 0. Record the head we are rebuilding against. If the ledger advances under
+  //    us, we must refuse rather than write a stale replay over fresh state.
+  const headBefore = await chainHead(db);
+
+  // 1. Never project a torn/tampered/unreadable log as truth.
+  let chain: Awaited<ReturnType<typeof verifyChain>>;
+  try {
+    chain = await verifyChain(db);
+  } catch (e) {
+    throw new FoldRebuildError(`ledger unreadable (${e instanceof Error ? e.message : "parse error"}) — refusing to rebuild`, "chain_broken");
+  }
+  if (!chain.ok) {
+    throw new FoldRebuildError(
+      `chain broken at seq ${chain.brokenAtSeq ?? "?"} (${chain.reason ?? "unknown"}) — refusing to rebuild`,
+      "chain_broken",
+    );
+  }
+
+  // 2. Authoritative target state = the pure reducer over the whole log — over a
+  //    name table that has first been checked against the ledger (I3-1278).
+  await assertNamesCommitted(db);
+  const target = await replayFromLog(db);
+  // I20-FX3A (I20-JN-FXB FXC-L2-SIBLING): a retracted passport's name is "" in the projection, as the live retraction
+  // writes it (events.ts retract_passport: display_name = ''); its passport_names rows leave in the batch below.
+  for (const p of target.passports) if (p.retracted) p.display_name = "";
+
+  // 3. Orphan guard BEFORE writing: a fold row whose key the log does not
+  //    project is unexplained. Refuse (and leave the tables untouched) rather
+  //    than silently delete a possibly FK-referenced row.
+  const existing = await foldRows(db);
+  const targetPassportIds = new Set(target.passports.map((p) => p.passport_id));
+  const targetAccountKeys = new Set(target.accounts.map((a) => a.account_key));
+  const orphanPassports = [...existing.passports.keys()].filter((k) => !targetPassportIds.has(k));
+  const orphanAccounts = [...existing.accounts.keys()].filter((k) => !targetAccountKeys.has(k));
+  if (orphanPassports.length || orphanAccounts.length) {
+    throw new FoldRebuildError(
+      `fold has rows absent from the log (passports: ${orphanPassports.slice(0, 5).join(",") || "none"}; accounts: ${orphanAccounts.slice(0, 5).join(",") || "none"}) — refusing to leave orphans; investigate`,
+      "orphan_rows",
+    );
+  }
+
+  // 3b. AHEAD guard, same shape and same reason as the orphan guard: a live row
+  //     whose `updated_seq` EXCEEDS the one the log projects claims an update
+  //     the ledger cannot account for. Since every ledger writer stamps
+  //     `updated_seq` with the appending event's seq, that is either an append
+  //     racing this rebuild or a row edited outside the ledger — and in both
+  //     cases writing the replay over it would move the row BACKWARDS. Refuse
+  //     before any write, naming the rows, rather than rewind them.
+  const aheadPassports = target.passports.filter((p) => (existing.passports.get(p.passport_id) ?? p.updated_seq) > p.updated_seq).map((p) => p.passport_id);
+  const aheadAccounts = target.accounts.filter((a) => (existing.accounts.get(a.account_key) ?? a.updated_seq) > a.updated_seq).map((a) => a.account_key);
+  if (aheadPassports.length || aheadAccounts.length) {
+    throw new FoldRebuildError(
+      `fold rows are AHEAD of the log — updated_seq greater than the replay's (passports: ${aheadPassports.slice(0, 5).join(",") || "none"}; accounts: ${aheadAccounts.slice(0, 5).join(",") || "none"}); nothing written. An append raced this rebuild (re-run with appends stopped) or the fold was written outside the ledger (investigate)`,
+      "fold_ahead",
+    );
+  }
+
+  // 4. Refuse if an append landed during verify/replay/scan (we'd be about to
+  //    write a target that no longer reflects the head).
+  if (!sameHead(await chainHead(db), headBefore)) {
+    throw new FoldRebuildError("ledger advanced during rebuild — re-run with appends stopped", "ledger_advanced");
+  }
+
+  // 5. Build the whole projection and write it in ONE atomic batch — passports
+  //    FIRST (the FK parent), then accounts. ON CONFLICT keeps row identity
+  //    (FK-safe) and moves only the derived columns. A single batch means a
+  //    reader can never see a half-rebuilt fold.
+  //
+  //    THE NO-REWIND GUARD RIDES EACH STATEMENT (see the header). Step 4's head
+  //    check and this write are two round trips; an append landing between them
+  //    is exactly the case the guard exists for, so it is re-asserted HERE, in
+  //    the same statement as the write, where no window is left:
+  //
+  //      updated_seq = CASE WHEN excluded.updated_seq >= <t>.updated_seq
+  //                        THEN excluded.updated_seq ELSE NULL END
+  //
+  //    `>=` (not `>`) is load-bearing in BOTH directions. It must admit equal
+  //    seqs, because that is the whole repair case this tool exists for — the
+  //    0050 no-backfill drift changes `added_by`, never `updated_seq` — and it
+  //    must reject a strictly greater live seq, which is precisely a row some
+  //    append moved after the target was computed. A rejected row yields NULL
+  //    into a NOT NULL column, which aborts the statement and therefore the
+  //    whole batch: the rebuild writes ALL of the projection or NONE of it.
+  const statements: DbStatement[] = [];
+  const rebuiltAt = new Date().toISOString();
+  const lapses = await proofLapseCorrections(db);
+  for (const p of target.passports) {
+    // THE NAME-LIVENESS GUARD RIDES THE STATEMENT, for the same reason and in
+    // the same shape as the no-rewind guard beside it — see THE SECOND INPUT in
+    // the header. `p.display_name` was resolved from `passport_names` during the
+    // replay, several round trips ago; an erasure landing since then is visible
+    // to NEITHER head check (it appends no event) NOR the seq guard (it moves no
+    // seq). So the string is re-checked HERE, against the live table, inside the
+    // same statement that writes it:
+    //
+    //   display_name = CASE WHEN EXISTS (…still there…) THEN excluded.display_name END
+    //
+    // and a name that has gone yields NULL into a NOT NULL column, which aborts
+    // the statement and therefore the whole batch. The rebuild writes ALL of the
+    // projection or NONE of it, so a raced erasure is never half-undone.
+    //
+    // ONLY a non-empty target name is guarded, and that is exact rather than
+    // lazy: an empty target name means the replay ALREADY resolved to "" (the
+    // rows were gone when it read), so writing "" can only agree with an erasure,
+    // never reverse one — and guarding it would make every never-named passport
+    // unrebuildable. The guard is keyed on (passport_id, display_name) rather
+    // than on `name_ref`, because `name_ref` is not part of StateSnapshot and
+    // re-deriving "which ref is current" here would be a THIRD copy of a fold
+    // rule that only two reducers are allowed to spell. `erasePassportNames`
+    // deletes ALL of a passport's rows, so the pair is exactly as sensitive.
+    const guarded = p.display_name !== "";
+    // I20-FXC (I20-JN-RG SEC-L2, D-0960(12)): a rebuild that WRITES a retraction owes the image service's biometric
+    // revoke exactly as the live retraction does (events.ts retract_passport), in the same batch. BEFORE the upsert
+    // and guarded on D1 not already holding the retraction, so a repeated rebuild (or one over a live retraction,
+    // which queued its own) queues nothing more.
+    if (p.retracted) statements.push(analyticsErasureOwedStatement(db, p.passport_id, rebuiltAt));
+    if (p.retracted) statements.push(imageConsentOwedOnRemovalStatement(db, p.passport_id, rebuiltAt, "NOT EXISTS (SELECT 1 FROM passports r WHERE r.passport_id = ? AND r.retracted = 1)", [p.passport_id]), faceRevokeOwedStatement(db, p.passport_id, rebuiltAt, "fold rebuild", "NOT EXISTS (SELECT 1 FROM passports r WHERE r.passport_id = ? AND r.retracted = 1)", [p.passport_id])); // I65-HOLD F1
+    statements.push(
+      db
+        .prepare(
+          "INSERT INTO passports (passport_id, display_name, display_name_skeleton, claim_state, subject_kind, operated_by, retracted, created_seq, updated_seq) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+            "ON CONFLICT(passport_id) DO UPDATE SET display_name = " +
+            (guarded
+              ? "CASE WHEN EXISTS (SELECT 1 FROM passport_names n WHERE n.passport_id = ? AND n.display_name = ?) THEN excluded.display_name ELSE NULL END"
+              : "excluded.display_name") +
+            // The two new columns rebuild like every other folded value. Omitting
+            // them here would make a rebuild QUIETLY UNDECLARE every character —
+            // the disclosure a fan relies on, deleted by a maintenance action.
+            // I20-W1D (#946 (a)): the stored skeleton follows the rebuilt name (name-fold.ts displayNameSkeleton).
+            ", display_name_skeleton = excluded.display_name_skeleton" +
+            ", claim_state = excluded.claim_state, subject_kind = excluded.subject_kind, operated_by = excluded.operated_by, " +
+            "retracted = excluded.retracted, created_seq = excluded.created_seq, " +
+            "updated_seq = CASE WHEN excluded.updated_seq >= passports.updated_seq THEN excluded.updated_seq ELSE NULL END",
+        )
+        .bind(
+          p.passport_id,
+          p.display_name,
+          displayNameSkeleton(p.display_name),
+          p.claim_state,
+          p.subject_kind,
+          p.operated_by,
+          p.retracted,
+          p.created_seq,
+          p.updated_seq,
+          ...(guarded ? [p.passport_id, p.display_name] : []),
+        ),
+    );
+    const owed = lapses.get(p.passport_id) ?? [];
+    for (const l of owed) if (l.action === "downgrade_claim") statements.push(...lapseControlProofs(db, p.passport_id, l.at, true));
+    if (p.retracted) statements.push(...retractionErasureStatements(db, p.passport_id, owed.find((l) => l.action === "retract_passport")?.at, rebuiltAt));
+  }
+  for (const a of target.accounts) {
+    statements.push(
+      db
+        .prepare(
+          "INSERT INTO passport_accounts (account_key, passport_id, platform, id_kind, id, url, relationship_basis, status, observed_at, updated_seq, added_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+            "ON CONFLICT(account_key) DO UPDATE SET passport_id = excluded.passport_id, platform = excluded.platform, id_kind = excluded.id_kind, id = excluded.id, url = excluded.url, relationship_basis = excluded.relationship_basis, status = excluded.status, observed_at = excluded.observed_at, added_by = excluded.added_by, " +
+            "updated_seq = CASE WHEN excluded.updated_seq >= passport_accounts.updated_seq THEN excluded.updated_seq ELSE NULL END",
+        )
+        .bind(a.account_key, a.passport_id, a.platform, a.id_kind, a.id, a.url, a.relationship_basis, a.status, a.observed_at, a.updated_seq, a.added_by),
+    );
+  }
+  // The audit rows ride the projection's batch (after it, so passports stay first).
+  // `statements` is empty only for a passport-less ledger (nothing to project);
+  // skip the batch only when there is also no audit row, since a real-D1 empty
+  // batch may reject.
+  const result: FoldRebuildResult = { events: chain.events, passports: target.passports.length, accounts: target.accounts.length };
+  if (audit) statements.push(...audit({ ...result }));
+  if (statements.length) {
+    try {
+      await db.batch(statements);
+    } catch (e) {
+      // The batch was refused and rolled back WHOLE (D1 batches, and the test
+      // double's transaction, are all-or-nothing), so whatever the cause, the
+      // one fact the operator needs is that the fold is UNCHANGED. Name the
+      // likely cause: if the head moved, an append raced into the write window
+      // and the guard above stopped it moving a row backwards.
+      const msg = e instanceof Error ? e.message : String(e);
+      if (!sameHead(await chainHead(db), headBefore)) {
+        throw new FoldRebuildError(
+          `ledger advanced into the write window — the stale projection was refused and rolled back, so the fold is UNCHANGED (and still reflects the racing append); re-run with appends stopped [${msg}]`,
+          "ledger_advanced",
+        );
+      }
+      // The OTHER input can move under a rebuild too, and it moves silently: an
+      // erasure appends no event, so the head check above is blind to it. Ask the
+      // name table directly rather than reading the driver's constraint text —
+      // the operator must be told that somebody exercised an erasure mid-rebuild,
+      // and above all that the rebuild did NOT undo it.
+      const erased = await erasedTargetNames(db, target);
+      if (erased.length) {
+        throw new FoldRebuildError(
+          `a display name was ERASED during the rebuild (passports: ${erased.slice(0, 5).join(",")}) — the stale projection would have restored it, so the batch was refused and rolled back WHOLE; nothing was written and the erasure stands. Re-run with appends and erasures stopped [${msg}]`,
+          "names_erased",
+        );
+      }
+      throw new FoldRebuildError(
+        `fold write refused and rolled back whole (${statements.length} statements) — nothing was written; a live row is ahead of the replay, the projection violates a constraint, or a joined audit row failed [${msg}]`,
+        "write_refused",
+      );
+    }
+  }
+
+  // 6. Refuse if an append raced the write (the fold we just wrote may no longer
+  //    match the head). Fail closed — an operator seeing this re-runs quiescent.
+  if (!sameHead(await chainHead(db), headBefore)) {
+    throw new FoldRebuildError("ledger advanced during rebuild — the fold may be stale; re-run with appends stopped", "ledger_advanced");
+  }
+
+  // 7. Storage-fidelity self-check: the written tables must byte-match the
+  //    reducer output (catches a bad INSERT, a CHECK coercion, or column drift).
+  //    NOT an independent reducer-equivalence check — see the header note.
+  const after = await snapshotState(db);
+  if (!snapshotsEqual(after, target)) {
+    // Disambiguate: a mismatch caused by an append that landed AFTER step 6's
+    // head read is a race (re-run), not a storage-fidelity fault.
+    if (!sameHead(await chainHead(db), headBefore)) {
+      throw new FoldRebuildError("ledger advanced during rebuild — the fold may be stale; re-run with appends stopped", "ledger_advanced");
+    }
+    // I3-1536 — an erasure landing AFTER the batch committed also moves the
+    // fold (it blanks the name) without moving the head. Ask the name table
+    // before calling it a storage fault.
+    const erased = await erasedTargetNames(db, target);
+    if (erased.length) {
+      throw new FoldRebuildError(
+        `a display name was ERASED after the rebuild wrote (passports: ${erased.slice(0, 5).join(",")}) — the fold was written, then the erasure applied on top of it, so the erasure stands; the post-write check differs only by that erasure. Re-run verify to confirm`,
+        "names_erased",
+      );
+    }
+    throw new FoldRebuildError("post-rebuild verification failed: written fold does not match the replay", "verify_failed");
+  }
+
+  return result;
+}
+
+/**
+ * I64-FOLD V1 (I63-RG-W2-06; I64-W0 amendment 1, D-1557): verifyFold's mask condition. A retracted passport's names are
+ * kept ON PURPOSE only when the retraction's batch wrote `retraction:names_erase_owed` (at or after the retraction's
+ * `created_at`; I64-FX-HOLD ruling 1) or a `passport` legal hold was open at it (opened at or before the retraction's
+ * `created_at`, released after it or not at all; the arm held retractions from before the marker rely on), and the owed erase has not been recorded since
+ * (`retraction:names_erase_done`, written by the hold-release sweep): for the marker, no DONE of a later audit_id (I66-SWEEP C2,
+ * requests.ts sweepRetractionNamesOwed's own two limbs); for the hold, no DONE at or after the retraction's instant. Read by the passport's `retract_passport`
+ * correction (one per passport: events.ts requireLivePassport). No retraction row, or any other answer: not kept.
+ */
+async function retractionNamesKept(db: DbLike, passportId: string): Promise<boolean> {
+  const row = await db
+    .prepare(
+      "SELECT (EXISTS (SELECT 1 FROM audit_log o WHERE o.item_id = t.subject AND o.action = 'retraction:names_erase_owed' AND o.created_at >= t.created_at AND NOT EXISTS (SELECT 1 FROM audit_log a WHERE a.item_id = o.item_id AND a.action = 'retraction:names_erase_done' AND a.audit_id > o.audit_id)) OR (EXISTS (SELECT 1 FROM legal_holds lh WHERE lh.subject_kind = 'passport' AND lh.subject_id = t.subject AND lh.opened_at <= t.created_at AND (lh.released_at IS NULL OR lh.released_at > t.created_at)) AND NOT EXISTS (SELECT 1 FROM audit_log a WHERE a.item_id = t.subject AND a.action = 'retraction:names_erase_done' AND a.created_at >= t.created_at))) AS kept FROM trust_events t WHERE t.subject = ? AND t.event_type = 'correction' AND CASE WHEN json_valid(t.payload) THEN json_extract(t.payload, '$.action') END = 'retract_passport' ORDER BY t.seq ASC LIMIT 1",
+    )
+    .bind(passportId)
+    .first<{ kept: number }>();
+  return row?.kept === 1;
+}
+===== END FILE: services/trust-core/src/fold-rebuild.ts =====
+
+===== BEGIN FILE: services/trust-core/src/fold.ts =====
+import type { DbLike } from "./db.js";
+import { touchedByFromActor } from "./provenance.js";
+
+/**
+ * Independent pure reducer for replay-determinism testing.
+ *
+ * DELIBERATE DUPLICATION: this module re-implements the fold semantics of
+ * events.ts as a pure function over the raw event log, WITHOUT sharing code
+ * with the SQL effects. The determinism test folds the log through this
+ * reducer and requires the result to equal the live tables byte-for-byte —
+ * so a divergence between "what the SQL did" and "what the rules say"
+ * becomes a test failure instead of silent drift. If you change fold rules,
+ * you must change both files, and the test will tell you if you didn't.
+ */
+
+export interface StateSnapshot {
+  passports: {
+    passport_id: string;
+    display_name: string;
+    claim_state: string;
+    /** `person` | `ai_character` | `brand` — the axis, orthogonal to claim_state. */
+    subject_kind: string;
+    /** Who answers for a character (`agc_`/`psp_`), or null for a person. */
+    operated_by: string | null;
+    retracted: number;
+    created_seq: number;
+    updated_seq: number;
+  }[];
+  accounts: {
+    account_key: string;
+    passport_id: string;
+    platform: string;
+    id_kind: string;
+    id: string;
+    url: string | null;
+    relationship_basis: string;
+    status: string;
+    observed_at: string;
+    updated_seq: number;
+    added_by: string | null; // provenance class of WHO added it (fold column)
+  }[];
+}
+
+interface RawEvent {
+  seq: number;
+  event_type: string;
+  subject: string;
+  payload: string;
+  actor_kind: string; // needed to fold `added_by` provenance
+}
+
+// Canonicalization is NOT part of the deliberate duplication: account keys
+// come from THE canonicalizer here exactly as in events.ts. The independent
+// reimplementation covers fold semantics only.
+import { subjectForAccount } from "@dhwaja/canonical";
+
+function key(payload: Record<string, unknown>): string {
+  return subjectForAccount(
+    String(payload.platform),
+    String(payload.id_kind),
+    String(payload.id),
+  ).canonical;
+}
+
+/**
+ * THE NAME-REFERENCE FOLD RULE, reimplemented here on purpose (window item 4).
+ *
+ * `passport_created` / `passport_renamed` commit {name_ref, name_hash}; the string
+ * lives in the mutable `passport_names` table. The rule both reducers must apply,
+ * byte-for-byte, is exactly:
+ *
+ *     display_name = names[name_ref] ?? ""
+ *
+ * The `?? ""` is not a defensive shrug — it is the ERASURE case. Deleting a name
+ * row is the whole point of the indirection, and after it is gone both the live
+ * writer (events.ts `resolveName`) and this replay must land on the same value or
+ * Invariant 2 breaks the moment anyone exercises their erasure right. Unlike
+ * canonicalAccount (shared below, because a canonicalization divergence is
+ * unsurvivable), this rule is a one-line map lookup: duplicating it is exactly
+ * what the deliberate-duplication contract asks for, and the determinism tests
+ * pin the two implementations together.
+ */
+function nameOf(payload: Record<string, unknown>, names: Map<string, string>): string {
+  return names.get(String(payload.name_ref)) ?? "";
+}
+
+export function replayState(
+  events: RawEvent[],
+  eventIdToSeq: Map<string, RawEvent>,
+  names: Map<string, string> = new Map(),
+): StateSnapshot {
+  const passports = new Map<string, StateSnapshot["passports"][number]>();
+  const accounts = new Map<string, StateSnapshot["accounts"][number]>();
+
+  for (const e of [...events].sort((a, b) => a.seq - b.seq)) {
+    const p = JSON.parse(e.payload) as Record<string, unknown>;
+    switch (e.event_type) {
+      case "passport_created":
+        passports.set(e.subject, {
+          passport_id: e.subject,
+          display_name: nameOf(p, names),
+          claim_state: "unclaimed",
+          // Every passport is minted a PERSON. A character is declared after the
+          // fact, by an operator, and there is no door back — see
+          // `DECLARABLE_KINDS`, which omits `person` on purpose.
+          subject_kind: "person",
+          operated_by: null,
+          retracted: 0,
+          created_seq: e.seq,
+          updated_seq: e.seq,
+        });
+        break;
+      case "character_operator_rebound": {
+      // MIRRORS THE WRITE, AND INHERITS NOTHING FROM THE NEIGHBOUR BELOW.
+      //
+      // `subject_kind_declared` declines unless the passport is `unclaimed`. A
+      // rebind on a CLAIMED character is the entire point of this event, so
+      // copying that guard here — the obvious thing to do, sitting one case
+      // away — would make the reducer and the writer disagree on the first real
+      // use of the feature.
+      //
+      // It also declines nothing else. The writer's accountability ceiling is a
+      // THROW, so a refused rebind rolls the whole append back and no event row
+      // is ever written: the reducer cannot see one. That is the same stance
+      // `claim_proven` takes, for the reason stated below — a pure reducer does
+      // not re-derive admission rules, and re-deriving this one is impossible
+      // anyway (it reads `agencies` and `request_suppressions`, which are not
+      // ledger state and are not in this reducer's world).
+      //
+      // `subject_kind` is untouched, exactly as in the writer, where the column
+      // is not in the statement at all.
+      const pass = passports.get(e.subject);
+      if (!pass || pass.retracted === 1) break;
+      pass.operated_by = String(p.operated_by);
+      pass.updated_seq = e.seq;
+      break;
+    }
+    case "subject_kind_declared": {
+        const pass = passports.get(e.subject);
+        // Mirrors `events.ts`: retracted, or already claimed by somebody, and
+        // the declaration is not applied. A pure reducer cannot throw the way
+        // the writer does, so it declines the effect — which is the same
+        // resulting state, which is what byte-for-byte agreement means.
+        if (!pass || pass.retracted === 1 || pass.claim_state !== "unclaimed") break;
+        pass.subject_kind = String(p.subject_kind);
+        pass.operated_by = String(p.operated_by);
+        pass.updated_seq = e.seq;
+        break;
+      }
+      case "subject_kind_corrected": {
+        // I16 #132W-08: mirrors events.ts — retracted, or already claimed by
+        // somebody, and the correction is not applied (the writer throws; a pure
+        // reducer declines the effect, the same resulting state). A person
+        // carries no operator, so operated_by is cleared with the kind.
+        const pass = passports.get(e.subject);
+        if (!pass || pass.retracted === 1 || pass.claim_state !== "unclaimed") break;
+        pass.subject_kind = String(p.subject_kind);
+        pass.operated_by = p.subject_kind === "person" ? null : String(p.operated_by);
+        pass.updated_seq = e.seq;
+        break;
+      }
+      case "passport_renamed": {
+        // Point a live passport at a different name row. display_name +
+        // updated_seq only — a rename never touches claim_state or retracted
+        // (mirrors events.ts foldEffects).
+        const pass = passports.get(e.subject);
+        if (pass) {
+          pass.display_name = nameOf(p, names);
+          pass.updated_seq = e.seq;
+        }
+        break;
+      }
+      case "account_added": {
+        const subj = subjectForAccount(String(p.platform), String(p.id_kind), String(p.id));
+        accounts.set(subj.canonical, {
+          account_key: subj.canonical,
+          passport_id: e.subject,
+          platform: subj.platform,
+          id_kind: subj.idKind,
+          id: subj.id,
+          url: typeof p.url === "string" ? p.url : null,
+          relationship_basis: String(p.relationship_basis),
+          status: "active",
+          observed_at: String(p.observed_at),
+          updated_seq: e.seq,
+          added_by: touchedByFromActor(e.actor_kind), // WHO added it — mirrors events.ts
+        });
+        break;
+      }
+      case "account_revoked": {
+        const a = accounts.get(String(p.account_key));
+        if (a) {
+          a.status = "revoked";
+          a.updated_seq = e.seq;
+        }
+        break;
+      }
+      case "account_reactivated": {
+        // F5: status back to active; updated_seq follows; added_by is PRESERVED
+        // (I3-0913), exactly as a transfer does. Everything else on the row untouched —
+        // mirrors events.ts. The preconditions (owned, revoked|historical, not
+        // delisted, reverses the latest revoking event, fresh proof) are
+        // append-time refusals, not fold rules: a row in the log passed them.
+        const a = accounts.get(String(p.account_key));
+        if (a) {
+          a.status = "active";
+          a.updated_seq = e.seq;
+        }
+        break;
+      }
+      case "account_transferred": {
+        // Move ownership to the subject passport; mirrors events.ts foldEffects
+        // (passport_id + updated_seq only — status is PRESERVED, never forced to
+        // 'active', so a transfer can't resurrect a revoked/historical account).
+        const a = accounts.get(String(p.account_key));
+        if (a) {
+          a.passport_id = e.subject;
+          a.updated_seq = e.seq;
+        }
+        break;
+      }
+      case "claim_proven": {
+        const pass = passports.get(e.subject);
+        if (pass) {
+          pass.claim_state = "claimed";
+          pass.updated_seq = e.seq;
+        }
+        break;
+      }
+      case "verification_granted": {
+        const pass = passports.get(e.subject);
+        if (pass) {
+          pass.claim_state = "verified";
+          pass.updated_seq = e.seq;
+        }
+        break;
+      }
+      case "verification_renewed": {
+        // The grant's clock moved; the state did not. claim_state stays
+        // "verified" and updated_seq advances — mirrors events.ts foldEffects.
+        const pass = passports.get(e.subject);
+        if (pass) {
+          pass.claim_state = "verified";
+          pass.updated_seq = e.seq;
+        }
+        break;
+      }
+      case "operator_lapsed": {
+        // verified -> claimed, `retracted` untouched — byte-for-byte the same
+        // effect as `verification_expired` below, because it IS the same fact
+        // (this passport stops being verified) arrived at by a different route:
+        // a clock there, a dead operator here. Mirrors events.ts foldEffects.
+        //
+        // The guards events.ts applies (must be verified, must not be a person)
+        // are NOT repeated: this reducer replays a log the ledger already
+        // accepted, and re-deriving admission rules here is how the two
+        // reducers drift. Same stance every other arm in this file takes.
+        const pass = passports.get(e.subject);
+        if (pass) {
+          pass.claim_state = "claimed";
+          pass.updated_seq = e.seq;
+        }
+        break;
+      }
+      case "verification_expired": {
+        // verified -> claimed, `retracted` untouched. Byte-for-byte the same
+        // effect as correction/downgrade_verification below, because it IS the
+        // same fact arrived at by a clock instead of by a human. Mirrors
+        // events.ts foldEffects.
+        const pass = passports.get(e.subject);
+        if (pass) {
+          pass.claim_state = "claimed";
+          pass.updated_seq = e.seq;
+        }
+        break;
+      }
+      case "correction": {
+        const action = String(p.action);
+        for (const targetId of p.target as string[]) {
+          const target = eventIdToSeq.get(targetId);
+          if (!target) continue;
+          if (action === "revoke_account" && target.event_type === "account_added") {
+            const a = accounts.get(key(JSON.parse(target.payload) as Record<string, unknown>));
+            if (a) {
+              a.status = "historical";
+              a.updated_seq = e.seq;
+            }
+          } else if (action === "downgrade_verification") {
+            // THE MIRROR IS `claim_state` AND NOTHING ELSE — stated, not
+            // omitted. events.ts also retires the subject's payout_tags rows in
+            // the same batch as this correction. That is deliberately NOT
+            // mirrored here, because `payout_tags` is not a fold table: it is a
+            // staging projection with its own staged→live→retired lifecycle
+            // (see events.ts, the `payout_tag_added`/`payout_tag_removed`
+            // derive-from-log family), so it is not part of StateSnapshot and
+            // `/ops/fold/rebuild` neither rebuilds it nor may overwrite it from
+            // the log. If payout_tags ever DOES become a fold of the ledger,
+            // this branch and StateSnapshot must both grow — that is the change
+            // the determinism guard is watching for.
+            const pass = passports.get(e.subject);
+            if (pass) {
+              pass.claim_state = "claimed";
+              pass.updated_seq = e.seq;
+            }
+          } else if (action === "downgrade_claim") {
+            const pass = passports.get(e.subject);
+            if (pass) {
+              pass.claim_state = "unclaimed";
+              pass.updated_seq = e.seq;
+            }
+          } else if (action === "retract_passport") {
+            const pass = passports.get(e.subject);
+            if (pass) {
+              pass.retracted = 1;
+              pass.updated_seq = e.seq;
+            }
+          }
+        }
+        break;
+      }
+      default:
+        break; // claim_started: recorded, no fold effect. Also any retired type still on file (I3-0966: handle_changed, D-1078(25)) — replay applies nothing for it.
+    }
+  }
+
+  return {
+    passports: [...passports.values()].sort((a, b) =>
+      a.passport_id < b.passport_id ? -1 : 1,
+    ),
+    accounts: [...accounts.values()].sort((a, b) =>
+      a.account_key < b.account_key ? -1 : 1,
+    ),
+  };
+}
+
+/** Read the live fold tables into the same snapshot shape. */
+export async function snapshotState(db: DbLike): Promise<StateSnapshot> {
+  const passports = (
+    await db
+      .prepare(
+        "SELECT passport_id, display_name, claim_state, subject_kind, operated_by, retracted, created_seq, updated_seq FROM passports ORDER BY passport_id",
+      )
+      .bind()
+      .all<StateSnapshot["passports"][number]>()
+  ).results;
+  const accounts = (
+    await db
+      .prepare(
+        "SELECT account_key, passport_id, platform, id_kind, id, url, relationship_basis, status, observed_at, updated_seq, added_by FROM passport_accounts ORDER BY account_key",
+      )
+      .bind()
+      .all<StateSnapshot["accounts"][number]>()
+  ).results;
+  return { passports, accounts };
+}
+
+/**
+ * I3-0870 — rows per round trip for the replay's ledger read. The whole-table
+ * `SELECT` this replaced is the shape `verifyChain` was paged away from
+ * (events.ts VERIFY_CHAIN_PAGE): one response carrying the entire ledger, which
+ * on a large ledger fails as a resource fault that `verifyFold` then reports as
+ * a broken ledger. Keyset on `seq`, so no row is skipped or read twice.
+ */
+export const REPLAY_PAGE = 1000;
+
+/** Fold the raw log through the pure reducer. */
+export async function replayFromLog(db: DbLike, page: number = REPLAY_PAGE): Promise<StateSnapshot> {
+  const results: Array<RawEvent & { event_id: string }> = [];
+  let cursor = 0;
+  for (;;) {
+    const { results: rows } = await db
+      .prepare("SELECT seq, event_id, event_type, subject, payload, actor_kind FROM trust_events WHERE seq > ? ORDER BY seq ASC LIMIT ?")
+      .bind(cursor, page)
+      .all<RawEvent & { event_id: string }>();
+    for (const r of rows) results.push(r);
+    if (rows.length < page) break;
+    cursor = rows[rows.length - 1]?.seq ?? cursor;
+  }
+  const byId = new Map<string, RawEvent>();
+  for (const r of results) byId.set(r.event_id, r);
+  // The mutable name table is an INPUT to the replay, exactly as the log is: the
+  // ledger holds the reference, this holds the string. An erased row is simply
+  // absent, and `nameOf` folds it to "" — the same value the live writer stores.
+  const { results: nameRows } = await db
+    .prepare("SELECT name_ref, display_name FROM passport_names")
+    .bind()
+    .all<{ name_ref: string; display_name: string }>();
+  const names = new Map<string, string>();
+  for (const n of nameRows) names.set(n.name_ref, n.display_name);
+  return replayState(results, byId, names);
+}
+===== END FILE: services/trust-core/src/fold.ts =====
+
+===== BEGIN FILE: services/trust-core/src/founder.ts =====
+import type { DbLike } from "./db.js";
+
+/**
+ * THE FOUNDER ACCOUNT — one flag, and EVERY way the founder differs from a
+ * normal account, in one file.
+ *
+ * The founder is EXCLUDED from things and EXEMPT FROM NOTHING. That one
+ * sentence is the whole model, and it is deliberately narrower than what used
+ * to be here. This module exists so that a future reader can answer "how is
+ * the founder special?" by reading ONE file instead of grepping for a passport
+ * id. Every exemption is listed in `FOUNDER_EXEMPTIONS` below, each one names
+ * the module that implements it, and `test/founder.test.ts` asserts the list
+ * and the implementations agree.
+ *
+ * ---------------------------------------------------------------------------
+ * REMOVED IN 0021 — THE "LIKE TOM ON MYSPACE" AUTO-EDGES (audit item #24)
+ * ---------------------------------------------------------------------------
+ * This file used to create two synthetic social edges at account birth: a
+ * fan → founder SAVE (written straight into `saves`, around `saveCreator` and
+ * around `MAX_SAVES_PER_ACCOUNT`) and a MUTUAL fan ↔ founder FOLLOW at first
+ * profile creation. Both are GONE — not relabelled, not made opt-out. Nothing
+ * in this repository creates a social edge a human did not ask for.
+ *
+ * They were removed because a synthetic edge is a decoration impersonating a
+ * fact, and each of these two had already grown teeth:
+ *   - the SAVE edge is what the broadcast fan-out, the recognition audience
+ *     gate, `recognizableFans`, the digest's `new_saves`, the ROI and
+ *     intelligence dashboards and every `save`-gated reverse-code pool read.
+ *     Every fan was auto-eligible for the founder's code pools and auto-
+ *     enrolled in the founder's broadcast audience, having chosen neither;
+ *   - the mutual FOLLOW edge made the founder a `isFriend` MUTUAL of every
+ *     profiled fan, which is the predicate that opens a `friends`-visibility
+ *     collection. One account could read every fan's "friends only" shelf.
+ *
+ * The five exemptions that rested on "the founder follows everyone" went with
+ * them (`social_follow_cap`, `recognition_active_follow_cap`,
+ * `recognition_follow_daily_budget`, `recognition_audience_gate`, and the
+ * `broadcast_reach` declaration). The founder now follows by hand, under every
+ * cap and behind every gate that binds any other creator. The one-shot cleanup
+ * of the rows those edges already wrote — and the drop of the
+ * `founder_autofollow` marker table — is `0021_founder_edges_referrals.sql`.
+ *
+ * ---------------------------------------------------------------------------
+ * FAIL CLOSED
+ * ---------------------------------------------------------------------------
+ * The flag is a single row in `founder`. An ABSENT row means THERE IS NO
+ * FOUNDER — never "everyone". Every predicate here returns false / null on an
+ * empty table, the reserved numbers stay reserved and unusable, and the
+ * `rankable_*` views exclude nobody (they are written with NOT EXISTS, so a
+ * NULL-yielding founder table cannot silently empty a board either).
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THE FOUNDER MAY *NEVER* DO
+ * ---------------------------------------------------------------------------
+ * No exemption in this file touches a VERDICT or the accusatory path. The
+ * founder gets no privileged treatment in checks, warnings, caution, reports,
+ * removal, claims, ratings or the registry; nothing here reads a billing tier
+ * (this module imports only the `DbLike` type, exactly like
+ * recognition-public.ts, so the paywall guard's serving-path closure can
+ * contain it without a single exemption). The founder's own passport is
+ * subject to every warning, every report and every operator action that any
+ * other creator is. If a future "founder can ..." lands anywhere near a
+ * verdict, it does not belong in this file — it does not belong at all.
+ */
+
+/** The founder's permanent registry join number, reserved in `0011_founder.sql`. */
+export const FOUNDER_JOIN_NO = 1;
+
+/** The founder's Founding-badge rank, reserved the same way. */
+export const FOUNDER_FOUNDING_RANK = 1;
+
+/**
+ * The placeholder row that HOLDS #1 in `join_numbers` and `founding` from
+ * migration time until the founder claims it. Deliberately not a well-formed
+ * passport id (`psp_` + 16 hex), so it can never collide with a real passport
+ * and never escapes to a client — every read path filters on the id shape.
+ */
+export const RESERVED_SENTINEL = "__founder_reserved__";
+
+/*
+ * `FOUNDER_AUTOFOLLOW_DISCLOSURE` USED TO LIVE HERE and is deliberately not
+ * replaced. It was a signup-time promise that "new accounts start out
+ * following Dhwaja's founder … unfollow any time and it stays unfollowed",
+ * served by `GET /public/config` and `GET /account/profile` and rendered on
+ * the join and profile screens. With the auto-edges gone there is nothing to
+ * disclose, and a disclosure that describes behaviour the code no longer has
+ * is worse than none: it is a false statement about the product on the one
+ * screen a fan reads before consenting to anything. Both the constant and
+ * `GET /public/config` (whose only field it was) are removed.
+ */
+
+/**
+ * EVERY EXEMPTION, ENUMERATED. This is the list; the code below and in the
+ * named modules is the implementation. `test/founder.test.ts` walks this array
+ * and proves each entry behaviourally, so an entry cannot rot into a comment.
+ *
+ * `kind`:
+ *   - "cap"      — a limit the founder is not subject to
+ *   - "gate"     — a precondition the founder does not have to satisfy
+ *   - "auto"     — something applied on the founder's behalf
+ *   - "excluded" — a surface the founder is kept OFF
+ *   - "declared" — an intended asymmetry with NO code behind it, written down
+ *                  so it is a decision rather than an accident
+ */
+export const FOUNDER_EXEMPTIONS = [
+  {
+    id: "leaderboards_excluded",
+    kind: "excluded",
+    module: "the `0011_founder.sql` rankable_* views, read by rankings.ts / leaderboard.ts / rewards.ts / requests.ts / social.ts",
+    rule: "The founder appears on NO published board: Top Collectors, Archive Collectors, Scouts, Supporters, Referrers, per-creator top-fans, Most Collected, Most Discovered, Fastest Rising, Breakout, every category board, Most Targeted, Top Requested, and overlap discovery. Their own public profile also publishes NO follower/following count (social.ts publicProfile returns null).",
+    why: "Nothing decorative may impersonate a fact, and the platform's own account sitting at #1 on the board fans read to find real creators is exactly that — in reverse, the founder's follows would poison the Scouts board. Enforced structurally by the views, not by a WHERE clause each board must remember. The NULLED FOLLOW COUNTS ARE KEPT ON A NARROWER ARGUMENT than the one that used to be here (audit item #24): they were justified by 'every fan starts out following them, so that number is a registration count wearing a follower count's label', and that is no longer true — the auto-edges are gone, so every remaining follower chose it. What survives is the SIZE ORACLE. The founder is the platform's own account and the only one with an operational reason to follow broadly; publishing their following count would publish a live lower bound on the profiled user base, which is the same quantity the registry refuses to leak everywhere else, and their follower count is a number the operator can move by their own action on the one profile fans treat as the platform speaking. Excluding a number nobody needs costs nothing; publishing an operator-movable count on an operator-held page is the kind of decoration this file exists to refuse.",
+  },
+  {
+    id: "join_no_1",
+    kind: "excluded",
+    module: "founding.ts (allocateJoinNumber) + the `0011_founder.sql` sentinel",
+    rule: "Join number #1 is the founder's, reserved by a sentinel row from migration time; every other passport allocates from 2 upward and cannot even attempt 1.",
+    why: "A reserved number must not be winnable by claiming fastest, and a sweep re-run must not be able to move it.",
+  },
+  {
+    id: "founding_rank_1",
+    kind: "excluded",
+    module: "founding.ts (awardFoundingIfEligible) + the `0011_founder.sql` sentinel",
+    rule: "Founding rank #1 is the founder's, reserved the same way. The founder IS awarded a Founding badge — it is an award, not a board.",
+    why: "DECISION (window item 10): the founding badge is a one-off award attached to a creator, not a ranked list fans read to find creators, so the 'excluded from every board' rule does not reach it. The slot counts against the 500.",
+  },
+] as const satisfies readonly {
+  id: string;
+  kind: "cap" | "gate" | "auto" | "excluded" | "declared";
+  module: string;
+  rule: string;
+  why: string;
+}[];
+
+export type FounderExemptionId = (typeof FOUNDER_EXEMPTIONS)[number]["id"];
+
+export interface FounderIds {
+  passport_id: string;
+  account_id: string | null;
+}
+
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+
+/** The configured founder, or null when there is none (the fail-closed case). */
+export async function founderIds(db: DbLike): Promise<FounderIds | null> {
+  const row = await db.prepare("SELECT passport_id, account_id FROM founder WHERE singleton = 1").bind().first<{ passport_id: string; account_id: string | null }>();
+  if (!row || typeof row.passport_id !== "string" || !PSP_RE.test(row.passport_id)) return null;
+  return { passport_id: row.passport_id, account_id: typeof row.account_id === "string" && row.account_id ? row.account_id : null };
+}
+
+/** Is this the founder's fan account? False whenever no founder is set. */
+export async function isFounderAccount(db: DbLike, accountId: string): Promise<boolean> {
+  if (typeof accountId !== "string" || accountId === "") return false;
+  const f = await founderIds(db);
+  return f !== null && f.account_id !== null && f.account_id === accountId;
+}
+
+export class FounderError extends Error {
+  override name = "FounderError";
+  constructor(
+    message: string,
+    public readonly status: 400 | 403 | 404 | 409 = 400,
+  ) {
+    super(message);
+  }
+}
+
+/**
+ * Bootstrap (or re-point) the founder. Operator-only by construction: nothing
+ * in the fan or creator surface calls this, and both ids are FK-checked by the
+ * schema, so a founder naming a non-existent passport/account cannot be
+ * written. Idempotent — re-running with the same ids is a no-op.
+ *
+ * Re-POINTING at a different passport is refused once join number #1 has
+ * actually been allocated: the number is a jersey number, and moving it after
+ * the fact would rewrite a permanent, already-published fact.
+ *
+ * #851b (D-0928(5)) — THE ONCE-EVER EXCEPTION TO DAY-LAGGED RANKING. Naming the founder's account drops it from
+ * `rankable_fan_accounts` (a VIEW, migration 0024: `NOT EXISTS (SELECT 1 FROM founder f WHERE f.account_id = …)`)
+ * AT ONCE — the next read of any surface built on that view no longer counts it, with no freeze, no sweep and no
+ * migration. It is accepted as a single bootstrap event (one founder row, ever), not a pattern to copy.
+ * Pinned by test/i16-l09-founder-rankable-drop.test.ts.
+ */
+export async function setFounder(db: DbLike, passportId: string, accountId: string | null = null, now: () => string = () => new Date().toISOString()): Promise<FounderIds> {
+  if (typeof passportId !== "string" || !PSP_RE.test(passportId)) throw new FounderError("bad passport id");
+  if (accountId !== null && (typeof accountId !== "string" || accountId === "")) throw new FounderError("bad account id");
+  const current = await founderIds(db);
+  if (current && current.passport_id !== passportId) {
+    const taken = await db.prepare("SELECT passport_id FROM join_numbers WHERE join_no = ?").bind(FOUNDER_JOIN_NO).first<{ passport_id: string }>();
+    if (taken && taken.passport_id !== RESERVED_SENTINEL) throw new FounderError("join number #1 is already allocated; the founder passport cannot be re-pointed", 409);
+  }
+  try {
+    await db
+      .prepare(
+        `INSERT INTO founder (singleton, passport_id, account_id, set_at) VALUES (1, ?, ?, ?)
+         ON CONFLICT(singleton) DO UPDATE SET passport_id = excluded.passport_id, account_id = excluded.account_id, set_at = excluded.set_at`,
+      )
+      .bind(passportId, accountId, now())
+      .run();
+  } catch {
+    // FK failure — the passport or the account does not exist. Fail closed:
+    // a founder that names nothing must not be half-written.
+    throw new FounderError("no such passport or account", 404);
+  }
+  return (await founderIds(db))!;
+}
+
+// ---------------------------------------------------------------------------
+// NO AUTO-EDGES. `applyFounderAutoFollow` and `founderAutoFollowStatements`
+// stood here and are DELETED (audit item #24) — see the removal note at the top
+// of this file. Nothing in this module writes to `saves` or `follows` any more,
+// and nothing outside it may write a social edge on a fan's behalf: a follow is
+// an act, and an act needs an actor. If a future "give new accounts something
+// in their feed" lands, it belongs in a RANKED SUGGESTION the fan can act on,
+// never in an edge written before they arrive.
+// ---------------------------------------------------------------------------
+===== END FILE: services/trust-core/src/founder.ts =====
+
+===== END OF CHUNK 54 OF 75 =====

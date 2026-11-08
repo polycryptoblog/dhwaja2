@@ -1,0 +1,3207 @@
+DHWAJA CODE REVIEW — server — CHUNK 71 OF 75
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (route*), services/trust-core/src (scouts*), services/trust-core/src (seeding*), services/trust-core/src (seo*), services/trust-core/src (sessions*), services/trust-core/src (settings*), services/trust-core/src (settlement*)
+Files in this chunk (7):
+  - services/trust-core/src/route-helpers.ts
+  - services/trust-core/src/scouts.ts
+  - services/trust-core/src/seeding.ts
+  - services/trust-core/src/seo-page.ts
+  - services/trust-core/src/sessions.ts
+  - services/trust-core/src/settings.ts
+  - services/trust-core/src/settlement-refusals.ts
+
+
+===== BEGIN FILE: services/trust-core/src/route-helpers.ts =====
+import { maskIp } from "./accounts.js";
+import { agencyAuthState } from "./agency_auth.js";
+import { memberRole, type AgencyRole } from "./agency_members.js";
+import { JwksCache, type Jwk } from "./auth.js";
+import { closureNotice, type ClosureNotice } from "./closures.js";
+import { appealDeadlineShown, CREATOR_SUSPENDED_SQL, creatorSuspension, creatorTerminated } from "./creator-close.js";
+import { recordEncounter } from "./codex.js";
+import { CREATOR_CLOSED_SQL, FROZEN_CLOSURE_STATES_SQL } from "./credits.js";
+import { currentCreatorEpoch } from "./creator-session.js";
+import { d1 } from "./db.js";
+import { appOriginFromEnv, consoleOriginFromEnv, originPadded, passkeyOriginsFromEnv, passkeyRpIdFromEnv, publicBaseUrlFromEnv, supportAddress } from "./env-config.js";
+import type { EvidenceStore } from "./evidence.js";
+import { oidcJwksCaches } from "./jwks-caches.js";
+import type { MediaStore } from "./media.js";
+import { accountSessionEpoch, currentSessionEpoch } from "./oidc.js";
+import type { AssertionResponse, CreatorAction, WebAuthnConfig } from "./passkeys.js";
+import { consumeRateLimit, rateLimitCount } from "./ratelimit.js";
+import { issueSession, sessionExpiresAt, verifySessionRotating } from "./sessions.js";
+import type { R2Bucket } from "@cloudflare/workers-types";
+import type { ConditionalObjectStore, VersionedObjectStore } from "@dhwaja/schema";
+import type { Env } from "./env.js";
+// `analyticsPublishArgs` and `deferrer` live in the leaf `publish-args.ts` so console.ts
+// can call them without an import edge to this file, which type-imports `Env` from env.ts
+// (QUEUE #258, no-circular). Re-exported: every router keeps importing them from here.
+import { analyticsPublishArgs } from "./publish-args.js";
+export { analyticsPublishArgs, deferrer } from "./publish-args.js";
+
+/**
+ * THE ROUTER-SHARED PRIMITIVES — the request-scoped helpers more than one router
+ * module needs, and nothing else.
+ *
+ * WHY THIS FILE EXISTS. `index.ts` is being split into bounded router modules
+ * (audit item #35). A handful of its module-scope helpers are read by routes in
+ * SEVERAL of those modules — principal resolution above all — so they cannot
+ * live in any one of them, and they must not live in `index.ts` either: a
+ * router module importing them from `index.ts` would be a runtime import cycle
+ * with the file that mounts it.
+ *
+ * WHAT MAY LIVE HERE, stated so this does not silently become a second
+ * `index.ts`: a helper that (a) is used by more than one router module, and
+ * (b) registers no route and constructs no router. There is deliberately no
+ * `hono` import in this file. A helper used by exactly one module belongs in
+ * that module, next to the routes that read it.
+ *
+ * THE `Env` EDGE IS TYPE-ONLY. `export type Env` lives in `env.ts` (`index.ts`
+ * re-exports it) — that declaration is the first of the three sources
+ * `tests/invariants/env-inventory.test.ts` derives the config contract from —
+ * so this file imports it with `import type`, which `verbatimModuleSyntax`
+ * erases entirely. There is no edge, type or value, from here to `index.ts`,
+ * and there must never be one.
+ */
+
+/**
+ * THE ONE PARSE OF THE `Authorization` HEADER. Every principal resolver in this
+ * file goes through here, so the credential grammar has a single spelling: a
+ * narrowing (a length bound, a charset, a second scheme) lands at EVERY
+ * resolver or at none (FAMILY-004 P1). Each resolver keeps its OWN verdict for
+ * a token it cannot parse — `null` for creator and agency, `stale` for the fan
+ * doors — because those answers are not the same answer, and only the parse is
+ * shared.
+ */
+function bearerToken(auth: string): string | null {
+  const m = /^Bearer\s+(.+)$/.exec(auth);
+  return m ? m[1]! : null;
+}
+
+/** One JWKS cache per OIDC provider certs URL (Google / Apple), module scope.
+ * `wantKid` (I3-0483): the kid the presented id_token names (auth.ts `unverifiedKid`). */
+export function oidcJwks(url: string, nowMs: number, wantKid?: string): Promise<Jwk[]> {
+  let cache = oidcJwksCaches.get(url);
+  if (!cache) {
+    cache = new JwksCache(url);
+    oidcJwksCaches.set(url, cache);
+  }
+  return cache.get(nowMs, fetch, wantKid);
+}
+
+/** The authenticated agency PRINCIPAL (S97): which agency, which member, what
+ * role. Session must verify, the agency must be active, the epoch fresh — and
+ * for a member-stamped token the member must STILL exist (a removed member's
+ * live session dies here, immediately) with their CURRENT role (a demotion
+ * applies to live sessions on the next request; the role is never trusted from
+ * the token).
+ *
+ * A token with NO member stamp is REJECTED. It used to resolve to
+ * `{ memberId: null, role: "admin" }`, which handed full agency authority to a
+ * session that named no seat and so bypassed the per-seat role system entirely
+ * — the one principal no demotion or removal could reach. There is no
+ * population it serves: every agency session is minted with a member stamp. */
+interface AgencyPrincipal {
+  agencyId: string;
+  memberId: string;
+  role: AgencyRole;
+  /**
+   * AG-02 — THE EPOCH THIS REQUEST WAS ACTUALLY AUTHORIZED UNDER.
+   *
+   * The check below reads the agency's CURRENT epoch and compares the token's
+   * against it, then used to throw the answer away. `/agency/refresh` then read
+   * the epoch a SECOND time and stamped its replacement token with whatever
+   * that read returned — so a key rotation or an agency-wide logout landing
+   * between the two reads handed the OLD session a replacement carrying the NEW
+   * generation. A revocation cannot end a session that renews itself into the
+   * generation that revoked it.
+   *
+   * Carrying it makes the renewal answerable at the WRITE: the replacement is
+   * stamped with the epoch that authorized it, so a concurrent bump invalidates
+   * it exactly like every other token of that generation. Moving into a newer
+   * epoch requires a fresh sign-in, which is the whole point of bumping it.
+   */
+  epoch: number;
+  /** I3-1740: the seat and seat epoch this request was authorized under, on a
+   * seat-key session only — carried for the same reason as `epoch`, so a
+   * renewal re-stamps the values that authorized it. */
+  seatId?: string;
+  seatEpoch?: number;
+}
+export async function agencyPrincipal(c: { env: Env; req: { header: (k: string) => string | undefined } }): Promise<AgencyPrincipal | null> {
+  const token = bearerToken(c.req.header("Authorization") ?? "");
+  if (!token) return null;
+  const s = (await verifySessionRotating(c.env, token, Math.floor(Date.now() / 1000)))?.subject ?? null;
+  if (!s || s.kind !== "agency") return null;
+  const db = d1(c.env.TRUST_DB);
+  const st = await agencyAuthState(db, s.id);
+  // NOT `<`: a token stamped ABOVE the stored epoch is a generation this
+  // service cannot mint (every writer is `session_epoch + 1`), so it is the
+  // signature of an epoch that went BACKWARDS — and under `<` it resurrected
+  // every session the bump had killed. Site 1 of 3; see `creatorId`.
+  if (!st || st.status !== "active" || s.ep !== st.session_epoch) return null;
+  if (!s.member) return null; // no seat named → no authority (never admin-by-default)
+  const role = await memberRole(db, s.id, s.member);
+  if (!role) return null; // member removed (or wrong agency) → session is dead
+  if (s.seat === undefined) return { agencyId: s.id, memberId: s.member, role, epoch: s.ep };
+  // I3-1740 (D-0860(3)): a seat-key session lives only while its seat of THIS
+  // agency is live at the epoch it was minted under — revoking one seat ends
+  // that seat's sessions and leaves the agency epoch alone.
+  const seat = await db.prepare("SELECT session_epoch FROM agency_seats WHERE seat_id = ? AND agency_id = ? AND revoked_at IS NULL").bind(s.seat, s.id).first<{ session_epoch: number }>();
+  if (!seat || seat.session_epoch !== s.seatEp) return null;
+  return { agencyId: s.id, memberId: s.member, role, epoch: s.ep, seatId: s.seat, seatEpoch: s.seatEp };
+}
+
+/** Credit-ledger entry id. */
+export function mintEntryId(): string {
+  return "cre_" + crypto.randomUUID().replace(/-/g, "").slice(0, 20);
+}
+
+/** R2 → ObjectStore adapter (tests use a Map double). Returns the CONDITIONAL
+ * flavour: R2 can create-if-absent atomically, and the editions sweep needs it. */
+/** A store that can refuse an oversized object BEFORE reading it. Declared here
+ * rather than in `@dhwaja/schema` for the same reason `delete` lives on the
+ * conditional store: the read-only registry must keep compiling against the
+ * narrow interface, and exactly one caller needs this capability. */
+export type BoundedObjectStore = ConditionalObjectStore & {
+  getBounded(key: string, maxBytes: number): Promise<string | null>;
+};
+
+export function r2Store(bucket: R2Bucket): BoundedObjectStore & Pick<VersionedObjectStore, "getVersioned" | "putIfMatch"> {
+  return {
+    // D-0955(4) (I20-L02): R2's own compare-and-swap (registry-gen.ts registryR2Store's contract), so the cron's
+    // standings build (war-match.ts buildWarStandings, store = this) writes conditionally on the etag it read first.
+    async getVersioned(key) {
+      const obj = await bucket.get(key);
+      return obj ? { value: await obj.text(), etag: obj.etag } : null;
+    },
+    async putIfMatch(key, value, etag) {
+      const res = await bucket.put(key, value, { onlyIf: etag === null ? { etagDoesNotMatch: "*" } : { etagMatches: etag } });
+      return res ? res.etag : null;
+    },
+    async put(key, value) {
+      await bucket.put(key, value);
+    },
+    // CONDITIONAL WRITE. `etagDoesNotMatch: "*"` is R2's "only if this key does
+    // not exist"; a failed condition returns null rather than throwing, and the
+    // stored object is left exactly as the winner wrote it.
+    async putIfAbsent(key, value) {
+      return (await bucket.put(key, value, { onlyIf: { etagDoesNotMatch: "*" } })) !== null;
+    },
+    async get(key) {
+      const obj = await bucket.get(key);
+      return obj ? await obj.text() : null;
+    },
+    // SIZE BEFORE BYTES. `R2ObjectBody` carries `size` before the body is
+    // consumed, so an oversized object is refused without ever being pulled into
+    // Worker memory. `get` above cannot do that — it has already committed to
+    // `text()` — which is why this is a separate method rather than a parameter,
+    // and why it is duck-typed at the call site: the shared `ObjectStore` has no
+    // size accessor and the read-only registry must keep compiling.
+    //
+    // The caller that needs it is the published checkpoint read: the object
+    // store is the one surface the threat model already concedes to a
+    // compromised Worker, so a grammar-valid key can hold an arbitrary object,
+    // and an unauthenticated route must not turn that into a way to kill the
+    // Worker on every request for a specific anchor.
+    async getBounded(key: string, maxBytes: number) {
+      const obj = await bucket.get(key);
+      if (!obj) return null;
+      if (typeof obj.size === "number" && obj.size > maxBytes) return null;
+      const text = await obj.text();
+      return text.length > maxBytes ? null : text;
+    },
+    // Idempotent by R2's own semantics: deleting an absent key resolves rather
+    // than throwing, so the checkpoint retention sweep can safely re-run over a
+    // page it already partly processed.
+    async delete(key) {
+      await bucket.delete(key);
+    },
+    async list(prefix) {
+      const keys: string[] = [];
+      let cursor: string | undefined;
+      do {
+        const page = await bucket.list(cursor ? { prefix, cursor } : { prefix });
+        for (const o of page.objects) keys.push(o.key);
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+      return keys;
+    },
+  };
+}
+
+// SEO — server-rendered, crawlable discovery pages (the SPA is hash-routed and
+// can't be indexed). Read the precomputed S81 artifact; script-free; canonical +
+// og from configured env only (never the Host header). Edge-cacheable.
+// `frame-ancestors 'none'` must be delivered as a RESPONSE HEADER — the spec
+// makes it header-only and every browser IGNORES it inside a <meta> CSP. These
+// pages are server-rendered here, so the header is the shipping path; without
+// it every public verdict page is framable and clickjackable.
+/**
+ * Encounter writes one address may make in an hour.
+ *
+ * Higher than `RANKING_WRITES_PER_IP_HOUR` because this rides ordinary page
+ * views and a household or a campus shares an address — a ceiling that a real
+ * afternoon of browsing could hit would silently stop logging Codex entries
+ * people expect to see. Low enough that it is not a free write endpoint.
+ */
+export const ENCOUNTER_WRITES_PER_IP_HOUR = 600;
+
+/** I3-1781 (hand-off from I4-10-R6): `base-uri 'none'` so an injected `<base>`
+ * cannot re-point the page's relative links. */
+export const SSR_CSP = "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'";
+/** I3-0812: every server-rendered HTML page sends no Referer when a visitor follows an outbound link (index.ts stamps it on each text/html response). */
+export const SSR_REFERRER_POLICY = "no-referrer";
+
+/** I3-1489 (hand-off from I4-09-R3): the edge's country (`request.cf`, set by
+ * the runtime), never the client-settable `CF-IPCountry` header. */
+export function edgeCountry(c: { req: object }): string {
+  const cf = (c.req as { raw?: { cf?: { country?: unknown } } }).raw?.cf;
+  return typeof cf?.country === "string" ? cf.country : "";
+}
+
+// ONE RULE PER ENV VAR, and it lives in env-config.ts, which `configHealth`
+// also reads. These were textually identical copies of the same regex, which is
+// how `/ops/config` ends up reporting a feature configured that the feature
+// itself refuses — see env-config.ts for the failure that already shipped.
+export const publicBase = (env: Env): string | null => publicBaseUrlFromEnv(env as unknown as Record<string, unknown>);
+
+export const appOrigin = (env: Env): string | null => appOriginFromEnv(env as unknown as Record<string, unknown>);
+
+export const consoleOrigin = (env: Env): string | null => consoleOriginFromEnv(env as unknown as Record<string, unknown>);
+
+/**
+ * THE 404 CARRIES THE 200'S CACHE HEADER, on every `/p/:id…` route whose 200
+ * carries one unconditionally.
+ *
+ * Not a performance tweak. A miss on these routes is answered without touching
+ * an edge cache, so an attacker could re-measure the ORIGIN as often as they
+ * liked — which is what made the "suppressed costs an extra D1 round trip"
+ * difference worth measuring in the first place (review MEDIUM 5; the round
+ * trip itself is gone, `passport-view.ts` livePassport). Caching the miss the
+ * same way the hit is cached means the second probe never reaches us, and it
+ * keeps the CACHEABILITY of a response from being a hit/miss signal of its own.
+ *
+ * The header is chosen by ROUTE, never by subject, so suppressed and
+ * never-listed stay byte-identical — pinned in
+ * `tests/invariants/suppression-oracles.test.ts`, which fingerprints every header.
+ *
+ * THREE ROUTES DELIBERATELY DO NOT GET ONE, and it is not an oversight:
+ *   `/p/:id`                — its 200 is uncached (SSR HTML), so a cached 404
+ *                             would be the asymmetry this constant exists to
+ *                             remove, pointing the other way.
+ *   `/p/:id/archive`        — their 200 is `public` only for an ANONYMOUS
+ *   `/p/:id/presentation`     caller; a session personalizes it. A 404 that
+ *                             claimed `public` on an authenticated request is
+ *                             the wrong default, so both take the strict one.
+ */
+export const NOT_FOUND_CACHE_60 = { "Cache-Control": "public, max-age=60" } as const;
+
+export const NOT_FOUND_CACHE_300 = { "Cache-Control": "public, max-age=300" } as const;
+
+/**
+ * The one answer for a lost ledger head race. `prev_hash` is UNIQUE, so every
+ * append is a global optimistic lock; `appendEvents` retries internally and only
+ * a genuinely overloaded ledger reaches here. It is OUR failure, not the
+ * caller's, so it is a 503 with a retry hint — never a domain verdict, and never
+ * a 4xx that tells a creator their proof failed. Fixed body, no detail.
+ */
+export function contentionResponse(c: { json: (body: unknown, status: 503, headers?: Record<string, string>) => Response }): Response {
+  return c.json({ error: "busy", retry: true }, 503, { "Retry-After": "1" });
+}
+
+/**
+ * A FAN CREDENTIAL IS ONE OF THREE THINGS, AND THE THIRD IS WHY THIS TYPE EXISTS.
+ *
+ * `fanId()` answers `string | null`, and `null` was two completely different
+ * requests wearing the same shape:
+ *
+ *   • NOBODY ASKED — no Authorization header at all. A stranger. On the passkey
+ *     register route that is the JOIN path, and it must stay open: an anonymous
+ *     ceremony IS how a new fan signs up (one tap, no form).
+ *   • SOMEBODY ASKED AND WE SAID NO — a credential WAS presented and it is not a
+ *     live fan session: expired, minted below the account's current session
+ *     epoch (another device pressed "log out everywhere"), naming an account
+ *     that has since been deleted, forged, or a creator/agency token on a fan
+ *     surface. That is emphatically not a signup.
+ *
+ * Collapsing the second into the first is the launch-blocking defect this type
+ * was added for. `/fan/passkey/register/start` read `null` as "anonymous, so
+ * mint a join challenge", `/fan/passkey/register` finished it, and the one act
+ * that RECOVERS an account — put a passkey back on it — instead created a
+ * BRAND-NEW EMPTY account, bound the fan's new passkey to that, and overwrote
+ * their real session with the new one. Their actual account came out of it
+ * passkey-less, and all three clients rendered "Passkey ready on this device."
+ *
+ * ONE ANSWER FOR EVERY NOT-LIVE CREDENTIAL, AND IT IS THE ONE HONO'S GATE
+ * ALREADY SENDS: `401 {"error":"unauthorized"}`. Expired, epoch-revoked,
+ * deleted-account, forged and wrong-kind are indistinguishable on the wire, on
+ * purpose — telling a bare token holder that their token was once REAL but the
+ * account has since been wiped or signed out everywhere is a fact about an
+ * account, handed to whoever holds the token. Reusing the existing machine
+ * token rather than inventing a `session_expired` also means a stale bearer
+ * here is indistinguishable from a stale bearer on `/account/save`, and the
+ * clients already read exactly this string (`isNoSession` in
+ * `apps/web/src/backup-email.ts`) as "you are signed out".
+ */
+type FanCaller =
+  | { kind: "anonymous" } // no credential presented — a stranger
+  | { kind: "stale" } // a credential WAS presented, and it is not a live fan session
+  | { kind: "live"; id: string } & { /** the epoch admission compared against (I12-RG-AUTH-06) */ ep: number } & {
+      /** I26-INT (SESSION H1, FAMILY-027): the verified token's own `exp` — the one parse of the bearer, so a re-mint keeps
+       * the presented sign-in's absolute end (I3-2055, D-1010(2)) without a second bearer grammar. */
+      exp: number;
+    };
+
+/**
+ * Classify the caller's fan credential. Enforces logout-everywhere: a token
+ * minted before the account's current session epoch is rejected (one indexed
+ * lookup), as is one naming an account that no longer exists.
+ *
+ * A present-but-unparseable Authorization header is `stale`, not `anonymous`:
+ * "I sent something you could not read" is still a caller asserting an
+ * identity, and downgrading it to anonymous is the same mistake one rung lower.
+ */
+export async function fanCaller(c: { env: Env; req: { header: (k: string) => string | undefined } }): Promise<FanCaller> {
+  return fanCallerWith(c, currentSessionEpoch);
+}
+
+/** The body of `fanCaller`, parameterised over the ONE thing the data-rights
+ * doors differ in: which epoch read decides whether the named account still has
+ * live sessions. Everything else — header shape, signature, expiry, token kind,
+ * epoch freshness — is one statement shared by both callers, so a later edit to
+ * fan-credential classification cannot land on one door and miss the other. */
+async function fanCallerWith(
+  c: { env: Env; req: { header: (k: string) => string | undefined } },
+  epochOf: (db: ReturnType<typeof d1>, accountId: string) => Promise<number | null>,
+  admitsRightsScope = false,
+): Promise<FanCaller> {
+  // PRESENCE DECIDES "NOBODY ASKED", never content. This used to trim FIRST and
+  // read the trimmed empty string as `anonymous`, which made a whitespace-only
+  // header — a credential that WAS presented — the one exception to the rule
+  // stated in the docblock above, at the two doors that branch on the
+  // difference (`fan-account-routes.ts:405,:438`, where `anonymous` IS the join
+  // path that mints an account).
+  const raw = c.req.header("Authorization");
+  if (raw === undefined) return { kind: "anonymous" };
+  const auth = raw.trim();
+  if (auth === "") return { kind: "stale" };
+  const token = bearerToken(auth);
+  if (!token) return { kind: "stale" };
+  const s = (await verifySessionRotating(c.env, token, Math.floor(Date.now() / 1000)))?.subject ?? null;
+  if (!s || s.kind !== "fan") return { kind: "stale" }; // expired/forged, or a creator token — NOT a fan token
+  const epoch = await epochOf(d1(c.env.TRUST_DB), s.id);
+  // `!==`, not `<` — site 2 of 3; see `creatorId` for why a future epoch is refused.
+  if (epoch === null) return { kind: "stale" }; // account deleted
+  // QUEUE #417: the data-rights-scoped token matches ONLY where the caller opted in.
+  if (s.ep !== epoch && !(admitsRightsScope && s.ep === dataRightsEpoch(epoch))) return { kind: "stale" }; // signed out everywhere
+  const exp = sessionExpiresAt(token);
+  if (exp === null) return { kind: "stale" }; // a verified token always carries exp; refuse rather than guess one
+  return { kind: "live", id: s.id, ep: epoch, exp };
+}
+
+/**
+ * QUEUE #417 (D-0580) — THE CLOSED-ACCOUNT SIGN-IN, SCOPED TO THE TWO
+ * DATA-RIGHTS DOORS AND NOTHING ELSE.
+ *
+ * A closed account that proves control at a sign-in finish (OIDC, passkey,
+ * OTP) is handed this token beside its closure notice. It is an ordinary
+ * signed fan token whose `ep` claim is the account's epoch ENCODED as
+ * `-1 - epoch`: always negative, while every real epoch is >= 0. So every
+ * resolver that compares `ep` against an account epoch refuses it by
+ * construction (`fanCallerWith` above with `admitsRightsScope` false — every
+ * `fanId` door; `index.ts` `/internal/session-check`, whose `s.ep !== epoch` is
+ * true for any negative) and ONLY `fanIdForDataRights` decodes it. It does not
+ * become a full session when the closure is lifted, and logout-everywhere
+ * still kills it (the epoch moves, so the encoded value moves).
+ *
+ * A route that wants closed accounts for some OTHER reason (a billing-portal
+ * cancel, say) must not reuse `fanIdForDataRights`: that would admit this
+ * token there too. Guard: `test/b27-oidc-closed-rights-signin.test.ts`, which
+ * enumerates `app.routes`.
+ */
+export function dataRightsEpoch(epoch: number): number {
+  return -1 - epoch;
+}
+
+/** Mint the data-rights-scoped fan session for `accountId` at its RAW epoch
+ * (`accountSessionEpoch`, never the closure-folded one). Null when sessions are
+ * disabled. */
+export async function issueDataRightsSession(secret: string | undefined, accountId: string, epoch: number, nowSec: number): Promise<string | null> {
+  return issueSession(secret, { kind: "fan", id: accountId, ep: dataRightsEpoch(epoch) }, nowSec);
+}
+
+/**
+ * Resolve a fan session from the Authorization: Bearer header, or null.
+ *
+ * UNCHANGED BEHAVIOUR, DELIBERATELY. Every gated route reads this and answers
+ * `401 {"error":"unauthorized"}` on null, which is already the right answer for
+ * a stale credential — so the ~55 `if (!id) return 401` sites need no edit and
+ * get none. The three-valued `fanCaller` above is for the handful of routes
+ * that branch on the ABSENCE of a session instead of refusing on it; the whole
+ * audit of those is pinned in `tests/invariants/route-authorization.test.ts`.
+ *
+ * It is also why the distinction must NOT be moved inside here: the
+ * multi-principal routes (`/report`, `/recovery/request`, `/billing/*`) call
+ * `fanId` first and fall through to `creatorId`/`agencyId`, so a CREATOR bearer
+ * is legitimately "not a live fan session" at that call — refusing on it here
+ * would lock every creator out of filing a report.
+ */
+export async function fanId(c: { env: Env; req: { header: (k: string) => string | undefined } }): Promise<string | null> {
+  const who = await fanCaller(c);
+  return who.kind === "live" ? who.id : null;
+}
+
+/**
+ * Resolve a fan session for the DATA-SUBJECT RIGHTS doors, and for no other.
+ *
+ * Identical to `fanId` except that an account under a `suspended` or
+ * `terminated` closure still resolves: it reads `accountSessionEpoch`
+ * (`oidc.ts`) instead of `currentSessionEpoch`, which is the same row read with
+ * the `account_closures` clause dropped.
+ *
+ * TWO CALL SITES, AND THE LIST IS TWO AND NOT MORE BECAUSE OF WHAT THE DOORS
+ * ARE, not because of who asked. `GET /account/export` is access/portability
+ * and `POST /account/delete` is erasure — the two rights a person needs MOST
+ * once their account is closed, and the two that are not service. Suspension
+ * and termination end the SERVICE; a product that closes an account and thereby
+ * locks the person out of their own erasure has the two backwards. Every other
+ * fan route delivers service, so every other route keeps `fanId` and keeps
+ * answering 401 — including `GET /account/delete/preview`, which serves
+ * payment-rail facts rather than the right itself.
+ *
+ * Deleted is still refused, a pre-epoch token is still refused, a creator token
+ * is still refused, and a forged one never got this far: see
+ * `accountSessionEpoch`'s docblock for what the relaxation is and is not. The
+ * tested predicate is `test/fr3-closed-account-rights.test.ts`.
+ *
+ * It is also the ONLY reader that admits the closed-account sign-in's scoped
+ * token (`dataRightsEpoch` above, QUEUE #417).
+ */
+export async function fanIdForDataRights(c: { env: Env; req: { header: (k: string) => string | undefined } }): Promise<string | null> {
+  const who = await fanCallerWith(c, accountSessionEpoch, true);
+  if (who.kind !== "live") return null;
+  // D-0813(1) / J-IDN-01, defence in depth behind `suspendAccount`'s epoch bump:
+  // under an open `account_compromise` closure NO token opens export or erasure
+  // — the holder may be the hijacker (mirrors `oidc.ts` resolveExisting, which
+  // mints no data-rights session under that category).
+  const closure = await d1(c.env.TRUST_DB)
+    .prepare("SELECT category FROM account_closures WHERE account_id = ? AND state <> 'lifted'")
+    .bind(who.id)
+    .first<{ category: string }>();
+  return closure?.category === "account_compromise" ? null : who.id;
+}
+
+/** Resolve a CREATOR session (→ the passport id) from Authorization, or null.
+ * Enforces logout-everywhere like fanId/agencyId: a token minted before the
+ * passport's current session epoch is rejected. Absent epoch row = 0, so
+ * pre-S69 tokens (minted with ep=0) stay valid until the first logout-all. */
+export async function creatorId(c: { env: Env; req: { header: (k: string) => string | undefined } }): Promise<string | null> {
+  return (await creatorAdmission(c))?.id ?? null;
+}
+
+/** I3-0338 — `creatorId`'s predicate (the ONE body both run), also returning the
+ * epoch the caller was admitted at, for a door whose later write must bind that
+ * generation rather than whatever is current by then (`finishPasskeyRegistration`). */
+export async function creatorAdmission(c: { env: Env; req: { header: (k: string) => string | undefined } }): Promise<{ id: string; ep: number } | null> {
+  const token = bearerToken(c.req.header("Authorization") ?? "");
+  if (!token) return null;
+  const s = (await verifySessionRotating(c.env, token, Math.floor(Date.now() / 1000)))?.subject ?? null;
+  if (!s) return null;
+  return creatorAdmissionForSubject(c.env, s);
+}
+
+/** I3-1350 (I16-W05F H2): `creatorAdmission`'s predicate on an already-verified
+ * subject (a session or an image token) — the ONE creator predicate. */
+export async function creatorAdmissionForSubject(env: Env, s: { kind: string; id: string; ep: number }, opts: { allowSelfClosed?: boolean } = {}): Promise<{ id: string; ep: number } | null> {
+  if (s.kind !== "creator") return null;
+  const epoch = await currentCreatorEpoch(d1(env.TRUST_DB), s.id);
+  // SITE 3 OF 3, and the one that carries the reason. `<` accepted any token
+  // stamped ABOVE the stored epoch. No writer in this service lowers an epoch
+  // (`creator-session.ts:47`, `oidc.ts:234`, `agency_auth.ts:45,:62` all
+  // increment; the watermark takes `MAX`), so such a token cannot be minted
+  // here — it means the epoch REGRESSED (a restore, a purge, a manual write),
+  // and `<` then silently revived every session a logout-everywhere or an
+  // involuntary recovery bump had killed. `!==` is the weakest change that
+  // refuses it: an absent row still reads 0, so the pre-S69 `ep=0` tokens this
+  // docblock promises are still accepted.
+  if (s.ep !== epoch) return null; // logged out everywhere / token revoked / epoch regressed
+  // I3-1422: a passport whose founder account is suspended or terminated
+  // (`account_closures`, any category — the same states `accountFrozen` reads)
+  // cannot act as its creator.
+  const closed = await d1(env.TRUST_DB)
+    .prepare(`SELECT ac.state AS closure_state FROM founder f JOIN account_closures ac ON ac.account_id = f.account_id WHERE f.passport_id = ? AND ac.state IN ${FROZEN_CLOSURE_STATES_SQL}`)
+    .bind(s.id)
+    .first<{ closure_state: string }>();
+  if (closed?.closure_state === "suspended" || closed?.closure_state === "terminated") return null;
+  // D-0960(2) (I20-W1A H2, landed by I20-L02): a creator who closed their creator account cannot act as its creator.
+  // The data-rights door (creatorIdForDataRights) does not run this predicate, so a closed creator keeps their export;
+  // `allowSelfClosed` (creatorIdForPayouts only) skips this one refusal and nothing else.
+  // I3-0699 (D-0992(1), D-0994(2)): a creator under a live STAFF suspension (creator_suspensions) reaches no payout
+  // or Connect door either — `allowSelfClosed` admits a creator's OWN close only. (The other doors refuse it through
+  // CREATOR_CLOSED_SQL below, which carries the same suspension arm.)
+  if (opts.allowSelfClosed === true) {
+    const susp = await d1(env.TRUST_DB).prepare(`SELECT ${CREATOR_SUSPENDED_SQL("?")} AS c`).bind(s.id).first<{ c: number }>();
+    return susp?.c === 1 ? null : { id: s.id, ep: epoch };
+  }
+  const selfClosed = await d1(env.TRUST_DB).prepare(`SELECT ${CREATOR_CLOSED_SQL("?")} AS c`).bind(s.id).first<{ c: number }>();
+  if (selfClosed?.c === 1) return null;
+  return { id: s.id, ep: epoch };
+}
+
+/**
+ * I3-0100 b (census pick) — THE CREATOR CLOSURE NOTICE. `creatorAdmissionForSubject` folds a suspended or terminated
+ * founder into null, so every creator door answers that creator a bare 401 and the console's closure panel
+ * (apps/creator-console/src/api.ts `closureNoticeFrom`) is never reached. This is the server half: for a request
+ * that carries a VALID, CURRENT-EPOCH creator session whose founder account is under a suspended/terminated
+ * `account_closures` row, the notice the fan sign-in doors give (closures.ts `closureNotice`); null otherwise —
+ * an unknown, forged, expired or logged-out token, a live creator, and a SELF-closed creator (creator_closures,
+ * D-0960(2)) all keep the 401 they had. Read only on a path that is already refusing (the middleware below).
+ */
+export async function creatorClosureNotice(env: Env, authorization: string | undefined, nowSec = Math.floor(Date.now() / 1000)): Promise<ClosureNotice | (Omit<Extract<ClosureNotice, { state: "suspended" }>, "appeal_deadline"> & { appeal_deadline: string | null }) | null> {
+  const token = bearerToken(authorization ?? "");
+  if (!token) return null;
+  const s = (await verifySessionRotating(env, token, nowSec))?.subject ?? null;
+  if (s?.kind !== "creator") return null;
+  const db = d1(env.TRUST_DB);
+  if (s.ep !== (await currentCreatorEpoch(db, s.id))) return null;
+  // I3-0400: a staff suspension of the creator itself (creator_suspensions, I23-W1-MONEY's creator-close.ts) first —
+  // its notice names the passport, the id the creator quotes — then the founder-account closure (I3-1422).
+  const own = await creatorSuspension(db, s.id);
+  // RG-04 (D-1010(4)): a TERMINATED episode answers the fan `terminated` notice (closures.ts closureNotice) — no deadline.
+  if (own && (await creatorTerminated(db, s.id))) return { error: "account_closed", state: "terminated", account_id: s.id, category: own.category, appeal_to: supportAddress(env as unknown as Record<string, unknown>) };
+  // I54 (P31 a): a window not yet started is sent as appeal_deadline null, never the sentinel date (the return type says so; I54-NOTICES H4).
+  if (own) return { error: "account_closed", state: "suspended", account_id: s.id, category: own.category, appeal_deadline: appealDeadlineShown(own.appeal_deadline), appeal_to: supportAddress(env as unknown as Record<string, unknown>) };
+  const founder = await db
+    .prepare(`SELECT ac.account_id AS account_id FROM founder f JOIN account_closures ac ON ac.account_id = f.account_id WHERE f.passport_id = ? AND ac.state IN ${FROZEN_CLOSURE_STATES_SQL}`)
+    .bind(s.id)
+    .first<{ account_id: string }>();
+  return founder ? closureNotice(db, founder.account_id, env as unknown as Record<string, unknown>) : null;
+}
+
+/** I3-0100 b: rewrites a 401 answered to such a session into 403 + the notice; every other response passes through
+ * untouched (a live request pays nothing: the read runs only after a 401). Mounted once, app-wide (index.ts, hub). */
+export async function creatorClosureMiddleware(c: { env: Env; req: { header: (k: string) => string | undefined }; res: Response; json: (b: unknown, s: 403) => Response }, next: () => Promise<void>): Promise<void> {
+  await next();
+  if (c.res.status !== 401) return;
+  const notice = await creatorClosureNotice(c.env, c.req.header("Authorization"));
+  if (notice) c.res = c.json(notice, 403);
+}
+
+/** I20-RG-MONEY-03 (D-0960(2), TERMS 7.4: the cleared balance is paid out, then the account closes): `creatorId`
+ * for the money doors a closed creator still needs — the earnings read and the Stripe Connect doors — and for no
+ * other. Same token, epoch and founder-closure refusals; only the creator's OWN close (creator_closures) admits. */
+export async function creatorIdForPayouts(c: { env: Env; req: { header: (k: string) => string | undefined } }): Promise<string | null> {
+  const token = bearerToken(c.req.header("Authorization") ?? "");
+  if (!token) return null;
+  const s = (await verifySessionRotating(c.env, token, Math.floor(Date.now() / 1000)))?.subject ?? null;
+  if (!s) return null;
+  return (await creatorAdmissionForSubject(c.env, s, { allowSelfClosed: true }))?.id ?? null;
+}
+
+/**
+ * QUEUE #578 (D-0680, D-0848(2)) — resolve a CREATOR session for the creator's
+ * DATA-SUBJECT RIGHTS door (`GET /account/creator/export`), and for no other.
+ *
+ * Identical to `creatorId` above (same token, same `!==` epoch check) except
+ * that a founder account under a `suspended`/`terminated` closure does NOT
+ * refuse: suspension ends the service, not the person's access to their own
+ * data (the same reasoning as `fanIdForDataRights`). An open
+ * `account_compromise` closure DOES refuse — the bearer may be the hijacker
+ * (D-0813(1) / J-IDN-01, mirrored from `fanIdForDataRights`).
+ * Guard: `test/i5-578-creator-export.test.ts`.
+ */
+export async function creatorIdForDataRights(c: { env: Env; req: { header: (k: string) => string | undefined } }): Promise<string | null> {
+  const token = bearerToken(c.req.header("Authorization") ?? "");
+  if (!token) return null;
+  const s = (await verifySessionRotating(c.env, token, Math.floor(Date.now() / 1000)))?.subject ?? null;
+  if (!s || s.kind !== "creator") return null;
+  const epoch = await currentCreatorEpoch(d1(c.env.TRUST_DB), s.id);
+  if (s.ep !== epoch) return null;
+  // I3-0400: a staff creator suspension under `account_compromise` refuses this door too (the bearer may be the hijacker).
+  const compromised = await d1(c.env.TRUST_DB)
+    .prepare(
+      "SELECT 1 AS x FROM founder f JOIN account_closures ac ON ac.account_id = f.account_id WHERE f.passport_id = ? AND ac.state <> 'lifted' AND ac.category = 'account_compromise' UNION ALL SELECT 1 FROM creator_suspensions cs WHERE cs.passport_id = ? AND cs.state <> 'lifted' AND cs.category = 'account_compromise'",
+    )
+    .bind(s.id, s.id)
+    .first<{ x: number }>();
+  return compromised ? null : s.id;
+}
+
+/** Resolve an AGENCY session (→ the agency id) from Authorization, or null.
+ * Enforces the agency is still active AND the session epoch is current — a
+ * rotated key or an explicit logout (both bump the epoch) invalidates the token. */
+export async function agencyId(c: { env: Env; req: { header: (k: string) => string | undefined } }): Promise<string | null> {
+  // Identity only (no capability check) — role-gated routes use agencyPrincipal
+  // + roleHasCap instead. Kept for surfaces where ANY authenticated agency
+  // principal may act (e.g. filing a recovery request).
+  return (await agencyPrincipal(c))?.agencyId ?? null;
+}
+
+/** Build ready-to-send redeem links from raw codes, keeping the code in the URL
+ * FRAGMENT (never sent to a server) — or undefined if no valid app origin is
+ * configured, in which case callers ship the plain codes only. */
+export function redeemLinks(env: Env, codes: string[]): string[] | undefined {
+  // I63 C2 (I62-CC-07, D-1537 Q6): settingValue (a TODO origin is unset) and ONE trailing slash off; two stay refused.
+  const origin = originPadded(env.APP_ORIGIN);
+  if (!origin || !/^https:\/\/[a-z0-9.-]+(:\d+)?$/i.test(origin)) return undefined;
+  return codes.map((code) => `${origin}/#/redeem/${code}`);
+}
+
+/** I21-Q161 (D-1030, Jason: "honour them as an opt-out of those writes"): a browser that sends Global Privacy Control
+ * (`Sec-GPC: 1`) or Do Not Track (`DNT: 1`) opts out of sighting and analytics writes. Any other value (`DNT: 0`) is not
+ * an opt-out. Read by `logEncounter`; a door writing an encounter without it does not honour the signal. */
+export function privacySignalOptOut(req: { header: (k: string) => string | undefined }): boolean {
+  return req.header("Sec-GPC")?.trim() === "1" || req.header("DNT")?.trim() === "1";
+}
+
+/** Best-effort Codex log for a SIGNED-IN viewer of a creator — never blocks or
+ * fails the caller's flow, and anonymous viewers record nothing (the blind-check
+ * privacy guarantee holds).
+ *
+ * F10 / #52 RIDES HERE, and this is the only place in the tree that turns a
+ * request header into a region count. One writer, one review surface.
+ *
+ * IT INHERITS THE CODEX'S GATES RATHER THAN SITTING BESIDE THEM. The first
+ * version called `recordEncounter` and then counted a region unconditionally on
+ * the next line, which silently broke two promises the Codex makes: a fan who
+ * used "Pause logging" — the product's one visible privacy switch — still had
+ * their IP-derived country counted, and a SUPPRESSED creator still accumulated
+ * a dashboard.
+ *
+ * ONE FAN-DAY, NOT ONE ACTION, AND NOW CLAIMED RATHER THAN DECIDED HERE. The
+ * region increment used to be a second statement on the next line, run when a
+ * point read said "new day". It is now statement 2 of `recordEncounter`'s ONE
+ * ATOMIC BATCH, gated on the claim token (ADR-0006 §2) — so this function no
+ * longer decides anything about days, and there is no window between deciding
+ * and counting for a second request to fit inside.
+ *
+ * THIS IS STILL THE ONLY PLACE A REQUEST HEADER BECOMES A REGION COUNT. The
+ * country is read here and handed on as a value; nothing downstream holds it
+ * beside a fan, and `regions.ts` still has no account parameter anywhere. */
+export async function logEncounter(c: { env: Env; req: { header: (k: string) => string | undefined }; executionCtx: { waitUntil: (p: Promise<unknown>) => void } }, passportId: string, source: string): Promise<void> {
+  if (privacySignalOptOut(c.req)) return; // I21-Q161: before any write — no sighting, no rate-limit unit, no analytics outbox row
+  try {
+    const viewer = await fanId(c); // OPTIONAL VIEWER — a stale credential logs nothing, exactly like a stranger
+    if (!viewer) return;
+    // A PER-IP CEILING, because this is a WRITE. Every sibling fan write —
+    // save, request, scout, ask — carries `RANKING_WRITES_PER_IP_HOUR`, and
+    // this one did not: `GET /p/:id` calls it on every request, which made the
+    // share landing the cheapest write in the product and the one an F11 review
+    // found could be used to walk a creator's region breakdown past its floor.
+    // The bucket is shared across sources on purpose: it is one ceiling on "how
+    // much can one address write through the encounter path", not four.
+    if (!(await fanIpAllowed(c, "enc", ENCOUNTER_WRITES_PER_IP_HOUR))) return;
+    const db = d1(c.env.TRUST_DB);
+    // `ANALYTICS_FAN_SECRET` is read through a narrow structural type because
+    // the `Env` interface in `index.ts` is item 12's file, not this one's; the
+    // cast names exactly the one field and nothing else.
+    const fanSecret = (c.env as { ANALYTICS_FAN_SECRET?: string }).ANALYTICS_FAN_SECRET;
+    const [pubEnv, pubCtx] = analyticsPublishArgs(c);
+    await recordEncounter(db, viewer, passportId, source, () => new Date().toISOString(), edgeCountry(c), fanSecret, pubEnv, pubCtx);
+  } catch {
+    /* the Codex is best-effort — a logging failure must never break the page/action */
+  }
+}
+
+/** WebAuthn config from env, or null if passkeys aren't configured (routes 503). */
+export function passkeyConfig(env: Env): WebAuthnConfig | null {
+  // BOTH predicates live in `env-config.ts` and `/ops/config`'s `passkeys` row
+  // reads the SAME two, so the console cannot report passkeys healthy on a
+  // config these routes will refuse. `passkeyRpIdFromEnv` is the trim this
+  // function used to do inline — the console's `has()` was presence BEFORE it,
+  // which is how `PASSKEY_RP_ID="\t"` read as configured there and as absent
+  // here. The origin grammar admits an Android app's `android:apk-key-hash:…`
+  // origin as well as a web one; see the comment there.
+  const rpId = passkeyRpIdFromEnv(env as unknown as Record<string, unknown>);
+  const origins = passkeyOriginsFromEnv(env as unknown as Record<string, unknown>);
+  if (!rpId || origins.length === 0) return null;
+  // D-1057(6), I11-Q7: PASSKEY_COOLING_OFF_HOURS, finite and >= 1 (D-1069: a cooling-off of at least 1 hour); anything
+  // else, 0 and fractions under 1 included, is no override (passkeys.ts default 24).
+  const raw = env.PASSKEY_COOLING_OFF_HOURS;
+  const h = typeof raw === "string" && raw.trim() !== "" ? Number(raw) : Number.NaN;
+  return Number.isFinite(h) && h >= 1 ? { rpId, origins, coolingOffHours: h } : { rpId, origins };
+}
+
+/** Parse a client-supplied WebAuthn assertion block. Shape only — every
+ * cryptographic check happens in passkeys.ts against a server-built action hash. */
+export function parseAssertion(raw: unknown): AssertionResponse | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const a = raw as Record<string, unknown>;
+  if (typeof a.credentialId !== "string" || typeof a.clientDataJSON !== "string" || typeof a.authenticatorData !== "string" || typeof a.signature !== "string") return null;
+  return { credentialId: a.credentialId, clientDataJSON: a.clientDataJSON, authenticatorData: a.authenticatorData, signature: a.signature };
+}
+
+/** Every CREATOR_SIGNABLE type that has its OWN door, refused at the generic /account/creator-action door (parseActions):
+ * signed there, each appended the ledger row without the machinery its door runs.
+ *  - creator_broadcast: /account/broadcast (Pro-gated frequency cap, sanitized message, send log; S71-HIGH).
+ *  - recognition_granted / _retracted: /account/recognition[/retract] (follow-gate, tier caps, projection write; S90).
+ *  - payout_tag_added / _removed: /account/payout-tags[/start] (address grammar, add/remove from the STORED intent,
+ *    cooling-off + follower alert; M3).
+ *  - payout_account_bound / _unbound: creator-payout.ts bind/unbind (OAuth binding, cooling-off, decision row; I3-1217).
+ *  - release_registered / _versioned / _withdrawn: releases.ts (manifest hash + `releases` row, withdraw flips status).
+ *  - handshake_answered: handshake-routes.ts (`buildAnswerDraft` from the stored row, closes it).
+ *  - question_answered / question_answer_retracted: question-routes.ts (writes the `questions` row).
+ * I3-1217 (I22-FX-MONEY): the release, handshake and question doors were the residual — a signed "withdrawn" landed
+ * while the release stayed published. The generic door's own types are the other ten (test/i22-fx-money-generic-door). */
+export const GENERIC_DOOR_REFUSED: ReadonlySet<string> = new Set([
+  "creator_broadcast",
+  "recognition_granted",
+  "recognition_retracted",
+  "payout_tag_added",
+  "payout_tag_removed",
+  "payout_account_bound",
+  "payout_account_unbound",
+  "release_registered",
+  "release_versioned",
+  "release_withdrawn",
+  "handshake_answered",
+  "question_answered",
+  "question_answer_retracted",
+]);
+
+/** Parse client-supplied creator actions (only {event_type, payload, supersedes}). */
+export function parseActions(raw: unknown): CreatorAction[] | null {
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 20) return null;
+  const out: CreatorAction[] = [];
+  for (const a of raw) {
+    if (typeof a !== "object" || a === null) return null;
+    const o = a as Record<string, unknown>;
+    if (typeof o.event_type !== "string") return null;
+    if (GENERIC_DOOR_REFUSED.has(o.event_type)) return null;
+    if (typeof o.payload !== "object" || o.payload === null || Array.isArray(o.payload)) return null;
+    if ("supersedes" in o && !(Array.isArray(o.supersedes) && o.supersedes.every((s) => typeof s === "string"))) return null;
+    out.push({ event_type: o.event_type as CreatorAction["event_type"], payload: o.payload as Record<string, unknown>, ...(o.supersedes ? { supersedes: o.supersedes as string[] } : {}) });
+  }
+  return out;
+}
+
+/** Audit #17/#18 — per-masked-IP hourly cap on the two authenticated fan WRITES
+ * that feed a public ranking (`POST /account/collect`, `POST
+ * /account/request-creator`). Both were completely unthrottled per IP while
+ * every other write route already used `fanIpAllowed`; combined with the
+ * OAuth birth path having no IP throttle at all, one address could mint
+ * accounts and cast votes with them at no cost. Generous — a fan collecting
+ * their way through a catalogue is normal, and a shared NAT carries many real
+ * fans — because the real anti-Sybil defence is the qualified-fan view and the
+ * age ramp, not this. This is the ceiling that stops the cheap version. */
+export const RANKING_WRITES_PER_IP_HOUR = 300;
+
+export const HOUR_MS = 60 * 60 * 1000;
+
+/** I3-0792 phase 1 (I23-W1-HUB H-4): the human sentence a 429 carries beside its unchanged machine `error`. */
+export const RATE_LIMIT_MESSAGE = "Too many requests from this network right now. Wait a few minutes and try again.";
+
+/** I3-0792 phase 1: ONE refusal BODY — `error` stays byte-identical (clients and tests switch on it) and an optional
+ * `message` is a sentence a client may show as-is (apps/web/src/api.ts renders it, I23-L03). A route answers
+ * `c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429)`. The 429 sites switch to this in the next phase
+ * (index.ts is the hub's); until then its production door count is zero. */
+export function refusal(error: string, message?: string): { error: string; message?: string } {
+  return { error, ...(message ? { message } : {}) };
+}
+
+/** D-1004(1): a literal 429 from a NON-IP cap whose site already spells a user-facing sentence answers that sentence
+ * as `message` too (no new wording); a non-IP cap with no sentence answers `refusal(error)` with no `message`. */
+export function capRefusal(sentence: string): { error: string; message: string } {
+  return { error: sentence, message: sentence };
+}
+
+/** The generic machine refusal a limiter answers; never shown as a sentence by itself. */
+const GENERIC_LIMIT_ERROR = "rate limit exceeded";
+
+/** I3-0792 / D-1004(1): the body for a THROWN error a route converts (`c.json(errorBody(e), e.status)`). A 429 marked
+ * `ipKeyed: true` (an IP-keyed limiter: accounts.ts checkThrottle, the fan-auth.ts JOIN throttle) answers `refusal(e.message, RATE_LIMIT_MESSAGE)`; any other 429 carries `message` only when its throw site
+ * already spells a user-facing sentence (not the generic "rate limit exceeded", not a machine token such as
+ * `queue_busy`), and that sentence is its own text; every other status keeps `{ error }`. */
+export function errorBody(e: { message: string; status: number }): { error: string; message?: string } {
+  // I25-Q4a (D-1030): a throw site marked `userFacing: true` spells an approved sentence, answered as `message` at any status.
+  if ((e as { userFacing?: unknown }).userFacing === true) return refusal(e.message, e.message);
+  if (e.status !== 429) return { error: e.message };
+  if ((e as { ipKeyed?: unknown }).ipKeyed === true) return refusal(e.message, RATE_LIMIT_MESSAGE);
+  return e.message === GENERIC_LIMIT_ERROR || /^[a-z0-9_]*$/.test(e.message) ? { error: e.message } : refusal(e.message, e.message);
+}
+
+/**
+ * Consume one unit of an hourly per-IP bucket.
+ *
+ * FAIL CLOSED on an absent client IP (invariant #6). This used to `return true`
+ * whenever `CF-Connecting-IP` was missing, on the assumption that the edge is
+ * always the gate — but any request path that does not traverse the CF edge (an
+ * enabled workers.dev route, a misconfigured origin, a direct-to-origin probe)
+ * arrives without that header, and the per-IP ceiling evaporated exactly where
+ * it was the only ceiling left. Headerless traffic now falls back to a SHARED
+ * bucket rather than to "allow": it is still served, but collectively capped
+ * instead of uncapped, so nobody buys an unlimited budget by stripping a header.
+ */
+const NO_IP_BUCKET = "noip";
+
+/**
+ * THE ONE READ OF THE CALLER'S ADDRESS. Both doors below go through here so the
+ * header that names a caller has a single spelling in this service: a check,
+ * a narrowing or a change of source lands at EVERY door or at none
+ * (FAMILY-004 P1 — the same predicate at every door is met by one helper
+ * interpolated at each, never by re-typing the literal).
+ *
+ * THE TWO DOORS DEGRADE DIFFERENTLY, DELIBERATELY, and this is the one place
+ * that says so:
+ *   `fanIpBucketKey` — a missing address falls back to the SHARED
+ *     `NO_IP_BUCKET`, so a headerless caller is still metered (collectively,
+ *     coarsely) and never uncapped.
+ *   `callerPrefix`   — a missing address answers `null`, and its callers key on
+ *     their own subject instead (`brand-enrolment.ts` per-domain,
+ *     `manual-claims.ts` per-passport). Pooling that population on one key was
+ *     itself a MEDIUM review finding: five requests from anybody closed
+ *     self-serve enrolment for everybody.
+ *
+ * WHAT THE KEY IS SCOPED TO, and why it is not free to rotate: the value is the
+ * CF edge's own connecting address, masked to a /24 (v4) or /48 (v6) by
+ * `maskIp`, which fails closed to one shared `invalid::/0` sentinel on anything
+ * that is not a well-formed literal — so no sequence of malformed values buys a
+ * second bucket. Rotating the key costs an address the edge will attribute.
+ */
+export function clientIp(c: { req: { header: (k: string) => string | undefined } }): string | undefined {
+  // I3-1216 (D-1078(14)): the header is the EDGE's only on a request the runtime marks as having come through
+  // Cloudflare (`request.cf`, the same read as `edgeCountry`); off the edge it is caller-chosen, so it is not read
+  // and the request answers as headerless — `fanIpBucketKey`'s one shared NO_IP_BUCKET, `callerPrefix`'s null.
+  if ((c.req as { raw?: { cf?: unknown } }).raw?.cf == null) return undefined;
+  return c.req.header("CF-Connecting-IP");
+}
+
+/** The bucket key a request consumes: masked prefix, or the shared headerless
+ * bucket. Never a raw address. */
+export function fanIpBucketKey(c: { req: { header: (k: string) => string | undefined } }, bucket: string): string {
+  const ip = clientIp(c);
+  return `${bucket}:${ip ? maskIp(ip) : NO_IP_BUCKET}`;
+}
+
+export async function fanIpAllowed(c: { env: Env; req: { header: (k: string) => string | undefined } }, bucket: string, cap: number): Promise<boolean> {
+  return consumeRateLimit(d1(c.env.TRUST_DB), fanIpBucketKey(c, bucket), Date.now(), cap, HOUR_MS);
+}
+
+/**
+ * I3-0760 / I3-0726: a FAILED-AUTHENTICATION throttle for the store webhook
+ * doors (Apple JWS, Google RTDN secret). The store is the caller and retries a
+ * refused delivery, so only failures spend the per-address hourly bucket —
+ * `recordStoreAuthFailure` on each one — and `storeAuthFailuresExhausted` is a
+ * read-only peek taken BEFORE any verification work, so an address over the
+ * cap costs one indexed read instead of a certificate-chain check.
+ */
+export async function storeAuthFailuresExhausted(c: { env: Env; req: { header: (k: string) => string | undefined } }, bucket: string, cap: number): Promise<boolean> {
+  return (await rateLimitCount(d1(c.env.TRUST_DB), fanIpBucketKey(c, bucket), Date.now(), HOUR_MS)) >= cap;
+}
+
+export async function recordStoreAuthFailure(c: { env: Env; req: { header: (k: string) => string | undefined } }, bucket: string, cap: number): Promise<void> {
+  await consumeRateLimit(d1(c.env.TRUST_DB), fanIpBucketKey(c, bucket), Date.now(), cap, HOUR_MS);
+}
+
+/** R2 → EvidenceStore adapter (flag 13): EVIDENCE_BUCKET only; KEYS live under
+ * `evidence/`. Null when it is not bound, so the upload route fails closed (503)
+ * and the erasure/retention legs skip rather than reading another bucket.
+ * #132CM-07: no MEDIA_BUCKET fallback — an erasure drained against the wrong
+ * bucket would report done over evidence it never reached. */
+export function evidenceStore(env: { EVIDENCE_BUCKET?: R2Bucket }): EvidenceStore | null {
+  const bucket = env.EVIDENCE_BUCKET;
+  if (!bucket) return null;
+  return {
+    async putBytes(key, bytes, contentType) {
+      await bucket.put(key, bytes, { httpMetadata: { contentType } });
+    },
+    async getBytes(key) {
+      const obj = await bucket.get(key);
+      if (!obj) return null;
+      return { bytes: new Uint8Array(await obj.arrayBuffer()), contentType: obj.httpMetadata?.contentType ?? "application/octet-stream" };
+    },
+    async delete(key) {
+      await bucket.delete(key);
+    },
+  };
+}
+
+// Body-size guard for the UNAUTHENTICATED entry routes (claim + device
+// register). These read c.req.json() before any session/proof exists, so an
+// anonymous caller could otherwise stream an arbitrarily large body into
+// memory. 64 KiB is far above any legitimate payload here (a passport id + an
+// account key). Session/creator routes read their body only AFTER the auth
+// check returns, so an anonymous request never buffers there; the few that do
+// read-then-check already cap raw.length inline. Applied as PER-ROUTE
+// middleware (not a global wildcard) so it can't collide with the 32 MiB
+// /ops/import cap and doesn't alter the route-surface invariant.
+// The const itself lives in auth.ts (I15-W3B: console.ts needs it, and an import
+// of this module from console.ts is a cycle through env.ts); re-exported here.
+export { anonBodyLimit } from "./auth.js";
+
+/** The MASKED client prefix keying every per-(subject, caller) resource in the
+ * service: removal's daily throttles, and — since the launch-blocking review —
+ * `claim_challenges`' live slot and daily issuance budget (claims.ts). Read from
+ * CF-Connecting-IP ONLY — never from the body, which the attacker controls (a
+ * body-supplied caller would mint a fresh counter per request and reinstate the
+ * very flood the keying exists to stop). */
+export function callerPrefix(c: { req: { header: (k: string) => string | undefined } }): string | null {
+  const ip = clientIp(c);
+  return ip ? maskIp(ip) : null;
+}
+
+/** R2 → MediaStore adapter (bytes; the sibling of r2Store's string ObjectStore).
+ * Returns null when the bucket is unprovisioned, so callers fail closed (503).
+ *
+ * THIS STORE IS ONLY THE ORIGIN HALF OF A DELETE. `GET /media/:hash` is served
+ * `public, max-age=31536000, immutable` deliberately — Cloudflare's CSAM tool
+ * scans at cache-fill — so dropping the R2 object stops nothing that a fan is
+ * actually served until the EDGE is purged as well. Every caller of
+ * `deleteMediaAsset` must therefore also pass an `EdgePurger`
+ * (`edgePurgerFromEnv`, media.ts); an absent one makes the delete refuse with a
+ * 503 rather than report a removal it did not complete. Do not add a delete path
+ * that takes this store and nothing else. */
+export function mediaStore(bucket: R2Bucket | undefined): MediaStore | null {
+  if (!bucket) return null;
+  return {
+    async putBytes(key, bytes, contentType) {
+      await bucket.put(key, bytes, { httpMetadata: { contentType } });
+    },
+    async getBytes(key) {
+      const obj = await bucket.get(key);
+      if (!obj) return null;
+      return { bytes: new Uint8Array(await obj.arrayBuffer()), contentType: obj.httpMetadata?.contentType ?? "application/octet-stream" };
+    },
+    async delete(key) {
+      await bucket.delete(key);
+    },
+    // I3-1701: the listing `sweepMediaOrphans` walks; `cursor` is null once R2 says the listing is complete.
+    async list(prefix, cursor) {
+      const r = await bucket.list({ prefix, limit: 1000, ...(cursor ? { cursor } : {}) });
+      return { objects: r.objects.map((o) => ({ key: o.key, uploaded: o.uploaded.toISOString() })), cursor: r.truncated ? r.cursor : null };
+    },
+  };
+}
+===== END FILE: services/trust-core/src/route-helpers.ts =====
+
+===== BEGIN FILE: services/trust-core/src/scouts.ts =====
+import { fanKey, occurredDay, outboxStatements } from "./analytics-events.js";
+import { publishAfterCommit, type AnalyticsTickEnv } from "./analytics-outbox.js";
+import { outboxSpan, outboxSpanSeqs } from "./events.js";
+import { CLAIM_STATE_AT_SQL, shownClassSql } from "./standing.js";
+import type { DbLike } from "./db.js";
+import { FOUNDING_FAN_MIN_AGE_DAYS, fanAgedEnoughExpr, fanCostedAgedEnoughExpr, qualifiedFanJoin } from "./fan-quality.js";
+import { foundingRank } from "./founding.js";
+import { livePassport, livePassportWithDemand } from "./passport-view.js";
+import { requestCreator } from "./requests.js";
+
+/**
+ * SCOUT — the scarce, numbered, snapshot-carrying act of early support.
+ * F6, 2026-09-03 (master list #44 Scout, #6 proof of early fandom).
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT WAS MISSING
+ * ---------------------------------------------------------------------------
+ * Scout existed as three disconnected pieces: the `scout`/`scout_10`/`scout_50`
+ * achievement tiers in `social.ts` (derived from `creator_encounters`), the
+ * `founding_fan_ranks` slate in `requests.ts`, and the `early_supporter:<psp>`
+ * achievement the web app labels "Early Scout". None of them cost the fan
+ * anything, none of them carried a number a fan could show, and none of them
+ * recorded what the creator LOOKED LIKE at the moment of discovery — so
+ * "I found them before anyone" was a feeling rather than a claim.
+ *
+ * ---------------------------------------------------------------------------
+ * SCOUTING IS LAYERED ON REQUESTING, NOT A RENAME OF IT
+ * ---------------------------------------------------------------------------
+ * `requestCreator` stays exactly as it is: free, capped at
+ * `MAX_REQUESTS_PER_ACCOUNT` for a lifetime, feeding the public demand counter
+ * and the Founding Fan slate. Scouting is a SECOND, budgeted verb that also
+ * records the request (idempotently, straight through `requestCreator`, with
+ * every one of its in-statement guards intact) and additionally mints a
+ * permanent ordinal.
+ *
+ * The alternative — renaming requests to Scouts — would have promoted every row
+ * already in `creator_requests` to a scarce ordinal retroactively, which is
+ * precisely the property being added, and would have changed the semantics of a
+ * route the Founding Fan freeze and four invariants are written against.
+ *
+ * ON AN UNCLAIMED PASSPORT a Scout is therefore strictly stronger than a
+ * request: it records one too, so the scout count can never exceed the demand
+ * count. ON A CLAIMED ONE the two genuinely part company, because
+ * `requestCreator` accepts unclaimed passports only (its own guard, and the
+ * Founding Fan freeze depends on it) — a claimed creator can be scouted and has
+ * no demand counter at all. That is a real difference between the two numbers
+ * and it is stated here rather than left for a reader to trip over.
+ *
+ * ---------------------------------------------------------------------------
+ * THE BUDGET IS A FOLD (F2's rule, applied to a non-money resource)
+ * ---------------------------------------------------------------------------
+ * `SCOUT_BUDGET_PER_PERIOD` Scouts per UTC calendar month, the same number for
+ * every account, and the remaining balance is `COUNT(*)` over the caller's own
+ * ordinal rows in the current `cohort`. There is no counter, no grant row and
+ * no second writer, so there is nothing to drift and no repair path to write.
+ *
+ * NO ROLLOVER. An unspent Scout is not an asset; it is an unexercised
+ * opportunity, and carrying it forward would turn a monthly attention budget
+ * into a hoardable balance — which is the thing #34 (scarcity is not the
+ * product) exists to refuse.
+ *
+ * ---------------------------------------------------------------------------
+ * NON-PURCHASABLE, STRUCTURALLY
+ * ---------------------------------------------------------------------------
+ * This module imports the `DbLike` TYPE, `fan-quality.ts`, `passport-view.ts`
+ * and `requests.ts` — and `requests.ts` is itself an ENTRY POINT of the paywall
+ * closure, so every edge out of here is already inside a walk that takes no
+ * exemptions of any kind. Nothing reachable from this module can see
+ * `billing.ts`, `entitlements.ts`, `credits.ts`, `iap.ts`, `iap-credits.ts` or
+ * `stripe.ts`, so "Scouts cannot be bought, granted or topped up" is a property
+ * of the module graph rather than a promise in a comment. Pinned by
+ * `tests/invariants/paywall.test.ts`, which is what actually enforces it —
+ * an earlier draft of this paragraph claimed a shorter import list than the
+ * file has, which is exactly why the argument must rest on the guard and not
+ * on a sentence.
+ *
+ * It is also the `entitlements.ts:10` paywall invariant read forwards: fan
+ * premium is a CAP-AND-TOOL gate, and a Scout is neither a cap nor a tool. A
+ * paying fan gets the same five.
+ *
+ * ---------------------------------------------------------------------------
+ * THE FLOOR
+ * ---------------------------------------------------------------------------
+ * Spending a Scout requires a QUALIFIED account (`fan-quality.ts`'s
+ * disjunction) QUALIFIED at least `FOUNDING_FAN_MIN_AGE_DAYS` days ago (the clock
+ * runs from `qualified_at`, never `accounts.created_at` — I3-1155) AND at least
+ * that many days after its first COSTED signal (`fanCostedAgedEnoughExpr`, D-0858(3)
+ * applying D-0844(2): a grandfathered pre-0117 passkey `qualified_at` does not
+ * count) — the same two floors `founding_fan_ranks` uses, for the reason that module's docblock gives:
+ * where the output is a permanent, publicly-numbered integer, the age RAMP
+ * cannot express "counts less" and a hard floor is the only honest instrument.
+ * One number for "old enough to be trusted with something permanent", not two.
+ *
+ * Unqualified and under-age accounts can still REQUEST. Nothing about that path
+ * changes.
+ *
+ * ---------------------------------------------------------------------------
+ * NO ORACLE, AND NO REFUND
+ * ---------------------------------------------------------------------------
+ * Suppressed, retracted and never-listed passports resolve through
+ * `livePassport` and answer identically — the shape `requestCreator` and
+ * `unrequestCreator` were rewritten into after the oracle sweep. A VERIFIED
+ * passport is refused (you cannot scout someone who has already arrived, which
+ * is what the word means and what the existing `scout` achievement already
+ * encodes as `first_state != 'verified'`); claim state is public on `/p/:id`
+ * for a live passport, so that refusal discloses nothing new.
+ *
+ * There is no unscout. Withdrawing the underlying request — only possible
+ * pre-claim — returns no budget and removes no ordinal. A budget that refills
+ * on withdrawal is a rate limit with a nicer name, and it would let one account
+ * churn the low ordinals across every passport in the registry.
+ *
+ * ---------------------------------------------------------------------------
+ * ERASURE: THE PERSON GOES, THE NUMBER STAYS SPENT
+ * ---------------------------------------------------------------------------
+ * `account_data.ts` TOMBSTONES a scout row rather than deleting it, and the
+ * reason is arithmetic. `founding_fan_ranks` can delete a spent slot safely
+ * because its ten slots are materialised in one batch at claim, so a hole stays
+ * a hole. Scout numbers are allocated incrementally from `MAX(ordinal) + 1`, so
+ * deleting the highest row MOVES the maximum and hands #7 to the next arrival —
+ * the re-minting this whole design refuses, reached through the erasure door.
+ * The tombstone keeps the number and drops the person.
+ *
+ * Every read here therefore has to say which side it is on, and they differ:
+ * the public counter JOINs `accounts` (a headcount of people who are here), the
+ * allocator does NOT (a number is spent whether or not its holder still
+ * exists), and the budget fold does not need to (a tombstone matches no live
+ * caller).
+ */
+
+export class ScoutError extends Error {
+  override name = "ScoutError";
+  constructor(
+    message: string,
+    public readonly status: 400 | 401 | 403 | 404 | 409 | 429 = 400,
+  ) {
+    super(message);
+  }
+}
+
+/** Scouts a fan may spend per period. Identical for every account, never
+ * purchasable, never granted, never rolled over. */
+export const SCOUT_BUDGET_PER_PERIOD = 5;
+
+/** How many ordinal-allocation retries before giving up. Each retry costs one
+ * lost race on UNIQUE(passport_id, ordinal); the bound exists so a pathological
+ * contention storm terminates rather than spinning. `founding.ts` uses the same
+ * shape. */
+const MAX_ALLOC_ATTEMPTS = 64;
+
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+const ACCOUNT_RE = /^[A-Za-z0-9_-]{1,64}$/;
+
+/**
+ * The period key: the UTC calendar month of an ISO instant, `YYYY-MM`.
+ *
+ * Sliced from the ISO string rather than parsed through `Date`, so a stored
+ * `scouted_at` and the cohort written beside it can never disagree because of a
+ * local-timezone reading, and the function is total for any instant this
+ * codebase produces (every `now()` in the tree is `toISOString()`).
+ */
+export function scoutCohort(iso: string): string {
+  const m = /^(\d{4})-(\d{2})-\d{2}T/.exec(iso);
+  if (!m) throw new ScoutError("unreadable instant");
+  return `${m[1]}-${m[2]}`;
+}
+
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sept", "Oct", "Nov", "Dec"] as const;
+
+/**
+ * The display string, and the ONE place it is spelled: `Scout #73 — Sept 2026`.
+ *
+ * Built here rather than at each surface because it appears on the fan profile,
+ * in the fan's own scout list and on the share copy, and three hand-built
+ * copies of a format string is how "Scout #73 - Sept 2026" and
+ * "Scout #73, September 2026" end up on two screens of the same product.
+ * Returns null for a malformed cohort rather than printing a broken label.
+ */
+export function scoutLabel(ordinal: number, cohort: string): string | null {
+  if (!Number.isInteger(ordinal) || ordinal < 1) return null;
+  const m = /^(\d{4})-(\d{2})$/.exec(cohort);
+  if (!m) return null;
+  const monthIndex = Number(m[2]) - 1;
+  const name = MONTH_NAMES[monthIndex];
+  if (!name) return null;
+  return `Scout #${ordinal} — ${name} ${m[1]}`;
+}
+
+export interface ScoutBudget {
+  /** The constant, exposed so a client never hard-codes it. */
+  budget: number;
+  spent: number;
+  remaining: number;
+  /** The period this budget belongs to, `YYYY-MM`. */
+  cohort: string;
+  /** When the budget refills — the first instant of the next UTC month. */
+  resets_at: string;
+}
+
+/** The first instant of the month AFTER the one this cohort names. */
+function periodReset(cohort: string): string {
+  const y = Number(cohort.slice(0, 4));
+  const mo = Number(cohort.slice(5, 7));
+  const nextY = mo === 12 ? y + 1 : y;
+  const nextMo = mo === 12 ? 1 : mo + 1;
+  return `${String(nextY).padStart(4, "0")}-${String(nextMo).padStart(2, "0")}-01T00:00:00.000Z`;
+}
+
+/**
+ * The caller's Scout budget for the period containing `nowIso`. A pure fold
+ * over their own rows — no stored counter is read and none exists.
+ */
+export async function scoutBudget(db: DbLike, accountId: string, nowIso: string): Promise<ScoutBudget> {
+  const cohort = scoutCohort(nowIso);
+  const row = await db.prepare("SELECT COUNT(*) AS n FROM scout_ordinals WHERE account_id = ? AND cohort = ?").bind(accountId, cohort).first<{ n: number }>();
+  const spent = row?.n ?? 0;
+  return {
+    budget: SCOUT_BUDGET_PER_PERIOD,
+    spent,
+    remaining: Math.max(0, SCOUT_BUDGET_PER_PERIOD - spent),
+    cohort,
+    resets_at: periodReset(cohort),
+  };
+}
+
+/**
+ * Is this account allowed to spend a Scout AT ALL — qualified, and old enough
+ * for a permanent public number? ONE statement: the age floor is
+ * `fanAgedEnoughExpr()` over the view's `qualified_at` (I3-1155) AND
+ * `fanCostedAgedEnoughExpr()` over `fan_costed_qualification` (D-0858(3)), so it rides the same row rather than
+ * costing a second round trip (and an unknown account answers false, which is
+ * the fail-closed direction).
+ *
+ * Measured AS OF `nowIso` rather than against wall-clock `julianday('now')`, so
+ * a caller can reproduce the decision and a test can drive it.
+ */
+export async function mayScout(db: DbLike, accountId: string, nowIso: string): Promise<boolean> {
+  if (!ACCOUNT_RE.test(accountId)) return false;
+  const row = await db
+    .prepare(
+      `SELECT 1 AS x FROM qualified_fan_accounts qf
+        WHERE qf.account_id = ? AND qf.qualified_at <= ?
+          AND ${fanAgedEnoughExpr()} AND ${fanCostedAgedEnoughExpr()}`,
+    )
+    .bind(accountId, nowIso, nowIso, nowIso)
+    .first();
+  return row !== null;
+}
+
+export interface ScoutSnapshot {
+  demand_at_scout: number;
+  claim_state_at_scout: "unclaimed" | "claimed";
+  join_no_at_scout: number | null;
+  founding_rank_at_scout: number | null;
+}
+
+export interface ScoutResult {
+  passport_id: string;
+  ordinal: number;
+  cohort: string;
+  scouted_at: string;
+  label: string;
+  snapshot: ScoutSnapshot;
+  /** True when this call minted the number; false when the caller already held
+   * one (idempotent re-scout — no second ordinal, no second spend). */
+  minted: boolean;
+}
+
+/** The caller's existing ordinal for this passport, or null. */
+async function existingScout(db: DbLike, accountId: string, passportId: string): Promise<ScoutResult | null> {
+  const r = await db
+    .prepare(
+      `SELECT ordinal, cohort, scouted_at, demand_at_scout, claim_state_at_scout, join_no_at_scout, founding_rank_at_scout
+         FROM scout_ordinals WHERE passport_id = ? AND account_id = ?`,
+    )
+    .bind(passportId, accountId)
+    .first<{
+      ordinal: number;
+      cohort: string;
+      scouted_at: string;
+      demand_at_scout: number;
+      claim_state_at_scout: "unclaimed" | "claimed";
+      join_no_at_scout: number | null;
+      founding_rank_at_scout: number | null;
+    }>();
+  if (!r) return null;
+  return {
+    passport_id: passportId,
+    ordinal: r.ordinal,
+    cohort: r.cohort,
+    scouted_at: r.scouted_at,
+    label: scoutLabel(r.ordinal, r.cohort) ?? `Scout #${r.ordinal}`,
+    snapshot: {
+      demand_at_scout: r.demand_at_scout,
+      claim_state_at_scout: r.claim_state_at_scout,
+      join_no_at_scout: r.join_no_at_scout,
+      founding_rank_at_scout: r.founding_rank_at_scout,
+    },
+    minted: false,
+  };
+}
+
+/**
+ * Spend one Scout on a creator and mint the permanent ordinal.
+ *
+ * ORDER OF OPERATIONS, AND WHY IT IS THIS ORDER:
+ *
+ *  1. THE PASSPORT GATE, through `livePassport`, so suppressed / retracted /
+ *     never-listed are one indistinguishable 404 — and it is FIRST, above even
+ *     the idempotent read, because a fan who scouted somebody before they were
+ *     delisted would otherwise get a 200 where a never-listed id gets a 404.
+ *  2. IDEMPOTENCE. An existing ordinal returns unchanged — before the budget is
+ *     consulted (so re-scouting can never cost a second Scout or fail because
+ *     the month is spent) and before the verified check (so a fan whose creator
+ *     has since arrived still gets their number back).
+ *  3. THE FLOOR, then the BUDGET. Both are caller-scoped facts; neither
+ *     discloses anything about the subject, so their order does not leak.
+ *  4. THE SNAPSHOT, read immediately before the INSERT.
+ *  5. THE ALLOCATION, whose guards live INSIDE the statement: the claim-state
+ *     condition is re-asserted in the INSERT's `WHERE EXISTS`, the same
+ *     no-check-then-act idiom `requestCreator` uses, so a verification landing
+ *     between step 2 and step 5 cannot produce a scout of an already-verified
+ *     creator.
+ *
+ * THE BUDGET IS ENFORCED IN THE INSERT, NOT AT STEP 3. Step 3 exists to
+ * produce a good error message; the database decides. An earlier draft checked
+ * the budget with a SELECT and then inserted, and recorded the race as
+ * "bounded at one" — which was wrong. Two scouts at the SAME creator do
+ * contend, on the primary key. N scouts at N DIFFERENT creators contend on
+ * NOTHING: different passports means a different PK and a different
+ * `MAX(ordinal)` per row, so fifty concurrent calls minted fifty ordinals
+ * against a budget of five, with only a per-IP rate limit in the way. The
+ * count now rides inside the INSERT's own WHERE (`requestCreator`'s idiom),
+ * so the ceiling holds however many callers arrive at once.
+ */
+export async function scoutCreator(
+  db: DbLike,
+  accountId: string,
+  passportId: string,
+  now: () => string = () => new Date().toISOString(),
+  /** `ANALYTICS_FAN_SECRET`; undefined is refused by `fanKey` (ADR-0006 §2). */
+  fanSecret?: string,
+  pubEnv?: AnalyticsTickEnv,
+  pubCtx?: { waitUntil(p: Promise<unknown>): void },
+): Promise<ScoutResult> {
+  if (!ACCOUNT_RE.test(accountId)) throw new ScoutError("no such account", 401);
+  const acct = await db.prepare("SELECT 1 AS x FROM accounts WHERE account_id = ?").bind(accountId).first();
+  if (!acct) throw new ScoutError("no such account", 401);
+  if (!PSP_RE.test(passportId)) throw new ScoutError("no such creator", 404);
+
+  // THE PASSPORT GATE COMES FIRST, BEFORE THE IDEMPOTENT READ, and the order is
+  // the whole of the no-oracle property. Read the caller's own row first and a
+  // fan who scouted somebody BEFORE they were delisted gets a 200 where a
+  // never-listed id gets a 404 — a suppressed-vs-never-listed pair on a route
+  // the oracle sweep drives with the subject in the body. Live + unsuppressed on
+  // ONE statement, and both branches answer 404 having spent the same
+  // statements.
+  const p = await livePassport(db, passportId);
+  if (!p) throw new ScoutError("no such creator", 404);
+
+  // IDEMPOTENCE, and it sits ABOVE the verified check on purpose: a fan who
+  // scouted a creator who has since arrived still gets their number back rather
+  // than a 409 about a creator they demonstrably found first.
+  const already = await existingScout(db, accountId, passportId);
+  if (already) return already;
+
+  // D-1087(3) (I3-1768): the claim state is the one a fan is shown at this instant (standing.ts CLAIM_STATE_AT_SQL, the
+  // term /p/:id reads), not the stored column: a lapsed grant the expiry sweep has not folded is scouted as claimed.
+  const nowIso = now();
+  const shown = await db.prepare(`SELECT ${CLAIM_STATE_AT_SQL} AS claim_state FROM passports p WHERE p.passport_id = ?`).bind(nowIso, passportId).first<{ claim_state: string }>();
+  if (!shown) throw new ScoutError("no such creator", 404);
+  if (shown.claim_state === "verified") {
+    // Scouting means finding someone BEFORE they arrived. Public claim state,
+    // so this is not an oracle.
+    throw new ScoutError("this creator is already verified — scouting is for finding them first", 409);
+  }
+  const claimState: "unclaimed" | "claimed" = shown.claim_state === "claimed" ? "claimed" : "unclaimed";
+
+  // `alloc`'s three in-statement guards, named ONCE so the INSERT's own WHERE and the emit's
+  // `extraWhere` cannot drift apart (INV-051 U-1). The clause is split at `WHERE EXISTS`
+  // deliberately: `tests/invariants/conditional-emit-scan.test.ts` finds a conditional
+  // producer by matching that token in the ENCLOSING FUNCTION's SOURCE TEXT, so folding the
+  // whole predicate behind a `${…}` hole would take this producer out of the guard's
+  // population — correct today and unwatched tomorrow. The token stays literal; only the tail
+  // is shared. Params, in order: passportId, nowIso, claimState, accountId, cohort.
+  // I3-1219 (I22): the suppression half of "still public" rides the statement too, correlated so the
+  // bind order above is unchanged; `livePassport` read it before the batch, which a suppression can follow.
+  // D-1087(3): the claim state it re-asserts is the shown one at `nowIso` (CLAIM_STATE_AT_SQL), the check's own rule.
+  const ALLOC_GUARD_TAIL = `(SELECT 1 FROM passports p WHERE p.passport_id = ? AND p.retracted = 0 AND ${CLAIM_STATE_AT_SQL} = ?
+                                 AND NOT EXISTS (SELECT 1 FROM request_suppressions x WHERE x.passport_id = p.passport_id))
+       AND (SELECT COUNT(*) FROM scout_ordinals WHERE account_id = ? AND cohort = ?) < ${SCOUT_BUDGET_PER_PERIOD}`;
+
+  if (!(await mayScout(db, accountId, nowIso))) {
+    throw new ScoutError(`scouting needs a verified account at least ${FOUNDING_FAN_MIN_AGE_DAYS} days old`, 403);
+  }
+  const budget = await scoutBudget(db, accountId, nowIso);
+  if (budget.remaining <= 0) {
+    throw new ScoutError(`no Scouts left this month — your budget of ${budget.budget} refills at ${budget.resets_at}`, 429);
+  }
+
+  const snapshot = await creatorSnapshot(db, passportId, claimState, accountId, nowIso);
+  const cohort = scoutCohort(nowIso);
+
+  // The pseudonym is computed ONCE, before the loop and before any statement is
+  // built: `outboxStatements` takes a key, never a promise (ADR-0006 §2).
+  const key = await fanKey(fanSecret, accountId, passportId);
+
+  for (let attempt = 0; attempt < MAX_ALLOC_ATTEMPTS; attempt++) {
+    // MAX + 1, NEVER COUNT + 1. An erased fan's row is deleted by
+    // `account_data.ts`; with COUNT the next arrival would be handed the erased
+    // fan's number, which is the re-minting `founding_fan_ranks` was written to
+    // make impossible. With MAX the number simply stays unfilled.
+    const row = await db.prepare("SELECT MAX(ordinal) AS maxo FROM scout_ordinals WHERE passport_id = ?").bind(passportId).first<{ maxo: number | null }>();
+    const next = (row?.maxo ?? 0) + 1;
+    try {
+      // EVERY GUARD LIVES INSIDE THE STATEMENT — no check-then-act window, the
+      // idiom `requestCreator` uses for its own lifetime cap (requests.ts).
+      //
+      //  * THE BUDGET. The pre-check above is a courtesy that produces a good
+      //    error message; THIS is the enforcement. Read-then-insert was not a
+      //    ceiling at all: N concurrent scouts at N DIFFERENT passports contend
+      //    on nothing — not the PK (different passports), not UNIQUE(ordinal)
+      //    (each allocator gets its own MAX per passport) — so one account
+      //    could fire fifty at once and mint fifty against a budget of five.
+      //    The earlier claim that "the overspend is bounded at one" was true
+      //    only for two requests aimed at the SAME creator. Counted inside the
+      //    INSERT, the budget is enforced by the database on every path.
+      //  * THE CLAIM STATE, bound rather than merely "<> verified": an
+      //    unclaimed → claimed transition between the read and this write would
+      //    otherwise freeze `claim_state_at_scout = 'unclaimed'` for a creator
+      //    who was already claimed — the more valuable of the two values, and a
+      //    snapshot that says something false.
+      //  * RETRACTION, unchanged.
+      // THE ANALYTICS ROW RIDES THE SAME BATCH (ADR-0006 §2): a UNIQUE loss on
+      // `ordinal` rolls the event back with the allocation it describes.
+      const alloc = db
+        .prepare(
+          `INSERT INTO scout_ordinals
+             (passport_id, account_id, ordinal, cohort, scouted_at, demand_at_scout, claim_state_at_scout, join_no_at_scout, founding_rank_at_scout)
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE EXISTS ${ALLOC_GUARD_TAIL}`,
+        )
+        .bind(
+          passportId,
+          accountId,
+          next,
+          cohort,
+          nowIso,
+          snapshot.demand_at_scout,
+          claimState,
+          snapshot.join_no_at_scout,
+          snapshot.founding_rank_at_scout,
+          passportId,
+          nowIso,
+          claimState,
+          accountId,
+          cohort,
+        );
+      // U-1 (INV-051, docket #23 D-2(ii)): a UNIQUE loss on `ordinal` does roll the
+      // event back with the allocation, but the two IN-STATEMENT guards above do
+      // not throw — a spent budget or a claim state that moved makes `alloc` a
+      // SILENT zero-row insert, and the block below reads that off the table and
+      // refuses the caller. So the emit carries `alloc`'s OWN predicate as
+      // `extraWhere` (`analytics-events.ts:400`), the same SQL and the same
+      // params, read BEFORE `alloc` in the same batch — the `creator-payout.ts:721`
+      // shape. `scout_created` now exists iff the ordinal does.
+      const span = outboxSpan(db);
+      const spanRes = await db.batch([
+        span.open,
+        ...outboxStatements(
+          db,
+          { kind: "scout_created", passportId, occurredDay: occurredDay(nowIso), fanKey: key },
+          { accountId, extraWhere: { sql: `EXISTS ${ALLOC_GUARD_TAIL}`, params: [passportId, nowIso, claimState, accountId, cohort] } },
+        ),
+        alloc,
+        span.close,
+      ]);
+      const seqs = outboxSpanSeqs(spanRes[0], spanRes[spanRes.length - 1]);
+      if (pubEnv && pubCtx) publishAfterCommit(pubEnv, pubCtx, seqs);
+      // `DbLike.batch` returns no `changes` (db.ts:20), so "did one of the three
+      // in-statement guards refuse?" is read off the table — the same question
+      // `res.changes === 0` asked, answered by the row rather than the driver.
+      // A row carrying somebody else's ordinal is the catch block's race
+      // arriving through the front door, and it is answered the same way.
+      const made = await existingScout(db, accountId, passportId);
+      if (made && made.ordinal !== next) return made;
+      if (!made) {
+        // One of the three in-statement guards refused. Re-read the caller's
+        // OWN budget to tell the two apart — caller-scoped, so distinguishing
+        // them discloses nothing about the subject.
+        const now2 = await scoutBudget(db, accountId, nowIso);
+        if (now2.remaining <= 0) throw new ScoutError(`no Scouts left this month — your budget of ${now2.budget} refills at ${now2.resets_at}`, 429);
+        throw new ScoutError("this creator is already verified — scouting is for finding them first", 409);
+      }
+      // A SCOUT IS STRICTLY STRONGER THAN A REQUEST, so it records one — HERE,
+      // in the primitive, not in the route. Put it in the handler and the next
+      // caller (a cron, a native client's own path, a test) mints an ordinal
+      // that the demand counter never hears about, and the two numbers drift
+      // apart silently. `requestCreator` re-checks everything itself inside its
+      // own INSERT, and it only ever accepts an UNCLAIMED passport, so this is
+      // a no-op for a claimed one.
+      //
+      // ITS ERRORS ARE SWALLOWED, DELIBERATELY. The ordinal is already written
+      // and the Scout is already spent; a fan who has hit their 1000-request
+      // lifetime cap must not lose the Scout they just paid for to a failure in
+      // the weaker, free half of the act.
+      if (claimState === "unclaimed") {
+        await requestCreator(db, accountId, passportId, () => nowIso).catch(() => undefined);
+      }
+      return {
+        passport_id: passportId,
+        ordinal: next,
+        cohort,
+        scouted_at: nowIso,
+        label: scoutLabel(next, cohort) ?? `Scout #${next}`,
+        snapshot,
+        minted: true,
+      };
+    } catch (e) {
+      if (e instanceof ScoutError) throw e;
+      // Lost the race on either the ordinal (someone took `next`) or the
+      // account (a concurrent scout of THIS passport by THIS fan) — re-read and
+      // resolve, exactly as `awardFoundingIfEligible` does.
+      const raced = await existingScout(db, accountId, passportId);
+      if (raced) return raced;
+      if (e instanceof Error && /UNIQUE constraint/i.test(e.message)) continue;
+      throw e;
+    }
+  }
+  throw new ScoutError("could not allocate a Scout number — try again", 409);
+}
+
+/**
+ * The #6 snapshot: what this creator looked like at this instant.
+ *
+ * Every figure is one the product already publishes about a creator, so the
+ * snapshot can never assert more than the public surfaces did. `demand_at_scout`
+ * uses the QUALIFIED requester count — the same expression `requestCard` and
+ * `creatorDemand` serve — so a fan's frozen "they had 11 fans" agrees with what
+ * /p/:id/requests said that day.
+ *
+ * NOT saves (S22 keeps the save list private and `rewards.ts` refuses to
+ * surface a save count) and NOT checks (the k-anonymous lookup means the server
+ * never learns who checked whom, so the number would be invented). Both
+ * exclusions are `creatorDemand`'s, for `creatorDemand`'s reasons.
+ */
+export async function creatorSnapshot(
+  db: DbLike,
+  passportId: string,
+  claimState: "unclaimed" | "claimed",
+  accountId: string,
+  nowIso: string = new Date().toISOString(),
+): Promise<ScoutSnapshot> {
+  // THE CALLER IS EXCLUDED, and the exclusion is the whole meaning of the
+  // number: "how many others had already asked for them when you arrived".
+  // Without it the figure depended on the ORDER a fan happened to act in — a
+  // fan who requested first and scouted second counted themselves, a fan who
+  // scouted first did not, and two people doing the same thing got snapshots
+  // one apart. Excluding the scouter makes it order-independent and makes the
+  // sentence on the profile true.
+  const demand = await db
+    .prepare(`SELECT COUNT(*) AS n FROM creator_requests r ${qualifiedFanJoin("r.account_id")} WHERE r.passport_id = ? AND r.account_id <> ?`)
+    .bind(passportId, accountId)
+    .first<{ n: number }>();
+  const ordinals = await db
+    .prepare("SELECT join_no FROM join_numbers WHERE passport_id = ?")
+    .bind(passportId)
+    .first<{ join_no: number | null }>();
+  return {
+    demand_at_scout: demand?.n ?? 0,
+    claim_state_at_scout: claimState,
+    join_no_at_scout: ordinals?.join_no ?? null,
+    // I3-0910: through the gate — a rank withheld while the passport is not live+verified is not frozen here.
+    // I3-1768 (I34-EXPIRY-A): at the scout's own instant, the one `claim_state_at_scout` was read at (CLAIM_STATE_AT_SQL).
+    founding_rank_at_scout: await foundingRank(db, passportId, nowIso),
+  };
+}
+
+export interface OwnScout {
+  passport_id: string;
+  display_name: string;
+  claim_state: string;
+  ordinal: number;
+  cohort: string;
+  label: string;
+  scouted_at: string;
+  snapshot: ScoutSnapshot;
+  /** Did the creator go on to verify? The payoff line on the fan's own list. */
+  arrived: boolean;
+}
+
+export const OWN_SCOUTS_LIMIT = 200;
+
+/**
+ * The caller's own scouts. Owner-scoped, never a public surface, and it hides
+ * suppressed subjects the way `listOwnRequests` does — a fan's own list is not
+ * a back door around somebody's delisting.
+ */
+export async function listOwnScouts(db: DbLike, accountId: string, nowMs: number = Date.now()): Promise<OwnScout[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT s.passport_id AS passport_id, p.display_name AS display_name, ${shownClassSql("p")} AS claim_state,
+              s.ordinal AS ordinal, s.cohort AS cohort, s.scouted_at AS scouted_at,
+              s.demand_at_scout AS demand_at_scout, s.claim_state_at_scout AS claim_state_at_scout,
+              s.join_no_at_scout AS join_no_at_scout, s.founding_rank_at_scout AS founding_rank_at_scout
+         FROM scout_ordinals s JOIN passports p ON p.passport_id = s.passport_id
+        WHERE s.account_id = ? AND p.retracted = 0
+          AND NOT EXISTS (SELECT 1 FROM request_suppressions x WHERE x.passport_id = p.passport_id)
+        ORDER BY s.scouted_at DESC LIMIT ?`,
+    )
+    .bind(new Date(nowMs).toISOString(), accountId, OWN_SCOUTS_LIMIT) // I34-W3-EXPIRY: the caller's instant (the wall clock when it has none). I3-1768 (D-1084(1), I32-FX2-SERVER): the class a fan is shown — a lapsed grant (standing.ts grantLiveAtSql) reads claimed.
+    .all<{
+      passport_id: string;
+      display_name: string;
+      claim_state: string;
+      ordinal: number;
+      cohort: string;
+      scouted_at: string;
+      demand_at_scout: number;
+      claim_state_at_scout: "unclaimed" | "claimed";
+      join_no_at_scout: number | null;
+      founding_rank_at_scout: number | null;
+    }>();
+  return results.map((r) => ({
+    passport_id: r.passport_id,
+    display_name: r.display_name,
+    claim_state: r.claim_state,
+    ordinal: r.ordinal,
+    cohort: r.cohort,
+    label: scoutLabel(r.ordinal, r.cohort) ?? `Scout #${r.ordinal}`,
+    scouted_at: r.scouted_at,
+    snapshot: {
+      demand_at_scout: r.demand_at_scout,
+      claim_state_at_scout: r.claim_state_at_scout,
+      join_no_at_scout: r.join_no_at_scout,
+      founding_rank_at_scout: r.founding_rank_at_scout,
+    },
+    arrived: r.claim_state === "verified",
+  }));
+}
+
+export interface ScoutCount {
+  passport_id: string;
+  display_name: string;
+  claim_state: string;
+  scout_count: number;
+  first_scouted_at: string | null;
+}
+
+/**
+ * The PUBLIC scout counter for a passport: how many, and since when. COUNTS
+ * ONLY — never who, the identical posture `requestCard` holds for requests
+ * (there is no endpoint anywhere that lists who scouted a creator).
+ *
+ * Gated on `livePassportWithDemand`, so the creator's own demand opt-out
+ * (audit item #13) and an operator suppression take the scout counter off the
+ * same surfaces they already take the request counter off, on the same
+ * statement. Returns null → the route 404s.
+ */
+export async function scoutCard(db: DbLike, passportId: string): Promise<ScoutCount | null> {
+  const p = await livePassportWithDemand(db, passportId);
+  if (!p) return null;
+  // JOIN accounts, so an ERASED fan's tombstoned row stops being counted. Two
+  // things are true at once and the join is what keeps them apart: the NUMBER
+  // stays spent forever (the row is still there, so nobody is ever handed the
+  // erased fan's #7), and the public headcount is a count of PEOPLE WHO ARE
+  // HERE — which is what "N fans Scouted this creator" claims and what the
+  // request counter already does by deleting its rows outright.
+  //
+  // Liveness only, and deliberately NOT a re-run of the qualified-fan
+  // predicate: a scout could only ever be spent by a qualified account (see
+  // `mayScout`), so every row here was qualified when it was written.
+  // Re-deriving that at read time would make a frozen public number move
+  // whenever a fan changed their email — precisely the drift
+  // `0024_fan_qualification.sql` was written to close.
+  const c = await db
+    .prepare("SELECT COUNT(*) AS n, MIN(s.scouted_at) AS first FROM scout_ordinals s JOIN accounts a ON a.account_id = s.account_id WHERE s.passport_id = ?")
+    .bind(passportId)
+    .first<{ n: number; first: string | null }>();
+  return {
+    passport_id: p.passport_id,
+    display_name: p.display_name,
+    claim_state: p.claim_state,
+    scout_count: c?.n ?? 0,
+    first_scouted_at: c?.first ?? null,
+  };
+}
+===== END FILE: services/trust-core/src/scouts.ts =====
+
+===== BEGIN FILE: services/trust-core/src/seeding.ts =====
+import { hasUnsafeDisplayText, hasVisibleText, SEED_SOURCES, SEED_TIERS, SOURCE_NOTE_MAX, type ProfileRecord, type SeedSource, type SeedTier } from "@dhwaja/schema";
+import type { DbLike, DbStatement } from "./db.js";
+import { CONSENT_REQUIRED_CATEGORIES, isCategory, type Category } from "./taxonomy.js";
+
+/**
+ * flag 14 — seeding metadata + metrics. OPERATOR-ONLY, NEVER SERVED.
+ *
+ * `seed_metadata` records how WE found a creator and which seeding strategy
+ * the listing belongs to. That is a fact about our sourcing process, not about
+ * the person, so it is invisible everywhere a fan or a creator can look: the
+ * passport view, the public JSON, the feed, the SEO answer page, and the
+ * ledger proof all stay byte-identical whether or not a row exists here
+ * (invariant-tested in `tests/invariants/seeding.test.ts` — a PROTECTED
+ * guard, pinned by content and by test count in
+ * `fixtures/invariant-manifest.json`, so "invariant-tested" is now a fact
+ * about the machinery and not just about the file's name).
+ *
+ * The two tiers exist because ONE metric would otherwise be dishonest:
+ *   - coverage   — famous creators who will most likely never claim. We list
+ *                  them so a fan checking their URL gets an answer at all.
+ *                  A claim rate here measures nothing and would read as a
+ *                  scoreboard on people who never opted in, so seedingMetrics
+ *                  deliberately does NOT compute one.
+ *   - conversion — mid-tail creators seeding is actively trying to convert.
+ *                  Claims-per-seed is the honest number for this tier only.
+ *
+ * The write happens in the SAME atomic batch as the passport creation
+ * (importer.applyProfile passes these statements to appendEvents), so metadata
+ * can never drift away from the listing it describes.
+ *
+ * CONSENT-BY-CLAIM (M5 review). A seeded listing may NOT carry a consent-gated
+ * taxonomy category (today: `adult`) while it is unclaimed. Unlike the seeding
+ * metadata here, a category IS public — reachable from the handle alone — so
+ * publishing it about someone who never opted in outs them. We will list an
+ * adult creator so a fan can check an account is really theirs; we will not
+ * publish the label until they claim and set it themselves. Enforced twice: in
+ * validateSeedMeta (itemized in the import report) and in setProfileMeta (the
+ * chokepoint that also covers the operator-override route).
+ */
+
+export const SEEDING_SOURCES = SEED_SOURCES;
+export const SEEDING_TIERS = SEED_TIERS;
+
+/** Documented defaults for a record that carries no seeding metadata: a
+ * hand-gathered OSINT listing added for coverage. Chosen so an untagged legacy
+ * import is never silently counted as a conversion attempt. */
+export const DEFAULT_SEED_SOURCE: SeedSource = "manual_osint";
+export const DEFAULT_SEED_TIER: SeedTier = "coverage";
+
+/**
+ * Categories whose listings MUST carry a written source note. The harm of a
+ * wrong adult listing is categorically worse than any other niche (outing,
+ * harassment, real-world safety), so "how do we know this?" has to be on the
+ * record BEFORE the row exists, not reconstructed afterwards.
+ *
+ * NOTE this is the WEAKER of the two adult rules and applies only once a
+ * creator has claimed. The strong one is the consent gate below: an unclaimed
+ * seed cannot carry a consent-gated category AT ALL, because a source note is
+ * operator-only bookkeeping and removes no public exposure.
+ */
+export const NOTE_REQUIRED_CATEGORIES: ReadonlySet<Category> = new Set<Category>(["adult"]);
+
+export class SeedingError extends Error {
+  override name = "SeedingError";
+}
+
+export interface SeedMeta {
+  source: SeedSource;
+  tier: SeedTier;
+  source_note: string | null;
+  category: Category | null;
+}
+
+/**
+ * Validate + default the seeding fields of a profile import record. PURE (no
+ * I/O) so importFile can run it on the dry-run path too — a dry run must not
+ * report "accepted" for a record the apply path would reject.
+ *
+ * Fail closed: an out-of-vocabulary category rejects; a consent-gated category
+ * on an unclaimed listing rejects outright; and (once claimed) an adult
+ * category without a non-empty source_note rejects.
+ *
+ * `claimed` describes the passport the record will produce. The importer always
+ * mints UNCLAIMED passports, so it passes false and the consent gate always
+ * fires there — the parameter exists so a future claimed-seed path inherits the
+ * weaker note rule instead of silently inheriting nothing.
+ */
+export function validateSeedMeta(rec: ProfileRecord, claimed = false): SeedMeta {
+  const source = rec.source ?? DEFAULT_SEED_SOURCE;
+  const tier = rec.tier ?? DEFAULT_SEED_TIER;
+  // Belt-and-braces: validateImportRecord already gates the vocabulary, but
+  // this module is also called directly (console/ops tooling), so re-check.
+  if (!(SEED_SOURCES as readonly string[]).includes(source)) throw new SeedingError(`unknown seeding source: ${String(source)}`);
+  if (!(SEED_TIERS as readonly string[]).includes(tier)) throw new SeedingError(`unknown seeding tier: ${String(tier)}`);
+
+  const rawNote = typeof rec.source_note === "string" ? rec.source_note.trim() : "";
+  if (rawNote.length > SOURCE_NOTE_MAX) throw new SeedingError(`source_note must be <= ${SOURCE_NOTE_MAX} chars`);
+  // The note is rendered in the ops console. REJECT markup/control characters
+  // at the source rather than stripping them (the display_name stance): a
+  // silently-rewritten provenance note is worse than a rejected line, because
+  // the operator would never learn their audit text was altered.
+  if (rawNote.includes("<") || rawNote.includes(">") || [...rawNote].some((ch) => ch.charCodeAt(0) < 0x20)) {
+    throw new SeedingError("source_note must contain no control or angle-bracket characters");
+  }
+  const source_note = rawNote === "" ? null : rawNote;
+
+  let category: Category | null = null;
+  if (rec.category !== undefined) {
+    if (!isCategory(rec.category)) throw new SeedingError(`unknown category: ${String(rec.category)}`);
+    category = rec.category;
+  }
+
+  // CONSENT GATE — the strong rule. We will list an adult creator so fans can
+  // check them; we will not PUBLISH the label that outs them until they claim.
+  // (Enforced again where the category is written — seedMetadataStmts below,
+  // which does NOT go through setProfileMeta — and in setProfileMeta for every
+  // later writer; this copy keeps the rejection itemized in the import report.)
+  if (category !== null && !claimed && CONSENT_REQUIRED_CATEGORIES.has(category)) {
+    throw new SeedingError(`the '${category}' category cannot be published for an unclaimed listing — the creator may set it themselves after claiming`);
+  }
+
+  // ADULT SAFEGUARD — the weaker rule, reachable once claimed: a
+  // categorized-adult listing needs written provenance on the record.
+  // #838 (D-0871(6)): trimmed is not visible — a note of only U+3164 or U+FFF9 is no provenance.
+  if (category !== null && NOTE_REQUIRED_CATEGORIES.has(category) && (source_note === null || !hasVisibleText(source_note))) {
+    throw new SeedingError(`a non-empty source_note is required for the '${category}' category`);
+  }
+  // I3-0787 b (I22-W1-AUTH): the shared display-text predicate, so line/paragraph separators, NEL, soft hyphens,
+  // zero-width and bidi-override characters are refused too (the C0 test above let them through). After the
+  // required-note rule, so a note with nothing visible still gets that rule's own answer.
+  if (source_note !== null && hasUnsafeDisplayText(source_note)) {
+    throw new SeedingError("source_note must contain no control, line- or paragraph-separator, invisible or direction-changing characters");
+  }
+
+  return { source, tier, source_note, category };
+}
+
+/**
+ * The statements that record seeding metadata for a freshly minted passport.
+ * Returned (not executed) so the caller can put them in the SAME batch as the
+ * passport_created / account_added append — one atomic write, no second write
+ * that can drift or half-fail.
+ */
+export function seedMetadataStmts(
+  db: DbLike,
+  passportId: string,
+  meta: SeedMeta,
+  batchId: string | null,
+  actor: string,
+  ts: string,
+): DbStatement[] {
+  const stmts: DbStatement[] = [
+    db
+      .prepare("INSERT INTO seed_metadata (passport_id, source, tier, batch_id, source_note, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind(passportId, meta.source, meta.tier, batchId, meta.source_note, ts),
+  ];
+  // The category is PUBLIC taxonomy (passport_profile), not seeding metadata —
+  // it lands in its own table exactly where a creator-set category would, so
+  // discovery/browse treat a seeded category identically to a self-set one.
+  // I3-1834: this raw write does not pass through setProfileMeta, so it carries
+  // setProfileMeta's consent refusal itself (taxonomy.ts, `claim_state ===
+  // "unclaimed"` branch): a seeded passport is freshly minted, hence unclaimed.
+  if (meta.category !== null && CONSENT_REQUIRED_CATEGORIES.has(meta.category)) {
+    throw new SeedingError(`the '${meta.category}' category cannot be published for an unclaimed listing — the creator may set it themselves after claiming`);
+  }
+  if (meta.category !== null) {
+    stmts.push(
+      db
+        .prepare("INSERT INTO passport_profile (passport_id, primary_category, secondary, language, region, updated_by, updated_at) VALUES (?, ?, '[]', NULL, NULL, ?, ?)")
+        .bind(passportId, meta.category, actor.slice(0, 128), ts),
+    );
+  }
+  return stmts;
+}
+
+/**
+ * ===========================================================================
+ * THE "NEVER RE-SEEDED" READ — ONE STATEMENT, TWO LEGS, EVERY DOOR.
+ * ===========================================================================
+ *
+ * "A delisted subject is never re-seeded" is the strongest promise this product
+ * makes, and until migration 0028 it was not recorded as a fact about the
+ * SUBJECT at all. It was recomputed at every enforcement point from a LIVE JOIN
+ * — `passport_accounts` → `request_suppressions` — and the suppression is keyed
+ * on `passport_id` while `account_transferred` is an `UPDATE passport_accounts
+ * SET passport_id = ?`. That statement MOVES the very row every one of those
+ * readers walks. Measured: one operator-adjudicated transfer off the delisted
+ * passport made `isSuppressedAccountKey` false, the next bulk import re-listed
+ * the person who asked to leave, their hash went back into the served buckets as
+ * `unclaimed`, and they became reportable and nominatable again — with nothing
+ * thrown and no operator signal (audit HIGH, 2026-08-26).
+ *
+ * So the promise now hangs off `suppressed_account_keys`: the account keys a
+ * suppression covers, FROZEN at suppression time and keyed on `account_key` —
+ * the canonical subject id, which nothing in this codebase can move from one row
+ * to another. `events.ts` still refuses the transfer (belt); this is the braces,
+ * and it holds against any future row movement nobody has written yet.
+ *
+ * TWO LEGS, AND IT IS A UNION — NEVER AN INTERSECTION. The live join stays,
+ * because the snapshot can only ever ADD refusals: a `request_suppressions` row
+ * written before 0028, or by any future writer that forgets to snapshot, must
+ * still refuse; and an account added to an ALREADY-suppressed passport (which
+ * did not exist to be frozen) is covered by the live leg alone.
+ *
+ * ONE STATEMENT, and that is load-bearing rather than tidy.
+ * `tests/invariants/suppression-oracles.test.ts` holds a suppressed subject's
+ * read to the SAME D1 statement SEQUENCE as a never-listed one's; two round
+ * trips where there used to be one would be a "did this person ask to be
+ * delisted?" oracle measured on the wire instead of in the body — the same
+ * oracle `reports.ts` STAGE 1b moved off the response and would have moved
+ * straight back onto the network. `UNION ALL … LIMIT 1` costs exactly what the
+ * single join cost: one prepared statement, one round trip, both legs on a
+ * PRIMARY KEY.
+ *
+ * BOUND TWICE, WITH ONE ARGUMENT. Callers get a ready-bound statement from
+ * `suppressedKeyStmt` rather than the SQL, so no caller can bind the key to one
+ * leg and forget the other — a half-bound union would fail OPEN.
+ */
+const SUPPRESSED_KEY_SQL = `SELECT 1 AS x FROM suppressed_account_keys k WHERE k.account_key = ?
+       UNION ALL
+       SELECT 1 AS x FROM passport_accounts a
+         JOIN request_suppressions s ON s.passport_id = a.passport_id
+        WHERE a.account_key = ?
+       LIMIT 1`;
+
+/**
+ * THE statement every "has this subject asked to be removed?" door runs: the
+ * importer, `POST /report`'s delisting shield, the nomination shield, and
+ * `account_added`. Returns it BOUND — see `SUPPRESSED_KEY_SQL` above.
+ *
+ * Deliberately UNFILTERED by account status and by passport retraction on BOTH
+ * legs — any historical link from this key to a suppressed passport is enough to
+ * refuse — and the 0028 backfill is unfiltered for exactly the same reason.
+ */
+export function suppressedKeyStmt(db: DbLike, accountKey: string): DbStatement {
+  return db.prepare(SUPPRESSED_KEY_SQL).bind(accountKey, accountKey);
+}
+
+/**
+ * FREEZE the account keys a suppression covers. Returned (not executed) so both
+ * removal-path writers (`verifyRemoval`, `resolveRemoval`) can put it in the
+ * SAME atomic batch as the `request_suppressions` INSERT it describes.
+ *
+ * THE ONE CALLER THAT CANNOT BATCH IT, stated rather than hidden: the ops lever
+ * `POST /ops/requests/:id/suppress` writes its suppression through
+ * `requests.ts setRequestSuppression`, the shared function that also validates
+ * the id and 404s an unknown passport, and that does its own single write. So
+ * the route runs this immediately afterwards instead. The failure window is
+ * covered by construction rather than by luck: a crash between the two leaves a
+ * suppression with NO snapshot, which is exactly the state the readers' UNION
+ * exists to handle (the live leg still refuses), so the delisting is fully in
+ * force either way — and the transfer guard in `events.ts` keeps that window
+ * from being exploitable even in principle.
+ *
+ * GUARDED ON THE SUPPRESSION ROW EXISTING, and that is not decoration. Both
+ * removal-path suppressions are themselves conditional INSERTs (the seeded-shape
+ * re-test in `verifyRemoval`, the still-open re-test in `resolveRemoval`), so an
+ * unguarded snapshot would freeze a key FOREVER on a call whose suppression
+ * legitimately declined — a permanent, invisible refusal to list somebody nobody
+ * ever delisted. Inside a batch the statements share a transaction, so this sees
+ * the INSERT that precedes it, exactly as `removal.ts`'s state UPDATE does.
+ *
+ * As WIDE as the read above: every account of the passport, whatever its status,
+ * whatever the passport's retraction. `ON CONFLICT DO NOTHING` keeps the FIRST
+ * freeze — a key already promised to one subject is not re-attributed by a later
+ * suppression of a passport that acquired it.
+ */
+export function snapshotSuppressedKeysStmt(db: DbLike, passportId: string, operator: string, ts: string): DbStatement {
+  return db
+    .prepare(
+      `INSERT INTO suppressed_account_keys (account_key, passport_id, operator, created_at)
+       SELECT a.account_key, a.passport_id, ?, ?
+         FROM passport_accounts a
+        WHERE a.passport_id = ?
+          AND EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = ?)
+       ON CONFLICT(account_key) DO NOTHING`,
+    )
+    .bind(operator, ts, passportId, passportId);
+}
+
+/**
+ * THAW them — the other half of the declared unsuppress ceremony. Returned (not
+ * executed) so the lift deletes from BOTH tables together.
+ *
+ * The ORDER matters and the lift route states it: the snapshot is dropped BEFORE
+ * the `request_suppressions` row, so a half-applied lift leaves the subject
+ * STILL SUPPRESSED (the live leg still refuses) rather than still listed but
+ * un-relistable. Both directions of a partial failure are then "the removal is
+ * still in force", which is the only fail-closed direction there is here.
+ */
+export function unsnapshotSuppressedKeysStmt(db: DbLike, passportId: string): DbStatement {
+  return db.prepare("DELETE FROM suppressed_account_keys WHERE passport_id = ?").bind(passportId);
+}
+
+/**
+ * Does this canonical account key belong to a subject that asked to be removed?
+ *
+ * The other half of the "never re-seeded" promise: a removal has to be
+ * permanent against the seeding tool itself, or the next bulk import quietly
+ * re-lists the person who left. Deliberately UNFILTERED by account status and
+ * by passport retraction — any historical link from this key to a suppressed
+ * passport is enough to refuse.
+ *
+ * IT IS AN EXACT STRING MATCH, AND THAT IS ONLY SOUND BECAUSE THE CANONICALIZER
+ * COLLAPSES SPELLINGS. Nothing is normalized here on purpose: `accountKey` is
+ * already the output of `subjectForAccount`/`canonicalizeLink`, so re-normalizing
+ * it would be a second, drifting copy of the rule that decides identity — the
+ * single-construction-point property `canonicalAccount` exists to hold.
+ *
+ * The load-bearing consequence is that this check is EXACTLY as strong as the
+ * canonicalizer under it, and for `link` subjects it briefly was not strong
+ * enough: RFC 3986 leaves several spellings of one page (`/Alice`, `/%41lice`,
+ * `//Alice`, a doubled `www.`), each of which built a DIFFERENT key, so a
+ * suppressed subject could be re-seeded under a spelling their removal never
+ * covered. Fixed where it belongs — in `buildNorm`/`normalizeHost` — so the
+ * variants now arrive here as the same key the suppression already holds
+ * (`tests/invariants/seeding.test.ts`, "a suppressed LINK cannot be re-seeded
+ * under an equivalent RFC 3986 spelling"). Any future widening of what a
+ * canonical id may contain has to ask this question again.
+ *
+ * SINCE MIGRATION 0028 it is the two-leg union above rather than the live join
+ * alone, so it no longer depends on `passport_accounts.passport_id` still
+ * pointing where it pointed when the person asked to leave.
+ */
+export async function isSuppressedAccountKey(db: DbLike, accountKey: string): Promise<boolean> {
+  const row = await suppressedKeyStmt(db, accountKey).first<{ x: number }>();
+  return row !== null;
+}
+
+export interface TierMetrics {
+  seeded: number;
+  live: number; // not retracted
+  requests: number; // fan "please claim this" requests against seeded passports
+  requests_per_seed: number;
+  suppressed: number;
+  /** Conversion tier ONLY. Absent for coverage — see the module header. */
+  claimed?: number;
+  claims_per_seed?: number;
+}
+
+export interface SeedingMetrics {
+  generated_at: string;
+  total_seeded: number;
+  by_source: { source: string; seeded: number }[];
+  tiers: { coverage: TierMetrics; conversion: TierMetrics };
+  /** Seeded passports an operator has suppressed (the removal signal). */
+  suppressed_total: number;
+}
+
+const rate = (n: number, d: number): number => (d === 0 ? 0 : Math.round((n / d) * 1000) / 1000);
+const num = (v: unknown): number => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+
+/**
+ * Operator-only seeding scoreboard. Five bounded GROUP BY aggregates over
+ * seed_metadata (never a per-row walk), so the cost is O(distinct tiers/sources)
+ * regardless of how many passports have been seeded.
+ */
+export async function seedingMetrics(db: DbLike, now: () => string = () => new Date().toISOString()): Promise<SeedingMetrics> {
+  const bySource = (await db.prepare("SELECT source, COUNT(*) AS n FROM seed_metadata GROUP BY source ORDER BY n DESC, source ASC").bind().all<{ source: string; n: number }>()).results;
+
+  const byTier = (await db
+    .prepare(
+      `SELECT m.tier AS tier, COUNT(*) AS n, SUM(CASE WHEN p.retracted = 0 THEN 1 ELSE 0 END) AS live
+       FROM seed_metadata m JOIN passports p ON p.passport_id = m.passport_id GROUP BY m.tier`,
+    )
+    .bind()
+    .all<{ tier: string; n: number; live: number }>()).results;
+
+  // Claims per seed — CONVERSION ONLY. A coverage-tier claim rate is a
+  // scoreboard on people who never opted in, so the query itself is scoped.
+  const claimsByTier = (await db
+    .prepare(
+      `SELECT m.tier AS tier, COUNT(*) AS n FROM seed_metadata m
+       JOIN passports p ON p.passport_id = m.passport_id
+       WHERE m.tier = 'conversion' AND p.retracted = 0 AND p.claim_state IN ('claimed','verified')
+       GROUP BY m.tier`,
+    )
+    .bind()
+    .all<{ tier: string; n: number }>()).results;
+
+  const requestsByTier = (await db
+    .prepare(
+      `SELECT m.tier AS tier, COUNT(*) AS n FROM creator_requests r
+       JOIN seed_metadata m ON m.passport_id = r.passport_id GROUP BY m.tier`,
+    )
+    .bind()
+    .all<{ tier: string; n: number }>()).results;
+
+  const suppressedByTier = (await db
+    .prepare(
+      `SELECT m.tier AS tier, COUNT(*) AS n FROM seed_metadata m
+       JOIN request_suppressions s ON s.passport_id = m.passport_id GROUP BY m.tier`,
+    )
+    .bind()
+    .all<{ tier: string; n: number }>()).results;
+
+  const pick = (rows: { tier: string; n: number }[], tier: string): number => num(rows.find((r) => r.tier === tier)?.n);
+  const build = (tier: SeedTier): TierMetrics => {
+    const t = byTier.find((r) => r.tier === tier);
+    const seeded = num(t?.n);
+    const requests = pick(requestsByTier, tier);
+    const base: TierMetrics = {
+      seeded,
+      live: num(t?.live),
+      requests,
+      requests_per_seed: rate(requests, seeded),
+      suppressed: pick(suppressedByTier, tier),
+    };
+    if (tier !== "conversion") return base;
+    const claimed = pick(claimsByTier, tier);
+    return { ...base, claimed, claims_per_seed: rate(claimed, seeded) };
+  };
+
+  const coverage = build("coverage");
+  const conversion = build("conversion");
+  return {
+    generated_at: now(),
+    total_seeded: bySource.reduce((a, r) => a + num(r.n), 0),
+    by_source: bySource.map((r) => ({ source: r.source, seeded: num(r.n) })),
+    tiers: { coverage, conversion },
+    suppressed_total: coverage.suppressed + conversion.suppressed,
+  };
+}
+
+export interface SeedListRow {
+  passport_id: string;
+  display_name: string | null;
+  claim_state: string;
+  retracted: number;
+  source: string;
+  tier: string;
+  batch_id: string | null;
+  source_note: string | null;
+  created_at: string;
+  requests: number;
+  suppressed: boolean;
+}
+
+export interface SeedListOpts {
+  tier?: string;
+  source?: string;
+  batch?: string;
+  limit?: number;
+  offset?: number;
+}
+
+export const SEED_LIST_MAX = 200;
+export const SEED_LIST_MAX_OFFSET = 100_000;
+
+/**
+ * Paginated operator listing of seeded passports WITH their metadata. Bounded
+ * on every axis: the page size clamps to 200, an offset past 100k serves no
+ * page and returns `truncated: true`, and
+ * an out-of-vocabulary tier/source filter returns nothing rather than being
+ * ignored (a typo must not silently widen the result set).
+ */
+export async function seedingList(db: DbLike, opts: SeedListOpts = {}): Promise<{ rows: SeedListRow[]; limit: number; offset: number; truncated: boolean }> {
+  const limit = Math.max(1, Math.min(SEED_LIST_MAX, Math.floor(opts.limit ?? 50) || 50));
+  const asked = Math.max(0, Math.floor(opts.offset ?? 0) || 0);
+  // I3-1833: past the cap, serve NOTHING and say so — never the clamped page
+  // again under a different offset (the console's Next re-served it forever).
+  if (asked > SEED_LIST_MAX_OFFSET) return { rows: [], limit, offset: asked, truncated: true };
+  const offset = asked;
+
+  const where: string[] = [];
+  const binds: unknown[] = [];
+  if (opts.tier !== undefined) {
+    if (!(SEED_TIERS as readonly string[]).includes(opts.tier)) return { rows: [], limit, offset, truncated: false };
+    where.push("m.tier = ?");
+    binds.push(opts.tier);
+  }
+  if (opts.source !== undefined) {
+    if (!(SEED_SOURCES as readonly string[]).includes(opts.source)) return { rows: [], limit, offset, truncated: false };
+    where.push("m.source = ?");
+    binds.push(opts.source);
+  }
+  if (opts.batch !== undefined) {
+    where.push("m.batch_id = ?");
+    binds.push(opts.batch.slice(0, 64));
+  }
+  const clause = where.length > 0 ? `WHERE ${where.join(" AND ")}` : "";
+
+  const { results } = await db
+    .prepare(
+      `SELECT m.passport_id, m.source, m.tier, m.batch_id, m.source_note, m.created_at,
+              p.display_name, p.claim_state, p.retracted,
+              (SELECT COUNT(*) FROM creator_requests r WHERE r.passport_id = m.passport_id) AS requests,
+              (SELECT COUNT(*) FROM request_suppressions s WHERE s.passport_id = m.passport_id) AS suppressed
+       FROM seed_metadata m JOIN passports p ON p.passport_id = m.passport_id
+       ${clause}
+       ORDER BY m.created_at DESC, m.passport_id DESC LIMIT ? OFFSET ?`,
+    )
+    .bind(...binds, limit, offset)
+    .all<{
+      passport_id: string;
+      source: string;
+      tier: string;
+      batch_id: string | null;
+      source_note: string | null;
+      created_at: string;
+      display_name: string | null;
+      claim_state: string;
+      retracted: number;
+      requests: number;
+      suppressed: number;
+    }>();
+
+  return {
+    limit,
+    offset,
+    truncated: false,
+    rows: results.map((r) => ({
+      passport_id: r.passport_id,
+      display_name: r.display_name,
+      claim_state: r.claim_state,
+      retracted: num(r.retracted),
+      source: r.source,
+      tier: r.tier,
+      batch_id: r.batch_id,
+      source_note: r.source_note,
+      created_at: r.created_at,
+      requests: num(r.requests),
+      suppressed: num(r.suppressed) > 0,
+    })),
+  };
+}
+===== END FILE: services/trust-core/src/seeding.ts =====
+
+===== BEGIN FILE: services/trust-core/src/seo-page.ts =====
+import { canonicalAccount } from "@dhwaja/canonical";
+import type { DbLike } from "./db.js";
+import { shieldedSqlPredicate } from "./account-visibility.js";
+import { absHttps, accountDisplay, getPassportView, isPagePath, isSeoPlatform, type PassportView, kindDisclosure, ratingsNote, SEO_HANDLE_RE as HANDLE_RE } from "./passport-view.js";
+// #902a (D-0920): the /is/ vocabulary and syntax gates and `isPagePath` live in passport-view.ts (the module this
+// one already imports), so the two no longer import each other; re-exported for every existing importer.
+export { isPagePath, isSeoPlatform };
+import { HOW_PATH, HOW_SUMMARY } from "./how-page.js";
+import { translator, type MessageKey } from "@dhwaja/i18n";
+import { esc, profileFooterFine, renderShell, VERDICTS, verdictPill, withEmphasis } from "./ssr-shell.js";
+
+/**
+ * flag 12 — the "Is @X real?" page: `GET /is/:platform/:handle`.
+ *
+ * This is the search-engine front door to the whole product. A fan types
+ * "is @candyqueen real" into Google; the answer they land on has to be the
+ * verdict itself, above the fold, in words a crawler can index — the hash-routed
+ * SPA cannot be indexed and the k-anonymous check path deliberately never sees a
+ * URL, so neither can serve this moment.
+ *
+ * Same posture as discovery-page.ts / the `/p/:id` share landing: a minimal,
+ * DEPENDENCY-FREE, server-rendered document, every dynamic value `esc()`'d,
+ * canonical/og from CONFIGURED env only (never the client-controlled Host
+ * header), and — the one exception — a single `<script type="application/ld+json">`
+ * FAQ block, serialized with JSON.stringify and `<`/`>`/`&` escaped to `\u00xx`
+ * so no display name can break out of the string, the script, or the document.
+ *
+ * WHAT GETS A PAGE (the whole privacy surface):
+ *  - the handle must canonicalize through @dhwaja/canonical — THE canonicalizer,
+ *    the same account key the registry and the extension check path use, never a
+ *    hand-rolled string;
+ *  - that key must be an ACTIVE account of a LISTED (non-retracted) passport that
+ *    is NOT suppressed by a removal request; and
+ *  - the account must survive the S101 asserted-but-unproven gate, which it does
+ *    by construction: the page lists only what `getPassportView` already serves
+ *    publicly on `/p/:id`, and requires THIS account to be in that list.
+ * Everything else — miss, malformed, suppressed, retracted, asserted-unproven —
+ * is the same hard 404 with the same bytes. No soft-404, no "we know that handle
+ * but won't say" page, no existence oracle beyond what /p/:id already answers.
+ *
+ * CONSENT-BY-CLAIM IS WHAT UNLOCKS INDEXABILITY. Serving a page and asking a
+ * search engine to rank it are different acts. An UNCLAIMED listing was compiled
+ * by US from public information; its subject never opted in, so publishing their
+ * cross-platform roster at a handle-addressable, SEO-optimized URL would be an
+ * outing tool — it ties an adult handle to a mainstream one under a real-sounding
+ * display name, and hands crawlers structured data to rank. So an unclaimed
+ * subject's page is `noindex,nofollow`, shows ONLY the account the visitor
+ * actually asked about, emits no JSON-LD, and carries NO passport id anywhere in
+ * its bytes (the link to /p/:id is the roster, one hop away); the fan who
+ * followed a link still gets their answer. Claimed/verified — where the creator proved control and
+ * opted into the surface — index in full. Same gate every other outward-pushing
+ * surface already applies (rankings.ts serves claimed/verified only). A
+ * removal-request suppression remains the opt-out for EVERY state, verified included.
+ */
+
+
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+
+/**
+ * JSON for a `<script type="application/ld+json">` body. `</script>` inside a
+ * string literal would otherwise end the element and hand the rest of the value
+ * to the HTML parser, so every `<`, `>` and `&` becomes a JSON `\u00xx` escape
+ * (still the same string to a JSON-LD consumer) — plus U+2028/9, which are raw
+ * newlines to a JS parser. This is the one place on the page that is not
+ * `esc()`'d, because HTML escaping inside a script element does NOT apply.
+ */
+export function jsonLdScriptBody(value: unknown): string {
+  return JSON.stringify(value).replace(/[<>&\u2028\u2029]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+
+
+export interface IsPageData {
+  /** Canonical platform key (the URL's own segment). */
+  platform: string;
+  /** Canonical (lowercased) handle — what canonicalAccount produced. */
+  handle: string;
+  /** Exactly what `/p/:id` already serves publicly. Nothing on this page comes
+   * from anywhere else — no new exposure is invented here. */
+  view: PassportView;
+}
+
+/**
+ * Resolve `/is/:platform/:handle` → the page data, or null for the one 404.
+ * Null covers every absence identically: bad platform, bad handle shape,
+ * uncanonicalizable id, no such account, revoked account, retracted passport,
+ * suppressed passport, or an asserted-but-unproven account the public passport
+ * view already refuses to list.
+ */
+export async function resolveIsPage(db: DbLike, platform: string, handle: string): Promise<IsPageData | null> {
+  if (!isSeoPlatform(platform) || !HANDLE_RE.test(handle)) return null;
+
+  // THE canonicalizer. Never a hand-rolled `v1|...` string: divergence between
+  // this key and the registry's is the defining failure mode of the design.
+  let key: string;
+  let id: string;
+  try {
+    const subject = canonicalAccount(platform, "handle", handle);
+    // Belt & suspenders: the platform must not have been re-mapped (aliases are
+    // refused above) and the id must be exactly the lowercased path segment, so
+    // the URL we canonicalize to is the URL we resolved.
+    if (subject.platform !== platform || subject.id !== handle.toLowerCase()) return null;
+    key = subject.canonical;
+    id = subject.id;
+  } catch {
+    return null; // CanonicalizeError → not a subject → not a page
+  }
+
+  // A removal-request suppression always wins (the flag-5 stance shared with the
+  // feed, the demand card and the request counter): the creator asked not to be
+  // a public surface, so an indexable page is exactly what must not exist.
+  //
+  // ON THE SAME STATEMENT, DELIBERATELY — the `livePassport` rule, applied to the
+  // one public route keyed by a HANDLE rather than an unguessable passport id,
+  // i.e. the most probeable surface in the product. Asked as a SECOND statement
+  // after the account read, a suppressed handle cost 3 D1 round trips where a
+  // never-listed one cost 2, behind byte-identical 404 bytes: a delisting oracle
+  // needing no calibration, on an input (a handle) the attacker already holds
+  // (review HIGH 2, this pass). The account row cannot be read and then filtered
+  // in TypeScript either — that is the same second round trip wearing a
+  // different hat. I3-0957 (I22-W1-LEDGER): a RETRACTED passport's handle is answered here too, by the
+  // `p.retracted = 0` EXISTS, rather than later by getPassportView's livePassport one statement deeper.
+  // `NOT EXISTS` is the idiom `livePassport`,
+  // `releases.ts getReleaseProvenance` and `requests.ts listOwnRequests` use.
+  const row = await db
+    .prepare(
+      `SELECT a.passport_id AS passport_id
+         FROM passport_accounts a
+        WHERE a.account_key = ? AND a.status = 'active'
+          AND NOT EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = a.passport_id)
+          AND EXISTS (SELECT 1 FROM passports p WHERE p.passport_id = a.passport_id AND p.retracted = 0)
+          AND NOT ${shieldedSqlPredicate()}`,
+    )
+    .bind(key)
+    .first<{ passport_id: string }>();
+  if (!row || !PSP_RE.test(row.passport_id)) return null;
+
+  // P1 RIDES THE SAME STATEMENT, for the reason written directly above and not
+  // as an optimisation. `getPassportView` below drops shielded accounts too, and
+  // the `listed` check after it would already 404 this page — but only after
+  // `livePassport`, the roster read, `accountProvenance`,
+  // `assertedKeysForPassport`, a per-row `accountProofStanding` and
+  // `impostorCount`'s unscoped scan had all run. Identical bytes reached ~10x
+  // later is the timing oracle this resolve was rewritten to close, so the
+  // shield is answered here, where a suppression is answered, and the second
+  // check below stays as the thing that cannot be forgotten rather than the
+  // thing doing the work.
+  //
+  // The public view is the ONLY source of page content — it already applies the
+  // retracted/unknown gate, the S101 asserted-unproven drop, and the flag-1
+  // impostor count with its own suppression rule.
+  const view = await getPassportView(db, row.passport_id);
+  if (!view) return null;
+
+  // This account must be one the public passport page itself lists. An account
+  // the S101 gate dropped gets no page — otherwise this route would launder an
+  // unproven famous handle into an indexed "yes, that's them".
+  const listed = view.accounts.some((a) => a.platform === platform && a.handle === id && a.status === "active");
+  if (!listed) return null;
+
+  return { platform, handle: id, view };
+}
+
+/** Verdict presentation. Icon + text label are MANDATORY and color is only an
+ * accent (design system §4: never color alone — greyscale screenshots, embeds,
+ * color-blind readers). Hexes mirror the `--verified`/`--claimed`/`--unclaimed`
+ * tokens by value, like card-render and badge.ts do. */
+/**
+ * THE VERDICT WORD STAYS HERE; THE SENTENCE MOVED.
+ *
+ * `word` is the state's LABEL — the same vocabulary the four clients pin by
+ * value in their own tables, and localizing it is the cross-client collision the
+ * roadmap records as a separate decision. `answerKey` names the sentence that
+ * explains it, which is page copy and belongs in the catalogue.
+ */
+const VERDICT: Record<PassportView["claim_state"], { word: string; icon: string; color: string; answerKey: MessageKey }> = {
+  verified: { ...VERDICTS.verified, word: "Verified", answerKey: "is.answer_verified" },
+  claimed: { ...VERDICTS.claimed, word: "Claimed", answerKey: "is.answer_claimed" },
+  unclaimed: { ...VERDICTS.unclaimed, word: "Unclaimed", answerKey: "is.answer_unclaimed" },
+};
+
+/** A locale-bound lookup. The catalogue returns TEXT; this file escapes it. */
+type Translate = (key: MessageKey, vars?: Readonly<Record<string, string>>) => string;
+
+export interface IsPageOpts {
+  /** Negotiated from `Accept-Language` by the route; English otherwise. */
+  locale?: string;
+  /** Absolute PUBLIC_BASE_URL + canonical path — built by the ROUTE from env and
+   * the ALREADY-VALIDATED platform/handle, never from the Host header. */
+  canonicalUrl?: string | null;
+  /** Absolute APP_ORIGIN deep link into the interactive SPA. */
+  appHref?: string | null;
+  /** I3-0392 — CONSOLE_ORIGIN (absolute https origin). On an UNCLAIMED page the
+   * claim block links to `${consoleOrigin}/#/signin` with NO passport id (this
+   * page must carry none in its bytes); unset or misshapen → no block. */
+  consoleOrigin?: string | null;
+  /** N-04 (D-0699): LISTING-POLICY §5's no-account correction/removal intake,
+   * same as passport-view.ts `PassportPageOpts.removeHref` — absolute
+   * APP_ORIGIN link to `#/remove`. Rendered only for an unclaimed listing;
+   * absent or misshapen → the block is omitted. See `removeBlock` below. */
+  removeHref?: string | null;
+  /**
+   * F19 / #4 — THE CREATOR'S SHARE CARD, inline.
+   *
+   * The check-result share card, and the shape it had to take. A positive check
+   * returns NO passport id — the k-anonymous bucket entry carries a hash, a
+   * trust class, a per-account confirmation flag and a subject kind, and that is
+   * all (`registry.ts RegistryEntry`; `views.ts checkResultView` already says so
+   * in as many words). So a fan holding a green answer cannot build a card for
+   * the creator, because they do not know who the creator is. The only ways to
+   * close that gap are to publish passport ids in the buckets or to make a
+   * second lookup that tells the server which handle was checked — both give
+   * away the property the whole check design exists for.
+   *
+   * So the card lives HERE, on the page the fan reaches by deliberately
+   * following a link out of the anonymous check. The page has already resolved
+   * the passport server-side, and `buildShareCardSvg` returns null for
+   * unclaimed, retracted and suppressed — the same gate this page's own
+   * `indexable` rule applies, arrived at independently.
+   *
+   * INLINE, NOT `og:image`. `/p/:id`'s own note is the reason: platforms do not
+   * accept SVG and PNG rasterisation is not worth a dependency. An `og:image`
+   * tag pointing at an SVG would be ignored by most unfurlers, so it would be a
+   * tag that looks like a feature. The card is screenshot-native instead — a
+   * screenshot of this page IS the share artifact, which is what `/p/:id`
+   * already relies on.
+   */
+  cardSvg?: string | null;
+  /** I3-1850: true when the card has no (complete) Power Ratings — the same note
+   * `/p/:id` renders (passport-view.ts `ratingsNote`). */
+  ratingsNull?: boolean;
+}
+
+/** One known account as a table row — the SAME exposure as `/p/:id` (platform,
+ * handle, status, http(s)-only link, provenance), never more. The provenance
+ * mark says WHO ASSERTED the row, not that it is true.
+ *
+ * The platform and identity cells go through the SHARED `accountDisplay` rule,
+ * so a Tier-2 `link` prints as "web link" plus its bare URL here too. This page
+ * is the crawlable one — it was rendering `link @livejasmin.com/en/chat/RileyMoon`
+ * into search results, which is both a fake handle and a fake platform. */
+function accountRow(a: PassportView["accounts"][number], hereOn: string, hereId: string, m: Translate): string {
+  const here = a.platform === hereOn && a.handle === hereId;
+  const link = a.url && /^https?:\/\//i.test(a.url) ? ` <a href="${esc(a.url)}" rel="nofollow noopener">link</a>` : "";
+  const mark =
+    a.touched_by === "creator"
+      ? `<span class="mark creator">${esc(m("is.mark_by_creator"))}</span>`
+      : a.touched_by === "agency"
+        ? `<span class="mark agency">${esc(m("is.mark_by_agency"))}</span>`
+        : `<span class="mark none">${esc(m("mark.listed_by_dhwaja"))}</span>`;
+  // THE CONFIRMATION MARK, WHICH THIS PAGE USED TO DROP.
+  //
+  // `/p/:id` renders it and this page did not, so the same row read "! not
+  // confirmed" on the passport page and carried no qualification at all on the
+  // crawlable one — under an H1 that names the handle and an answer that said
+  // Dhwaja had confirmed control of it. F15's per-account link is what made the
+  // two adjacent (one click apart, with the affirmative one asked to be
+  // indexed), and an adversarial review measured the contradiction on a
+  // three-way CHOOSER, whose whole purpose is "pick the real one from a vetted
+  // set": all three alternates were marked unconfirmed on `/p/:id` and each
+  // linked to a page asserting confirmed control. `confirmed` is a SECOND,
+  // ORTHOGONAL AXIS to `touched_by` — who asserted the row versus whether
+  // anybody ever checked — and a page that publishes one without the other
+  // launders exactly the case the axis exists for.
+  const confirm = a.confirmed ? "" : ` <span class="mark unconfirmed" title="${esc(m("pv.unconfirmed_title"))}">${esc(m("pv.unconfirmed"))}</span>`;
+  const state = a.status !== "active" ? ` <span class="m">(${esc(a.status)})</span>` : "";
+  const shown = accountDisplay(a.platform, a.handle);
+  return `<tr${here ? ' class="here"' : ""}><td>${esc(shown.platform)}</td><td><code>${esc(shown.ident)}</code>${here ? ` <span class="m">${esc(m("is.here_note"))}</span>` : ""}${state}${link}</td><td>${mark}${confirm}</td></tr>`;
+}
+
+/**
+ * The crawlable answer page. Script-free apart from the JSON-LD FAQ block; no
+ * remote fonts/CSS/images (CSP `default-src 'none'; style-src 'unsafe-inline'`).
+ */
+export function renderIsPageHtml(d: IsPageData, opts: IsPageOpts = {}): string {
+  const locale = opts.locale ?? "en";
+  const m = translator(locale);
+  const v = d.view;
+  const meta = VERDICT[v.claim_state] ?? VERDICT.unclaimed;
+  const who = v.display_name;
+  const at = `@${d.handle}`;
+  const title = m("is.title", { at, platform: d.platform, word: meta.word });
+  // THE ANSWER IS SCOPED TO THE ROW THE VISITOR ASKED ABOUT.
+  //
+  // `meta.answerKey` is keyed on the PASSPORT's claim state, and for a verified
+  // subject it said "Dhwaja confirmed both account control and identity" — about
+  // whichever handle is in the URL. A verified passport legitimately carries
+  // rows nobody ever proved (operator-listed OSINT, which is most of the
+  // registry's coverage) and rows whose proof has lapsed, and `getPassportView`
+  // keeps-and-marks both rather than hiding them. So the affirmative sentence
+  // was being made about accounts that had had no check at all, on the crawlable
+  // page, in the og description, and inside the JSON-LD `acceptedAnswer` — the
+  // three places it is hardest to correct once indexed.
+  //
+  // The verdict WORD is untouched: it is the subject's own state, it is the
+  // cross-client pinned vocabulary, and it is not a claim about this row. What
+  // is scoped is the sentence.
+  const asked = v.accounts.find((a) => a.platform === d.platform && a.handle === d.handle) ?? null;
+  const askedConfirmed = asked ? asked.confirmed : false;
+  const answerKey: MessageKey = askedConfirmed || v.claim_state === "unclaimed" ? meta.answerKey : v.claim_state === "verified" ? "is.answer_verified_unconfirmed" : "is.answer_claimed_unconfirmed";
+  const answer = m(answerKey, { name: who });
+  // The same derivation `/p/:id` and the PSA use — three surfaces disclosing one
+  // fact in three phrasings is how one of them drifts.
+  const kind = kindDisclosure(v.subject_kind, m);
+  // The description is the og/twitter unfurl AND the crawler's snippet, and it
+  // said only the verdict — so a shared link to a verified AI character read
+  // "Verified: this is really them" next to a human-looking handle, in the one
+  // place nobody clicks through. The plain sentence goes first because an unfurl
+  // truncates from the right.
+  const description = (kind.plain ? `${kind.plain} ${meta.word}: ${answer}` : `${meta.word}: ${answer}`).slice(0, 300);
+  const canon = absHttps(opts.canonicalUrl);
+  const app = absHttps(opts.appHref, "#");
+
+  // flag 1: the impostor line rides the public view's `impostor_count`, which is
+  // ABSENT at zero by construction — so there is no "0 known fakes" copy to
+  // render, and a suppressed passport never reaches this page at all.
+  const fakes = typeof v.impostor_count === "number" && v.impostor_count > 0 ? v.impostor_count : null;
+  // TWO KEYS, NOT ONE WITH A PLURAL RULE. English needs "1 known fake" and "N
+  // known fakes"; other languages need more forms than that, and inventing a
+  // pluralization engine here would be building the wrong thing at the wrong
+  // time. Selecting the key by count keeps both forms visible to a translator.
+  // The `<strong>` around the opening clause is RESTORED: this is the
+  // impersonation warning on the page a search engine sends a worried fan to,
+  // and its emphasis is not decoration. Message and run are both catalogue text,
+  // escaped separately; `withEmphasis` writes the only tag. I3-1995: the display
+  // name rides withEmphasis' `plain` map (its `{name}` token left in the message),
+  // so a name containing `{strong}` is inserted once and never re-scanned.
+  const fakesLine = fakes
+    ? `<p class="fakes">${withEmphasis(esc(m(fakes === 1 ? "is.fakes_one" : "is.fakes_many", { count: String(fakes), name: "{name}" })), { strong: esc(m(fakes === 1 ? "is.fakes_one_strong" : "is.fakes_many_strong", { count: String(fakes) })) }, "strong", { name: esc(who) })}</p>`
+    : "";
+
+  // CONSENT-BY-CLAIM (review FIX 1): an UNCLAIMED listing is OSINT compiled from
+  // public information by us, not by its subject — so it gets the answer, but not
+  // the amplification. Indexing an unclaimed subject's cross-platform roster under
+  // their handle is an outing vector: it ties, say, an adult handle to a mainstream
+  // one plus a real-sounding display name, and hands search engines a structured
+  // artifact to rank. Claiming is the consent signal that unlocks indexability
+  // (the same gate every other outward-pushing surface uses — rankings.ts serves
+  // claimed/verified only). Suppression stays the opt-out for EVERY state.
+  const indexable = v.claim_state !== "unclaimed";
+
+  // Unclaimed → ONLY the account the visitor asked about. The direct-visitor
+  // answer is intact; the cross-platform roster (still on /p/:id, where it is not
+  // handle-addressable) is not republished under this handle's URL.
+  // I3-0149: a claimed/verified subject's page ALSO shows only the asked row.
+  // One indexable /is/ page per handle stays (the search intent is per handle),
+  // but repeating the full roster on every sibling made them near-duplicates;
+  // the roster lives on /p/:id, linked below.
+  const shown = v.accounts.filter((a) => a.platform === d.platform && a.handle === d.handle);
+  const rows = shown.map((a) => accountRow(a, d.platform, d.handle, m)).join("");
+  const accountsHeading = esc(m("is.accounts_heading_asked"));
+  // ...AND NO PASSPORT LINK EITHER, for the same reason (review HIGH 2). Hiding
+  // the roster and then printing `<a href="/p/psp_…">` next to it withheld
+  // nothing: `GET /p/:id/json` returns the whole cross-platform roster, so the
+  // handle→roster path was two deterministic hops, and `rel="nofollow"` is an
+  // instruction to a crawler, not a limit on a script. The passport id is the
+  // ONLY thing on this page that resolves the handle to the rest of the
+  // listing, so an unclaimed page must not carry it at all — not in a link, not
+  // in a data attribute, not in the JSON-LD (which it already omits). A fan who
+  // followed a link still gets the verdict and the account they asked about,
+  // which is the whole protective function; the roster stays on /p/:id, where
+  // it is not addressable from a handle. Claimed/verified — where the creator
+  // proved control and opted in — links as before.
+  // I3-0149: the /is/ page shows the asked row only, so the link says how many
+  // OTHER accounts the profile lists (is.more_accounts_*), else the plain profile link.
+  const others = v.accounts.length - shown.length;
+  const profileText = others > 0 ? m(others === 1 ? "is.more_accounts_one" : "is.more_accounts_many", { count: String(others) }) : m("is.profile_link", { name: who });
+  const profile = indexable && PSP_RE.test(v.passport_id) ? `<p class="more"><a href="/p/${v.passport_id}">${esc(profileText)}</a></p>` : "";
+  // I3-0392: the unclaimed page gets the same claim block /p/:id uses
+  // (passport-view.ts claimBlock), built HERE from the origin so no passport id
+  // can reach its href. No valid https origin → no block (a dead button is worse).
+  const consoleOrigin = absHttps(opts.consoleOrigin);
+  const claimBlock =
+    !indexable && consoleOrigin
+      ? `<div class="claimcta"><h2>${esc(m("pv.claim_heading"))}</h2><p>${esc(m("pv.claim_body"))}</p><p><a class="claimbtn" href="${esc(`${consoleOrigin.replace(/\/+$/, "")}/#/signin`)}" rel="noopener nofollow">${esc(m("pv.claim_cta"))}</a></p></div>`
+      : "";
+
+  // N-04 (D-0699): LISTING-POLICY §5 promises anyone listed without signing up
+  // a correction/removal path with "no proof, no account needed". Same gate
+  // and same markup as passport-view.ts `removeBlock` — independent of
+  // `claimBlock` (this intake needs APP_ORIGIN, not CONSOLE_ORIGIN). No valid
+  // `removeHref` → omitted.
+  const removeHref = !indexable ? absHttps(opts.removeHref, "#") : null;
+  const removeBlock =
+    removeHref !== null
+      ? `<div class="hint"><h2>${esc(m("pv.remove_heading"))}</h2><p>${esc(m("pv.remove_body"))}</p><p><a href="${esc(removeHref)}" rel="nofollow">${esc(m("pv.remove_cta"))}</a></p></div>`
+      : "";
+
+  // Structured data is an INDEXING AID, so it is built (and emitted) only for a
+  // consenting — claimed or verified — subject. An unclaimed page carries no
+  // ld+json at all, alongside its noindex directive.
+  const faq = {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    mainEntity: [
+      {
+        "@type": "Question",
+        name: m("is.h1", { at, platform: d.platform, name: who }),
+        acceptedAnswer: { "@type": "Answer", text: answer },
+      },
+      ...(fakes
+        ? [
+            {
+              "@type": "Question",
+              name: m("is.faq_fakes_q", { name: who }),
+              acceptedAnswer: {
+                "@type": "Answer",
+                // I3-0420 (I22-W1-CONSOLES, landed by I22-L02): two whole sentences, no spliced English "s".
+                text: m(fakes === 1 ? "is.faq_fakes_a_one" : "is.faq_fakes_a_many", { count: String(fakes), name: who }),
+              },
+            },
+          ]
+        : []),
+      // I3-1628: no page-independent Q&A. HOW_SUMMARY is the same ~700 bytes on
+      // every /is/ page, for a FAQ rich result this site class is no longer
+      // granted; it is shown ONCE, in the "How Dhwaja decides" section below.
+    ],
+  };
+
+  const og = [
+    `<meta property="og:title" content="${esc(title)}">`,
+    `<meta property="og:description" content="${esc(description)}">`,
+    `<meta property="og:type" content="website">`,
+    // The two tags addressed to indexers ride the SAME consent gate as `robots`
+    // and the JSON-LD (review LOW 8) — three of five amplification surfaces used
+    // to be gated and two were not, against this file's own rationale above.
+    indexable && canon ? `<meta property="og:url" content="${esc(canon)}">` : "",
+    `<meta name="twitter:card" content="summary">`,
+    `<meta name="twitter:title" content="${esc(title)}">`,
+    `<meta name="twitter:description" content="${esc(description)}">`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+
+  // The visible FAQ is rendered from the SAME `mainEntity` array as the JSON-LD,
+  // so the structured data can never claim a question the page does not show
+  // (search engines require FAQ markup to match visible content — and a reader
+  // with scripts off gets the identical answers).
+  const faqHtml = indexable
+    ? `<h2>${esc(m("is.faq_heading"))}</h2><div class="faq">${faq.mainEntity
+        .map((q) => `<div class="qa"><p class="q">${esc(q.name)}</p><p class="a">${esc(q.acceptedAnswer.text)}</p></div>`)
+        .join("")}</div>`
+    : "";
+
+  // The card rides the SAME consent gate as everything else that amplifies:
+  // `buildShareCardSvg` already returns null for unclaimed/retracted/suppressed,
+  // and `indexable` is re-checked here so the two can never come apart if the
+  // caller ever passes a card it should not have.
+  // I3-1445: a visitor from search meets the verdict, then what the verdict
+  // means and who decides it, BEFORE the roster — not at the bottom of the page.
+  // I3-1458: the pill word is the design-system vocabulary (VERDICTS), never a
+  // runtime case transform of `meta.word`.
+  // I3-0049: the card is emitted AFTER the answer block (see `body`) — the verdict is
+  // the first thing under the question, the screenshot-native card follows it.
+  const card = indexable && opts.cardSvg ? `<figure class="cardcol">${opts.cardSvg}<figcaption class="cardcap">${esc(m("is.card_caption"))}</figcaption>${ratingsNote(v.claim_state, opts.ratingsNull, m)}</figure>` : "";
+  const body = `<nav class="crumbs"><a href="/discover">${esc(m("browse.crumb"))}</a> › ${esc(who)}</nav>
+<h1>${esc(m("is.h1", { at, platform: d.platform, name: who }))}</h1>
+<div class="answer">
+<div class="pillrow">${verdictPill(v.claim_state)}${kind.chip}</div>
+<p>${esc(answer)}</p>
+${kind.plain ? `<p class="kindnote">${esc(kind.plain)}</p>` : ""}
+</div>
+${fakesLine}
+${card}
+<h2>${esc(m("is.how_heading"))}</h2>
+<p>${esc(HOW_SUMMARY)}</p>
+<p><a href="${esc(HOW_PATH)}">${esc(m("is.how_cta"))}</a></p>
+<h2>${accountsHeading}</h2>
+<table><tr><th scope="col">${esc(m("col.platform"))}</th><th scope="col">${esc(m("col.account"))}</th><th scope="col">${esc(m("col.asserted"))}</th></tr>${rows}</table>
+${profile}
+${claimBlock}
+${removeBlock}
+${faqHtml}`;
+
+  return renderShell({
+    locale,
+    title,
+    description,
+    robots: indexable ? "index,follow" : "noindex,nofollow",
+    canonicalUrl: indexable ? canon : null,
+    headExtra: og,
+    appHref: app,
+    body,
+    footerNote: m("is.footer_note"),
+    // I3-1167 (D-0920 A): this page's URL names the profile, so the fine print drops "never sees which profile".
+    footerFine: profileFooterFine(locale),
+    // The ONE script on the page, and only for a consenting subject. It is not
+    // executable content under this CSP either way — `default-src 'none'` has no
+    // script-src — but the JSON-LD is still escaped so no display name can break
+    // out of the string, the element, or the document.
+    tail: indexable ? `<script type="application/ld+json">${jsonLdScriptBody(faq)}</script>` : "",
+  });
+}
+===== END FILE: services/trust-core/src/seo-page.ts =====
+
+===== BEGIN FILE: services/trust-core/src/sessions.ts =====
+/**
+ * Session tokens — moved to @dhwaja/session so the image worker (and any future
+ * service) verifies the SAME HMAC-signed tokens from ONE implementation, never a
+ * divergent copy. This module re-exports it so trust-core's existing
+ * `./sessions.js` imports keep working unchanged.
+ */
+export * from "@dhwaja/session";
+
+import { DISPUTE_FINGERPRINT_KEY_LABEL, type SessionSubject, usableSessionSecret, verifySession as verifyPackageSession } from "@dhwaja/session";
+
+/** D-0960(13): the scope label of the dispute-fingerprint key. The key is HMAC(session secret, this label), so a
+ * fingerprint is keyed with a secret no email list can derive and is scoped to this one use: no other HMAC of the
+ * session secret (session tokens, service credentials, OTP hashes) can be joined with it (D-0695's two clauses).
+ * Moved here from account_data.ts by I23-L05 (paywall invariant: email.ts must not import account_data.ts). */
+export const DISPUTE_FINGERPRINT_SCOPE = DISPUTE_FINGERPRINT_KEY_LABEL; // packages/session: the credential door refuses it (I20-FXC)
+
+/** trust-core's ONE scoped keyed-MAC body (single-hasher KEYED_MAC_EXEMPTIONS: 4 sites): HMAC-SHA256 of `message`
+ * under a key derived from `secret` with the fixed `scope` label, so two scopes' outputs cannot be joined. Callers:
+ * account_data.ts disputeIdentityFingerprint and the erasure-journal key; email.ts emailAddressHash (I3-0014 e).
+ * Moved VERBATIM from account_data.ts by I23-L05 so email.ts reaches it without account_data -> billing. */
+export async function scopedKeyedMac(secret: string, scope: string, message: string): Promise<string> {
+  const enc = new TextEncoder();
+  const root = await crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const scoped = new Uint8Array(await crypto.subtle.sign("HMAC", root, enc.encode(scope)));
+  const key = await crypto.subtle.importKey("raw", scoped, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const tag = new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(message)));
+  return [...tag].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/**
+ * JA-02 (I24-W1-JOURNAL): the SESSION_SECRET values retired by a rotation, from `SESSION_SECRET_PREVIOUS`
+ * (comma-separated, trimmed, deduped; an entry `usableSessionSecret` refuses is dropped — no journal key was ever
+ * written under one, `eraseAccountWithSubscriptions` journals only under a usable secret). The replay tries each after
+ * the current secret, so a journal object keyed under a retired secret is still found. D-1003(3) (I24-INT): the email
+ * suppression lookup (email.ts) and the dispute-fingerprint lookup (admin.ts disputeMonitor) consult the same list.
+ * The code imposes NO period and reads whatever the operator has configured; DEPLOY.md states the period:
+ * Retention (I24-Q2, R3-I29-Q2): keep a retired secret as long as the longest record keyed under it, and drop it then — the dead-email list (2 years from the last bounce), pending dispute fingerprints (`dispute_fingerprint_hold_days`, 120 days by default), erased-account dispute fingerprints (the money-record period, `money_record_retention_years`, 7 years from the end of the tax year by default) and the erasure journal.
+ * An erasure journaled under a secret the operator has removed from this list is not found by a replay.
+ */
+export function previousSessionSecrets(env: Record<string, unknown>): string[] {
+  const raw = env.SESSION_SECRET_PREVIOUS;
+  if (typeof raw !== "string") return [];
+  const out: string[] = [];
+  for (const part of raw.split(",")) {
+    const s = part.trim();
+    if (usableSessionSecret(s) && !out.includes(s)) out.push(s);
+  }
+  return out;
+}
+
+/** I3-2055 (I25-W1-COOKIE, D-1007): the fan session IDLE window — ENGINEERING DEFAULT, Jason's to change
+ * (docs/SESSION-COOKIES.md). A fan token whose last mint (`iat`) is older than this is refused by `verifySession`
+ * below; a session in use is re-minted at most once a day (csrf.ts finishSessionResponse), so an UNUSED session runs
+ * out here. A session in use still runs out at the 30-day ABSOLUTE cap: a renewal keeps the original sign-in's exp
+ * (packages/session/src/index.ts issueSession `expCap`, D-1010(2)). Creator and agency sessions are not covered by
+ * this idle window (agency has its own 90-day renewal ceiling). */
+export const FAN_SESSION_IDLE_SECONDS = 14 * 24 * 60 * 60;
+
+/** The `iat` claim of a session token, read WITHOUT verifying it (callers verify first), or null. */
+export function sessionIssuedAt(token: string): number | null {
+  const payload = token.split(".")[0] ?? "";
+  if (!/^[A-Za-z0-9_-]+$/.test(payload)) return null;
+  try {
+    const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const claims = JSON.parse(atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4))) as { iat?: unknown };
+    return typeof claims.iat === "number" && Number.isFinite(claims.iat) ? claims.iat : null;
+  } catch {
+    return null;
+  }
+}
+
+/** I3-2055: the `exp` claim of a token, read WITHOUT verifying it (callers verify first), or null. */
+export function sessionExpiresAt(token: string): number | null {
+  const payload = token.split(".")[0] ?? "";
+  if (!/^[A-Za-z0-9_-]+$/.test(payload)) return null;
+  try {
+    const b64 = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const c = JSON.parse(atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4))) as { exp?: unknown };
+    return typeof c.exp === "number" && Number.isSafeInteger(c.exp) ? c.exp : null;
+  } catch {
+    return null;
+  }
+}
+
+/** trust-core's `verifySession`: the package verifier (this local export shadows the star re-export above, so every
+ * `./sessions.js` importer gets it), plus the fan idle window. */
+export async function verifySession(secret: string | undefined, token: string, nowSec: number): Promise<SessionSubject | null> {
+  const s = await verifyPackageSession(secret, token, nowSec);
+  if (s?.kind !== "fan") return s;
+  const iat = sessionIssuedAt(token);
+  return iat !== null && nowSec - iat <= FAN_SESSION_IDLE_SECONDS ? s : null;
+}
+
+/** I7-Q4 (D-1030): the secrets a session may verify under, current first — SESSION_SECRET, then each
+ * `previousSessionSecrets` entry not equal to it. Empty while SESSION_SECRET is unusable: sessions are off, and a retired
+ * secret alone never admits. Minting stays on SESSION_SECRET alone (issueSession). No retention period is decided here
+ * (JASON-QUESTIONS 2): a retired secret verifies for exactly as long as the operator keeps it in SESSION_SECRET_PREVIOUS. */
+export function sessionSecrets(env: { SESSION_SECRET?: unknown; SESSION_SECRET_PREVIOUS?: unknown }): string[] {
+  const current = env.SESSION_SECRET;
+  if (!usableSessionSecret(current)) return [];
+  return [current, ...previousSessionSecrets(env).filter((s) => s !== current)];
+}
+
+/** I7-Q4: `verifySession` under each `sessionSecrets` entry in order; the subject plus the secret that verified it, or
+ * null. The token format is unchanged (no key id), so a token from before a rotation verifies under the retired secret
+ * while that secret is in SESSION_SECRET_PREVIOUS; csrf.ts derives the CSRF handle under the returned secret. */
+export async function verifySessionRotating(env: { SESSION_SECRET?: unknown; SESSION_SECRET_PREVIOUS?: unknown }, token: string, nowSec: number): Promise<{ subject: SessionSubject; secret: string } | null> {
+  for (const secret of sessionSecrets(env)) {
+    const subject = await verifySession(secret, token, nowSec);
+    if (subject) return { subject, secret };
+  }
+  return null;
+}
+===== END FILE: services/trust-core/src/sessions.ts =====
+
+===== BEGIN FILE: services/trust-core/src/settings.ts =====
+import type { DbLike } from "./db.js";
+import { auditStmt } from "./review.js";
+import { FRAUD_REVIEW_KIND } from "./warning-vocab.js";
+
+/**
+ * Operator-toggled settings (ops_settings key/value). Currently the
+ * confirmed_fraud SERVING gate: published confirmed_fraud warnings stay deferred
+ * from public serving (registry-build honors this) until counsel clears them and
+ * an operator flips it. Default OFF (absent key = off / fail-safe).
+ */
+
+export const SERVE_CONFIRMED_FRAUD = "serve_confirmed_fraud";
+
+/** S66 face-triage gates. BOTH default off/absent (fail closed):
+ *  - face_triage_enabled ("1") turns the sweep on — flip only after the
+ *    embedding backend + Vectorize are provisioned AND counsel has signed off
+ *    on the biometric handling (docs/FAN-REPORT-TRIAGE-PLAN.md).
+ *  - face_triage_wording_id names the approved impersonation wording an
+ *    AUTO-DRAFT cites. Absent → high-confidence matches still rank top of the
+ *    queue but no draft is auto-created (degrades to the human path). */
+export const FACE_TRIAGE_ENABLED = "face_triage_enabled";
+export const FACE_TRIAGE_WORDING = "face_triage_wording_id";
+
+/** The `caution` soft-class SERVING gate. DEFAULT ON (D-0534, D-0994(1)): an absent key
+ * serves the class (`servingCaution` / `SERVING_CAUTION_SQL` below); only an operator's
+ * explicit "0" (POST /ops/settings/serve-caution {"on":false}) turns it off. */
+export const SERVE_CAUTION = "serve_caution";
+
+export async function getSetting(db: DbLike, key: string): Promise<string | null> {
+  const row = await db.prepare("SELECT value FROM ops_settings WHERE key = ?").bind(key).first<{ value: string }>();
+  return row?.value ?? null;
+}
+
+/** Set a setting + audit. Upsert. */
+export async function setSetting(db: DbLike, actor: string, key: string, value: string, now: () => string = () => new Date().toISOString()): Promise<void> {
+  await setSettings(db, actor, [[key, value]], now);
+}
+
+/** I3-2114: set SEVERAL settings (+ one audit each) as ONE batch — a jointly
+ * approved change lands whole or not at all. */
+export async function setSettings(db: DbLike, actor: string, entries: ReadonlyArray<readonly [string, string]>, now: () => string = () => new Date().toISOString()): Promise<void> {
+  const ts = now();
+  await db.batch(
+    entries.flatMap(([key, value]) => [
+      db.prepare("INSERT INTO ops_settings (key, value, updated_by, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_by = excluded.updated_by, updated_at = excluded.updated_at").bind(key, value, actor, ts),
+      auditStmt(db, actor, "settings:set", key, value.slice(0, 100), ts),
+    ]),
+  );
+}
+
+export class SettingsError extends Error {
+  override name = "SettingsError";
+  constructor(
+    message: string,
+    public readonly status: 409 = 409,
+  ) {
+    super(message);
+  }
+}
+
+
+/**
+ * WARN49 (docket #49, ruled by the orchestrator in Jason's stead 2026-09-12,
+ * W0's option (b); INV-027 — its precedence sentence does not move).
+ *
+ * `serve_confirmed_fraud` may not be flipped ON while a fraud-class warning
+ * was published at a PROVEN creator's own account hash and the review item
+ * `warnings.ts publishWarning` wrote for it (marked `FRAUD_REVIEW_KIND`) is
+ * still `open`. Turning it OFF is never gated — same one-way-ratchet shape as
+ * every other liability-creating flip in this file: the safe direction is
+ * always immediate.
+ *
+ * The review item is a RECORD, not a block on PUBLISHING (`publishWarning`
+ * never refuses on its account). It has teeth in TWO places. Here, the flag
+ * flip. And at SERVE time (D-0442, Jason 2026-09-18): while the item is open
+ * the registry build holds the warning and keeps serving the proven creator
+ * (`registry-build.ts`, the D-0442 filter over `warningEntriesFrom`); only an
+ * APPROVAL (`review.ts approveFraudAtProvenCreator`, with a recorded reason)
+ * lets the warning displace the creator, and a reject keeps the creator.
+ * What both enforce is exactly the ruling's sentence:
+ * "the delisting of a proven creator is always a decision a named human
+ * took, never a side effect of a flag." The item closes through the SAME
+ * generic `review.ts` doors (`approveItem`/`rejectItem`) every other review
+ * item closes through — a named operator's decision, never a timer.
+ *
+ * This is the ONE writer of `SERVE_CONFIRMED_FRAUD` in the product
+ * (`console.ts POST /ops/settings/serve-confirmed-fraud` is the only call
+ * site — grep confirms it) — the control lives in the primitive rather than
+ * being re-typed at that caller (FAMILY-004 P1).
+ */
+export async function setServingConfirmedFraud(
+  db: DbLike,
+  actor: string,
+  value: string,
+  now: () => string = () => new Date().toISOString(),
+): Promise<void> {
+  if (value === "1") {
+    // I3-0078: this used to be `SELECT payload ... LIMIT 2000` with NO
+    // ORDER BY, then parse every row in JS looking for FRAUD_REVIEW_KIND. Two
+    // ways to fail open: (1) once open disputes exceed the limit, SQLite is
+    // free to hand back ANY 2000 rows — there is no ordering predicate to make
+    // that set stable or complete, so the marker row can silently fall outside
+    // it and the gate never sees it; (2) that failure gets WORSE as the queue
+    // grows, which is exactly backwards for a liability-creating flip. The
+    // fix is to not enumerate at all: match the marker directly with
+    // `json_extract`, an indexed-predicate existence check with no row cap —
+    // it finds the marker regardless of how many other open disputes exist,
+    // because it never has to choose a subset.
+    const marked = await db
+      .prepare("SELECT 1 FROM review_queue WHERE item_type = 'dispute' AND state = 'open' AND json_extract(payload, '$.kind') = ? LIMIT 1")
+      .bind(FRAUD_REVIEW_KIND)
+      .first();
+    if (marked) {
+      throw new SettingsError(
+        "a fraud-class warning was published at a proven creator's own account and that review is still open — serve_confirmed_fraud cannot be turned on until it is closed",
+      );
+    }
+  }
+  await setSetting(db, actor, SERVE_CONFIRMED_FRAUD, value, now);
+}
+
+/** Whether published confirmed_fraud warnings should be SERVED to fans. Default
+ * false — the legal-sensitive fail-safe. */
+export async function servingConfirmedFraud(db: DbLike): Promise<boolean> {
+  return (await getSetting(db, SERVE_CONFIRMED_FRAUD)) === "1";
+}
+
+/** Whether the `caution` soft class should be served at all. DEFAULT ON (D-0534, D-0994(1)): an unset setting
+ * serves it, and only an operator's explicit off (`POST /ops/settings/serve-caution {"on":false}`, which writes "0")
+ * turns it off — a vetted-but-unasserted handle must prove itself rather than inherit its passport's class. */
+export async function servingCaution(db: DbLike): Promise<boolean> {
+  return (await getSetting(db, SERVE_CAUTION)) !== "0";
+}
+
+/** I3-0658 (D-0534): `servingCaution` as a SQL predicate, for a reader that must stay ONE statement (social.ts
+ * `creatorHandleCollision`, whose D1 statement sequence the suppression-oracle guard pins). The same rule: unset is
+ * ON, only the operator's explicit "0" is off. */
+export const SERVING_CAUTION_SQL = `COALESCE((SELECT g.value FROM ops_settings g WHERE g.key = '${SERVE_CAUTION}'), '1') <> '0'`;
+
+/**
+ * Whether every listed account must carry its OWN current control proof to be
+ * served at its passport's class — the PER-ACCOUNT standing model.
+ *
+ * THE SAME SWITCH AS `serve_caution`, DELIBERATELY, AND NOT A SECOND ONE.
+ * Widening "needs its own proof" from asserted-and-domain accounts to ALL
+ * accounts leaves a residue: every operator/OSINT-seeded row that nobody has
+ * ever proved. That residue must land somewhere, and the only somewhere that is
+ * honest is the `caution` class ("listed but not proven") — its REAL members
+ * are only listed accounts (while it is served, decoys take the class too, at
+ * the real rate — D-0707, registry-build.ts `classThresholdsFrom`), it is
+ * pointer-less for this population, auto-clears the instant the account is
+ * proven, and already exists. Dropping the residue instead would delist the
+ * whole OSINT coverage tier, which is the opposite of what an anti-impersonation
+ * registry is for.
+ *
+ * So the two are one decision: turn per-account standing on and the residue is
+ * served as caution (the default since D-0994(1)); turn it off and every surface keeps exactly
+ * the passport-level behaviour it had. Two independent flags would let an
+ * operator select the one combination that is strictly worse than both — proofs
+ * required, residue unserved — and nobody would have chosen it on purpose.
+ *
+ * It is a separate FUNCTION rather than a bare `servingCaution` call at each
+ * site because the call sites are asking a different question ("must this
+ * account prove itself?" rather than "may an amber label be served?"), and a
+ * reader of `registry-build.ts` should not have to infer the coupling from a
+ * variable name.
+ */
+export async function servingPerAccountStanding(db: DbLike): Promise<boolean> {
+  return servingCaution(db);
+}
+
+/** All settings, for the dashboard. */
+export async function allSettings(db: DbLike): Promise<Record<string, string>> {
+  const { results } = await db.prepare("SELECT key, value FROM ops_settings").bind().all<{ key: string; value: string }>();
+  const out: Record<string, string> = {};
+  for (const r of results) out[r.key] = r.value;
+  return out;
+}
+===== END FILE: services/trust-core/src/settings.ts =====
+
+===== BEGIN FILE: services/trust-core/src/settlement-refusals.ts =====
+import { hasUnsafeIdentifierText } from "@dhwaja/schema";
+import { type DbLike, type DbStatement, inChunks } from "./db.js";
+import { bannedSettlementRefundOwedStmt } from "./credits.js";
+import { PAYER_REFUND_RAILS, REFUND_OWED_FAILED_ACTION, REFUND_OWED_MAX_ATTEMPTS } from "./stripe.js";
+
+/**
+ * I21-Q80 / I21-Q69 (D-1030: "(a) record the refund owed"; "(a) record a refund owed and refund; the crypto rail is
+ * off"): a settlement refused because the account is CHARGEBACK-BANNED (`accounts.banned_at`, refunds.ts) is owed back
+ * to the payer, recorded in the same table and shape as a settlement refused onto a frozen account (credits.ts
+ * grantCredits `frozenRefusalStmt`, 0120): one `credit_settlement_refusals` row per settlement, status `refund_owed`.
+ *
+ * `reason` is 'frozen': 0120's CHECK admits no other value, and the rail branches that call this already answer a
+ * banned settlement as a frozen one (index.ts `logFrozenSettlement`, `credit:frozen_settlement`). The account's ban is
+ * what tells the two apart. Who acts next: Stripe rows are refunded by the I4-Q7 actuator (stripe.ts
+ * `refundOwedStripe`, rail 'stripe' only); a crypto or store row is refunded by an operator from
+ * `listSettlementRefusals`, and stays `refund_owed` until then — unless the same settlement is re-delivered and granted
+ * as credits first (I39-CREDITS, D-1158 answer 1): grantCredits then cancels the refund (status `credited_after_lift`
+ * with `refund_cancelled_at`, 0275), and the row is no longer by hand.
+ */
+
+const ACCOUNT_RE = /^[A-Za-z0-9_-]{1,64}$/;
+const RAILS = new Set(["stripe", "apple", "google", "crypto"]);
+/** D-1059(15) (RGM-N4): the rails a payer refunds by itself — OPEN-ROWS B2 (D-1064(11)): built from stripe.ts
+ * PAYER_REFUND_RAILS, the constant refundOwedStripe's SELECT binds, never a hand copy. */
+const PAYER_RAILS: ReadonlySet<string> = new Set<string>(PAYER_REFUND_RAILS);
+/** I40-MONEY (D-1169 answer 2): the rails only an operator refunds (every rail no payer serves). */
+const BY_HAND_RAILS: readonly string[] = [...RAILS].filter((r) => !PAYER_RAILS.has(r));
+
+export interface BannedSettlement {
+  accountId: string;
+  rail: "stripe" | "apple" | "google" | "crypto";
+  /** The rail's settlement id (the refusal's key: one row per settlement). */
+  externalTxnId: string;
+  /** The payment ref (Stripe PaymentIntent) a dispute or refund marker for this payment is keyed by, when there is one. */
+  paymentRef?: string | undefined;
+  grossCents: number;
+  credits: number;
+}
+
+export class SettlementRefusalError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "SettlementRefusalError";
+  }
+}
+
+/**
+ * The `refund_owed` row for a settlement refused on a chargeback ban, for the refusing branch's own write (INSERT OR
+ * IGNORE on the settlement id: a redelivery records nothing new). Written only while the account EXISTS and IS banned
+ * (an erased account leaves no row under its id, INV-061; a statement bound for an account that is not banned writes
+ * nothing), only when this rail never granted the settlement, and not when the processor already returned the money.
+ * The statement is credits.ts `bannedSettlementRefundOwedStmt` (D-1037(4): the one spelling grantCredits also writes in
+ * its own batch), so the dispute marker is asked through credits.ts `DISPUTE_BEFORE_GRANT_SQL` — a marker answered by a
+ * WON dispute no longer suppresses the row (I29-LOOSE H4, D-1037(2)) — and, off the crypto rail (I26-Q5), only a FULL
+ * refund marker does (`REFUND_BEFORE_GRANT_SQL`, D-1037(1)). Throws on a malformed settlement.
+ */
+export function refundOwedOnBanStmt(db: DbLike, s: BannedSettlement, ts: string): DbStatement {
+  if (!ACCOUNT_RE.test(s.accountId)) throw new SettlementRefusalError("bad account id");
+  if (!RAILS.has(s.rail)) throw new SettlementRefusalError("bad rail");
+  if (typeof s.externalTxnId !== "string" || s.externalTxnId.length === 0 || s.externalTxnId.length > 200) throw new SettlementRefusalError("bad external txn id");
+  if (!Number.isSafeInteger(s.grossCents) || s.grossCents < 0 || !Number.isSafeInteger(s.credits) || s.credits <= 0) throw new SettlementRefusalError("bad amounts");
+  if (typeof ts !== "string" || Number.isNaN(Date.parse(ts))) throw new SettlementRefusalError("bad timestamp");
+  return bannedSettlementRefundOwedStmt(db, s, ts);
+}
+
+export interface SettlementRefusalRow {
+  external_txn_id: string;
+  account_id: string;
+  rail: string;
+  gross_cents: number;
+  credits: number;
+  reason: string;
+  status: string;
+  at: string;
+  resolved_at: string | null;
+  /** I30-CONSOLE RGM-05-MARK (D-1051(3); D-1049(1) keeps the bound): the payer's failed refund attempts on this row —
+   * the REFUND_OWED_FAILED_ACTION audit rows keyed item_id = external_txn_id, the count stripe.ts refundOwedStripe reads. */
+  failures: number;
+  /** True while the row is still `refund_owed` and has REFUND_OWED_MAX_ATTEMPTS failures: the payer never asks it again,
+   * so an operator refunds it by hand. Nothing here moves money. */
+  parked: boolean;
+  /** D-1059(15) (RGM-N4): true while the row is still `refund_owed` and only an operator will refund it — its rail has no
+   * payer (Apple, Google, crypto: PAYER_RAILS), or the payer parked it. */
+  by_hand: boolean;
+  /** I39-CREDITS (0275): when the payer claimed the row for its refund POST (the row stays `refund_owed`), else null. */
+  refund_claimed_at: string | null;
+  /** I39-CREDITS (0275): when the refund was cancelled because the settlement was granted as credits, else null. */
+  refund_cancelled_at: string | null;
+  /** I39-CREDITS: true when `refund_cancelled_at` is set (status `credited_after_lift`, no refund was paid). */
+  refund_cancelled: boolean;
+  /** I39-CREDITS: `SETTLEMENT_REFUND_CANCELLED_LABEL` on a cancelled row, else null (settlementRefusalCancelledLabel). */
+  cancelled_label: string | null;
+  /** I40-MONEY (D-1169 answer 2): `SETTLEMENT_REFUNDED_BY_HAND_LABEL` on a row an operator marked refunded by hand
+   * (`refunded_by_hand_at`, 0279), else null (settlementRefundedByHandLabel). */
+  by_hand_refund_label: string | null;
+}
+
+/** I39-CREDITS: the refunds-owed worklist label for a row whose refund was
+ * cancelled because the same payment was later granted as credits. Differs from console.ts
+ * SETTLEMENT_ALSO_CREDITED_LABEL, which also shows on a row whose refund WAS paid. */
+export const SETTLEMENT_REFUND_CANCELLED_LABEL = "Refund cancelled: this payment was granted as credits after the account was restored, so no refund is owed.";
+
+/** I39-CREDITS: the worklist label for one row — SETTLEMENT_REFUND_CANCELLED_LABEL when its refund was cancelled
+ * (`refund_cancelled_at` set; 0275's CHECK admits that only with status `credited_after_lift`), else null. */
+export function settlementRefusalCancelledLabel(row: { refund_cancelled_at: string | null }): string | null {
+  return row.refund_cancelled_at !== null ? SETTLEMENT_REFUND_CANCELLED_LABEL : null;
+}
+
+/** I40-MONEY (D-1169 answer 2; wording approved D-1193(8)): the worklist label for a row an operator marked as
+ * refunded outside the product (markSettlementRefundedByHand). */
+export const SETTLEMENT_REFUNDED_BY_HAND_LABEL = "Refunded by hand: an operator recorded that this payment was refunded outside the product.";
+
+/** I40-MONEY: SETTLEMENT_REFUNDED_BY_HAND_LABEL when `refunded_by_hand_at` (0279) is set, else null (also when the
+ * column is not there yet). */
+export function settlementRefundedByHandLabel(row: { refunded_by_hand_at?: string | null }): string | null {
+  return typeof row.refunded_by_hand_at === "string" ? SETTLEMENT_REFUNDED_BY_HAND_LABEL : null;
+}
+
+/** I40-MONEY (D-1169 answer 2): the audit row of a by-hand refund mark (actor the operator, item the settlement id). */
+export const SETTLEMENT_REFUNDED_BY_HAND_ACTION = "credit:refund_owed_refunded_by_hand";
+const OP_RE = /^op_[0-9a-f]{20}$/;
+
+export type ByHandMarkRefusal = "not_found" | "not_owed" | "claimed" | "not_by_hand";
+
+/**
+ * I40-MONEY (D-1169 answer 2; W0-MNY-01): an operator records that one settlement owed by hand was refunded outside the
+ * product (Apple, Google, crypto, or a Stripe row the payer parked). One batch: a conditional UPDATE to status
+ * `refunded` with resolved_at, as the refund job writes a paid row, plus who, when and the reference (0279), and one
+ * SETTLEMENT_REFUNDED_BY_HAND_ACTION audit row gated on that UPDATE (changes()). The UPDATE matches only a row that is
+ * `refund_owed`, unclaimed (`refund_claimed_at IS NULL`: never claimed, or released) and by hand (the `by_hand` rule of
+ * listSettlementRefusals: a rail with no payer, or REFUND_OWED_MAX_ATTEMPTS failures). Anything else is refused and
+ * named by a read after the batch. A marked row is `refunded`, so every `refund_owed` reader reads it as not owed and
+ * credits.ts REFUND_WENT_OUT_SQL refuses its re-delivery. Throws SettlementRefusalError on malformed input.
+ */
+export async function markSettlementRefundedByHand(
+  db: DbLike,
+  m: { externalTxnId: string; operatorId: string; reference: string },
+  now: () => string = () => new Date().toISOString(),
+): Promise<{ marked: true } | { marked: false; reason: ByHandMarkRefusal }> {
+  if (typeof m.externalTxnId !== "string" || m.externalTxnId.length === 0 || m.externalTxnId.length > 200) throw new SettlementRefusalError("bad external txn id");
+  if (typeof m.operatorId !== "string" || !OP_RE.test(m.operatorId)) throw new SettlementRefusalError("bad operator id");
+  if (typeof m.reference !== "string" || m.reference.trim().length === 0 || m.reference.length > 200 || hasUnsafeIdentifierText(m.reference)) throw new SettlementRefusalError("bad reference");
+  const ts = now();
+  if (typeof ts !== "string" || Number.isNaN(Date.parse(ts))) throw new SettlementRefusalError("bad timestamp");
+  // By hand = a rail with no payer (BY_HAND_RAILS, one conditional UPDATE per inChunks chunk: 5 binds beside it) OR
+  // parked: at least REFUND_OWED_MAX_ATTEMPTS failed attempts, i.e. the MAX-th failure row exists (OFFSET MAX - 1).
+  // Every UPDATE asks `refund_owed`, so the first that matches ends the others; each is followed by its audit row,
+  // gated on that UPDATE (changes()).
+  const SET =
+    "UPDATE credit_settlement_refusals SET status = 'refunded', resolved_at = ?, refunded_by_hand_at = ?, refunded_by_hand_by = ?, refunded_by_hand_ref = ? " +
+    "WHERE external_txn_id = ? AND status = 'refund_owed' AND refund_claimed_at IS NULL AND ";
+  const audit = () =>
+    db
+      .prepare(
+        "INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT ?, ?, 'rail=' || s.rail || ' gross_cents=' || s.gross_cents || ' credits=' || s.credits || ' ref=' || s.refunded_by_hand_ref, ?, s.external_txn_id, 'operator' FROM credit_settlement_refusals s WHERE s.external_txn_id = ? AND changes() = 1",
+      )
+      .bind(m.operatorId, SETTLEMENT_REFUNDED_BY_HAND_ACTION, ts, m.externalTxnId);
+  const stmts: DbStatement[] = [];
+  for (const chunk of inChunks(BY_HAND_RAILS, 5)) {
+    stmts.push(db.prepare(`${SET}rail IN (${chunk.map(() => "?").join(", ")})`).bind(ts, ts, m.operatorId, m.reference, m.externalTxnId, ...chunk), audit());
+  }
+  stmts.push(
+    db
+      .prepare(`${SET}EXISTS (SELECT 1 FROM audit_log a WHERE a.item_id = credit_settlement_refusals.external_txn_id AND a.action = ? LIMIT 1 OFFSET ?)`)
+      .bind(ts, ts, m.operatorId, m.reference, m.externalTxnId, REFUND_OWED_FAILED_ACTION, REFUND_OWED_MAX_ATTEMPTS - 1),
+    audit(),
+  );
+  const res = (await db.batch(stmts)) as { meta?: { changes?: number } }[];
+  if (res.some((x, i) => i % 2 === 0 && (x?.meta?.changes ?? 0) === 1)) return { marked: true };
+  const r = await db
+    .prepare("SELECT status, refund_claimed_at FROM credit_settlement_refusals WHERE external_txn_id = ?")
+    .bind(m.externalTxnId)
+    .first<{ status: string; refund_claimed_at: string | null }>();
+  if (!r) return { marked: false, reason: "not_found" };
+  if (r.status !== "refund_owed") return { marked: false, reason: "not_owed" };
+  if (r.refund_claimed_at !== null) return { marked: false, reason: "claimed" };
+  return { marked: false, reason: "not_by_hand" };
+}
+
+/**
+ * The refused-settlement worklist (census surprise 3: refunds owed had no reader but the Stripe actuator), for
+ * I29-OPS's `GET /ops/settlement-refusals`: rows in `status`, oldest first, optionally one rail, at most `limit` (1-500,
+ * default 100). `more` is true when rows exist past the limit, so a caller never reads the page as the whole population.
+ * I39-FX-MONEY (D-1164): the default `refund_owed_or_cancelled` is the operator worklist — every `refund_owed` row, then
+ * every row whose refund was cancelled (`refund_cancelled_at` set), each oldest first; `refund_owed` alone is asked by name.
+ */
+export async function listSettlementRefusals(
+  db: DbLike,
+  opts: { status?: "refund_owed" | "refunded" | "credited_after_lift" | "refund_owed_or_cancelled"; rail?: BannedSettlement["rail"]; limit?: number } = {},
+): Promise<{ rows: SettlementRefusalRow[]; more: boolean }> {
+  const status = opts.status ?? "refund_owed_or_cancelled";
+  if (status !== "refund_owed" && status !== "refunded" && status !== "credited_after_lift" && status !== "refund_owed_or_cancelled") throw new SettlementRefusalError("bad status");
+  const worklist = status === "refund_owed_or_cancelled";
+  if (opts.rail !== undefined && !RAILS.has(opts.rail)) throw new SettlementRefusalError("bad rail");
+  const n = opts.limit === undefined ? 100 : opts.limit;
+  if (!Number.isInteger(n) || n < 1 || n > 500) throw new SettlementRefusalError("bad limit");
+  const rs = await db
+    .prepare(
+      // I40-MONEY: `*` (every 0120/0275 column, and 0279's once it is applied) so the by-hand mark reads where it exists.
+      "SELECT *, " +
+        "(SELECT COUNT(*) FROM audit_log a WHERE a.item_id = credit_settlement_refusals.external_txn_id AND a.action = ?) AS failures FROM credit_settlement_refusals " +
+        `WHERE ${worklist ? "(status = 'refund_owed' OR refund_cancelled_at IS NOT NULL)" : "status = ?"}${opts.rail !== undefined ? " AND rail = ?" : ""} ORDER BY ${worklist ? "status <> 'refund_owed', " : ""}at, external_txn_id LIMIT ?`,
+    )
+    .bind(REFUND_OWED_FAILED_ACTION, ...(worklist ? [] : [status]), ...(opts.rail !== undefined ? [opts.rail] : []), n + 1)
+    .all<Omit<SettlementRefusalRow, "parked" | "by_hand" | "refund_cancelled" | "cancelled_label" | "by_hand_refund_label"> & { refunded_by_hand_at?: string | null }>();
+  const rows = (rs.results ?? []).map((r) => {
+    const parked = r.status === "refund_owed" && Number(r.failures) >= REFUND_OWED_MAX_ATTEMPTS;
+    const cancelledLabel = settlementRefusalCancelledLabel(r);
+    return { ...r, failures: Number(r.failures), parked, by_hand: r.status === "refund_owed" && (parked || !PAYER_RAILS.has(r.rail)), refund_cancelled: cancelledLabel !== null, cancelled_label: cancelledLabel, by_hand_refund_label: settlementRefundedByHandLabel(r) };
+  });
+  return { rows: rows.slice(0, n), more: rows.length > n };
+}
+===== END FILE: services/trust-core/src/settlement-refusals.ts =====
+
+===== END OF CHUNK 71 OF 75 =====

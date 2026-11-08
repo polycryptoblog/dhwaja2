@@ -1,0 +1,2831 @@
+DHWAJA CODE REVIEW — server — CHUNK 41 OF 75
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (claim*), services/trust-core/src (claims*), services/trust-core/src (clawback*)
+Files in this chunk (4):
+  - services/trust-core/src/claim-callback-page.ts
+  - services/trust-core/src/claim-routes.ts
+  - services/trust-core/src/claims.ts
+  - services/trust-core/src/clawback.ts
+
+
+===== BEGIN FILE: services/trust-core/src/claim-callback-page.ts =====
+import { translator, type MessageKey } from "@dhwaja/i18n";
+import { esc, renderShell } from "./ssr-shell.js";
+
+/**
+ * The OAuth claim callback's NO-CONSOLE fallback page (I3-1587 put it in the
+ * product shell; D-0842(3) moved its copy into the catalogue). It is the only
+ * page `claim-routes.ts` renders, so it lives here, where the SSR prose lint
+ * walks it, and the route module keeps only its API errors.
+ *
+ * `outcome` is a server-side enum. It is never reflected: an unknown value
+ * renders `claim.outcome.bad_state`, the same answer the old table gave.
+ * `claimRef` is escaped here even though the caller has already required
+ * 64 lowercase hex (esc is the identity on that alphabet).
+ */
+const OUTCOME_KEY: Readonly<Record<string, MessageKey>> = {
+  identity_mismatch: "claim.outcome.identity_mismatch",
+  exchange_failed: "claim.outcome.exchange_failed",
+  expired: "claim.outcome.expired",
+  bad_state: "claim.outcome.bad_state",
+  pending_review: "claim.outcome.pending_review",
+};
+
+export type ClaimCallbackPage =
+  | { kind: "claimed" }
+  | { kind: "pending"; outcome: string; claimRef: string }
+  | { kind: "failed"; outcome: string };
+
+export function claimCallbackPage(page: ClaimCallbackPage, locale = "en"): string {
+  const m = translator(locale);
+  const outcome = (o: string): string => m(Object.hasOwn(OUTCOME_KEY, o) ? OUTCOME_KEY[o]! : "claim.outcome.bad_state");
+  let heading: string;
+  let rest = "";
+  if (page.kind === "claimed") {
+    heading = m("claim.callback.verified_claimed");
+    rest = `<p class="lede">${esc(m("claim.callback.verified_claimed_lede"))}</p>`;
+  } else if (page.kind === "pending") {
+    heading = m("claim.callback.verified_pending", { outcome: outcome(page.outcome) });
+    rest = `<p class="lede">${esc(m("claim.callback.claim_ref"))} <code>${esc(page.claimRef)}</code></p>`;
+  } else {
+    heading = m("claim.callback.failed", { outcome: outcome(page.outcome) });
+  }
+  return renderShell({ title: `${heading} · Dhwaja`, robots: "noindex,nofollow", body: `<h1>${esc(heading)}</h1>${rest}`, locale });
+}
+===== END FILE: services/trust-core/src/claim-callback-page.ts =====
+
+===== BEGIN FILE: services/trust-core/src/claim-routes.ts =====
+import { Hono, type Context } from "hono";
+import { logError } from "./log.js";
+import { brandEnrolStatus, EnrolError, startBrandEnrol, verifyBrandEnrol } from "./brand-enrolment.js";
+import { AccountKeyFormatError, ageAckMatches, ClaimError, creatorMinAge, openClaimChallenge, passportAlreadyClaimedPublicly, recordClaimAgeAck, startClaim, verifyClaim } from "./claims.js";
+import { currentCreatorEpoch } from "./creator-session.js";
+import { d1 } from "./db.js";
+import { claimRefHashOf, consumeManualClaimRef, manualClaimStatus, manualClaimStatusByCode, ManualClaimError, requestManualClaim } from "./manual-claims.js";
+import { dohTxtLookup, domainAccountKey, DomainClaimError, openDomainClaimChallenge, startDomainClaim, verifyDomainClaim } from "./domain-claims.js";
+import { dohResolverFromEnv, supportAddress } from "./env-config.js";
+import { LedgerContentionError } from "./events.js";
+import { completeOAuthClaim, createOAuthHandoff, redeemOAuthHandoff, startOAuthClaim } from "./oauth-claims.js";
+import { PasskeyError, refuseSigninAssertion, startSigninAssertion, verifySigninAssertion, type AssertionResponse } from "./passkeys.js";
+import { livePassport } from "./passport-view.js";
+import { analyticsPublishArgs, anonBodyLimit, callerPrefix, consoleOrigin, contentionResponse, fanIpAllowed, passkeyConfig, SSR_CSP, refusal, RATE_LIMIT_MESSAGE , errorBody } from "./route-helpers.js";
+import { publishHook } from "./analytics-outbox.js";
+import { issueSession, usableSessionSecret } from "./sessions.js";
+import { claimCallbackPage } from "./claim-callback-page.js";
+import type { Env } from "./env.js";
+
+/**
+ * I3-0764 (D-0833(4)) — the fallback for a throw no typed arm above it claimed:
+ * a storage fault, a bug, an outage is ours — logged, answered 500, never a 400
+ * that tells the caller their request was the problem.
+ */
+function serverFault(c: Context<{ Bindings: Env }>, route: string, e: unknown, code: string): Response {
+  // #859 (I16-W04C): the ONE log line for a fault — callers no longer log their own line before this one, and
+  // `code` (each door's own literal failure name, logged as `reason`, a key log.ts ALLOWED_KEYS keeps) is what
+  // tells two faults on the same route apart.
+  logError({ cid: crypto.randomUUID(), hop: "http", route, reason: code, msg: "unexpected route fault", err: e instanceof Error ? e.name : typeof e });
+  return c.json({ error: "internal" }, 500);
+}
+
+
+/**
+ * PASSPORT CLAIM — the three proofs that bind a passport to the human who owns
+ * the accounts on it, and nothing else.
+ *
+ * BOUNDARY. Bio-code (`/claim/start` + `/claim/verify`), brand-domain DNS TXT
+ * (`/claim/domain/*`) and platform OAuth (`/claim/oauth/*`), plus the per-IP
+ * ceilings and the handoff exchange that turn a completed proof into a creator
+ * session. Every route here is ANONYMOUS by design — the proof IS the
+ * authorization — which is why they are the ones wearing `anonBodyLimit`.
+ *
+ * NOT here: the account-level RE-proof (`/account/prove/*`), which is a
+ * creator-session route about an already-claimed passport.
+ */
+/**
+ * Per-masked-IP hourly caps on the two ANONYMOUS legs of the bio-code claim.
+ *
+ * There were none at all until the launch-blocking review, on both the leg that
+ * mints a per-victim challenge row and the leg that drives an OUTBOUND profile
+ * fetch at reddit / linktr.ee / allmylinks / beacons from Cloudflare egress. The
+ * per-(account, caller) caps in claims.ts bound TARGETING — how much of one
+ * account's budget one address can spend — and these bound VOLUME from one
+ * address across all accounts, which is the pairing `/removal/start` already
+ * uses and the reason its numbers are the same.
+ *
+ * PS-174/PS-177 (CLAIMROUTE_TRU): module-scope + exported, not a local inside
+ * `makeClaimRoutes`, so a test can import the real constant instead of
+ * hardcoding a copy of "30" / "60" that silently drifts from the code, and a
+ * mutation of either value now has something outside this file to break
+ * against (see `test/claim-route-caps.test.ts`).
+ */
+export const CLAIM_STARTS_PER_IP_HOUR = 30;
+/** I3-2053 b: GET /claim/oauth/:platform/callback per caller address per hour (a ceremony needs one). */
+export const OAUTH_CALLBACKS_PER_IP_HOUR = 60;
+export const CLAIM_VERIFIES_PER_IP_HOUR = 60;
+/** RJb-T2-AS-014: POST /brand/enrol/status reads per IP per hour (removal status's posture). */
+export const BRAND_ENROL_STATUS_PER_IP_HOUR = 60;
+/** I44-CLAIMS (QUEUE #984 B8, D-1272): GET /claim/min-age reads per IP per hour, on its OWN bucket ("clmminage") so the
+ * console's one read per claim-view boot never spends the clmstart / clmvfy claim budgets. */
+export const CLAIM_MIN_AGE_READS_PER_IP_HOUR = 60;
+
+/** I21-Q20 / D-1059(1): every claim door's refusal unless `ageAckMatches` (claims.ts) — names the age (the `creator_min_age` setting). Copy approved, sheet-2 W62 (D-1365). */
+export function ageAckRequired(minAge: number): { error: "age_ack_required"; min_age: number; message: string } {
+  return { error: "age_ack_required", min_age: minAge, message: `Confirm that you are at least ${minAge} years old to claim this profile.` };
+}
+
+export function makeClaimRoutes(): Hono<{ Bindings: Env }> {
+  const app = new Hono<{ Bindings: Env }>();
+
+
+  app.post("/claim/start", anonBodyLimit, async (c) => {
+    if (!(await fanIpAllowed(c, "clmstart", CLAIM_STARTS_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { passport_id?: unknown; account_key?: unknown; age_ack?: unknown; min_age?: unknown } | null;
+    if (!body || typeof body.passport_id !== "string" || typeof body.account_key !== "string") {
+      return c.json({ error: "passport_id and account_key required" }, 400);
+    }
+    try {
+      const db = d1(c.env.TRUST_DB);
+      // D-1057(2): a finished claim is answered before the age acknowledgement (I21-Q20 binds a new claim), so the
+      // console's I3-2118 re-check is never asked for one. The same 409 startClaim throws; acknowledged passports only.
+      if (await passportAlreadyClaimedPublicly(db, body.passport_id)) return c.json(errorBody(new ClaimError("passport already claimed", 409)), 409);
+      // I21-Q20: no challenge without the creator's age acknowledgement; the age confirmed is stored with it.
+      const minAge = await creatorMinAge(db);
+      if (!ageAckMatches(body, minAge)) return c.json(ageAckRequired(minAge), 400);
+      const r = await startClaim(db, body.passport_id, body.account_key, callerPrefix(c), undefined, undefined, minAge);
+      return c.json(r);
+    } catch (e) {
+      // M-03: the account_key field now also accepts a profile URL; a URL that
+      // does not resolve is refused by name, never folded into the generic
+      // catch-all "error" below.
+      if (e instanceof AccountKeyFormatError) return c.json({ error: e.message }, 400);
+      if (e instanceof ClaimError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/claim/start", e, "claim_start");
+    }
+  });
+
+  // D-1057(3): the age the claim doors make the creator confirm, readable before any refusal names it.
+  app.get("/claim/min-age", async (c) => {
+    if (!(await fanIpAllowed(c, "clmminage", CLAIM_MIN_AGE_READS_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    return c.json({ min_age: await creatorMinAge(d1(c.env.TRUST_DB)) });
+  });
+
+  app.post("/claim/verify", anonBodyLimit, async (c) => {
+    // Each verify against a live challenge drives an outbound profile fetch, so
+    // this is the claim route with real egress cost per call.
+    if (!(await fanIpAllowed(c, "clmvfy", CLAIM_VERIFIES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { challenge_id?: unknown; age_ack?: unknown; min_age?: unknown } | null;
+    if (!body || typeof body.challenge_id !== "string") return c.json({ error: "challenge_id required" }, 400);
+    // H10: a claim is ONE-SHOT. Do not consume it if we cannot then mint the
+    // session that consuming it earns — an unusable SESSION_SECRET would leave
+    // the creator claimed-but-sessionless (and, pre-H2, permanently locked out).
+    // Refuse loudly first; the claim stays spendable once secrets are fixed.
+    if (!usableSessionSecret(c.env.SESSION_SECRET)) return c.json({ error: "sessions_unavailable" }, 503);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      // I46-FX1 SCB-001 (W0-14): an unknown, spent or expired challenge gets its own refusal before the age check.
+      const open = await openClaimChallenge(db, body.challenge_id, Date.now());
+      if (open.expired) return c.json(open.expired, 409);
+      // I21-Q20: the claim is not proven without the age acknowledgement, which is stamped on the live challenge first.
+      const minAge = await creatorMinAge(db);
+      if (!ageAckMatches(body, minAge)) return c.json(ageAckRequired(minAge), 400);
+      await recordClaimAgeAck(db, body.challenge_id, minAge, new Date().toISOString());
+      const r = await verifyClaim(db, body.challenge_id, undefined, undefined, undefined, claimRefHashOf, publishHook(...analyticsPublishArgs(c)));
+      if (r.ok && r.passport_id) {
+        // Mint at the passport's current epoch so logout-all can invalidate it.
+        const ep = await currentCreatorEpoch(db, r.passport_id);
+        const session = await issueSession(c.env.SESSION_SECRET, { kind: "creator", id: r.passport_id, ep }, Math.floor(Date.now() / 1000));
+        return c.json({ ...r, ...(session ? { session } : {}) });
+      }
+      // I3-1659: `pending_review` is a successful proof a person must confirm —
+      // 200, no session (`r.ok` is false), exactly as /claim/domain/verify.
+      return c.json(r, r.outcome === "verified" || r.outcome === "pending_review" ? 200 : 409);
+    } catch (e) {
+      if (e instanceof LedgerContentionError) return contentionResponse(c);
+      if (e instanceof ClaimError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/claim/verify", e, "claim_verify");
+    }
+  });
+
+  // H9: MANUAL CLAIM — the intake for platforms with no fetchable profile and no
+  // OAuth (Instagram / TikTok / OnlyFans). Anonymous + proof-authorized like the
+  // bio-code claim (the code posted on the account IS the proof; an operator
+  // reads it instead of a fetch), and capped on the same per-IP ceilings.
+  app.post("/claim/manual/start", anonBodyLimit, async (c) => {
+    if (!(await fanIpAllowed(c, "clmstart", CLAIM_STARTS_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { passport_id?: unknown; account_key?: unknown; age_ack?: unknown; min_age?: unknown } | null;
+    if (!body || typeof body.passport_id !== "string" || typeof body.account_key !== "string") {
+      return c.json({ error: "passport_id and account_key required" }, 400);
+    }
+    try {
+      const db = d1(c.env.TRUST_DB);
+      // D-1059(1): the /claim/start age check, after the same finished-claim answer (D-1057(2)).
+      if (await passportAlreadyClaimedPublicly(db, body.passport_id)) return c.json(errorBody(new ManualClaimError("passport already claimed", 409)), 409);
+      const minAge = await creatorMinAge(db);
+      if (!ageAckMatches(body, minAge)) return c.json(ageAckRequired(minAge), 400);
+      // I-06: callerPrefix keys the per-caller sub-cap inside requestManualClaim.
+      const r = await requestManualClaim(db, body.passport_id, body.account_key, undefined, undefined, callerPrefix(c));
+      return c.json(r);
+    } catch (e) {
+      // M-03: same account_key widening as /claim/start (see there).
+      if (e instanceof AccountKeyFormatError) return c.json({ error: e.message }, 400);
+      if (e instanceof ManualClaimError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/claim/manual/start", e, "manual_claim_start");
+    }
+  });
+
+  // Poll a manual claim by its bearer ref. Once the operator has approved and the
+  // passport is claimed, this mints the creator session the bio-code path mints
+  // inline — same H10 guard: never report approval we cannot back with a session.
+  //
+  // TWO WAYS IN, AND ONLY ONE OF THEM MINTS. The `claim_ref` is the secret the
+  // creator was handed once, and it earns the session. `{passport_id, code}` is
+  // the RECOVERY lookup for a creator who lost the ref (the console now persists
+  // it, but a cleared browser is a real thing): both halves of that pair are
+  // public — the code is posted in a public bio on purpose, for an operator to
+  // read — so it answers with STATE ONLY. See `manualClaimStatusByCode` for why
+  // making a published value session-minting would be worse than the lockout it
+  // would fix.
+  app.post("/claim/manual/status", anonBodyLimit, async (c) => {
+    if (!(await fanIpAllowed(c, "clmvfy", CLAIM_VERIFIES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { claim_ref?: unknown; passport_id?: unknown; code?: unknown; age_ack?: unknown; min_age?: unknown } | null;
+    if (!body) return c.json({ error: "claim_ref, or passport_id and code, required" }, 400);
+    const byCode = typeof body.passport_id === "string" && typeof body.code === "string";
+    if (typeof body.claim_ref !== "string" && !byCode) return c.json({ error: "claim_ref, or passport_id and code, required" }, 400);
+    if (byCode && typeof body.claim_ref !== "string") {
+      const pid = body.passport_id as string;
+      const code = body.code as string;
+      if (!/^psp_[0-9a-f]{16}$/.test(pid) || code.length === 0 || code.length > 128) return c.json({ error: "passport_id and code required" }, 400);
+      try {
+        // No session mint on this arm, so no `usableSessionSecret` gate: a
+        // deployment with broken session secrets can still tell a creator what
+        // happened to their claim, which is the only thing this arm does.
+        const r = await manualClaimStatusByCode(d1(c.env.TRUST_DB), pid, code);
+        return c.json({ ...r, session_minted: false });
+      } catch (e) {
+        if (e instanceof ManualClaimError) return c.json(errorBody(e), e.status);
+        return serverFault(c, "/claim/manual/status", e, "manual_claim_status_by_code");
+      }
+    }
+    if (typeof body.claim_ref !== "string") return c.json({ error: "claim_ref required" }, 400);
+    if (!usableSessionSecret(c.env.SESSION_SECRET)) return c.json({ error: "sessions_unavailable" }, 503);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      const r = await manualClaimStatus(db, body.claim_ref);
+      if (r.state === "approved" && r.passport_id) {
+        // D-1059(1): the operator-approved door — no creator session without the age check, asked BEFORE the ref is spent.
+        const minAge = await creatorMinAge(db);
+        if (!ageAckMatches(body, minAge)) return c.json(ageAckRequired(minAge), 400);
+        // CL:I-01. The ref is spent here, once, and the epoch is the one bound at
+        // approval — never a fresh read (`consumeManualClaimRef`, manual-claims.ts).
+        // A consumed or epoch-stale ref falls through to the SAME `{state,
+        // passport_id}` body below with no session: never a 410 and never a
+        // distinct "already used" message, which would be a new oracle for
+        // whoever guessed or stole the ref (the 404-uniformity its at
+        // manual-claims.test.ts:166,311 exist to keep that shut).
+        const spend = await consumeManualClaimRef(db, body.claim_ref, undefined, minAge); // D-1060(3): the age this door checked
+        if (spend.minted) {
+          const session = await issueSession(
+            c.env.SESSION_SECRET,
+            { kind: "creator", id: r.passport_id, ep: spend.epoch ?? 0 },
+            Math.floor(Date.now() / 1000),
+          );
+          // Never report an approval we cannot back with a session (H10): the
+          // usableSessionSecret guard above should make this unreachable, but if
+          // the mint still fails, fail closed rather than saying "approved" with
+          // no session for the creator to use. The ref is already spent at this
+          // point, so name the row an operator can find it by.
+          if (!session) {
+            logError({ cid: crypto.randomUUID(), hop: "http", route: "/claim/manual/status", reason: "manual_claim_session_mint", spend_item_id: spend.item_id, msg: "manual claim ref consumed but session mint failed" });
+            return c.json({ error: "sessions_unavailable" }, 503);
+          }
+          return c.json({ ...r, session });
+        }
+      }
+      return c.json(r);
+    } catch (e) {
+      if (e instanceof ManualClaimError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/claim/manual/status", e, "manual_claim_status");
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // SELF-SERVE BRAND ENROLMENT (slice 35) — the door with no passport.
+  //
+  // Every other domain ceremony names a passport in its body. This one cannot:
+  // it exists for a brand that has never been listed, which is the population
+  // `startDomainProof`'s refusal has been pointing at ("claim the passport
+  // first") since it was written, at a door nobody had built. A proof here files
+  // an OPERATOR QUEUE ITEM and mints nothing — see `brand-enrolment.ts`.
+  //
+  // Anonymous and proof-gated, on the same basis as `/claim/domain/*`: the TXT
+  // record published under the domain IS the authorization. The START half
+  // deliberately reads nothing about the domain, so it cannot answer any
+  // question about who is listed or who asked to leave.
+  app.post("/brand/enrol/start", anonBodyLimit, async (c) => {
+    if (!(await fanIpAllowed(c, "clmstart", CLAIM_STARTS_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { domain?: unknown } | null;
+    if (!body || typeof body.domain !== "string") return c.json({ error: "domain required" }, 400);
+    // Fail closed BEFORE the day budget is spent: a build with no configured DoH
+    // resolver can never verify the token this would mint, and handing out a
+    // ceremony that cannot be completed is worse than saying so.
+    if (!dohResolverFromEnv(c.env as unknown as Record<string, unknown>)) return c.json({ error: "domain_verification_unavailable" }, 503);
+    try {
+      return c.json(await startBrandEnrol(d1(c.env.TRUST_DB), body.domain, undefined, undefined, callerPrefix(c)));
+    } catch (e) {
+      if (e instanceof DomainClaimError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/brand/enrol/start", e, "brand_enrol_start");
+    }
+  });
+
+  // RJb-T2-AS-014 (D-0920 (b)+(c)): the anonymous state read for an enrolment, by the id the verify answer returned.
+  // `POST /removal/status`'s shape (index.ts), which the ruling names as the model: the id rides in the BODY, because a
+  // URL reaches the invocation log and this service puts exactly one capability in a URL (/unsubscribe/:token, forced
+  // by RFC 8058); the rate bucket is spent BEFORE the lookup, so the limiter is not a "does this id exist" oracle; an
+  // unknown or malformed id is one uniform 404; the body is the state only.
+  app.post("/brand/enrol/status", anonBodyLimit, async (c) => {
+    if (!(await fanIpAllowed(c, "enrstatus", BRAND_ENROL_STATUS_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { enrolment_id?: unknown } | null;
+    if (!body || typeof body.enrolment_id !== "string") return c.json({ error: "enrolment_id required" }, 400);
+    try {
+      return c.json(await brandEnrolStatus(d1(c.env.TRUST_DB), body.enrolment_id));
+    } catch (e) {
+      if (e instanceof EnrolError && e.status === 404) return c.json({ error: "not_found" }, 404);
+      return serverFault(c, "/brand/enrol/status", e, "brand_enrol_status");
+    }
+  });
+
+  app.post("/brand/enrol/verify", anonBodyLimit, async (c) => {
+    if (!(await fanIpAllowed(c, "clmvfy", CLAIM_VERIFIES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { challenge_id?: unknown; suggested_name?: unknown; contact_email?: unknown } | null;
+    if (!body || typeof body.challenge_id !== "string") return c.json({ error: "challenge_id required" }, 400);
+    const resolver = dohResolverFromEnv(c.env as unknown as Record<string, unknown>);
+    if (!resolver) return c.json({ error: "domain_verification_unavailable" }, 503);
+    try {
+      const r = await verifyBrandEnrol(d1(c.env.TRUST_DB), body.challenge_id, dohTxtLookup(resolver), {
+        // Both are UNTRUSTED and neither is authorization. The name is a
+        // suggestion the operator may overwrite; the address is so an operator
+        // can come back with a question. Clamped in the module.
+        suggestedName: typeof body.suggested_name === "string" ? body.suggested_name : null,
+        contactEmail: typeof body.contact_email === "string" ? body.contact_email : null,
+      });
+      // I3-1166: a refusal names where to ask (SUPPORT_EMAIL, else the placeholder).
+      if (r.outcome === "enrolled") return c.json(r, 200);
+      return c.json({ ...r, support_to: supportAddress(c.env as unknown as Record<string, unknown>) }, 409);
+    } catch (e) {
+      if (e instanceof DomainClaimError) return c.json({ ...errorBody(e), support_to: supportAddress(c.env as unknown as Record<string, unknown>) }, e.status);
+      return serverFault(c, "/brand/enrol/verify", e, "brand_enrol_verify");
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // BRAND CONTEST (D-0561 / J-02) — THE FILING CHANNEL FOR THE GATE'S REFUSAL.
+  //
+  // `verifyDomainAdd` refuses a host that resembles a name listed under somebody
+  // else with one uniform 409 and no subject (`domain-claims.ts:1141`), which is
+  // the right refusal and was a dead end: the refused party could not learn who
+  // blocked them and had nowhere to file. These two routes are that filing
+  // channel, and they are deliberately the SAME ceremony as `/brand/enrol/*` —
+  // the start door below is `startBrandEnrol` itself, so there is one issuer,
+  // one set of caps and one TXT record shape rather than a second of each.
+  //
+  // ANONYMOUS, PROOF-GATED, AND THE PASSPORT IN THE BODY IS NOT AUTHORIZED BY
+  // IT. The DNS proof authorizes the filing (D-0593); the passport is the
+  // filer's claim about which standing they want the contested host attached to,
+  // and it is an OPERATOR under dual control who decides whether it gets
+  // attached (`admitBrandContest`). Filing mints nothing.
+  app.post("/brand/contest/start", anonBodyLimit, async (c) => {
+    if (!(await fanIpAllowed(c, "clmstart", CLAIM_STARTS_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { domain?: unknown } | null;
+    if (!body || typeof body.domain !== "string") return c.json({ error: "domain required" }, 400);
+    // Fail closed BEFORE the day budget is spent, exactly as the enrolment start
+    // door does: a build with no DoH resolver can never verify the token this
+    // would mint.
+    if (!dohResolverFromEnv(c.env as unknown as Record<string, unknown>)) return c.json({ error: "domain_verification_unavailable" }, 503);
+    try {
+      // The passport is NOT taken here. A start door that accepted one would
+      // answer "is this passport real" to an anonymous caller, and the start
+      // half deliberately reads nothing about anybody: every eligibility
+      // question is asked at verify, behind the TXT record.
+      return c.json(await startBrandEnrol(d1(c.env.TRUST_DB), body.domain, undefined, undefined, callerPrefix(c)));
+    } catch (e) {
+      if (e instanceof DomainClaimError) return c.json(errorBody(e), e.status);
+      // Structured, per `log-no-raw-console.test.ts`: this file has ZERO raw console
+      // calls. The one log line for this fault is serverFault's (#859), carrying the code.
+      return serverFault(c, "/brand/contest/start", e, "brand_contest_start_failed");
+    }
+  });
+
+  // REMOVED — D-0650 (Jason, QUEUE #480). `POST /brand/contest/verify` stood
+  // here and took `passport_id` FROM THE REQUEST BODY, so a lookalike who could
+  // publish a TXT record under the contested host could file a brand dispute
+  // NAMING A THIRD PARTY as the filer of record — and D-0595 notifies the
+  // INCUMBENT, not the named filer, so that party was never told.
+  //
+  // NOT GATED, DELETED. `POST /account/brand-contest/verify`
+  // (creator-contact-routes.ts:668) reuses `verifyBrandContest` whole and takes
+  // the filer from the SESSION — there is no `passport_id` to supply. Gating
+  // this door would have been a second implementation of that same control.
+  //
+  // AND IT COST NO CALLER: the ladder inside `verifyBrandContest` asks
+  // `subjectMayAddAccounts` (brand-enrolment.ts:847), which requires
+  // `claim_state IN ('claimed','verified') AND retracted = 0` — a LIVE CLAIMED
+  // passport — so every filer this door could ever serve is one who can sign
+  // in. The passport-less brand owner it reads as existing for could never file
+  // through it.
+  //
+  // THE START HALF ABOVE STAYS. It mints a token against a domain and reads
+  // nothing about anybody; it has no signed-in twin and needs none.
+
+  // Brand domain control-proof (Cluster E): prove control of a domain account by
+  // publishing a Dhwaja token as a DNS TXT record, verified over DoH. Public +
+  // proof-gated (the DNS control IS the authorization), like the bio-code claim.
+  app.post("/claim/domain/start", anonBodyLimit, async (c) => {
+    // Same per-IP cap as the other claim entry routes — this one also seeds
+    // outbound DoH work downstream, so it is not free to call anonymously.
+    if (!(await fanIpAllowed(c, "clmstart", CLAIM_STARTS_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { passport_id?: unknown; domain?: unknown } | null;
+    if (!body || typeof body.passport_id !== "string" || typeof body.domain !== "string") return c.json({ error: "passport_id and domain required" }, 400);
+    // I3-0918 a / I3-2185 (I22-W1-AUTH): the sibling start doors' fail-closed gate — no token, no budget spent,
+    // when this build has no DoH resolver to verify it with.
+    if (!dohResolverFromEnv(c.env as unknown as Record<string, unknown>)) return c.json({ error: "domain_verification_unavailable" }, 503);
+    try {
+      // callerPrefix keys the live slot and the per-day budget per (domain,
+      // caller) — without it one anonymous stranger held the domain's ONLY live
+      // challenge slot and could wedge the real owner out of self-serve claiming.
+      const r = await startDomainClaim(d1(c.env.TRUST_DB), body.passport_id, domainAccountKey(body.domain), undefined, undefined, callerPrefix(c));
+      return c.json(r);
+    } catch (e) {
+      if (e instanceof DomainClaimError) return c.json(errorBody(e), e.status);
+      if (e instanceof Error && /invalid domain/i.test(e.message)) return c.json({ error: e.message }, 400);
+      return serverFault(c, "/claim/domain/start", e, "domain_claim_start");
+    }
+  });
+
+  app.post("/claim/domain/verify", anonBodyLimit, async (c) => {
+    // Each verify against a live challenge drives an outbound DoH lookup — the
+    // same egress-cost shape as /claim/verify, so the same per-IP cap.
+    if (!(await fanIpAllowed(c, "clmvfy", CLAIM_VERIFIES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { challenge_id?: unknown; age_ack?: unknown; min_age?: unknown } | null;
+    if (!body || typeof body.challenge_id !== "string") return c.json({ error: "challenge_id required" }, 400);
+    const resolver = dohResolverFromEnv(c.env as unknown as Record<string, unknown>);
+    if (!resolver) return c.json({ error: "domain_verification_unavailable" }, 503);
+    // H10: same one-shot protection as /claim/verify — don't consume the claim
+    // unless the earned session can actually be minted.
+    if (!usableSessionSecret(c.env.SESSION_SECRET)) return c.json({ error: "sessions_unavailable" }, 503);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      // I46-FX1 SCB-001 (W0-14): as /claim/verify, the challenge status is answered before the age check.
+      const open = await openDomainClaimChallenge(db, body.challenge_id, Date.now());
+      if (open.expired) return c.json(open.expired, 409);
+      // D-1059(1): as /claim/verify — the age check, stamped on the live challenge (same table) before it is spent.
+      const minAge = await creatorMinAge(db);
+      if (!ageAckMatches(body, minAge)) return c.json(ageAckRequired(minAge), 400);
+      await recordClaimAgeAck(db, body.challenge_id, minAge, new Date().toISOString());
+      const r = await verifyDomainClaim(db, body.challenge_id, dohTxtLookup(resolver), undefined, undefined, publishHook(...analyticsPublishArgs(c)));
+      if (r.ok && r.passport_id) {
+        const ep = await currentCreatorEpoch(db, r.passport_id);
+        const session = await issueSession(c.env.SESSION_SECRET, { kind: "creator", id: r.passport_id, ep }, Math.floor(Date.now() / 1000));
+        return c.json({ ...r, ...(session ? { session } : {}) });
+      }
+      // S-007 X3(b): `pending_review` is a SUCCESSFUL verify that deliberately
+      // mints nothing — the proof matched, continuity did not, a person decides.
+      // It cannot reach the mint branch above (`r.ok` is false by construction),
+      // and it is a 200 because nothing was refused: the caller's next move is
+      // to poll the `claim_ref`, not to retry the ceremony.
+      return c.json(r, r.outcome === "verified" || r.outcome === "pending_review" ? 200 : 409);
+    } catch (e) {
+      if (e instanceof LedgerContentionError) return contentionResponse(c);
+      if (e instanceof DomainClaimError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/claim/domain/verify", e, "domain_claim_verify");
+    }
+  });
+
+  app.post("/claim/oauth/:platform/start", anonBodyLimit, async (c) => {
+    if (!(await fanIpAllowed(c, "clmstart", CLAIM_STARTS_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const platform = c.req.param("platform");
+    const body = (await c.req.json().catch(() => null)) as { passport_id?: unknown; account_key?: unknown; age_ack?: unknown; min_age?: unknown } | null;
+    if (!body || typeof body.passport_id !== "string" || typeof body.account_key !== "string") {
+      return c.json({ error: "passport_id and account_key required" }, 400);
+    }
+    try {
+      const db = d1(c.env.TRUST_DB);
+      // D-1059(1): the /claim/start age check, after the same finished-claim answer (D-1057(2)); the callback carries no body.
+      if (await passportAlreadyClaimedPublicly(db, body.passport_id)) return c.json(errorBody(new ClaimError("passport already claimed", 409)), 409);
+      const minAge = await creatorMinAge(db);
+      if (!ageAckMatches(body, minAge)) return c.json(ageAckRequired(minAge), 400);
+      const r = await startOAuthClaim(db, c.env as Record<string, unknown>, platform, body.passport_id, body.account_key, callerPrefix(c), undefined, undefined, minAge); // D-1060(3)
+      return c.json(r);
+    } catch (e) {
+      // M-03: same account_key widening as /claim/start (see there).
+      if (e instanceof AccountKeyFormatError) return c.json({ error: e.message }, 400);
+      if (e instanceof ClaimError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/claim/oauth/:platform/start", e, "oauth_start");
+    }
+  });
+
+  app.get("/claim/oauth/:platform/callback", async (c) => {
+    // I3-2004: Hono runs a GET handler for HEAD; a one-time callback must not be consumed by one.
+    if (c.req.method === "HEAD") return c.body(null, 405, { Allow: "GET" });
+    // I3-2053 b (I22-W1-AUTH): a per-visitor hourly cap, as every other anonymous claim door has.
+    if (!(await fanIpAllowed(c, "oauthcb", OAUTH_CALLBACKS_PER_IP_HOUR))) return c.text("Too many attempts — please try again later.", 429, { "Retry-After": "3600" });
+    const platform = c.req.param("platform");
+    const code = c.req.query("code");
+    const state = c.req.query("state");
+    if (typeof code !== "string" || typeof state !== "string" || code.length > 2048 || code.length === 0) {
+      return c.text("Missing or invalid code/state.", 400);
+    }
+    // I3-0960: H10, as /claim/verify has it — the claim is ONE-SHOT, so never
+    // commit it (nor mint the handoff it earns) while no session could follow.
+    if (!usableSessionSecret(c.env.SESSION_SECRET)) return c.text("Sessions are unavailable — please try again later.", 503, { "Retry-After": "60" });
+    try {
+      const dbc = d1(c.env.TRUST_DB);
+      const console_ = consoleOrigin(c.env);
+      // INT-ID7 sibling (D-1010(11)): this ceremony's purpose, read before completion, so a FAILED account proof (a
+      // signed-in creator proving one account) returns to the console's accounts page, not to the sign-in error screen.
+      const accountProof = (await dbc.prepare("SELECT purpose FROM oauth_challenges WHERE state = ?").bind(state).first<{ purpose: string | null }>())?.purpose === "account_proof";
+      // I3-1078: with a console to reach, the handoff code is minted IN the
+      // claim's batch — a claim that commits always carries its sign-in handoff.
+      const r = await completeOAuthClaim(dbc, c.env as Record<string, unknown>, platform, code, state, undefined, undefined, undefined, publishHook(...analyticsPublishArgs(c)), Boolean(console_));
+      // Deliver the result to the CONSOLE via a one-time handoff code in the
+      // redirect (never a session token). The target is ONLY the configured
+      // CONSOLE_ORIGIN (never a request-derived value → no open redirect); the
+      // query values are a fixed-vocabulary outcome + a hex code, so nothing
+      // hostile can ride the URL.
+      //
+      // H8: this was `appOrigin` (the FAN app), whose SPA has no route for the
+      // `#/signin?oauth=…` handoff — so the code landed on the fan app, the
+      // console never saw it, and OAuth-based claiming (the primary path for X)
+      // could never complete. It is the CREATOR CONSOLE that both starts this
+      // flow and has the route to finish it. When CONSOLE_ORIGIN is unset there
+      // is no console to reach, so fall back to the static HTML (the claim still
+      // succeeded server-side).
+      // I3-1721 (I25-W1-IDENTITY H7): an account-proof ceremony proves one account on an already-signed-in passport. It
+      // carries no passport_id on purpose, so no sign-in handoff is ever minted from it; send the creator back to accounts.
+      if (r.ok && r.outcome === "account_proven") {
+        if (console_) return c.redirect(`${console_}/#/accounts?oauth=proved`, 302);
+        return c.html(claimCallbackPage({ kind: "claimed" }), 200, { "Content-Security-Policy": SSR_CSP, "X-Content-Type-Options": "nosniff" });
+      }
+      if (r.ok && r.passport_id) {
+        if (console_) {
+          // Bind the handoff to THIS flow's state (the initiating browser holds it),
+          // so a leaked code can't sign anyone else in. Minted in the claim's batch
+          // (I3-1078); a separate mint only when this request committed nothing
+          // (the creator's own second tab won the claim — `completeOAuthClaim`).
+          const handoff = r.handoff ?? (await createOAuthHandoff(dbc, r.passport_id, state));
+          return c.redirect(`${console_}/#/signin?oauth=ok&code=${handoff}`, 302);
+        }
+        return c.html(claimCallbackPage({ kind: "claimed" }), 200, { "Content-Security-Policy": SSR_CSP, "X-Content-Type-Options": "nosniff" });
+      }
+      // #527 (FX-A hand-off): `pending_review` mints a one-time `claim_ref` (stored only as
+      // its hash) that /claim/manual/status answers. Render it here, console or not: the
+      // console's `oauthReturn` reads only ok|err, so a redirect would lose the ref.
+      if (r.outcome === "pending_review" && typeof r.claim_ref === "string" && /^[0-9a-f]{64}$/.test(r.claim_ref)) {
+        return c.html(
+          claimCallbackPage({ kind: "pending", outcome: r.outcome, claimRef: r.claim_ref }),
+          200,
+          { "Content-Security-Policy": SSR_CSP, "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" },
+        );
+      }
+      const reason = /^[a-z_]{1,40}$/.test(r.outcome) ? r.outcome : "error"; // fixed-vocab, URL-safe
+      if (console_) return c.redirect(`${console_}/#/${accountProof ? "accounts" : "signin"}?oauth=err&reason=${reason}`, 302);
+      return c.html(claimCallbackPage({ kind: "failed", outcome: r.outcome }), 409, { "Content-Security-Policy": SSR_CSP, "X-Content-Type-Options": "nosniff" });
+    } catch (e) {
+      // Contention is ours, not the creator's: never render it as a claim verdict.
+      if (e instanceof LedgerContentionError) return c.text("Dhwaja is busy — please try again.", 503, { "Retry-After": "1" });
+      if (e instanceof ClaimError) return c.text(e.message, e.status);
+      return serverFault(c, "/claim/oauth/:platform/callback", e, "oauth_callback");
+    }
+  });
+
+  // The console exchanges a one-time handoff code (from the OAuth callback
+  // redirect) for a freshly-minted creator session. Public + proof-gated: the
+  // single-use, short-TTL, 256-bit code IS the proof; a stale/used/unknown code
+  // yields a uniform 401. No account_key/passport is trusted from the client here.
+  app.post("/claim/oauth/exchange", anonBodyLimit, async (c) => {
+    // I-16 (CLAIMROUTE_TRU): this leg redeems the handoff and mints a creator
+    // session — the same class of high-value anonymous compute every other
+    // door in this file bounds per-IP. It had none. `code`/`state` are still
+    // validated below the gate; the gate itself must run BEFORE that parsing
+    // so an unbounded caller cannot spend the parse/redeem cost for free.
+    if (!(await fanIpAllowed(c, "oauthxchg", CLAIM_VERIFIES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { code?: unknown; state?: unknown; age_ack?: unknown; min_age?: unknown } | null;
+    if (!body || typeof body.code !== "string") return c.json({ error: "code required" }, 400);
+    // I3-0960: refuse BEFORE the redeem, which burns the single-use handoff —
+    // a code spent on a session that cannot be minted is a creator locked out.
+    if (!usableSessionSecret(c.env.SESSION_SECRET)) return c.json({ error: "sessions_unavailable" }, 503);
+    const db = d1(c.env.TRUST_DB);
+    // I12-RG-AUTH-05: the handoff stores no epoch, so its mint instant is read
+    // BEFORE the redeem below consumes the row; any creator_sessions bump stamped
+    // at or after it (a reset, a recovery, a logout-everywhere) ends the handoff.
+    const minted = await db.prepare("SELECT created_at FROM oauth_handoffs WHERE code = ? AND expires_at > ?").bind(body.code, new Date().toISOString()).first<{ created_at: string }>();
+    // I46-FXR-CODE F1 (D-1307; W0-14's order at the verify doors): a dead, spent or unknown code (no live row: the
+    // redeem's own `expires_at > now`, oauth-claims.ts) gets its own refusal before the age check; the redeem reaps it.
+    if (!minted) {
+      await redeemOAuthHandoff(db, body.code, body.state);
+      return c.json({ error: "invalid or expired code" }, 401);
+    }
+    // D-1059(1): no creator session from an OAuth claim without the age check, asked BEFORE the handoff is redeemed.
+    const minAge = await creatorMinAge(db);
+    if (!ageAckMatches(body, minAge)) return c.json(ageAckRequired(minAge), 400);
+    // The state binds the code to the initiating browser; a leaked code without the
+    // matching state can never redeem (anti login-CSRF / session fixation).
+    const passportId = await redeemOAuthHandoff(db, body.code, body.state);
+    if (!passportId) return c.json({ error: "invalid or expired code" }, 401);
+    // ONE read for the verdict and the epoch minted: a bump after it leaves the
+    // session below a dead generation, never a live one.
+    const gen = await db.prepare("SELECT session_epoch, updated_at FROM creator_sessions WHERE passport_id = ?").bind(passportId).first<{ session_epoch: number; updated_at: string }>();
+    // A passport never bumped (no row) has had no reset to outlive.
+    if (gen && gen.updated_at >= minted.created_at) return c.json({ error: "invalid or expired code" }, 401);
+    const ep = gen?.session_epoch ?? 0;
+    const session = await issueSession(c.env.SESSION_SECRET, { kind: "creator", id: passportId, ep }, Math.floor(Date.now() / 1000));
+    if (!session) return serverFault(c, "/claim/oauth/exchange", new Error("session issue failed"), "oauth_exchange_session_issue");
+    return c.json({ ok: true, session, passport_id: passportId });
+  });
+
+  // H2 — CREATOR PASSKEY SIGN-IN (already-claimed re-entry). A creator whose
+  // session ended (logout-all, epoch bump, 30-day TTL) proves possession of a
+  // registered passkey for a KNOWN passport id and gets a fresh session — WITHOUT
+  // re-running the one-shot claim. Two legs, no ledger append.
+  //
+  // NO ORACLE (QUEUE #382, D-0824(3)): there is deliberately no handle→passport
+  // lookup (the reason F14 was parked). A LIVE passport (`livePassport`: listed,
+  // not retracted, not delisted) keeps its answer — its real challenge, or 403 "no
+  // registered passkey" when it has none, which `/p/:id` already makes public and
+  // the console's zero-passkey messaging relies on. Any other id — suppressed
+  // (passkey or not), retracted, never listed — gets that same 403 WITHOUT its
+  // passkey rows being read, so a delisted creator answers exactly as a
+  // never-listed id: same status, body, headers and reads, and no challenge meter
+  // spent. A suppressed creator's way back in is operator recovery.
+  app.post("/account/creator-signin/start", anonBodyLimit, async (c) => {
+    // Per-IP cap: this drives a challenge INSERT and reveals passkey presence, so
+    // bound it like the other anonymous claim doors.
+    if (!(await fanIpAllowed(c, "csignin", CLAIM_VERIFIES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { passport_id?: unknown } | null;
+    if (!body || typeof body.passport_id !== "string" || !/^psp_[0-9a-f]{16}$/.test(body.passport_id)) return c.json({ error: "passport_id required" }, 400);
+    const cfg = passkeyConfig(c.env);
+    if (!cfg) return c.json({ error: "passkeys_unavailable" }, 503);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      if (!(await livePassport(db, body.passport_id))) throw new PasskeyError("no registered passkey", 403);
+      const opts = await startSigninAssertion(db, body.passport_id, cfg, Date.now(), undefined, undefined, callerPrefix(c));
+      return c.json(opts);
+    } catch (e) {
+      if (e instanceof PasskeyError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/creator-signin/start", e, "creator_signin_start");
+    }
+  });
+
+  app.post("/account/creator-signin", anonBodyLimit, async (c) => {
+    // I-16 (CLAIMROUTE_TRU): the FINISH leg — the one that runs ECDSA
+    // verification and mints the session — carried no per-IP bound while the
+    // START leg above it does (":95", bucket "csignin"), and this file's own
+    // comment there says every anonymous claim door is bounded. Same bucket:
+    // start and finish are one ceremony sharing one budget, same as every
+    // other paired leg in this file.
+    if (!(await fanIpAllowed(c, "csignin", CLAIM_VERIFIES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const cfg = passkeyConfig(c.env);
+    if (!cfg) return c.json({ error: "passkeys_unavailable" }, 503);
+    // Fail closed BEFORE verifying: a valid assertion whose session can't be
+    // minted must not consume the single-use challenge for nothing.
+    if (!usableSessionSecret(c.env.SESSION_SECRET)) return c.json({ error: "sessions_unavailable" }, 503);
+    const body = (await c.req.json().catch(() => null)) as { passport_id?: unknown; assertion?: unknown } | null;
+    const a = body?.assertion as Record<string, unknown> | undefined;
+    if (
+      !body || typeof body.passport_id !== "string" || !/^psp_[0-9a-f]{16}$/.test(body.passport_id) ||
+      !a || typeof a.credentialId !== "string" || typeof a.clientDataJSON !== "string" || typeof a.authenticatorData !== "string" || typeof a.signature !== "string"
+    ) {
+      return c.json({ error: "passport_id and assertion required" }, 400);
+    }
+    const assertion: AssertionResponse = { credentialId: a.credentialId, clientDataJSON: a.clientDataJSON, authenticatorData: a.authenticatorData, signature: a.signature };
+    try {
+      const db = d1(c.env.TRUST_DB);
+      // D-0824(3) + D-0840(1): a passport that is not LIVE never matches a credential.
+      // Its refusal runs the same parse checks, lookup and challenge consume a
+      // never-listed id's does and answers the same challenge refusal, so a real
+      // credential of a delisted creator is refused exactly as a never-listed id's is.
+      if (!(await livePassport(db, body.passport_id))) await refuseSigninAssertion(db, body.passport_id, assertion, cfg, Date.now());
+      // INV-058 — THE EPOCH IS ESTABLISHED BEFORE THE VERDICT IT IS BOUND TO.
+      // `verifySigninAssertion` fences the credential's `status = 'active'` in
+      // its own final UPDATE (passkeys.ts:478-:497), so a revoke landing before
+      // that write is already a 401. What it cannot fence is THIS mint: the
+      // epoch used to be read by a LATER statement, so a break-glass reset
+      // committing in the window (bumpCreatorEpoch then revoke,
+      // passkeys.ts:818-:821) was picked up BY that read and the session was
+      // minted at the epoch the revocation itself produced — the one value that
+      // cannot kill it (`creatorId`, route-helpers.ts:479, refuses only
+      // `s.ep !== epoch`, and route-helpers.ts:509 is the same test). Reading
+      // it FIRST inverts that: any later bump is strictly greater than the
+      // minted `ep`, so a session that escapes is dead at every checkpoint.
+      // The re-read gives the later statement its own verdict — a moved epoch
+      // refuses outright instead of handing out a token already dead. Every
+      // writer of this column (passkeys.ts:748/:818, recovery.ts:786,
+      // console.ts:1434, creator-contact-routes.ts:700) exists to END
+      // outstanding creator authority, so racing one is a refusal by intent.
+      const ep = await currentCreatorEpoch(db, body.passport_id);
+      await verifySigninAssertion(db, body.passport_id, assertion, cfg, Date.now());
+      if ((await currentCreatorEpoch(db, body.passport_id)) !== ep) return c.json({ error: "credential is no longer active" }, 401);
+      const session = await issueSession(c.env.SESSION_SECRET, { kind: "creator", id: body.passport_id, ep }, Math.floor(Date.now() / 1000));
+      if (!session) return c.json({ error: "sessions_unavailable" }, 503);
+      return c.json({ ok: true, session, passport_id: body.passport_id });
+    } catch (e) {
+      if (e instanceof PasskeyError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/creator-signin", e, "creator_signin");
+    }
+  });
+
+  return app;
+}
+===== END FILE: services/trust-core/src/claim-routes.ts =====
+
+===== BEGIN FILE: services/trust-core/src/claims.ts =====
+import { CanonicalizeError, canonicalAccount, canonicalize, subjectForAccount } from "@dhwaja/canonical";
+import { accountProofDetail, accountProofStanding, needsOwnProof as needsOwnProofTerm } from "./account-standing.js";
+import { shieldedAccountKeys } from "./account-visibility.js";
+import type { DbLike, DbStatement } from "./db.js";
+import { accountableSubjectSqlAt, LedgerContentionError, isUnaccountableCharacter, tryAppendEvents } from "./events.js";
+import { mintId } from "./ids.js";
+// THE suppression predicate, never a second spelling of it — see
+// `seeding.ts SUPPRESSED_KEY_SQL` for why it is a bound statement rather than
+// SQL text, and `stillClaimable` below for the door that asks it.
+import { suppressedKeyStmt } from "./seeding.js";
+import { LINK_PLATFORM, verificationTarget, verifyCodePresent } from "./verify-fetch.js";
+
+/**
+ * Bio-code claim flow. A creator proves they control one of a passport's
+ * accounts by placing a short random code in that account's public profile;
+ * we fetch the constructed profile URL (see verify-fetch.ts — SSRF-hardened)
+ * and, on a match, write claim_proven.
+ *
+ * The proof IS the authorization: starting a claim needs no login. The write
+ * goes through appendEvents (which enforces the state machine: only an
+ * unclaimed passport can become claimed), so a race or replay can't
+ * double-claim. actor_kind is "system" (an automated verifier did the proof).
+ */
+
+export const CODE_TTL_MS = 60 * 60 * 1000; // 1h to place the code
+export const MAX_VERIFY_ATTEMPTS = 10;
+
+/**
+ * WHAT A CHALLENGE AUTHORIZES — one value per VERIFY DOOR, written at issue and
+ * asserted at completion. Persisted in `claim_challenges.purpose` (migration
+ * 0027, whose header carries the measured takeover this closes).
+ *
+ * `claim_challenges` is one table behind five ceremonies, and until 0027 the row
+ * recorded which one it belonged to nowhere. `verifyClaim` loaded a challenge by
+ * `challenge_id` alone, so the code minted by the ANONYMOUS, bare-`{url}`
+ * `POST /removal/start` — "please delist me" — was a valid credential for "I am
+ * this creator": an attacker who knew only a profile URL got `claim_proven` on
+ * the ledger and a live creator session over somebody else's passport.
+ *
+ * THE MISMATCH IS INDISTINGUISHABLE FROM AN UNKNOWN ID, EVERYWHERE. Every door
+ * below throws the same `404 no such challenge` for a wrong purpose as for a
+ * challenge_id that never existed, and that is not politeness — it is the second
+ * half of the fix. `removal.ts` hands a DECOY challenge_id to any caller whose
+ * subject is unlisted, suppressed or ineligible, so that a removal request
+ * cannot reveal listedness. Posting that id to `/claim/verify` used to answer
+ * 409 for a real challenge and 404 for a decoy: one unauthenticated request per
+ * subject, and the whole decoy-padding/counting-DB apparatus was undone. Any
+ * distinguishable "wrong purpose" error re-opens it.
+ */
+export const CHALLENGE_PURPOSES = ["claim", "account_proof", "removal", "domain_claim", "domain_proof", "domain_add", "contest", "brand_enrol", "agency_domain"] as const;
+export type ChallengePurpose = (typeof CHALLENGE_PURPOSES)[number];
+/**
+ * Daily issuance cap keyed on (ACCOUNT **and** CALLER) — never the account
+ * alone, for the reason `removal.ts` states about its own caps and this module
+ * learned the harder way (adversarial review, LAUNCH-BLOCKING).
+ *
+ * `POST /claim/start` is anonymous by design: the bio-code proof IS the
+ * authorization and an unclaimed creator has no session to present. Both of its
+ * inputs are anonymously discoverable (`/p/:id/json` publishes platform +
+ * handle; passport ids are enumerable from the sitemap), so an account-only cap
+ * is a budget a STRANGER spends on the victim's behalf — measured at five
+ * anonymous 200s, after which the real creator's own claim and S101
+ * account-proof both answered 409 for the rest of the day. Per (account,
+ * caller) it still stops one actor cycling challenges on one account, while the
+ * per-IP route caps bound global volume and the per-challenge attempt cap bounds
+ * outbound verification fetches.
+ */
+export const MAX_CHALLENGES_PER_DAY = 5;
+export const CHALLENGE_WINDOW_MS = 24 * 60 * 60 * 1000;
+/**
+ * How long a terminal (expired/failed) challenge row is kept before the cron
+ * drops it. MUST stay well above `CHALLENGE_WINDOW_MS`: a prune that reached
+ * inside the issuance window would REFUND the daily budget, which is the cap
+ * this module exists to hold. `used` rows are NEVER pruned at any age — a used
+ * row IS the control proof `isAccountProven` reads.
+ */
+export const CHALLENGE_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+
+export class ClaimError extends Error {
+  override name = "ClaimError";
+  constructor(
+    message: string,
+    public readonly status: 400 | 404 | 409 = 400,
+  ) {
+    super(message);
+  }
+}
+
+export interface StartResult {
+  challenge_id: string;
+  code: string;
+  place_in: string; // human hint: which profile + where
+  expires_at: string;
+}
+
+interface AccountRow {
+  account_key: string;
+  passport_id: string;
+  platform: string;
+  /** "url" is the generic M3 `link` account (platform "link"); "domain" proves
+   * via DNS, not a bio code. Both may reach a lookup here; the gates below decide
+   * which flow each is eligible for. */
+  id_kind: "handle" | "pid" | "url" | "domain";
+  id: string;
+  status: string;
+  claim_state: string;
+  retracted: number;
+}
+
+/**
+ * Which id_kind a stored challenge row proves — derived, because
+ * `claim_challenges` carries `platform_key`/`handle` but not `id_kind`. Only two
+ * kinds ever reach a bio-code VERIFY with a real target: a Tier-1 `handle`, and
+ * a generic `link` (`platform_key === "link"`). A pid never gets a target at
+ * start; a domain is refused at start. So the derivation is exact: link ⇒ "url",
+ * everything else ⇒ "handle". Keeping it in one place stops the two verify paths
+ * (`verifyClaim`, `verifyAccountProof`) from drifting — they hardcoded "handle",
+ * which silently sent a link's proof fetch to `profileUrl` and got null. */
+function challengeIdKind(platformKey: string): "handle" | "url" {
+  return platformKey === LINK_PLATFORM ? "url" : "handle";
+}
+
+/**
+ * I3-1659 — CONTINUITY AT THE BIO-CODE DOOR. The domain door's rule
+ * (`domain-claims.ts domainClaimNeedsReview`, S-007 X3(b)) asked of the account
+ * this challenge names: TRUE when the passport is operator-seeded (`seed_metadata`,
+ * the table IS the population) AND the account's earliest `account_added` is
+ * older, in LEDGER time (`trust_events.created_at`, never a caller-supplied
+ * `observed_at`), than the window. Seeded with no datable add → TRUE (fail
+ * closed). Not imported from domain-claims.ts: that module imports this one,
+ * and `no-circular` is an error — the equality is pinned by
+ * `test/b27-claimkind.test.ts` instead.
+ */
+export const CLAIM_CONTINUITY_DAYS = 30;
+
+/** I21-Q20 (Jason (2), D-1030): the creator minimum age the bio-code claim doors make the creator confirm
+ * (`age_ack: true`), stored with the challenge (migration 0266). An `ops_settings` value, registered on the two-person
+ * limits door by I30-CONSOLE; absent or not a whole number from CREATOR_MIN_AGE_MIN (18) to 150 reads as the default. */
+export const CREATOR_MIN_AGE_KEY = "creator_min_age";
+export const CREATOR_MIN_AGE_DEFAULT = 18;
+/** D-1069 (I30 JASON-QUESTIONS 34): the floor no setting can take the creator minimum age under — the limits door's
+ * `min` (console.ts OPS_LIMIT_SETTINGS) and this reader's lower bound. */
+export const CREATOR_MIN_AGE_MIN = 18;
+export async function creatorMinAge(db: DbLike): Promise<number> {
+  const row = await db.prepare("SELECT value FROM ops_settings WHERE key = ?").bind(CREATOR_MIN_AGE_KEY).first<{ value: string }>();
+  const v = row && /^[0-9]{1,3}$/.test(row.value) ? Number(row.value) : Number.NaN;
+  return v >= CREATOR_MIN_AGE_MIN && v <= 150 ? v : CREATOR_MIN_AGE_DEFAULT;
+}
+
+/** D-1059(1) / D-1057(3): THE age check every claim door asks (claim-routes.ts) — the body ticks `age_ack: true` AND the
+ * age it names is the current setting. `min_age` is the age the client drew in its box; a body naming none is read as
+ * CREATOR_MIN_AGE_DEFAULT, the age every client that sends no age drew (the console before D-1057(3)). */
+export function ageAckMatches(body: { age_ack?: unknown; min_age?: unknown } | null, minAge: number): boolean {
+  if (body?.age_ack !== true) return false;
+  return (body.min_age === undefined ? CREATOR_MIN_AGE_DEFAULT : body.min_age) === minAge;
+}
+
+/** I21-Q20: the verify door's acknowledgement, stamped on the live challenge before it is spent. */
+export async function recordClaimAgeAck(db: DbLike, challengeId: string, minAge: number, nowIso: string): Promise<void> {
+  await db.prepare("UPDATE claim_challenges SET age_ack_min_age = ?, age_ack_at = ? WHERE challenge_id = ? AND status = 'issued'").bind(minAge, nowIso, challengeId).run();
+}
+
+/**
+ * I3-0007 (D-0979, D-0981(9)): THE REVIEW HOLD EVERY SELF-SERVE CLAIM DOOR ASKS
+ * FIRST (bio-code `verifyClaim`, OAuth `completeOAuthClaim`, DNS
+ * `verifyDomainClaim` via `domainClaimNeedsReview`). TRUE when either:
+ *  (a) the passport is operator-seeded (`seed_metadata`) and was never proven
+ *      (no `claim_proven`/`verification_granted` on its ledger) — whatever its
+ *      age and whatever the method: the seeder did not know who the person is;
+ *  (b) the passport WAS proven before, and no proof of it carries a recorded
+ *      provider id (`oauth_challenges.provider_pid`, migration 0123) — until the
+ *      creator re-connects once by OAuth and the id is recorded.
+ *      I62 P5 (D-0981(9), D-1522, D-1524 Reading A): given `accountKey`, only a
+ *      pinned proof OF THAT ACCOUNT counts (`AND account_key = ?`), so a second
+ *      account of a proven passport is held; absent, any pinned proof of the
+ *      passport counts (the DNS door: a domain is never an `oauth_challenges`
+ *      account_key).
+ * One statement, so the three facts are read together.
+ */
+export async function seededOrUnpinnedHold(db: DbLike, passportId: string, accountKey?: string): Promise<boolean> {
+  // I62-FX2-GATE (inv109): two literal statements, one per arm, so the bounded-query guard plans each.
+  const stmt =
+    accountKey === undefined
+      ? db
+          .prepare(
+            `SELECT EXISTS (SELECT 1 FROM seed_metadata WHERE passport_id = ?) AS seeded,
+              EXISTS (SELECT 1 FROM trust_events WHERE subject = ? AND event_type IN ('claim_proven', 'verification_granted')) AS proven,
+              EXISTS (SELECT 1 FROM oauth_challenges WHERE passport_id = ? AND status = 'proven' AND provider_pid IS NOT NULL) AS pinned`,
+          )
+          .bind(passportId, passportId, passportId)
+      : db
+          .prepare(
+            `SELECT EXISTS (SELECT 1 FROM seed_metadata WHERE passport_id = ?) AS seeded,
+              EXISTS (SELECT 1 FROM trust_events WHERE subject = ? AND event_type IN ('claim_proven', 'verification_granted')) AS proven,
+              EXISTS (SELECT 1 FROM oauth_challenges WHERE passport_id = ? AND status = 'proven' AND provider_pid IS NOT NULL AND account_key = ?) AS pinned`,
+          )
+          .bind(passportId, passportId, passportId, accountKey);
+  const row = await stmt.first<{ seeded: number; proven: number; pinned: number }>();
+  if (!row) return true;
+  if (row.seeded && !row.proven) return true;
+  return Boolean(row.proven) && !row.pinned;
+}
+
+export async function claimNeedsReview(db: DbLike, passportId: string, accountKey: string, nowMs: number): Promise<boolean> {
+  if (await seededOrUnpinnedHold(db, passportId, accountKey)) return true;
+  const seeded = await db.prepare("SELECT 1 AS x FROM seed_metadata WHERE passport_id = ? LIMIT 1").bind(passportId).first<{ x: number }>();
+  if (!seeded) return false;
+  // The key is DERIVED from each add's payload exactly as the fold derives it,
+  // so the account matched here is the account the challenge names.
+  const { results } = await db
+    .prepare("SELECT created_at, payload FROM trust_events WHERE event_type = 'account_added' AND subject = ?")
+    .bind(passportId)
+    .all<{ created_at: string; payload: string }>();
+  let addedAt = Infinity;
+  for (const r of results ?? []) {
+    let key: string;
+    try {
+      const p = JSON.parse(r.payload) as Record<string, unknown>;
+      key = subjectForAccount(String(p.platform), String(p.id_kind), String(p.id)).canonical;
+    } catch {
+      continue;
+    }
+    const t = Date.parse(r.created_at);
+    if (key === accountKey && Number.isFinite(t) && t < addedAt) addedAt = t;
+  }
+  if (!Number.isFinite(addedAt)) return true;
+  return nowMs - addedAt > CLAIM_CONTINUITY_DAYS * 24 * 60 * 60 * 1000;
+}
+
+/** Exported for removal.ts, which must return a challenge-SHAPED body for a
+ * subject it deliberately refuses to issue a REAL challenge for (unlisted,
+ * suppressed, or otherwise ineligible). Same generator, so a decoy code is
+ * indistinguishable from a live one — that is the whole point. This module
+ * remains the ONLY writer of `claim_challenges`. */
+export function newCode(): string {
+  // Human-transcribable bio-code: 10 CSPRNG chars over a 32-symbol base32-ish
+  // alphabet (unambiguous chars) = 50 bits of effective entropy. It is
+  // single-use, short-TTL, and rate-limited at issuance/verification, so 50
+  // bits is ample against online guessing (it is NOT a long-lived secret).
+  // Each byte maps uniformly onto 32 symbols (256 = 8×32, no modulo bias).
+  const bytes = crypto.getRandomValues(new Uint8Array(10));
+  const alpha = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let s = "";
+  for (const b of bytes) s += alpha[b % 32];
+  return `dhwaja-${s}`;
+}
+
+/**
+ * The value the `caller` column carries. NULL never reaches it: SQLite treats
+ * NULLs in a UNIQUE index as DISTINCT, so a nullable caller would make
+ * `idx_claim_live` inert on exactly the headerless requests the shared bucket
+ * exists for. An absent client IP collapses to ONE shared slot — still capped,
+ * just collectively — which is the same assumption `fanIpAllowed` already makes
+ * about the edge. It is the MASKED prefix the route reads from
+ * `CF-Connecting-IP`, never anything from the body.
+ */
+export function callerKey(caller: string | null): string {
+  return typeof caller === "string" && caller.length > 0 ? caller.slice(0, 64) : "-";
+}
+
+/**
+ * Expire every live challenge on this account whose TTL has passed.
+ *
+ * THE LIVE SLOT MUST NOT OUTLIVE THE CODE (adversarial review, LAUNCH-BLOCKING).
+ * `idx_claim_live` is a partial UNIQUE index over `status = 'issued'`, and until
+ * this existed nothing in the product ever moved a row OUT of 'issued' unless
+ * the caller came back holding the `challenge_id` — which is returned only to
+ * them. An abandoned challenge therefore held the slot FOREVER rather than for
+ * the hour its code was good for: measured at one anonymous `POST /claim/start`
+ * still answering 409 to the real creator a simulated year later. A partial
+ * index cannot express "and not expired" (there is no `now()` a WHERE clause may
+ * reference), so the expiry is SWEPT instead — here, per account, in the SAME
+ * atomic batch as the insert that needs the slot, and table-wide from the cron
+ * in `pruneClaimChallenges`. Doing it in the batch is what makes it free of a
+ * TOCTOU: the reap and the insert commit together or not at all.
+ */
+export function reapExpired(db: DbLike, accountKey: string, nowIso: string): DbStatement {
+  return db
+    .prepare("UPDATE claim_challenges SET status = 'expired' WHERE account_key = ? AND status = 'issued' AND expires_at <= ?")
+    .bind(accountKey, nowIso);
+}
+
+/**
+ * Issue a challenge row — the daily cap, the reap and the insert, in one place.
+ *
+ * The ONLY writer of `claim_challenges`, shared by the anonymous bio-code claim
+ * and the authenticated S101 account-proof so the two cannot drift apart on the
+ * caller keying (they did not drift before; `/removal/start`'s mitigation was
+ * applied to one door and this module's wider one was left open, which is the
+ * same failure in a different shape).
+ */
+async function issueChallenge(
+  db: DbLike,
+  acct: AccountRow,
+  caller: string | null,
+  noun: "claim" | "proof",
+  now: () => string,
+  nowMs: number,
+  /** REQUIRED, and never defaulted here on purpose: the one place a challenge is
+   * born is the one place that must state what it will be spendable for. A
+   * caller that could omit it would silently inherit somebody else's ceremony —
+   * which is the defect migration 0027 exists to remove. */
+  purpose: ChallengePurpose,
+  /** I21-Q20: the minimum age the creator confirmed, stamped in the SAME batch as the INSERT; null on every other door. */
+  ageAckMinAge: number | null = null,
+): Promise<StartResult> {
+  const key = callerKey(caller);
+  // Rate cap per (account, caller): bounds challenge rows and, through them,
+  // outbound verification fetches, regardless of how a caller cycles failed or
+  // expired challenges — without letting one caller spend another's budget.
+  const windowStart = new Date(nowMs - CHALLENGE_WINDOW_MS).toISOString();
+  const recent = await db
+    .prepare("SELECT COUNT(*) AS n FROM claim_challenges WHERE account_key = ? AND caller = ? AND created_at >= ?")
+    .bind(acct.account_key, key, windowStart)
+    .first<{ n: number }>();
+  if ((recent?.n ?? 0) >= MAX_CHALLENGES_PER_DAY) {
+    throw new ClaimError(`too many ${noun} attempts for this account today`, 409);
+  }
+
+  const code = newCode();
+  const id = mintId("chg");
+  const ts = now();
+  const expires = new Date(nowMs + CODE_TTL_MS).toISOString();
+  try {
+    await db.batch([
+      reapExpired(db, acct.account_key, new Date(nowMs).toISOString()),
+      db
+        .prepare(
+          "INSERT INTO claim_challenges (challenge_id, passport_id, account_key, caller, platform_key, handle, code, status, created_at, expires_at, purpose) VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', ?, ?, ?)",
+        )
+        .bind(id, acct.passport_id, acct.account_key, key, acct.platform, acct.id, code, ts, expires, purpose),
+      ...(ageAckMinAge !== null ? [db.prepare("UPDATE claim_challenges SET age_ack_min_age = ?, age_ack_at = ? WHERE challenge_id = ?").bind(ageAckMinAge, ts, id)] : []),
+    ]);
+  } catch (e) {
+    // The partial-unique index means one live challenge per (account, caller).
+    if (e instanceof Error && /UNIQUE|constraint/i.test(e.message)) {
+      throw new ClaimError(`a ${noun} is already in progress for this account`, 409);
+    }
+    throw e;
+  }
+  return { challenge_id: id, code, place_in: placeInFor(acct.platform, acct.id_kind, acct.id), expires_at: expires };
+}
+
+/**
+ * #132PS-211 (D-0920): THE AUTHENTICATED RE-READ of a live `account_proof` code. The start door answers the code
+ * exactly once and then refuses a second start for an hour ("already in progress"), so a creator who lost the tab
+ * was locked out of their own proof. This hands the SAME live challenge back — never a new one — to the passport
+ * that started it: the route passes the SESSION's passport id, and the row must carry it (claim_challenges stores
+ * no session id, so any session of that passport is its owner). Own-passport only by construction: an
+ * `account_proof` row is minted only for an account on the session's passport, so a hit and a miss tell the caller
+ * nothing about anyone else's roster. `removal` rows (anonymous door) and `contest` rows (whose ineligible branch
+ * is a stored-nothing decoy, so a re-read would be a listedness oracle) are deliberately not re-readable.
+ */
+export async function rereadLiveChallenge(db: DbLike, sessionPassportId: string, rawAccountKey: string, nowMs: number = Date.now()): Promise<StartResult | null> {
+  let accountKey: string;
+  try {
+    accountKey = resolveClaimAccountKey(rawAccountKey);
+  } catch {
+    return null;
+  }
+  const row = await db
+    .prepare(
+      `SELECT challenge_id, code, platform_key, handle, account_key, expires_at FROM claim_challenges
+        WHERE passport_id = ? AND account_key = ? AND purpose = 'account_proof' AND status = 'issued' AND expires_at > ?
+        ORDER BY created_at DESC LIMIT 1`,
+    )
+    .bind(sessionPassportId, accountKey, new Date(nowMs).toISOString())
+    .first<{ challenge_id: string; code: string; platform_key: string; handle: string; account_key: string; expires_at: string }>();
+  if (!row) return null;
+  return { challenge_id: row.challenge_id, code: row.code, place_in: placeInFor(row.platform_key, row.account_key.split("|")[2] ?? "handle", row.handle), expires_at: row.expires_at };
+}
+
+/**
+ * WHERE TO PUT THE CODE — one sentence, built from the account's own fields.
+ *
+ * EXPORTED so `contested-accounts.ts` composes the DECOY's sentence with the
+ * identical function. Its first cut hardcoded a different string on the decoy
+ * branch, which made the very first byte of the very first response a
+ * "is this handle listed?" answer (review, HIGH). The decoy derives its
+ * arguments from the key the CALLER sent, so the two branches are one
+ * implementation reading one grammar and the answer carries nothing back that
+ * did not go out.
+ *
+ * A generic `link` id is a URL norm, not an @handle — hint the page itself.
+ */
+export function placeInFor(platform: string, idKind: string, id: string): string {
+  return idKind === "url" ? `the page at https://${id} — put the code in its visible text/bio` : `${platform} profile of @${id} (bio)`;
+}
+
+/**
+ * Cron hygiene for `claim_challenges` (see `reapExpired` for why the expiry has
+ * to be swept rather than indexed). Three statements, in this order:
+ *
+ *  1. every live row past its TTL becomes 'expired', so it stops holding a live
+ *     slot even for an account nobody starts a claim on again;
+ *  2. terminal rows older than `CHALLENGE_RETENTION_MS` are dropped, so an
+ *     anonymous route cannot grow this table without bound;
+ *  3. the `caller` of a settled row past the issuance window is scrubbed.
+ *
+ * `used` is deliberately absent from (2) at every age: a used row IS the control
+ * proof `isAccountProven`, the registry build and the report shield read.
+ *
+ * (3) EXISTS BECAUSE A `used` ROW IS KEPT FOREVER. `caller` is a masked /24 or
+ * /48 prefix, not an address, but keeping one attached to a permanent proof
+ * record is data this feature does not need: it is load-bearing only while the
+ * row holds a live slot and only inside the 24h issuance window. Outside both it
+ * is scrubbed to the shared sentinel. It cannot refund a budget — the count
+ * window is `created_at >= now - CHALLENGE_WINDOW_MS` and this only touches rows
+ * older than that — and it cannot collide with `idx_claim_live`, which indexes
+ * `status = 'issued'` rows only, which this excludes.
+ *
+ * ---------------------------------------------------------------------------
+ * HYGIENE NEVER TOUCHES A CONSUMED CHALLENGE (audit HIGH)
+ * ---------------------------------------------------------------------------
+ * `claim_consumed` is the one-shot ledger of "this challenge bought a
+ * `claim_proven`". A row that has one has ALREADY been spent, and its
+ * `claim_challenges` row is the only per-account control proof
+ * `accountProofStanding` / `freshProofPairs` can see — so destroying it or
+ * moving it to a terminal state is silently un-proving an account that was
+ * proved. It was measured: the cron flipped a live challenge `issued → expired`
+ * while its verify was in flight, and past `CHALLENGE_RETENTION_MS` the DELETE
+ * below removed the row outright, leaving `claim_state: claimed` with
+ * `isAccountProven: false` and — for a domain, where `servingClassFor` sets
+ * `needsOwnProof` — the brand's listing dropped out of the registry entirely.
+ *
+ * The verify doors are fixed where the damage was done: every proof write is an
+ * UPSERT (claims.ts `verifyClaim` and `verifyAccountProof`; domain-claims.ts
+ * `verifyDomainClaim`, `verifyDomainProof` (I3-0696 b, I22) and the domain-add
+ * door), so it lands even onto a row hygiene has moved or removed. This
+ * clause is the other half, and it is not redundant with that one: it protects
+ * rows ALREADY damaged by the old behaviour (an `expired` row with a
+ * `claim_consumed` sibling is a proof waiting to be repaired, not litter) and it
+ * states the rule where hygiene lives, so the next statement added here inherits
+ * it rather than re-deriving it. `oauth-claims.ts` files its own consumptions
+ * under `oauth:<state>` keys, a disjoint key space, so this correlates on
+ * nothing of that door's.
+ */
+export async function pruneClaimChallenges(db: DbLike, nowMs: number): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE claim_challenges SET status = 'expired'
+        WHERE status = 'issued' AND expires_at <= ?
+          AND NOT EXISTS (SELECT 1 FROM claim_consumed cc WHERE cc.challenge_id = claim_challenges.challenge_id)`,
+    )
+    .bind(new Date(nowMs).toISOString())
+    .run();
+  await db
+    .prepare(
+      `DELETE FROM claim_challenges
+        WHERE status IN ('expired','failed') AND created_at < ?
+          AND NOT EXISTS (SELECT 1 FROM claim_consumed cc WHERE cc.challenge_id = claim_challenges.challenge_id)`,
+    )
+    .bind(new Date(nowMs - CHALLENGE_RETENTION_MS).toISOString())
+    .run();
+  await db
+    .prepare("UPDATE claim_challenges SET caller = '-' WHERE caller <> '-' AND status <> 'issued' AND created_at < ?")
+    .bind(new Date(nowMs - CHALLENGE_WINDOW_MS).toISOString())
+    .run();
+}
+
+/**
+ * M39: fold a possibly HAND-TYPED canonical account key to its true canonical
+ * form before lookup. The creator console's claim form takes the account key as
+ * FREE TEXT (placeholder "v1|platform|handle|name") and feeds it to the bio-code,
+ * OAuth and manual paths alike, so a creator typing their real handle casing —
+ * "v1|x|handle|CandyQueen" — would miss the stored "…|candyqueen". Re-running
+ * canonicalAccount on the (platform, idKind, id) triple folds case, a leading
+ * "@", and platform aliases exactly as the importer did when the account was
+ * seeded. A key of an un-canonicalizable shape (url/norm, or malformed) is
+ * returned UNCHANGED, so it simply 404s as before — this only ever widens a
+ * match, never invents a new failure mode on a trust path.
+ */
+export function canonicalizeAccountKey(raw: string): string {
+  const parts = raw.split("|");
+  if (parts.length === 4 && parts[0] === "v1") {
+    const idKind = parts[2];
+    if (idKind === "handle" || idKind === "pid" || idKind === "domain") {
+      try {
+        return canonicalAccount(parts[1]!, idKind, parts[3]!).canonical;
+      } catch {
+        return raw;
+      }
+    }
+  }
+  return raw;
+}
+
+/**
+ * M-03 (docket #36(e)): the claim form's account-key field accepts a PROFILE
+ * URL as an alternative to the hand-typed canonical key — the thing a real
+ * creator has never seen vs. the thing they actually have. This widens what
+ * the claimant TYPES only: a URL is resolved to the exact same canonical
+ * account string @dhwaja/canonical's `canonicalize()` produces for that URL
+ * everywhere else in the system (the single-hasher tripwire is exactly why
+ * this does not re-implement that parsing), so a claimant who pastes
+ * `https://reddit.com/user/candyqueen` and one who types
+ * `v1|reddit|handle|candyqueen` land on the identical account_key — the same
+ * row, the same `verificationTarget`, the same proof obligation downstream.
+ * Nothing here decides authorization; it only decides which string names the
+ * account the rest of the door already gates.
+ *
+ * A string that is not shaped like a URL is untouched: it still goes through
+ * `canonicalizeAccountKey` exactly as before (a hand-typed `v1|...` key, or
+ * any other free text, keeps 404ing exactly as it did pre-widening — this
+ * never invents a new match for non-URL input). A string that IS shaped like
+ * a URL but does not parse is refused HERE, by name, with the accepted shapes
+ * stated — never "invalid input" (the ruling's explicit requirement).
+ */
+export class AccountKeyFormatError extends Error {
+  override name = "AccountKeyFormatError";
+}
+
+/** Dispatch only: true for anything that reads as an attempted URL, so a
+ * hand-typed `v1|...` key (which always contains "|" and never a bare host)
+ * is never misrouted into URL resolution. Never mistaken for the canonical
+ * parser itself — it decides which parser to call, not what a URL means. */
+function looksLikeProfileUrl(raw: string): boolean {
+  const s = raw.trim();
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) return true; // explicit scheme
+  if (s.includes("|")) return false; // a v1|... key is never a URL candidate
+  return /^(www\.)?[a-z0-9-]+(\.[a-z0-9-]+)+(\/|\?|$)/i.test(s); // bare host[/path]
+}
+
+/**
+ * The account-key resolver every claim-start door in the M-03 door set calls
+ * in place of `canonicalizeAccountKey` (that function is still called FROM
+ * here for the non-URL case, unchanged). Throws `AccountKeyFormatError` —
+ * callers map it to a 400 naming the accepted shapes — only when the input
+ * was clearly an attempted URL and `canonicalize()` itself refused it
+ * (unparseable, non-http(s) scheme, too long, unrepresentable); a
+ * successfully-parsed URL for an unmodelled account still falls through to
+ * the door's ordinary "no such account on that passport" 404, exactly as a
+ * mistyped canonical key does today.
+ */
+export function resolveClaimAccountKey(raw: string): string {
+  if (!looksLikeProfileUrl(raw)) return canonicalizeAccountKey(raw);
+  try {
+    return canonicalize(raw.trim()).canonical;
+  } catch (e) {
+    if (e instanceof CanonicalizeError) {
+      throw new AccountKeyFormatError(
+        "could not read that as a profile URL — paste the full profile link (for example https://instagram.com/yourhandle) or the account key shown on your passport",
+      );
+    }
+    throw e;
+  }
+}
+
+export async function startClaim(
+  db: DbLike,
+  passportId: string,
+  rawAccountKey: string,
+  /** MASKED client prefix from the route. Never read from the body — a
+   * body-supplied caller would mint a fresh slot and a fresh budget per request
+   * and reinstate exactly the flood the keying exists to stop. */
+  caller: string | null,
+  now: () => string = () => new Date().toISOString(),
+  nowMs: number = Date.now(),
+  /** I21-Q20: the minimum age the creator confirmed at the door (`creatorMinAge`), stored with the challenge. */
+  ageAckMinAge: number | null = null,
+): Promise<StartResult> {
+  const accountKey = resolveClaimAccountKey(rawAccountKey);
+  const acct = await db
+    .prepare(
+      `SELECT a.account_key, a.passport_id, a.platform, a.id_kind, a.id, a.status, p.claim_state, p.retracted
+       FROM passport_accounts a JOIN passports p ON p.passport_id = a.passport_id
+       WHERE a.account_key = ? AND a.passport_id = ?`,
+    )
+    .bind(accountKey, passportId)
+    .first<AccountRow>();
+  // INV-003 SHADOW BRANCH. For the population the public surface does not
+  // acknowledge at all -- passport absent, `retracted != 0`, or suppressed --
+  // this door must answer every key the same way a never-written passport is
+  // answered, and the ONLY answer a nonexistent passport can give without
+  // admitting anything is the one a claimable account gets. So no
+  // distinguishing `ClaimError` is thrown here: every key gets a challenge.
+  // REAL where the account is genuinely on the roster, unshielded, active,
+  // unclaimed and has a `verificationTarget`; PHANTOM otherwise, bound to the
+  // CALLER-SUPPLIED (passport_id, account_key) -- the "bound to the challenger,
+  // not the incumbent" shape `startContestProof` uses at :712.
+  //
+  // THE PHANTOM IS A REAL `claim_challenges` ROW, never a decoy id. A decoy
+  // posted to `/claim/verify` answers `404 no such challenge` where a real one
+  // answers 409/`NOT_CLAIMABLE`: the same oracle moved one door downstream,
+  // which is the thing the CHALLENGE_PURPOSES docblock at :30-48 records
+  // happening once already.
+  //
+  // BOTH READS RUN UNCONDITIONALLY. The line this replaced was
+  // `if (!acct || await accountIsShielded(...))`, which SHORT-CIRCUITS: the
+  // shield read runs when the account exists and not when it does not, so the
+  // two worlds differed in statement SEQUENCE even where every status matched.
+  const pub = await passportPublicState(db, passportId);
+  if (!pub.acknowledged) {
+    const shielded = await accountIsShielded(db, passportId, accountKey);
+    const claimable =
+      !!acct &&
+      // #850a (I16-W05B): ALSO A BACKSTOP, measured. In this branch the phantom carries the caller's key parts and
+      // `passport_accounts.id` IS the key's canonical id (events.ts account_added binds `subject.id`), so a shielded
+      // roster account and its phantom issue the same row and the same response; deleting this conjunct is an
+      // equivalent mutant (test/i16-w05b-startclaim-shield.test.ts stays green). Kept so a future phantom that
+      // stops mirroring the key cannot quietly start answering a shielded account with its real row.
+      !shielded &&
+      acct.retracted === 0 &&
+      acct.status === "active" &&
+      acct.claim_state === "unclaimed" &&
+      // D-0815(3): a BACKSTOP, kept; no behaviour depends on it today. The phantom
+      // is built from the same key parts as the matched row, so dropping this
+      // conjunct changes neither the challenge row nor the response (B27-FX4A
+      // c388-clause-redundant, executed). No test is owed (D-0815(3)).
+      !!verificationTarget(acct.platform, acct.id_kind, acct.id);
+    return issueChallenge(db, claimable ? (acct as AccountRow) : phantomAccountFor(passportId, accountKey), caller, "claim", now, nowMs, "claim", ageAckMinAge);
+  }
+  if (pub.claimed) throw new ClaimError("passport already claimed", 409);
+  // PS-009: a retracted passport has no public page at all (`getPassportView`
+  // filters `retracted = 0`), so its roster must be exactly as invisible here.
+  // This used to be `acct.retracted === 1 -> 409 "passport retracted"`, asked
+  // ONLY when `acct` was found -- an off-roster key on the SAME retracted
+  // passport fell through to the generic 404 below untouched. That is a
+  // 404-vs-409 membership oracle for a taken-down listing, the identical shape
+  // `passportAlreadyClaimedPublicly` exists to close for a claimed passport,
+  // just left open for a retracted one. Answered here, before the roster is
+  // consulted, with the SAME sentence and status a non-member gets.
+  // Subsumed by the shadow branch above (`retracted != 0` is never
+  // `acknowledged`), kept as a defence in depth rather than deleted.
+  if (acct?.retracted === 1) throw new ClaimError("no such account on that passport", 404);
+  if (!acct || (await accountIsShielded(db, passportId, accountKey))) throw new ClaimError("no such account on that passport", 404);
+  if (acct.status !== "active") throw new ClaimError("account not active", 409);
+  if (acct.claim_state !== "unclaimed") throw new ClaimError("passport already claimed", 409);
+
+  const target = verificationTarget(acct.platform, acct.id_kind, acct.id);
+  if (!target) throw new ClaimError("this platform requires manual verification", 409);
+
+  return issueChallenge(db, acct, caller, "claim", now, nowMs, "claim", ageAckMinAge);
+}
+
+/**
+ * THE TWO FACTS `passportAlreadyClaimedPublicly` FOLDED INTO ONE BOOLEAN.
+ *
+ * That function answers false both for "this passport is not publicly
+ * acknowledged" and for "it is acknowledged and still claimable", which is all
+ * its four callers need. `startClaim` needs them apart: the first is the
+ * population INV-003 governs. ONE query, so nothing here changes the statement
+ * sequence the old call made.
+ */
+export async function passportPublicState(db: DbLike, passportId: string): Promise<{ acknowledged: boolean; claimed: boolean }> {
+  const p = await db
+    .prepare(
+      `SELECT p.claim_state AS claim_state, p.retracted AS retracted,
+              (SELECT COUNT(*) FROM request_suppressions s WHERE s.passport_id = p.passport_id) AS suppressed
+         FROM passports p WHERE p.passport_id = ?`,
+    )
+    .bind(passportId)
+    .first<{ claim_state: string; retracted: number; suppressed: number }>();
+  if (!p) return { acknowledged: false, claimed: false };
+  if (p.retracted !== 0 || (p.suppressed ?? 0) > 0) return { acknowledged: false, claimed: false };
+  return { acknowledged: true, claimed: p.claim_state !== "unclaimed" };
+}
+
+/**
+ * THE PHANTOM'S ACCOUNT ROW, DERIVED FROM THE CALLER'S OWN BYTES AND NOTHING
+ * ELSE. Every field comes from the `(passport_id, account_key)` this request
+ * carried, so the row — and the `place_in` sentence `issueChallenge` composes
+ * from it via `placeInFor` (:248) — cannot carry back one bit that did not go
+ * out. The key grammar is `v1|platform|id_kind|id`, read the same way
+ * `contested-accounts.ts:129` reads it for its decoy.
+ */
+function phantomAccountFor(passportId: string, accountKey: string): AccountRow {
+  const parts = accountKey.split("|");
+  return {
+    account_key: accountKey,
+    passport_id: passportId,
+    platform: parts[1] ?? "",
+    id_kind: (parts[2] as AccountRow["id_kind"]) ?? "handle",
+    id: parts[3] ?? "",
+    status: "active",
+    claim_state: "unclaimed",
+    retracted: 0,
+  };
+}
+
+/**
+ * THE ROSTER IS NOT A MEMBERSHIP ORACLE — the guard all four anonymous
+ * claim-START doors share.
+ *
+ * Every one of them read `passport_accounts` FIRST and answered 404 "no such
+ * account on that passport" before it ever looked at the passport's own state.
+ * So on a claimed passport an anonymous caller got 404 for a key that is not on
+ * the roster and 409 "passport already claimed" for one that is — a
+ * confirm-or-deny for any candidate handle, at 30 starts an hour, against a
+ * passport id the product publishes everywhere and an account_key anybody can
+ * compute offline with `canonicalAccount`.
+ *
+ * That answered for the two populations `getPassportView` deliberately drops:
+ * P1-SHIELDED accounts (whose whole purpose is that the roster does not link
+ * them) and S101 asserted-unproven ones. `/is/:platform/:handle` 404s for both,
+ * and this door contradicted it.
+ *
+ * The fix is an ORDERING, and it is deliberately narrow. When the passport is
+ * one the public surface already acknowledges — live, unsuppressed — and it is
+ * no longer claimable, that is answered BEFORE the roster is consulted, so
+ * every account key gets the same 409. Nothing here is new information: a live
+ * unsuppressed passport's existence and claim state are both on `/p/:id`.
+ *
+ * For a RETRACTED or SUPPRESSED passport this returns false, and answering
+ * their claim state HERE would still build a delisting oracle — the thing
+ * `claims.ts`'s verify-leg reasoning refuses to do. The clause that used to
+ * close this docblock, that those branches bought nothing "since a suppressed
+ * passport's whole roster is already hidden", was FALSE: PRE-W304/INV003 proved
+ * by execution that the branches it waved through WERE the roster oracle (200 +
+ * a live challenge for a member key, 404 for a non-member, on one suppressed
+ * passport). That population is now answered by `startClaim`'s shadow branch
+ * (:428-460), which widens SUCCESS instead of refusing — so this function's
+ * `false` no longer hands anything to a distinguishing refusal.
+ */
+export async function passportAlreadyClaimedPublicly(db: DbLike, passportId: string): Promise<boolean> {
+  const pub = await passportPublicState(db, passportId);
+  return pub.acknowledged && pub.claimed;
+}
+
+/**
+ * A SHIELDED ACCOUNT IS NOT ON THE ROSTER, AS FAR AS THESE DOORS ARE CONCERNED.
+ *
+ * `passportAlreadyClaimedPublicly` closes the 404-vs-409 split for a LIVE,
+ * UNSUPPRESSED, already-claimed passport, and that is the state a shield is
+ * normally set in. It is not the only state a shield can be READ in:
+ *
+ *   - the creator files a removal request, the passport is suppressed, and the
+ *     guard stands down (it must — answering early there would say "this
+ *     subject asked to be delisted"). The old split comes back.
+ *   - a `correction` downgrades the passport to `unclaimed` without touching
+ *     the shield rows, and a shielded key then issues a REAL bio-code challenge
+ *     where a key that is not on the passport 404s.
+ *
+ * In both, an anonymous caller confirms that a handle they merely suspected is
+ * on that passport — which is the whole of what the shield removes. So the
+ * shield is answered by the ONE thing that is true in every state: the account
+ * is not on the roster this door will act on, and the caller is told exactly
+ * what they are told about a handle that was never listed at all.
+ *
+ * The cost is stated: a shielded account cannot be used to CLAIM a passport.
+ * Shielding takes a creator session, which takes a claimed passport, so the
+ * only way to reach that is a passport downgraded after the fact — and the way
+ * back is the creator's own passkey un-shielding it, or claiming with any other
+ * account on the passport.
+ */
+export async function accountIsShielded(db: DbLike, passportId: string, accountKey: string): Promise<boolean> {
+  return (await shieldedAccountKeys(db, passportId)).has(accountKey);
+}
+
+// --- S101: per-account control-proof (re-proof on an already-claimed passport) ---
+//
+// A creator-added account (`relationship_basis: creator_claimed`, S98) is a
+// passkey-signed ASSERTION, not a control-proof — so, mirroring the S76 domain
+// rule, it is not SERVED in the registry and does not SHIELD from reports until
+// the creator proves control of THAT account with the same bio-code machinery.
+// The proof record is the used challenge row (no ledger event, no fold churn —
+// exactly how DNS-proven domains work).
+
+/** Start a control-proof for an account already on the CREATOR'S OWN passport.
+ * Same code/TTL/rate machinery as startClaim, but the passport may be claimed
+ * or verified (that's the point — this proves ONE MORE account), and the caller
+ * is the authenticated creator (the route passes the session's passport id). */
+export async function startAccountProof(
+  db: DbLike,
+  passportId: string,
+  accountKey: string,
+  /** MASKED client prefix from the route — see `startClaim`. Session-gated here,
+   * but keyed the same way so the two doors into `claim_challenges` cannot
+   * drift, and so `/removal/start` (which reaches this function from an
+   * ANONYMOUS route) is keyed too. */
+  caller: string | null,
+  now: () => string = () => new Date().toISOString(),
+  nowMs: number = Date.now(),
+  /**
+   * WHICH DOOR WILL BE ALLOWED TO SPEND THIS CHALLENGE.
+   *
+   * This function is reached from TWO places with completely different
+   * authority: `/account/prove/start`, where the caller holds a creator session
+   * for the passport, and `startRemoval`, which is ANONYMOUS and takes a bare
+   * `{url}`. Both need the same code/TTL/cap/live-slot machinery, which is why
+   * they share the issuer — and sharing the issuer is exactly how the removal
+   * door came to mint a credential that `/claim/verify` would accept. The
+   * removal path passes `"removal"`, so the row it writes is spendable at
+   * `verifyRemoval` and NOWHERE else.
+   *
+   * Defaulted to `"account_proof"` so the session-gated route (in
+   * `creator-contact-routes.ts`) reads unchanged. A caller that forgets to pass
+   * its own purpose fails CLOSED — its verify door asserts a purpose the row
+   * does not carry and answers `404 no such challenge` — so the mistake is a
+   * broken ceremony in the test suite, never an open one in production.
+   */
+  purpose: ChallengePurpose = "account_proof",
+): Promise<StartResult> {
+  // I3-0697: the M-03 resolver, in the primitive — a pasted profile URL names
+  // the same account_key a hand-typed one does. A URL that does not parse is
+  // refused BY NAME as a ClaimError so every door's existing catch reports it.
+  try {
+    accountKey = resolveClaimAccountKey(accountKey);
+  } catch (e) {
+    if (e instanceof AccountKeyFormatError) throw new ClaimError(e.message, 400);
+    throw e;
+  }
+  const acct = await db
+    .prepare(
+      `SELECT a.account_key, a.passport_id, a.platform, a.id_kind, a.id, a.status, p.claim_state, p.retracted
+       FROM passport_accounts a JOIN passports p ON p.passport_id = a.passport_id
+       WHERE a.account_key = ? AND a.passport_id = ?`,
+    )
+    .bind(accountKey, passportId)
+    .first<AccountRow>();
+  if (!acct) throw new ClaimError("no such account on your passport", 404);
+  if (acct.retracted === 1) throw new ClaimError("passport retracted", 409);
+  // F5: a REVOKED or HISTORICAL account the creator still owns may be RE-PROVED
+  // (purpose `account_proof` only — the removal door keeps its active-only
+  // gate). The proof by itself re-lists nothing: the row stays revoked, is not
+  // served, and is not reportable or nominatable any differently; what it does
+  // is put the fact "control re-proven, on this date" on file for an operator's
+  // `account_reactivated{control_reproven}` decision — the creator's own path
+  // back, which no door offered before (F5 review).
+  const reproof = purpose === "account_proof" && (acct.status === "revoked" || acct.status === "historical");
+  if (acct.status !== "active" && !reproof) throw new ClaimError("account not active", 409);
+  // A domain proves control through DNS (domain-claims.ts), never a bio code. A
+  // generic `link` (id_kind "url") DOES prove via a bio code — the code goes on
+  // the linked page and we fetch it — so it falls through here alongside
+  // handle/pid; `verificationTarget` returns null for a link with no fetchable
+  // page, and the manual-verification refusal below catches that case.
+  if (acct.id_kind === "domain") throw new ClaimError("domains prove control via DNS, not a bio code", 409);
+  if (acct.id_kind !== "handle" && acct.id_kind !== "pid" && acct.id_kind !== "url") {
+    throw new ClaimError("this account type cannot prove control with a bio code", 409);
+  }
+
+  // RE-PROOF IS ALLOWED ONCE THE OLD PROOF HAS AGED OUT. This used to be
+  // "already proven → 409" against the EVER predicate, which was harmless while
+  // a proof was permanent and became a LOCKOUT the moment it stopped being: a
+  // creator whose bio-code proof had passed `PROOF_TTL_MS` was dropped from the
+  // registry, lost the report shield, and had the only door back through this
+  // function shut in their face by the record of the proof that had just
+  // expired. The refusal now says what it means — "you have already proved this
+  // AND that proof is still good, so there is nothing to do" — and every other
+  // standing (`proven_stale`, `asserted_unproven`, `listed_unconfirmed`,
+  // `transferred`) is a reason to run the ceremony, not a reason to refuse it.
+  //
+  // `transferred` in particular MUST fall through: it means somebody else's
+  // proof is on file for this account, and the caller (who owns the row today)
+  // has to be able to prove it for themselves — that is the whole point of
+  // binding a proof to a passport.
+  //
+  // …and a RE-PROOF of a revoked/historical row is never "already proven": the
+  // point of that ceremony is to date a proof AFTER the revocation (F5's
+  // `control_reproven` reads only those), and a still-current proof from before
+  // the takedown is exactly what must not stand in for it.
+  // S-070 MA-01 — THE ADVERTISED EARLY RENEWAL IS NOW ACTUALLY PERMITTED.
+  //
+  // The console does not merely allow renewal inside the 14-day warning window,
+  // it SELLS it: `views.ts:1284` tells the creator "this proof runs out on
+  // <date> … renewing now costs you nothing" and `views.ts:1438` puts a
+  // Re-prove button under it, and `views.ts:246` links there from the banner
+  // with "Renewing takes one short code in that profile's bio. Renew it →".
+  // Every one of those paths arrived here and got a flat 409: the predicate was
+  // `proven_current`, full stop, so the ONLY moment a renewal could start was
+  // after the proof had already lapsed — which is precisely the interruption
+  // the warning exists to let the creator avoid. Between the warning and the
+  // deadline the advice was unfollowable.
+  //
+  // ONE WINDOW, NOT A SECOND DEFINITION. The window is
+  // `PROOF_EXPIRY_WARNING_MS` via `deriveStanding`'s `expiring_soon`, which is
+  // the same quantity the console chip, the digest nag and the expiry cron all
+  // read — so the button, the email and this door can never disagree about
+  // whether a creator is inside it.
+  //
+  // NOTHING IS WEAKENED. `expiring_soon` is `now < expires_at <= now + 14d`, so
+  // a proof with a long life left still gets the same refusal it always did; a
+  // proof with no readable deadline is not "expiring soon" and is still
+  // refused. Starting a challenge writes a `claim_challenges` row and touches
+  // no existing proof, so the current proof stays current for its whole
+  // remaining life whether or not the new ceremony is finished or abandoned —
+  // which is the property that makes renewing early cost nothing.
+  const proof = await accountProofDetail(db, passportId, accountKey, nowMs);
+  if (proof.standing === "proven_current" && !proof.expiring_soon && !reproof) throw new ClaimError("this account is already proven", 409);
+
+  const target = verificationTarget(acct.platform, acct.id_kind, acct.id);
+  if (!target) throw new ClaimError("this platform requires manual verification", 409);
+
+  return issueChallenge(db, acct, caller, "proof", now, nowMs, purpose);
+}
+
+/**
+ * X1 — THE CONTESTED-ACCOUNT PROOF: prove control of an account that is on
+ * SOMEBODY ELSE'S passport.
+ *
+ * The door this closes: `account_added` refuses a duplicate `account_key`, and
+ * every existing proof door is scoped to your own passport
+ * (`startAccountProof`), to an unclaimed passport (`startClaim`), or to the
+ * operator-seeded shape (`startRemoval`). So the first party to ASSERT a key
+ * owned it permanently against a person who could prove control of it, with no
+ * self-serve route of any kind.
+ *
+ * THE CHALLENGE ROW IS BOUND TO THE CHALLENGER, NOT THE INCUMBENT, and that is
+ * the load-bearing line in this function. `issueChallenge` writes
+ * `acct.passport_id`, and a used row IS the control proof that
+ * `accountProofStanding`, the registry build and the report shield all read —
+ * so binding it to the incumbent would mean a squatter's victim proving the
+ * squat FOR them. Bound to the challenger it says the true thing (this person
+ * demonstrated control of this account) and reads as nothing at all today,
+ * because the account is not on their passport; if an operator later moves the
+ * row, the proof is already on file for its new owner.
+ *
+ * EVERY REFUSAL IS ONE STRING. The caller supplies an account key, so a
+ * distinguishable refusal is a "is this handle listed, and is it mine?" oracle
+ * over exactly the population no public surface serves. `contested-accounts.ts`
+ * turns every throw here into a decoy challenge, the shape `startRemoval` uses.
+ */
+export async function startContestProof(
+  db: DbLike,
+  challengerPassportId: string,
+  rawAccountKey: string,
+  caller: string | null,
+  now: () => string = () => new Date().toISOString(),
+  nowMs: number = Date.now(),
+): Promise<StartResult> {
+  const accountKey = canonicalizeAccountKey(rawAccountKey);
+  const acct = await db
+    .prepare(
+      `SELECT a.account_key, a.passport_id, a.platform, a.id_kind, a.id, a.status, p.claim_state, p.retracted
+         FROM passport_accounts a JOIN passports p ON p.passport_id = a.passport_id
+        WHERE a.account_key = ?`,
+    )
+    .bind(accountKey)
+    .first<AccountRow>();
+  const NOPE = new ClaimError("not contestable", 409);
+  if (!acct) throw NOPE;
+  // Your own row has its own door — `/account/prove/*` — and routing it here
+  // would let a creator mint a proof bound to their passport for a row they
+  // already hold, bypassing that door's own standing checks.
+  if (acct.passport_id === challengerPassportId) throw NOPE;
+  // RETRACTED is out (there is no listing to contest), but REVOKED is NOT.
+  // `account_added`'s duplicate check has no status filter, so a revoked row
+  // still holds the key against its real owner — and refusing to contest it
+  // made the squat both permanent AND unchallengeable, which is the state a
+  // squatter reaches by simply revoking their own rows (review, HIGH).
+  if (acct.retracted === 1) throw NOPE;
+  // A suppressed subject is never confirmed to exist, on any door.
+  const hidden = await db.prepare("SELECT 1 AS x FROM request_suppressions WHERE passport_id = ?").bind(acct.passport_id).first<{ x: number }>();
+  if (hidden) throw NOPE;
+  if (acct.id_kind === "domain") throw NOPE; // DNS, not a bio code
+  if (acct.id_kind !== "handle" && acct.id_kind !== "pid" && acct.id_kind !== "url") throw NOPE;
+  if (!verificationTarget(acct.platform, acct.id_kind, acct.id)) throw NOPE;
+  return issueChallenge(db, { ...acct, passport_id: challengerPassportId }, caller, "proof", now, nowMs, "contest");
+}
+
+/**
+ * Charge ONE verification attempt against a challenge, atomically.
+ *
+ * THE CAP IS DECIDED IN THIS STATEMENT, not by a `SELECT` several statements
+ * earlier (adversarial review, MEDIUM) — the same defect and the same fix as
+ * `fan-auth.ts issueOtp`, `accounts.ts saveCreator` and `collections.ts
+ * collectCard`. Read-then-increment is overshot by the width of a concurrent
+ * burst: five verifies of one challenge held on the row read (test/db-recorder
+ * `Barrier`, arrivals asserted) drove FIVE outbound profile fetches against a
+ * remaining budget of one and left `attempts = 14` against a cap of 10, with the
+ * challenge still `issued`. `MAX_VERIFY_ATTEMPTS` is the only per-challenge
+ * bound on egress to reddit / linktr.ee / allmylinks / beacons, so an overshoot
+ * here is our own egress getting us blocked at those platforms — which takes
+ * bio-code verification down for every creator, not just the one racing.
+ *
+ * `changes === 1` means this caller holds one of the ≤ `max` slots.
+ * `changes === 0` means either the budget is spent or a concurrent verify
+ * already closed the challenge; the guarded close below distinguishes them
+ * without a second read.
+ *
+ * EXPORTED, PARAMETERISED, AND SHARED WITH THE DOMAIN DOORS. `domain-claims.ts`
+ * had the same debit written out longhand in two places, both check-then-act:
+ * `SELECT attempts` → compare → an UNGUARDED `UPDATE attempts = attempts + 1`.
+ * Measured under a 5-way race with one attempt left: five outbound DoH lookups
+ * against a remaining budget of one, `attempts = 14` against a cap of 10, and
+ * the challenge still `issued` — so the next sequential verify flipped a LIVE
+ * challenge to `failed` and the brand lost a ceremony it had done nothing wrong
+ * in. Copying the correct statement was never going to hold; there is one copy
+ * now, and `tests/invariants/concurrency-guards.test.ts` races all three doors.
+ *
+ * `max` and `fail` are parameters rather than two functions because the ONLY
+ * differences between the doors are the ceiling and the error class the route
+ * catches (`ClaimError` → `/claim/*`, `DomainClaimError` → `/claim/domain/*`).
+ * The statements themselves — the guard, the order, the close — must not vary,
+ * so they do not.
+ */
+export async function chargeAttempt(
+  db: DbLike,
+  challengeId: string,
+  max: number = MAX_VERIFY_ATTEMPTS,
+  fail: (message: string) => Error = (m) => new ClaimError(m, 409),
+): Promise<void> {
+  const charged = await db
+    .prepare("UPDATE claim_challenges SET attempts = attempts + 1 WHERE challenge_id = ? AND status = 'issued' AND attempts < ?")
+    .bind(challengeId, max)
+    .run();
+  if (charged.changes === 1) return;
+  // `AND NOT EXISTS (claim_consumed)` for the same reason `pruneClaimChallenges`
+  // carries it: a challenge that has already bought a `claim_proven` must never
+  // be moved to a terminal state by anything but its own proof write. The
+  // `status = 'issued'` clause makes it unreachable today (a consumed challenge
+  // commits as `used` in the same batch as its consumption), which is exactly
+  // why it is cheap to state — this is the door that closed a LIVE challenge to
+  // `failed` while the winner's fetch was still in flight, and the rule that
+  // stops it doing so belongs beside the statement rather than in the argument
+  // for why it currently cannot.
+  const closed = await db
+    .prepare(
+      `UPDATE claim_challenges SET status = 'failed'
+        WHERE challenge_id = ? AND status = 'issued'
+          AND NOT EXISTS (SELECT 1 FROM claim_consumed cc WHERE cc.challenge_id = claim_challenges.challenge_id)`,
+    )
+    .bind(challengeId)
+    .run();
+  throw fail(closed.changes === 1 ? "too many attempts" : "challenge is not open");
+}
+
+/**
+ * Verify an account proof: fetch the profile, look for the code, and — unlike
+ * verifyClaim — write NO ledger event. The used challenge row IS the proof
+ * (the S76 domain pattern); the registry build and the report shield read it.
+ * The atomic status='issued'→'used' UPDATE serializes concurrent verifies.
+ */
+export async function verifyAccountProof(
+  db: DbLike,
+  passportId: string,
+  challengeId: string,
+  nowMs: number = Date.now(),
+  fetchImpl: typeof fetch = fetch,
+  /** The purpose this door will spend, and NOTHING else. `/account/prove/verify`
+   * takes the default; `removal.ts verifyRemoval` passes `"removal"`, so the two
+   * ceremonies that share this function cannot complete each other's challenge.
+   * A wrong value fails closed (404), never open. */
+  expectPurpose: ChallengePurpose = "account_proof",
+): Promise<{ ok: boolean; outcome: VerifyResult["outcome"]; account_key?: string }> {
+  const chg = await db.prepare("SELECT * FROM claim_challenges WHERE challenge_id = ?").bind(challengeId).first<ChallengeRow>();
+  if (!chg) throw new ClaimError("no such challenge", 404);
+  // BYTE-IDENTICAL TO "no such challenge", DELIBERATELY — see CHALLENGE_PURPOSES.
+  // A challenge minted for another ceremony is not a challenge THIS door has
+  // ever heard of, and saying anything more specific hands back the listedness
+  // bit `removal.ts`'s decoys exist to withhold.
+  if (chg.purpose !== expectPurpose) throw new ClaimError("no such challenge", 404);
+  // Belt and braces on the CHANNEL as well as the purpose (the symmetric partner
+  // of `verifyDomainClaim`'s `platform_key !== 'domain'`): a domain proves control
+  // through DNS, never a fetched page. Unreachable while the purposes above hold —
+  // which is the point of having both — and it wears the same indistinguishable
+  // shape so it can never become an oracle if it ever does become reachable.
+  if (chg.platform_key === "domain") throw new ClaimError("no such challenge", 404);
+  if (chg.passport_id !== passportId) throw new ClaimError("no such challenge", 404); // not yours → indistinguishable
+  if (chg.status !== "issued") throw new ClaimError("challenge is not open", 409);
+  if (Date.parse(chg.expires_at) < nowMs) {
+    await db.prepare("UPDATE claim_challenges SET status = 'expired' WHERE challenge_id = ? AND status = 'issued'").bind(challengeId).run();
+    return { ok: false, outcome: "expired" };
+  }
+  await chargeAttempt(db, challengeId);
+
+  const target = verificationTarget(chg.platform_key, challengeIdKind(chg.platform_key), chg.handle);
+  if (!target) return { ok: false, outcome: "manual" };
+  const outcome = await verifyCodePresent(chg.platform_key, target, chg.code, fetchImpl);
+  if (outcome.status !== "verified") {
+    return { ok: false, outcome: outcome.status === "code_absent" ? "code_absent" : "unreachable" };
+  }
+  // THE PROOF GETS A DATE (migration 0014). `status = 'used'` records THAT
+  // control was demonstrated; `proved_at` records WHEN, which is the fact every
+  // freshness read needs and the one this row did not carry. It is the verify
+  // instant, NOT `created_at` — `created_at` is when the CHALLENGE was issued,
+  // up to `CODE_TTL_MS` earlier, and dating a proof an hour early is a free hour
+  // off its life.
+  //
+  // `valid_until` IS LEFT NULL, DELIBERATELY, AND ON EVERY PATH IN THIS REPO. A
+  // NULL means "derive the expiry from `proved_at` + `PROOF_TTL_MS`", and that
+  // constant lives in `account-standing.ts` — so revising the freshness policy
+  // is a one-line code change rather than a migration over every proof ever
+  // taken, and no row silently keeps the answer that was current when it was
+  // written. `valid_until` is reserved for a proof that genuinely carries its
+  // own deadline (a platform token with a stated lifetime, an operator pinning a
+  // shorter window on a contested account); a bio code has no such deadline, so
+  // writing one here would be inventing policy per row. Same reasoning in
+  // `verifyClaim`, `domain-claims.ts` and `oauth-claims.ts`.
+  //
+  // `method` is audit-only — nothing branches on it — and mirrors the `method`
+  // the `claim_proven` payload already carries, so the projection does not
+  // forget which door somebody came through.
+  const provedAt = new Date(nowMs).toISOString();
+  // THE PROOF ROW MUST LAND WHENEVER THE CODE WAS PRESENT — the same UPSERT as
+  // `verifyClaim`'s proof arm, for the same three measured triggers stated
+  // there: the cron's `issued -> expired` on its own clock, a second tab
+  // driving `chargeAttempt` to the ceiling (`-> failed`), and the retention
+  // DELETE. Each falsifies a `WHERE status = 'issued'` guard WHILE this fetch is
+  // in flight, and a guarded UPDATE matching zero rows threw away a bio code
+  // this function had already fetched and matched: `409 challenge is not open`,
+  // the account left unproven, and with it the registry serving gate and the
+  // report shield. The claim door was fixed and this one was not.
+  //
+  // It cannot mint anything. Every value is `chg`'s own, `challenge_id` is the
+  // PRIMARY KEY so there is at most one row, the row is born `used` — which the
+  // status gate in `verifyAccountProof` (`chg.status !== "issued"`) refuses — and `idx_claim_live` indexes
+  // `status = 'issued'` only, so no live slot is taken and no daily budget is
+  // refunded (`created_at` is the original). `caller` is rebuilt as the shared
+  // sentinel, never from `chg`, because the DELETE this arm recovers from only
+  // fires past `CHALLENGE_RETENTION_MS` — thirty times `CHALLENGE_WINDOW_MS` —
+  // so the cron's scrub had already dropped that value. `purpose` is the
+  // literal this door asserted (`chg.purpose !== expectPurpose`). `result_event` stays NULL: this
+  // ceremony writes no ledger event.
+  //
+  // The rowcount guard this replaces read "concurrent verify won". Replay is
+  // still refused, by `verifyAccountProof`'s `status !== 'issued'` gate on the NEXT
+  // call; two verifies interleaved inside one call now both record the same
+  // proof of the same code, which is idempotent — there is no one-shot marker
+  // on this door (`claim_consumed` is the claim door's) for them to contend for.
+  await db
+    .prepare(
+      `INSERT INTO claim_challenges (challenge_id, passport_id, account_key, caller, platform_key, handle, code, status, attempts, created_at, expires_at, purpose, proved_at, method)
+       VALUES (?, ?, ?, '-', ?, ?, ?, 'used', ?, ?, ?, ?, ?, 'bio_code')
+       ON CONFLICT(challenge_id) DO UPDATE SET status = 'used', proved_at = excluded.proved_at, method = excluded.method`,
+    )
+    .bind(challengeId, chg.passport_id, chg.account_key, chg.platform_key, chg.handle, chg.code, chg.attempts + 1, chg.created_at, chg.expires_at, expectPurpose, provedAt)
+    .run();
+  return { ok: true, outcome: "verified", account_key: chg.account_key };
+}
+
+/**
+ * Is this account's control proof CURRENT, and does it belong to THIS passport?
+ *
+ * Was `isAccountProven(db, accountKey)` — "has this account EVER passed a
+ * control-proof", with no passport bind and no time bound — and both omissions
+ * were findings. EVER made a bio code that sat in a profile for ten minutes in
+ * 2026 answer YES in 2031. The missing passport bind made the proof a property
+ * of the HANDLE rather than of the person who proved it, so selling, losing or
+ * transferring the account handed the new holder the old holder's proof.
+ *
+ * It is now exactly `accountProofStanding(...) === "proven_current"` and holds
+ * no predicate of its own — a second spelling of this question is how the first
+ * one drifted. It survives as a name because "is this proven right now" reads
+ * better at a call site than a string comparison, and because a single wrapper
+ * is the cheapest place to notice if `AccountStanding` ever grows a sixth member
+ * that ought to count.
+ */
+export async function isAccountProven(db: DbLike, passportId: string, accountKey: string, nowMs: number): Promise<boolean> {
+  return (await accountProofStanding(db, passportId, accountKey, nowMs)) === "proven_current";
+}
+
+/** Fold a set of `account_added` rows (actor_kind + payload) into the set of
+ * account_keys that are ASSERTIONS awaiting a control-proof: added ONLY by a
+ * non-operator actor (`creator_passkey`/`agency`) and NEVER by `operator`/
+ * `system`. Keys off the event's ACTOR_KIND — unforgeable via the
+ * privileged-actor gate — NOT the client-supplied `relationship_basis` label (a
+ * self-add can set that to any vocabulary value, e.g. `manual_osint`, to look
+ * operator-vetted). A payload that fails to canonicalize is skipped; it can only
+ * ever be a would-be VETTED op-add (every stored event already canonicalized at
+ * append time), so a skip fails SAFE (still served), never open. */
+function foldAsserted(rows: { actor_kind: string; payload: string }[]): Set<string> {
+  const vetted = new Set<string>();
+  const asserted = new Set<string>();
+  for (const r of rows) {
+    let key: string;
+    try {
+      const p = JSON.parse(r.payload) as Record<string, unknown>;
+      key = subjectForAccount(String(p.platform), String(p.id_kind), String(p.id)).canonical;
+    } catch {
+      continue;
+    }
+    if (r.actor_kind === "operator" || r.actor_kind === "system") vetted.add(key);
+    else if (r.actor_kind === "creator_passkey" || r.actor_kind === "agency") asserted.add(key);
+  }
+  const out = new Set<string>();
+  for (const k of asserted) if (!vetted.has(k)) out.add(k);
+  return out;
+}
+
+/**
+ * ALL asserted-awaiting-proof account keys across the ledger (S101) — the BATCH
+ * form for the periodic registry build. Per-REQUEST paths (report shield,
+ * `/p/:id`, cards) must use `assertedKeysForPassport` instead, which bounds the
+ * scan to one passport's adds so a report can't trigger a full-ledger scan.
+ */
+export async function assertedAccountKeys(db: DbLike): Promise<Set<string>> {
+  const { results } = await db
+    .prepare("SELECT actor_kind, payload FROM trust_events WHERE event_type = 'account_added'")
+    .bind()
+    .all<{ actor_kind: string; payload: string }>();
+  return foldAsserted(results);
+}
+
+/** Asserted-awaiting-proof keys for ONE passport — the per-request form. Scans
+ * only that passport's `account_added` events (indexed by subject), so it's the
+ * same cost class as the pre-S101 real-link guard. */
+export async function assertedKeysForPassport(db: DbLike, passportId: string): Promise<Set<string>> {
+  const own = await accountAddedRows(db, passportId);
+  const out = foldAsserted(own);
+  // I3-2112 (D-0836(1)): an account TRANSFERRED IN keeps the provenance it had.
+  // The transfer preserves `passport_accounts.added_by` (I3-0913, events.ts),
+  // and the whole-ledger reader `assertedAccountKeys` still sees the source's
+  // creator/agency add — so this reader follows the key back along its
+  // `account_transferred` chain (bounded) and folds EVERY add of that key it
+  // finds, on the receiving passport and on each passport it came from, with
+  // the same vetted-beats-asserted rule. An operator transfer vets nothing.
+  const { results: transfers } = await db
+    .prepare("SELECT payload FROM trust_events WHERE event_type = 'account_transferred' AND subject = ?")
+    .bind(passportId)
+    .all<{ payload: string }>();
+  for (const t of transfers) {
+    const key = transferredKey(t.payload);
+    if (!key || out.has(key.account_key)) continue;
+    const rows = own.filter((r) => rowKey(r) === key.account_key);
+    const seen = new Set<string>([passportId]);
+    let from: string | null = key.from_passport;
+    for (let hop = 0; from && !seen.has(from) && hop < TRANSFER_CHAIN_MAX_HOPS; hop++) {
+      seen.add(from);
+      for (const r of await accountAddedRows(db, from)) if (rowKey(r) === key.account_key) rows.push(r);
+      const prev: { payload: string } | null = await db
+        .prepare("SELECT payload FROM trust_events WHERE event_type = 'account_transferred' AND subject = ? AND json_extract(payload, '$.account_key') = ? ORDER BY seq DESC LIMIT 1")
+        .bind(from, key.account_key)
+        .first<{ payload: string }>();
+      from = prev ? (transferredKey(prev.payload)?.from_passport ?? null) : null;
+    }
+    if (foldAsserted(rows).has(key.account_key)) out.add(key.account_key);
+  }
+  return out;
+}
+
+/** Hops followed back along one key's `account_transferred` chain (I3-2112). */
+const TRANSFER_CHAIN_MAX_HOPS = 8;
+
+async function accountAddedRows(db: DbLike, passportId: string): Promise<{ actor_kind: string; payload: string }[]> {
+  const { results } = await db
+    .prepare("SELECT actor_kind, payload FROM trust_events WHERE event_type = 'account_added' AND subject = ?")
+    .bind(passportId)
+    .all<{ actor_kind: string; payload: string }>();
+  return results;
+}
+
+function rowKey(r: { payload: string }): string | null {
+  try {
+    const p = JSON.parse(r.payload) as Record<string, unknown>;
+    return subjectForAccount(String(p.platform), String(p.id_kind), String(p.id)).canonical;
+  } catch {
+    return null;
+  }
+}
+
+function transferredKey(payload: string): { account_key: string; from_passport: string | null } | null {
+  try {
+    const p = JSON.parse(payload) as Record<string, unknown>;
+    if (typeof p.account_key !== "string") return null;
+    return { account_key: p.account_key, from_passport: typeof p.from_passport === "string" ? p.from_passport : null };
+  } catch {
+    return null;
+  }
+}
+
+/** Single-account form for the report shield: was this exact account added ONLY
+ * via creator/agency assertion (never operator/system)? Bounded to the owning
+ * passport's adds. Gated on actor_kind, not the client label. */
+export async function accountIsAsserted(db: DbLike, accountKey: string): Promise<boolean> {
+  const owner = await db.prepare("SELECT passport_id FROM passport_accounts WHERE account_key = ?").bind(accountKey).first<{ passport_id: string }>();
+  if (!owner) return false;
+  return (await assertedKeysForPassport(db, owner.passport_id)).has(accountKey);
+}
+
+/** THE needs-own-proof term, the one spelling (I13 #908). A `domain` or a `link` account, any account while per-account
+ * standing is served, and any ASSERTED account must carry its own current proof before it counts as "a creator's own".
+ * `perAccountProof` is the caller's `await servingPerAccountStanding(db)`, read BEFORE this call: `claims.ts` cannot import
+ * `settings.ts` (claims -> settings -> review -> events -> analytics-events -> codex -> passport-view -> claims is a new
+ * `no-circular` error), so the setting is passed in and the assertion lookup stays behind it (skipped when it is true).
+ * `reports.ts` states the same terms at its report shield (its `isDomain` form: a bare-domain report has no account key yet). */
+export async function accountNeedsOwnProof(db: DbLike, accountKey: string, perAccountProof: boolean): Promise<boolean> {
+  // account-standing.ts needsOwnProof, the one spelling (D-0994(1)); the assertion lookup runs only when the term is not already true.
+  const term = { kind: accountKey.split("|")[1] ?? "", perAccountProof };
+  return needsOwnProofTerm({ ...term, asserted: false }) || needsOwnProofTerm({ ...term, asserted: await accountIsAsserted(db, accountKey) });
+}
+
+/** Does this ACTIVE account of `passportId` protect its hash against an impersonation warning? True when it needs no own
+ * proof (an operator-vetted handle) or is proven_current for this very passport. Shared by `warnings.ts`
+ * `hashIsCreatorAccount` (publish) and `importer.ts` `applyDetermination` (import): one question, one predicate
+ * (I3-0361, I12-FX8/FX9/FX12). An assertion never shields. */
+export async function accountShieldsAgainstImpersonation(db: DbLike, passportId: string, accountKey: string, nowMs: number, perAccountProof: boolean): Promise<boolean> {
+  return !(await accountNeedsOwnProof(db, accountKey, perAccountProof)) || (await isAccountProven(db, passportId, accountKey, nowMs));
+}
+
+export interface VerifyResult {
+  ok: boolean;
+  /** DOMAIN outcomes only. Contention is deliberately absent — a lost head race
+   * leaves this function as a thrown `LedgerContentionError` (503 "try again" at
+   * the route), because there is no honest thing to tell a creator here except
+   * that we could not get a turn. */
+  outcome: "verified" | "code_absent" | "manual" | "unreachable" | "expired" | "pending_review";
+  passport_id?: string;
+  event_id?: string;
+  /** `pending_review` only: the poll handle, returned exactly once. */
+  claim_ref?: string;
+  state?: "pending_review";
+}
+
+/**
+ * Run an append that a verify attempt was already charged for, and REFUND the
+ * attempt if the ledger could not get a turn.
+ *
+ * The attempt debit is deliberately unconditional and up-front (it bounds
+ * outbound profile fetches, and an attacker must not be able to dodge it by
+ * aborting). But a head race is OUR failure, not a failed proof: the creator's
+ * code was there, the fetch matched, and nothing about their profile was wrong.
+ * Charging for it spends a 10-attempt budget on our own write contention. The
+ * refund is floored at 0 and touches only this challenge's counter.
+ */
+export async function refundAttemptOnContention<T>(db: DbLike, challengeId: string, run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (e) {
+    if (e instanceof LedgerContentionError) {
+      await db
+        .prepare("UPDATE claim_challenges SET attempts = attempts - 1 WHERE challenge_id = ? AND status = 'issued' AND attempts > 0")
+        .bind(challengeId)
+        .run();
+    }
+    throw e;
+  }
+}
+
+/**
+ * IS THIS (PASSPORT, ACCOUNT) STILL CLAIMABLE — asked again, AFTER the fetch.
+ *
+ * ---------------------------------------------------------------------------
+ * THE HOUR-LONG WINDOW, AND WHY THE CHALLENGE ROW IS NOT AN ANSWER
+ * ---------------------------------------------------------------------------
+ * `startClaim` gates on the account and the passport at ISSUE time. The code is
+ * then good for `CODE_TTL_MS` (an hour; `DOMAIN_CODE_TTL_MS` is a whole day),
+ * and until this existed the verify doors consulted the CHALLENGE ROW and
+ * nothing else — no account read, no passport read, no suppression read. So
+ * every operator remediation taken inside that window was simply not applied,
+ * and three shapes were measured end to end:
+ *
+ *   account_revoked mid-challenge     → {"ok":true,"outcome":"verified"},
+ *                                       claim_state claimed, account revoked.
+ *   account_transferred mid-challenge → verified, and the claimant landed
+ *                                       `claim_proven` + a live creator session
+ *                                       on a passport they now control nothing
+ *                                       on. THIS IS THE SHARP ONE: moving a
+ *                                       wrongly-seeded account off a passport IS
+ *                                       the remediation, and it did not stop the
+ *                                       claim it was taken to stop.
+ *   a DELISTED passport               → verified, so somebody who asked to be
+ *                                       removed ends up `claimed`, with a
+ *                                       session, on a listing they wanted gone.
+ *
+ * WHY IT IS SAFE TO ANSWER THIS ONLY AFTER THE FETCH — and why it must be.
+ * `/claim/verify` is anonymous and takes only a `challenge_id`. Refusing EARLY
+ * (or refusing distinguishably at `/claim/start`) would answer "has this subject
+ * asked to be delisted?" to any caller holding a challenge id, which is the one
+ * bit `removal.ts` spends its entire design withholding. Reaching this line
+ * requires the bio code to have been fetched from the account's own profile, so
+ * the caller has already demonstrated control of the account they are asking
+ * about. Every refusal below therefore wears ONE message and one status, and
+ * never says which of the four predicates failed.
+ *
+ * BOTH READS ALWAYS RUN. The suppression read is not skipped when the account
+ * read already refused: a statement SEQUENCE that varies with the answer is the
+ * same oracle measured on the wire instead of in the body (the property
+ * `tests/invariants/suppression-oracles.test.ts` holds `/report` to). Two reads,
+ * always, whatever the verdict.
+ *
+ * THE TWO DOORS THAT CALL IT, AND THE TWO THAT DELIBERATELY DO NOT.
+ * `verifyClaim` and `verifyDomainClaim` do: they are ANONYMOUS, they flip a
+ * passport `unclaimed → claimed` on the ledger, and their route mints a creator
+ * SESSION on success — so a stale gate there hands somebody an identity.
+ * `verifyAccountProof` and `verifyDomainProof` do not, and that is a decision
+ * rather than an omission: both are session-gated on the caller's OWN passport,
+ * write no ledger event and mint no session, and the row they write is bound to
+ * the (passport, account) PAIR. A revoked or transferred account therefore
+ * cannot turn that row into trust — `registry-build.ts` and
+ * `creatorAccountStandings` reach proofs THROUGH `passport_accounts`, so a row
+ * that has moved or gone inactive is not served whatever proof sits beside it,
+ * and `accountProofStanding` reads a proof left behind by a previous owner as
+ * `transferred`. Widening this to those doors would add two reads to a path that
+ * has nothing to gain from them.
+ */
+export async function stillClaimable(db: DbLike, passportId: string, accountKey: string, nowMs: number = Date.now()): Promise<boolean> {
+  // `startClaim`'s gate, restated as a predicate: the account still hangs off
+  // THIS passport, it is still active, and the passport is still an unclaimed,
+  // unretracted one. Deliberately a fresh read of the fold rather than anything
+  // carried on the challenge row — the challenge row is what was true an hour
+  // ago, which is precisely the thing that stopped being true.
+  //
+  // ...AND, since slice 14, that a character has somebody answering for it.
+  //
+  // IT IS THE GATE'S OWN STRING, not a restatement of it — `ACCOUNTABLE_SUBJECT_SQL`,
+  // the exact expression `accountablePassport` evaluates inside its CASE. It was
+  // a hand-copy until adversarial review measured what the copy had already lost:
+  // the `NOT EXISTS request_suppressions` clause. A character bound to a verified
+  // person who had asked to be DELISTED passed this pre-check and was refused by
+  // the fold, and the two refusals do not look alike — the fold's is a NOT NULL
+  // constraint on a different column, which `isClaimGateRefusal` does not match,
+  // so it escaped as a 400 while every other unaccountable case answered 409.
+  // The response varied with WHICH predicate failed, and the distinguishing bit
+  // was a delisting: precisely the oracle `NOT_CLAIMABLE` exists to close.
+  //
+  // A pre-check that merely AGREES with the gate is not enough; it has to be the
+  // same string, because agreement is a property somebody edits away one clause
+  // at a time and nothing tells them.
+  //
+  // THE REFUSAL STAYS UNIFORM. The plan for this slice said this predicate
+  // should hand a legitimate agency a specific reason — and reading
+  // `NOT_CLAIMABLE`'s own docblock says why that is wrong: naming which
+  // predicate failed is what puts the delisting bit back on the wire, and
+  // "this one is a character with no operator" is a new bit of exactly that
+  // kind, told to an anonymous caller. Whoever needs the specific reason is an
+  // OPERATOR looking at the passport in the console, which is an authenticated
+  // surface and is where that sentence belongs (slice B).
+  const live = await db
+    .prepare(
+      `SELECT 1 AS x FROM passport_accounts a JOIN passports ON passports.passport_id = a.passport_id
+        WHERE a.account_key = ? AND a.passport_id = ? AND a.status = 'active'
+          AND passports.claim_state = 'unclaimed' AND passports.retracted = 0
+          AND (${accountableSubjectSqlAt(nowMs)})`,
+    )
+    .bind(accountKey, passportId)
+    .first<{ x: number }>();
+  const suppressed = await suppressedKeyStmt(db, accountKey).first<{ x: number }>();
+  return live !== null && suppressed === null;
+}
+
+/**
+ * THE SAME PREDICATE FOR A PASSPORT THAT MAY GROW AN ACCOUNT — `stillClaimable`
+ * for the far side of the ladder. `stillClaimable` asks "is this passport still
+ * UNCLAIMED and accountable, and is this account still hanging off it"; this asks
+ * "is this passport still CLAIMED-or-verified and accountable", which is what the
+ * self-serve domain-add door needs at both of its halves.
+ *
+ * IT EXISTS BECAUSE THE HAND-COPY DID NOT WORK. `verifyDomainAdd` wrote its own
+ * `claim_state !== "unclaimed" && retracted === 0`, and adversarial review pointed
+ * at exactly the clause a hand-copy always loses: `ACCOUNTABLE_SUBJECT_SQL`. A
+ * CHARACTER passport whose operating agency has lapsed, been retracted or asked to
+ * be delisted is still `claimed` and un-retracted, and `account_added` applies no
+ * accountability CASE of its own — so an unaccountable character could self-serve
+ * a brand-new, publicly-served, `confirmed` domain account that the claim door
+ * would refuse for the same passport. `character-lapse-sweep.ts` states the rule
+ * this restores: "a pre-check that merely AGREES with the gate is not enough; it
+ * has to be the same string."
+ */
+export async function subjectMayAddAccounts(db: DbLike, passportId: string, nowMs: number = Date.now()): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT 1 AS x FROM passports
+        WHERE passports.passport_id = ? AND passports.retracted = 0
+          AND passports.claim_state IN ('claimed','verified')
+          AND (${accountableSubjectSqlAt(nowMs)})`,
+    )
+    .bind(passportId)
+    .first<{ x: number }>();
+  return row !== null;
+}
+
+/**
+ * THE SAME PREDICATE, IN THE BATCH — the one-shot consumption and the
+ * eligibility gate as a single statement.
+ *
+ * `stillClaimable` closes the window that is actually exploitable (an hour, a
+ * day for a domain). This closes the microseconds between that read and the
+ * commit, using the mechanism this repo already reserves for exactly that job:
+ * a NOT NULL column fed from a scalar subquery, so a failing predicate supplies
+ * NULL, the constraint fires and D1 rolls the whole batch back — the
+ * `claim_proven` event, the fold's `claim_state` flip, the proof row, all of it.
+ * `standing.ts verifiedMintGate` / `recognitionQuotaGate` are the same idiom
+ * against `write_admissions.subject`; this one rides `claim_consumed.consumed_at`
+ * because the row it guards is the one-shot marker itself, so the gate and the
+ * exactly-once lock are the same write and cannot be separated by a later edit.
+ *
+ * WHAT IT DOES **NOT** TEST, AND WHY — read this before adding a clause.
+ *
+ *  - `p.claim_state = 'unclaimed'` is ABSENT ON PURPOSE. `extraStatements` run
+ *    AFTER the fold effects in the same batch (`events.ts appendEventsOnce`),
+ *    and `claim_proven`'s own effect is `statePassport(..., 'claimed')` — so by
+ *    the time this statement runs the passport is already `claimed` INSIDE this
+ *    transaction and the clause would refuse every honest claim. That predicate
+ *    is the ledger's job and the ledger does it under the `prev_hash` head lock:
+ *    "claim_proven requires unclaimed" is re-read on every retry, so two
+ *    claimants racing one passport are serialized there, not here.
+ *  - SUPPRESSION is absent because the only correct spelling of it is
+ *    `seeding.ts suppressedKeyStmt`, which is a BOUND STATEMENT (deliberately —
+ *    a half-bound union would fail OPEN) and cannot be a subquery of this one.
+ *    A hand-rolled second copy of that union is precisely the drift that helper
+ *    exists to prevent, so suppression stays a `stillClaimable` read and the
+ *    residual is written down here rather than papered over: a delisting that
+ *    lands in the microseconds after that read still completes this claim. The
+ *    delisting itself is unaffected — `servingClassFor` drops a
+ *    removal-requested listing regardless of claim state.
+ *
+ * So what rides the batch is the half the ledger cannot see at all: the account
+ * is still on this passport, and still active. That is the transfer/revoke
+ * shape, which is the sharp one.
+ */
+/**
+ * THE ELIGIBILITY GATE.
+ *
+ * The accountability rule for characters was briefly written here and does NOT
+ * live here: adversarial review found it gated one claim door of three, because
+ * `oauth-claims.ts` builds its own extra statements and the manual path reaches
+ * `claim_proven` through `review.ts approveItem`. It now lives in the FOLD
+ * (`events.ts accountablePassport`), which every door passes through — see that
+ * function for the reasoning. This statement is unchanged from before slice 14.
+ */
+export function claimConsumedGateStmt(db: DbLike, challengeId: string, passportId: string, accountKey: string, ts: string): DbStatement {
+  return db
+    .prepare(
+      `INSERT INTO claim_consumed (challenge_id, consumed_at)
+       VALUES (?, (SELECT ? FROM passport_accounts a
+                     JOIN passports p ON p.passport_id = a.passport_id
+                    WHERE a.account_key = ? AND a.passport_id = ? AND a.status = 'active' AND p.retracted = 0))`,
+    )
+    .bind(challengeId, ts, accountKey, passportId);
+}
+
+/**
+ * Did the gate above refuse this batch?
+ *
+ * Matched on the EXACT column, exactly as `standing.ts isWriteAdmissionRefusal`
+ * matches `write_admissions.subject` — a broad `/constraint/i` would swallow the
+ * `claim_consumed` PRIMARY KEY loss in the same statement, which is a different
+ * answer ("somebody already spent this challenge") that the callers already
+ * translate correctly. better-sqlite3 says `NOT NULL constraint failed:
+ * claim_consumed.consumed_at`; D1 wraps the same sentence in `D1_ERROR: … :
+ * SQLITE_CONSTRAINT`, so this is a `test` and not an equality.
+ *
+ * It reaches the caller as a thrown error rather than a `LedgerRefusal`: a NOT
+ * NULL failure is explicitly NOT a head race (`events.ts NOT_A_HEAD_RACE_RE`, so
+ * it is never retried) and does not match `UNIQUENESS_LOST_RE` (so
+ * `tryAppendEvents` rethrows it unchanged). Both doors catch it and answer with
+ * the SAME sentence `stillClaimable`'s refusal uses.
+ */
+const CLAIM_GATE_REFUSED_RE = /NOT NULL constraint failed:\s*claim_consumed\.consumed_at/i;
+
+export function isClaimGateRefusal(e: unknown): boolean {
+  return e instanceof Error && CLAIM_GATE_REFUSED_RE.test(e.message);
+}
+
+/**
+ * THE REFUSAL EVERY CLAIM DOOR TRANSLATES — both atomic gates, one sentence.
+ *
+ * There are two, on two different NOT NULL columns, and to a caller they mean
+ * exactly the same thing: `claim_consumed.consumed_at` (the account moved, was
+ * revoked, was delisted) and `passports.claim_state` (a character with nobody
+ * live answering for it). They were translated by ONE door and not the other,
+ * so an unaccountable character produced `{"error":"error"}` 400 from
+ * `/claim/verify` while every neighbouring refusal produced NOT_CLAIMABLE 409 —
+ * a difference an anonymous caller can read, which is the whole thing
+ * `NOT_CLAIMABLE` is for.
+ *
+ * Exported as ONE predicate rather than two checks per door precisely because
+ * "remember to also catch the other one" is how the first door was missed. A
+ * third gate belongs in here, not in a fourth `catch`.
+ */
+export function isUniformClaimRefusal(e: unknown): boolean {
+  return isClaimGateRefusal(e) || isUnaccountableCharacter(e);
+}
+
+/** The ONE sentence every eligibility refusal wears, at both doors. It names no
+ * predicate: which of "revoked", "transferred", "retracted" or "delisted"
+ * happened is not something an anonymous verify is owed, and saying would put
+ * the delisting bit back on the wire. */
+export const NOT_CLAIMABLE = "this account can no longer be claimed";
+
+interface ChallengeRow {
+  challenge_id: string;
+  passport_id: string;
+  account_key: string;
+  /** The masked caller prefix. Read back only so the proof UPSERT below can
+   * rebuild a row hygiene deleted; never re-written from it (see there). */
+  caller: string;
+  platform_key: string;
+  handle: string;
+  code: string;
+  status: string;
+  attempts: number;
+  created_at: string;
+  expires_at: string;
+  /** Typed as the open `string` the column actually is, not `ChallengePurpose`:
+   * the value comes back from D1, so narrowing it here would be an assertion
+   * about data rather than a check of it. Every door COMPARES it against a
+   * `ChallengePurpose`, which is the check. A row written before migration 0027
+   * (or by a future INSERT that forgets the column) reads 'unknown' and matches
+   * no door — fail-closed by construction. */
+  purpose: string;
+}
+
+/**
+ * I3-1659 — the review exit of `verifyClaim`, in `domain-claims.ts
+ * routeDomainClaimToReview`'s shape: one batch consumes the challenge, enqueues
+ * an `item_type = 'claim'` item GUARDED BY THAT CONSUMPTION (K concurrent
+ * verifies enqueue once), and writes the audit line guarded by the item. The
+ * item carries `claim_ref_hash`, so `/claim/manual/status` polls it and
+ * `review.ts approveItem`'s claim branch grants it; no `claim_proven`, no session.
+ * The hash is `manual-claims.ts claimRefHashOf`, THE one claim-ref hasher, passed
+ * in by the caller: that module imports this one (`no-circular`), and this module
+ * is not a `sha256Hex` importer (tests/invariants/single-hasher).
+ */
+async function routeClaimToReview(db: DbLike, chg: ChallengeRow, now: () => string, hashClaimRef: (claimRef: string) => Promise<string>): Promise<VerifyResult> {
+  const ts = now();
+  const claimRef = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
+  const itemId = mintId("itm");
+  const payloadJson = JSON.stringify({
+    source: "bio_code_claim",
+    method: "bio_code_review",
+    platform: chg.platform_key,
+    handle: chg.handle,
+    account_key: chg.account_key,
+    claim_ref_hash: await hashClaimRef(claimRef),
+  });
+  await db.batch([
+    // I26-W1-MONEY (I3-0696 sibling, I22 RJ-02): the spend is an UPSERT, as `verifyAccountProof` writes its own — a
+    // guarded `status = 'issued'` UPDATE lost a bio code that MATCHED while the challenge was live whenever hygiene
+    // flipped the row to `expired` (or deleted it) during the profile fetch. A row already `used` (a concurrent verify
+    // won) is left alone, so `proved_at = ts` still binds the enqueue to THIS spend: one-shot holds.
+    db
+      .prepare(
+        `INSERT INTO claim_challenges (challenge_id, passport_id, account_key, caller, platform_key, handle, code, status, attempts, created_at, expires_at, purpose, proved_at, method)
+         VALUES (?, ?, ?, '-', ?, ?, ?, 'used', ?, ?, ?, ?, ?, 'bio_code')
+         ON CONFLICT(challenge_id) DO UPDATE SET status = 'used', proved_at = excluded.proved_at, method = excluded.method WHERE claim_challenges.status <> 'used'`,
+      )
+      .bind(chg.challenge_id, chg.passport_id, chg.account_key, chg.platform_key, chg.handle, chg.code, chg.attempts + 1, chg.created_at, chg.expires_at, chg.purpose, ts),
+    db
+      .prepare(
+        `INSERT INTO review_queue (item_id, item_type, state, subject, payload, created_at, updated_at, import_batch_id)
+         SELECT ?, 'claim', 'open', ?, ?, ?, ?, NULL
+          WHERE EXISTS (SELECT 1 FROM claim_challenges c WHERE c.challenge_id = ? AND c.status = 'used' AND c.proved_at = ?)`,
+      )
+      .bind(itemId, chg.passport_id, payloadJson, ts, ts, chg.challenge_id, ts),
+    db
+      .prepare(
+        `INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind)
+         SELECT 'system', 'enqueue:claim', ?, ?, ?, 'system' WHERE EXISTS (SELECT 1 FROM review_queue q WHERE q.item_id = ?)`,
+      )
+      .bind(itemId, ts, itemId, itemId), // I34-W3-SEAM-P (D-1119(8), D-1120(6)): the review-queue audit copy keeps only the item id
+  ]);
+  const mine = await db.prepare("SELECT 1 AS x FROM review_queue WHERE item_id = ?").bind(itemId).first();
+  if (!mine) throw new ClaimError("challenge is not open", 409);
+  return { ok: false, outcome: "pending_review", state: "pending_review", claim_ref: claimRef, passport_id: chg.passport_id };
+}
+
+/** I46-FX1 SCB-001 (QUEUE #1017, W0-14): THE CHALLENGE-STATUS REFUSALS `verifyClaim` ASKS FIRST, exported so
+ * /claim/verify (claim-routes.ts) asks them BEFORE the age check: an unknown, foreign-purpose or domain id throws
+ * `no such challenge` 404, a spent one `challenge is not open` 409, and an expired one is flipped and returned as
+ * `expired`. Nothing is charged here; `verifyClaim` charges after it. */
+export async function openClaimChallenge(db: DbLike, challengeId: string, nowMs: number): Promise<{ chg: ChallengeRow; expired: VerifyResult | null }> {
+  const chg = await db.prepare("SELECT * FROM claim_challenges WHERE challenge_id = ?").bind(challengeId).first<ChallengeRow>();
+  if (!chg) throw new ClaimError("no such challenge", 404);
+  // THE DOOR THE TAKEOVER CAME THROUGH, AND THE TWO LINES THAT SHUT IT.
+  //
+  // This route is anonymous and takes NOTHING but a challenge_id — that is
+  // deliberate and correct, because the proof IS the authorization. What was
+  // missing is that the id had to name a credential minted FOR THIS CEREMONY.
+  // Without the purpose test, the code handed out by the bare-`{url}`
+  // `POST /removal/start` completed a CLAIM here: `claim_proven` on the ledger
+  // and a creator session for a stranger (migration 0027 has the full chain).
+  //
+  // `404 no such challenge` — the SAME BYTES an unknown id gets, on purpose. A
+  // real removal challenge answering anything a decoy does not is the listedness
+  // oracle that `removal.ts` spends its whole design defeating.
+  if (chg.purpose !== "claim") throw new ClaimError("no such challenge", 404);
+  // The symmetric partner of `verifyDomainClaim`'s `platform_key !== 'domain'`:
+  // a domain account proves control by DNS, never by a fetched page, so a domain
+  // challenge is not something this door has ever been able to complete. Made
+  // explicit rather than left implied by `verificationTarget` returning null.
+  if (chg.platform_key === "domain") throw new ClaimError("no such challenge", 404);
+  if (chg.status !== "issued") throw new ClaimError("challenge is not open", 409);
+  if (Date.parse(chg.expires_at) < nowMs) {
+    await db.prepare("UPDATE claim_challenges SET status = 'expired' WHERE challenge_id = ? AND status = 'issued'").bind(challengeId).run();
+    return { chg, expired: { ok: false, outcome: "expired" } };
+  }
+  return { chg, expired: null };
+}
+
+export async function verifyClaim(
+  db: DbLike,
+  challengeId: string,
+  now: () => string = () => new Date().toISOString(),
+  nowMs: number = Date.now(),
+  fetchImpl: typeof fetch = fetch,
+  /** `manual-claims.ts claimRefHashOf` — required for the I3-1659 review exit;
+   * a caller without it throws there, before anything is consumed. */
+  hashClaimRef?: (claimRef: string) => Promise<string>,
+  /** QUEUE #19: `publishHook(...)`'s thunk; `tryAppendEvents` runs it once after the
+   * batch commits, publishing foldEffects' `creator_claimed` outbox row now. */
+  afterCommit?: () => void,
+): Promise<VerifyResult> {
+  const open = await openClaimChallenge(db, challengeId, nowMs);
+  if (open.expired) return open.expired;
+  const chg = open.chg;
+  await chargeAttempt(db, challengeId);
+
+  const target = verificationTarget(chg.platform_key, challengeIdKind(chg.platform_key), chg.handle);
+  if (!target) return { ok: false, outcome: "manual" };
+
+  const outcome = await verifyCodePresent(chg.platform_key, target, chg.code, fetchImpl);
+  if (outcome.status !== "verified") {
+    return { ok: false, outcome: outcome.status === "code_absent" ? "code_absent" : "unreachable" };
+  }
+
+  // THE GATE, RE-ASKED. `startClaim` decided this an hour ago and the challenge
+  // row is a record of that decision, not of the world — see `stillClaimable`
+  // for the three measured shapes (revoke, transfer, delist) that walked
+  // straight past it. Asked HERE, after the fetch, because reaching this line
+  // means control of the account has just been demonstrated: an earlier or a
+  // more specific refusal would be a listedness oracle on an anonymous route.
+  //
+  // The attempt stays charged. The creator's code WAS present, so this is not a
+  // failed proof — but it is not our own write contention either (which is what
+  // `refundAttemptOnContention` refunds for), and the budget it spends bounds
+  // outbound fetches against an account that has just been taken out of scope.
+  if (!(await stillClaimable(db, chg.passport_id, chg.account_key, nowMs))) throw new ClaimError(NOT_CLAIMABLE, 409);
+
+  // I3-1659: CONTINUITY, asked after the proof (so it is no "we seeded this"
+  // oracle to anyone who can name the passport) and before the write.
+  if (await claimNeedsReview(db, chg.passport_id, chg.account_key, nowMs)) {
+    if (!hashClaimRef) throw new Error("verifyClaim: the review exit needs hashClaimRef (manual-claims.ts claimRefHashOf)");
+    return routeClaimToReview(db, chg, now, hashClaimRef);
+  }
+
+  // Proven. Write claim_proven; appendEvents enforces "must be unclaimed", so a
+  // concurrent/duplicate verify can't double-claim. Mark the challenge used in
+  // the SAME atomic batch as the event.
+  //
+  // tryAppendEvents, NOT try/catch. The old catch read
+  // `/UNIQUE|constraint/i.test(e.message) → code_absent`, and the ledger's
+  // `prev_hash` UNIQUE matches that: a creator whose code WAS in their bio, racing
+  // any unrelated append anywhere in the product, was told the code was absent
+  // and charged an attempt for it. `LedgerRefusal` has no contention member, so
+  // that translation is now unwritable; contention propagates (see below).
+  const ts = now();
+  let r: Awaited<ReturnType<typeof tryAppendEvents>>;
+  try {
+    r = await refundAttemptOnContention(db, challengeId, () =>
+      tryAppendEvents(
+        db,
+        [{ event_type: "claim_proven", subject: chg.passport_id, actor_kind: "system", actor_id: challengeId.slice(0, 128), payload: { method: "bio_code" } }],
+        now,
+        [],
+        [
+          // Single-claim serialization AND the eligibility gate, in one write:
+          // a duplicate/concurrent verify of this challenge violates the
+          // claim_consumed PK, and an account that was revoked or moved between
+          // `stillClaimable` and this commit supplies a NULL `consumed_at`.
+          // Either way the whole batch rolls back, `claim_proven` included —
+          // never two events for one proof, and never a proof over a remediation.
+          claimConsumedGateStmt(db, challengeId, chg.passport_id, chg.account_key, ts),
+          // THE PROOF ROW MUST LAND WHENEVER THE EVENT DOES (audit HIGH).
+          //
+          // This was a guarded `UPDATE … WHERE challenge_id = ? AND status =
+          // 'issued'`, and a batch statement that matches ZERO rows does not
+          // fail its batch — so whenever the guard was falsified the
+          // `claim_proven` committed and the proof row did not. Three triggers
+          // were measured, none of them exotic: the cron flipping `issued →
+          // expired` on its own clock while this fetch was in flight; the
+          // creator's own second tab driving `chargeAttempt` to the ceiling and
+          // closing the challenge `→ failed`; and, past
+          // `CHALLENGE_RETENTION_MS`, the cron DELETING the row outright. The
+          // result each time was `claim_state: claimed` with no proof: a Tier-1
+          // handle `confirmed:false` forever (amber caution, no report shield),
+          // and for a DOMAIN — where `servingClassFor` sets `needsOwnProof` —
+          // the brand's listing dropped clean out of the registry.
+          //
+          // An UPSERT is the only shape that is correct for all three. Dropping
+          // the `status` clause alone fixes the first two (the row is merely in
+          // the wrong state) and CANNOT fix the third (there is no row to
+          // update), so the INSERT arm rebuilds exactly the row this function
+          // already read and validated. It cannot mint anything new: the values
+          // are `chg`'s own, the challenge_id is the PRIMARY KEY so there is at
+          // most one row, and it is born `used`, which every verify door refuses
+          // — unspendable by construction. `idx_claim_live` indexes `status =
+          // 'issued'` only, so the live slot is untouched, and `created_at` is
+          // the original, so no daily budget is refunded.
+          //
+          // `proved_at = ts` — the SAME instant the `claim_proven` event is
+          // stamped with, because they record the same fact and a projection
+          // that disagreed with the ledger about when a proof happened would be
+          // a second source of truth. `valid_until` stays NULL; see
+          // `verifyAccountProof` for the whole argument.
+          //
+          // `caller` is rebuilt as the shared sentinel rather than from `chg`:
+          // the DELETE this arm recovers from only fires past
+          // `CHALLENGE_RETENTION_MS`, which is thirty times
+          // `CHALLENGE_WINDOW_MS`, so the cron's scrub had already replaced that
+          // value long before — writing it back would resurrect data hygiene
+          // deliberately dropped. `purpose` is the literal the gate above
+          // asserted, not a re-read of it.
+          //
+          // `result_event` IS BOUND IN THIS BATCH (I4-07-R3 WO-C): the sub-select
+          // reads the `claim_proven` row the SAME batch appended just above it
+          // (appendEvents runs the ledger INSERT before extraStatements), so no
+          // '__pending__' placeholder is ever committed and no second write has
+          // to backfill it — a lost second write used to leave the placeholder.
+          db
+            .prepare(
+              `INSERT INTO claim_challenges (challenge_id, passport_id, account_key, caller, platform_key, handle, code, status, attempts, created_at, expires_at, purpose, result_event, proved_at, method)
+               VALUES (?, ?, ?, '-', ?, ?, ?, 'used', ?, ?, ?, 'claim', (SELECT event_id FROM trust_events WHERE subject = ? AND event_type = 'claim_proven' ORDER BY seq DESC LIMIT 1), ?, 'bio_code')
+               ON CONFLICT(challenge_id) DO UPDATE SET status = 'used', result_event = excluded.result_event, proved_at = excluded.proved_at, method = excluded.method`,
+            )
+            .bind(challengeId, chg.passport_id, chg.account_key, chg.platform_key, chg.handle, chg.code, chg.attempts + 1, chg.created_at, chg.expires_at, chg.passport_id, ts),
+        ],
+        ["system"], // S27: system actor now requires explicit authorization
+        afterCommit,
+      ),
+    );
+  } catch (e) {
+    // The batch gate refused: the account was revoked or moved off this passport
+    // between `stillClaimable` and the commit. Same sentence, same status as the
+    // read-time refusal — a caller must not be able to tell the microsecond race
+    // from the hour-long one, and there is nothing different for them to do.
+    if (isUniformClaimRefusal(e)) throw new ClaimError(NOT_CLAIMABLE, 409);
+    throw e;
+  }
+  if (!r.ok) {
+    // ONE refusal is "another verify of this same proof already claimed the
+    // passport" — the state machine's "requires unclaimed", or the lost
+    // claim_consumed PK. Everything else (a retracted passport, an invalid
+    // envelope) is a different fault and is rethrown unchanged rather than
+    // dressed up as a missing bio code. Neither branch can be contention.
+    const alreadyClaimed = r.refusal.kind === "conflict" || /requires unclaimed/.test(r.refusal.message);
+    if (!alreadyClaimed) throw r.refusal.error;
+    // I3-2061: WHICH verify won decides the answer, and `claim_consumed` is the
+    // fact that says. Its row for THIS challenge_id exists only if a concurrent
+    // verify of this same proof committed (this batch rolled back whole), so the
+    // claim succeeded and the answer is `verified` — never `code_absent`, which
+    // told a creator whose code WAS present that it was missing. No row means a
+    // different door claimed the passport in the window: `stillClaimable`'s own
+    // refusal, one microsecond late.
+    const won = await db.prepare("SELECT result_event FROM claim_challenges WHERE challenge_id = ? AND status = 'used' AND EXISTS (SELECT 1 FROM claim_consumed WHERE challenge_id = ?)").bind(challengeId, challengeId).first<{ result_event: string | null }>();
+    if (!won) throw new ClaimError(NOT_CLAIMABLE, 409);
+    const ev = typeof won.result_event === "string" && won.result_event !== "__pending__" ? { event_id: won.result_event } : {};
+    return { ok: true, outcome: "verified", passport_id: chg.passport_id, ...ev };
+  }
+  const event = r.events[0];
+  // No backfill: the UPSERT above named the event in the same batch that
+  // appended it, and born `used` (so it is never a non-proof row naming a
+  // `claim_proven` — the self-contradicting record the audit found).
+  void ts;
+  return { ok: true, outcome: "verified", passport_id: chg.passport_id, event_id: event!.event_id };
+}
+===== END FILE: services/trust-core/src/claims.ts =====
+
+===== BEGIN FILE: services/trust-core/src/clawback.ts =====
+import { hasVisibleText } from "@dhwaja/schema";
+import type { DbLike } from "./db.js";
+
+/**
+ * J-01 STAGE 3 — the clawback's NAME-BEFORE-YOU-MOVE precondition (QUEUE #426).
+ *
+ * Jason, D-0616: "the claw must name every creator it touches and the reason
+ * before it moves a cent", under his standing constraint that "a clawback taken
+ * from the wrong creator is money out of a real person's balance ... unlike the
+ * schema change it cannot be reversed".
+ *
+ * THIS MODULE MOVES NO MONEY AND CONTAINS NO WRITE. It is the gate a claw must
+ * pass BEFORE its committing batch is built. That ordering is the ruling: a claw
+ * that computes targets, moves the money, and then records what it did satisfies
+ * the sentence and violates the rule, because the record is then a receipt and
+ * not a precondition.
+ *
+ * WHY THERE IS NO SELECTION RULE HERE, AND WHY THAT IS NOT AN OMISSION.
+ * D-0616 names "MOST RECENT FIRST" and cites its three candidates to
+ * `org/07-findings/W3-09-batch/SCOUT/SCOPE-J01-S1.md`. That packet does not
+ * contain them: measured at packet md5 bd89f1db8a8964c6ce6ef4b72825a48d, the
+ * strings "most recent", "most-recent", "oldest-first", "oldest first",
+ * "pro-rata" and "pro rata" each occur ZERO times in it. Its three candidates
+ * are mechanisms (extend the existing walk past the hold / record a candidate
+ * set and claim nothing / add a purchase->sale edge going forward), not
+ * orderings. So there is no candidate definition to implement, and the bare
+ * phrase under-determines the claw in four ways that each decide whose money
+ * moves (REPORT.md, W2-G, "THE STOP"). Minting one here would be a builder
+ * choosing the attribution rule, which is the one thing this row was held open
+ * to prevent.
+ *
+ * FAIL-CLOSED, BY CONSTRUCTION. `RULED_ATTRIBUTION_RULES` is the closed set of
+ * attribution rules Jason has defined well enough to execute. It is EMPTY, so
+ * `assertFullyNamed` refuses every manifest today. A claw becomes possible when
+ * a rule id is added to that set together with its definition -- an act of
+ * ruling, not of building.
+ *
+ * LOST DISPUTES DO NOT PASS THROUGH HERE (D-0960(1)). A lost dispute's past-hold
+ * remainder is netted by refunds.ts in the reversal's own batch: one
+ * `creator_dispute_debits` row per creator and sale (`disputeDebitStmts`), which
+ * creator-payout.ts subtracts at the creator's next payout. Only what that walk
+ * did not net stays `reserve_loss_cents` and reaches this module unnamed; a
+ * REFUND's past-hold remainder stays unnamed whole. No production module imports
+ * this one (grep of services, apps and packages: three test files only).
+ */
+
+/** The closed set of attribution rules that are DEFINED well enough to move
+ * money. EMPTY at HEAD: see the module docblock. A builder may not add to this;
+ * the entry arrives with the definition it names. */
+export const RULED_ATTRIBUTION_RULES: readonly string[] = [];
+
+/** Why one named creator is being clawed. A closed union: free text cannot be a
+ * reason, because a reason that can be anything cannot be reviewed. */
+export type ClawReasonCode =
+  /** The sale carries this reversal's own landed flip (`reversed_by = rev AND
+   * reversed = 1`) -- the only creator linkage this schema DERIVES rather than
+   * chooses (admin.ts reversalAttribution, migrations/0058_credit_journal.sql:101). */
+  | "within_hold_landed_flip"
+  /** The sale was selected by a ruled past-hold attribution rule. Carries the
+   * rule id, which must be in RULED_ATTRIBUTION_RULES. */
+  | "past_hold_ruled_selection";
+
+export interface ClawTarget {
+  passport_id: string;
+  sale_id: string;
+  /** Creator NET -- what actually leaves this creator's balance. */
+  net_cents: number;
+  /** GROSS backing -- the denomination the shortfall is stated in
+   * (`credit_reversals.reserve_loss_cents`). The two are NOT interconvertible
+   * for the shortfall itself, which is why both travel. */
+  gross_backing_cents: number;
+  reason_code: ClawReasonCode;
+  /** The rule that selected this target, or null for a derived linkage. */
+  rule_id: string | null;
+  /** Operator-readable, and REQUIRED: the sentence an operator reads before
+   * approving. Non-empty is enforced. */
+  reason: string;
+}
+
+/** Money the claw would have to move that it CANNOT name a creator for. Every
+ * entry here is a refusal cause; none is a rounding note. */
+export interface UnnamedMoney {
+  gross_backing_cents: number;
+  why: string;
+}
+
+export interface ClawManifest {
+  reversal_id: string;
+  account_id: string;
+  /** GROSS backing cents the claw is trying to recover:
+   * `credit_reversals.reserve_loss_cents`, the money out the door. */
+  shortfall_gross_cents: number;
+  targets: ClawTarget[];
+  unnamed: UnnamedMoney[];
+  /** The population a rule would select FROM, under exactly the bounds the
+   * stage-2 operator read uses. Served so a manifest can be reviewed against
+   * the same evidence the operator saw; it is NOT a target list. */
+  candidate_population_sales: number;
+  candidates_from: string | null;
+}
+
+export type ClawRefusalCode =
+  | "no_reversal"
+  | "nothing_to_claw"
+  | "empty_target_set"
+  | "unnamed_money"
+  | "target_missing_creator"
+  | "target_missing_reason"
+  | "unruled_attribution"
+  | "named_total_below_shortfall";
+
+/** A refusal is thrown, never returned as a flag: a caller that forgets to read
+ * a boolean still does not move money. */
+export class ClawRefusal extends Error {
+  constructor(
+    readonly code: ClawRefusalCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ClawRefusal";
+  }
+}
+
+const CRV_RE = /^crv_[0-9a-f]{20}$/;
+
+/**
+ * Build the manifest. READS ONLY. The candidate population is read under the
+ * SAME three bounds the stage-2 operator read applies, so a manifest and the
+ * screen an operator approved from describe one population:
+ *   account_id = the reversal's account (the money tombstone after an erasure),
+ *   at >= the disputed purchase's `at` (credits cannot be spent before they are
+ *     granted -- the bound goes on the SPEND instant, not on `clears_at`),
+ *   clears_at <= the reversal's `at` (past-hold AT THE INSTANT THE REVERSAL RAN,
+ *     which is the population `refunds.ts`'s `clears_at > ?` excluded from
+ *     marking; binding the reversal's own `at` rather than `now` is also what
+ *     stops the pool growing under the claw as sales clear mid-operation).
+ * A purchase row that cannot be read leaves the population EMPTY by
+ * construction rather than unbounded below.
+ */
+export async function buildClawManifest(db: DbLike, reversalId: string): Promise<ClawManifest> {
+  if (!CRV_RE.test(reversalId)) throw new ClawRefusal("no_reversal", "bad reversal id");
+  const rev = await db
+    .prepare("SELECT reversal_id, account_id, purchase_id, reserve_loss_cents, at, kind FROM credit_reversals WHERE reversal_id = ?")
+    .bind(reversalId)
+    .first<{ reversal_id: string; account_id: string; purchase_id: string; reserve_loss_cents: number; at: string; kind: string }>();
+  if (!rev) throw new ClawRefusal("no_reversal", "no such reversal: " + reversalId);
+
+  const purchase = await db
+    .prepare("SELECT at FROM credit_purchases WHERE purchase_id = ?")
+    .bind(rev.purchase_id)
+    .first<{ at: string }>();
+
+  const shortfall = rev.reserve_loss_cents;
+  const bounded = shortfall > 0 && purchase != null;
+  const popRow = !bounded
+    ? null
+    : await db
+        .prepare("SELECT COUNT(*) AS n FROM sales WHERE account_id = ? AND at >= ? AND clears_at <= ? AND reversed = 0")
+        .bind(rev.account_id, purchase!.at, rev.at)
+        .first<{ n: number }>();
+
+  // NO RULE, SO NO TARGETS. The shortfall (`reserve_loss_cents`) is real money and
+  // it is recorded here as UNNAMED rather than distributed over the candidates: a
+  // candidate is a creator who MIGHT have received it, and rendering that as a
+  // target is exactly the wrong-creator claw Jason's constraint names. For a LOST
+  // dispute the shortfall is only what refunds.ts did not net as
+  // `creator_dispute_debits` (D-0960(1)); for a refund it is the whole past-hold
+  // remainder, and the production read says so (admin.ts reversalAttribution:
+  // remainder_attribution "none — not derivable from the schema" for a refund,
+  // LOST_DISPUTE_ATTRIBUTION for a dispute).
+  const unnamed: UnnamedMoney[] =
+    shortfall > 0
+      ? [
+          {
+            gross_backing_cents: shortfall,
+            why:
+              purchase == null
+                ? "the purchase row this reversal names could not be read, so the candidate population has no lower time bound"
+                : rev.kind === "dispute"
+                  ? "a lost dispute's past-hold remainder is attributed by D-0960(1): refunds.ts records creator_dispute_debits rows (newest-first over the fan's cleared sales since the purchase), netted against each creator's next payout; this manifest does not claw them again"
+                  : "no ruled past-hold attribution rule for a refund: which creator received a past-hold spend is not derivable from this schema (credits are fungible; there is no purchase->sale edge)",
+          },
+        ]
+      : [];
+
+  return {
+    reversal_id: rev.reversal_id,
+    account_id: rev.account_id,
+    shortfall_gross_cents: shortfall,
+    targets: [],
+    unnamed,
+    candidate_population_sales: popRow?.n ?? 0,
+    candidates_from: purchase?.at ?? null,
+  };
+}
+
+/**
+ * THE PRECONDITION. Throws unless every cent the claw would move is attached to
+ * a named creator, a ruled reason and a sale. Call this BEFORE building any
+ * statement; a caller that reaches its committing batch has already passed it.
+ *
+ * THE EMPTY-SET CASE IS A REFUSAL, NOT A PASS. `for (const t of targets)` over
+ * an empty array satisfies every per-target check vacuously, and for a claw the
+ * empty target set is the likeliest input -- so emptiness is tested BEFORE the
+ * loop and refused on its own code. A claw with nothing to take is a no-op that
+ * must be reported as a refusal, never executed as a success.
+ */
+export function assertFullyNamed(m: ClawManifest): void {
+  if (m.shortfall_gross_cents <= 0 && m.targets.length === 0) {
+    throw new ClawRefusal("nothing_to_claw", "reversal " + m.reversal_id + " has no shortfall: there is nothing to claw");
+  }
+  if (m.unnamed.length > 0) {
+    const total = m.unnamed.reduce((a, u) => a + u.gross_backing_cents, 0);
+    throw new ClawRefusal(
+      "unnamed_money",
+      "refusing: " + total + " gross backing cents on reversal " + m.reversal_id + " cannot be attached to a creator (" + m.unnamed.map((u) => u.why).join("; ") + ")",
+    );
+  }
+  if (m.targets.length === 0) {
+    throw new ClawRefusal("empty_target_set", "refusing: reversal " + m.reversal_id + " has a shortfall of " + m.shortfall_gross_cents + " and an empty target set");
+  }
+  for (const t of m.targets) {
+    if (!t.passport_id || !t.sale_id) {
+      throw new ClawRefusal("target_missing_creator", "refusing: a target on reversal " + m.reversal_id + " names no creator or no sale");
+    }
+    if (!t.reason || t.reason.trim().length === 0 || !hasVisibleText(t.reason)) {
+      throw new ClawRefusal("target_missing_reason", "refusing: target " + t.sale_id + " carries no reason");
+    }
+    if (t.reason_code === "past_hold_ruled_selection" && (t.rule_id === null || !RULED_ATTRIBUTION_RULES.includes(t.rule_id))) {
+      throw new ClawRefusal(
+        "unruled_attribution",
+        "refusing: target " + t.sale_id + " cites attribution rule " + String(t.rule_id) + ", which is not in the ruled set",
+      );
+    }
+  }
+  // The named cents must COVER the shortfall. A manifest that names half the
+  // money and moves it is a partial claw dressed as a complete one; the whole
+  // operation refuses rather than taking what it can name.
+  const named = m.targets.reduce((a, t) => a + t.gross_backing_cents, 0);
+  if (named < m.shortfall_gross_cents) {
+    throw new ClawRefusal(
+      "named_total_below_shortfall",
+      "refusing: targets name " + named + " gross backing cents against a shortfall of " + m.shortfall_gross_cents,
+    );
+  }
+}
+===== END FILE: services/trust-core/src/clawback.ts =====
+
+===== END OF CHUNK 41 OF 75 =====

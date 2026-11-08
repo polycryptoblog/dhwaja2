@@ -1,0 +1,3164 @@
+DHWAJA CODE REVIEW — server — CHUNK 72 OF 75
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (share*), services/trust-core/src (social*), services/trust-core/src (ssr*), services/trust-core/src (standing*)
+Files in this chunk (4):
+  - services/trust-core/src/share-card.ts
+  - services/trust-core/src/social.ts
+  - services/trust-core/src/ssr-shell.ts
+  - services/trust-core/src/standing.ts
+
+
+===== BEGIN FILE: services/trust-core/src/share-card.ts =====
+import { cardModelFromLive, renderCardSvg } from "@dhwaja/card-render";
+import { cardData } from "./cards.js";
+import type { ArtifactReader, PowerRatings } from "./ratings.js";
+import { RATING_DIMENSIONS, serveRatings } from "./ratings.js";
+import type { DbLike } from "./db.js";
+import { HOW_PATH } from "./how-page.js";
+
+/**
+ * D-0841(2): the card's methodology pointer. A constant (no request input), on
+ * the POWER RATINGS label row, right-aligned (card-render geometry: panel right
+ * edge 468, label baseline 498 in the 500x700 viewBox). It links the existing
+ * How-it-works page, not a new route; the path is printed so a screenshot keeps it.
+ */
+const HOW_POINTER = `<a href="${HOW_PATH}"><text x="468" y="498" text-anchor="end" class="wm">HOW TO READ · ${HOW_PATH}</text></a>`;
+
+function withHowPointer(svg: string): string {
+  const at = svg.lastIndexOf("<!-- foil sheen");
+  const cut = at >= 0 ? at : svg.lastIndexOf("</svg>");
+  return cut < 0 ? svg : `${svg.slice(0, cut)}${HOW_POINTER}\n${svg.slice(cut)}`;
+}
+
+/**
+ * The shareable live foil card as a self-contained SVG — the render behind
+ * GET /p/:id/card.svg and the inline card on the public passport page.
+ *
+ * "The link is the proof": a creator shares/embeds this card, and it exists
+ * ONLY for claimed/verified passports (cardData returns null for unclaimed —
+ * an unclaimed listing must never look endorsed). Retracted, SUPPRESSED and
+ * unknown → null, so this route is the same 404 bytes as a never-listed id
+ * (`cardData` holds that gate — see the note there).
+ *
+ * Render is a pure function of already-escape-hardened inputs (card-render is
+ * the SPA's fuzzed renderer); the ROUTE additionally serves it with
+ * default-src 'none' CSP + nosniff as defense in depth.
+ */
+export async function buildShareCardSvg(db: DbLike, store: ArtifactReader, passportId: string, now: () => string = () => new Date().toISOString()): Promise<string | null> {
+  return (await buildShareCard(db, store, passportId, now))?.svg ?? null;
+}
+
+/** The card plus I3-1850's `ratingsNull`: true when the card is drawn without a
+ * complete set of Power Ratings (no/garbled artifact, or any of the seven
+ * dimensions missing — apps/web/src/views.ts `ratingsMissing` parity). */
+export async function buildShareCard(db: DbLike, store: ArtifactReader, passportId: string, now: () => string = () => new Date().toISOString()): Promise<{ svg: string; ratingsNull: boolean } | null> {
+  if (!/^psp_[0-9a-f]{16}$/.test(passportId)) return null;
+  // I34-FX3-INSTANT (I34-RG-W3M EXPIRY:16): ONE instant for the card — the badge (cardData), the ratings (serveRatings)
+  // and the `as_of` stamp are read at the same `at`, so a card cannot show ratings and a lapsed badge together.
+  const at = now();
+  const card = await cardData(db, passportId, Date.parse(at));
+  if (!card) return null; // unknown / retracted / unclaimed
+  let ratings: PowerRatings | null = null;
+  try {
+    ratings = await serveRatings(store, db, passportId, at); // I34-W3-EXPIRY (I34-RJ-07 lead): the card's own clock, not the wall clock
+  } catch {
+    ratings = null; // a missing/garbled ratings artifact must never sink the card
+  }
+  const ratingsNull = !ratings?.ratings || RATING_DIMENSIONS.some((d) => !ratings?.ratings?.[d]);
+  const svg = renderCardSvg(
+    cardModelFromLive({
+      passport_id: card.passport_id,
+      display_name: card.display_name,
+      badge: card.badge,
+      founding_rank: card.founding_rank,
+      palette_seed: card.palette_seed,
+      power_ratings: ratings ? { ratings: ratings.ratings } : null,
+      // The kind mark. A share card is the artifact with no page around it —
+      // no honest line, no link back, nothing but the image — so a character
+      // that says nothing here is a character a fan reads as a person.
+      subject_kind: card.subject_kind,
+      // Y6 — A LIVE CARD IS A CLAIM ABOUT THE MOMENT IT WAS DRAWN, and it now
+      // says which moment. A frozen weekly edition already dates itself (week,
+      // population, content hash); this one carried nothing, so a screenshot of
+      // "VERIFIED" stayed convincing for as long as the image survived, whatever
+      // happened to the standing behind it. Injected rather than read inside the
+      // renderer, which must stay pure — editions are content-hashed.
+      as_of: at,
+    }),
+  );
+  return { svg: withHowPointer(svg), ratingsNull };
+}
+===== END FILE: services/trust-core/src/share-card.ts =====
+
+===== BEGIN FILE: services/trust-core/src/social.ts =====
+import { hasUnsafeDisplayText, hasVisibleText } from "@dhwaja/schema";
+import { shieldedSqlPredicate } from "./account-visibility.js";
+import { fanKey, occurredDay, outboxStatements } from "./analytics-events.js";
+import { confusableSkeleton, displayNameSkeleton } from "./name-fold.js";
+import { publishAfterCommit, type AnalyticsTickEnv } from "./analytics-outbox.js";
+import { outboxSpan, outboxSpanSeqs } from "./events.js";
+// The acq-id shape has ONE home (`credentials.ts`), which is where the minter
+// and its gate live. This file used to carry a byte-identical copy.
+import { ACQ_ID_RE } from "./credentials.js";
+import { inChunks, type DbLike, type DbStatement } from "./db.js";
+// account-standing.ts imports ONLY the DbLike type, so the freshness policy can
+// be shared with this public serving path without widening its import graph.
+import { freshProofBounds } from "./account-standing.js";
+import { grantLiveAtSql, shownClassSql } from "./standing.js";
+import { SERVING_CAUTION_SQL } from "./settings.js";
+import { cardData, type CardData } from "./cards.js";
+import { FOUNDING_RANK_ENRICH_CAP, foundingRank, requestAchievements } from "./requests.js";
+// founder.ts imports ONLY the DbLike type (exactly like recognition-public.ts),
+// so pulling the founder rules into this PUBLIC /u/:handle serving path cannot
+// put billing on its import graph. Every founder exemption is enumerated there.
+import { isFounderAccount } from "./founder.js";
+import { consumeRateLimit } from "./ratelimit.js";
+// recognition-public.ts, NOT recognition.ts: the public recognition projection
+// is a plain SELECT whose only import is the DbLike type, while recognition.ts
+// reads the creator's billing tier for the Pro SEND caps. Importing the narrow
+// module keeps this serving path — the public GET /u/:handle profile —
+// structurally unable to reach billing (paywall invariant), with no allowlist
+// entry standing in for it.
+import { publicRecognitionsFor, type PublicRecognition } from "./recognition-public.js";
+import { REPORTER_TIERS, reporterAchievementId } from "./reporter-tier.js";
+import { scoutLabel } from "./scouts.js";
+import { constellation } from "./fan-connections-public.js";
+import { FROZEN_CLOSURE_STATES_SQL } from "./credits.js";
+import { type LadderStanding, warLadderStanding } from "./war-ladder.js";
+
+/**
+ * S22 — user social layer. Pseudonymous profiles, collection visibility,
+ * featured showcase, verified-acquisition + completion achievements, the
+ * follower/following graph, acquisition-overlap discovery, and independently
+ * verifiable collectibles.
+ *
+ * Everything is derived from tables (acquisitions, releases, card_collections)
+ * — no new trust-ledger event types, so the fold/determinism reducer and the
+ * golden chain are untouched.
+ *
+ * Privacy model:
+ *  - Profiles are OPT-IN; an account without one is socially invisible.
+ *  - The handle is the only public identifier; account_id never leaves the
+ *    server on a social surface.
+ *  - `visibility` gates the collection, achievements, and participation in
+ *    overlap discovery: public → anyone; friends → mutual follow; private →
+ *    owner only. Featured items are a deliberate act of publication and show
+ *    wherever the profile shows.
+ *  - A collectible is verified by its acquisition_id — an unguessable
+ *    capability the holder chooses to share (never enumerable). The receipt
+ *    itself never names a holder (F4b): the id outlives ownership (gifting),
+ *    so naming the CURRENT holder to anyone holding the id would make the id
+ *    a tracker on whoever holds the item next. Who holds it is the holder's
+ *    to show, on their own profile page — where the handle appears only if
+ *    that profile is public.
+ */
+
+export class SocialError extends Error {
+  override name = "SocialError";
+  constructor(
+    message: string,
+    public readonly status: 400 | 401 | 403 | 404 | 409 | 429 = 400,
+    /** M12: a fixed, safe reason code the client maps to its own copy. The
+     * `message` is never rendered to a fan (uncontrolled sink); the code is the
+     * reviewed vocabulary that lets the client tell a HANDLE collision from a
+     * DISPLAY-NAME refusal instead of blaming the handle for both. */
+    public readonly code?: "handle_taken" | "display_name" | "bio" | "handle_shape" | "rate_limit" | "follow_refused",
+  ) {
+    super(message);
+  }
+}
+
+export const MAX_FOLLOWS_PER_ACCOUNT = 5000;
+export const MAX_FEATURED = 12;
+export const MAX_PROFILE_UPDATES_PER_DAY = 20;
+/** A vacated handle stays reserved for its previous owner this long (S27). */
+export const HANDLE_RESERVATION_DAYS = 30;
+/** Cap on simultaneous reservations one account can hold — otherwise handle
+ * cycling (bounded only by the 20/day profile throttle) becomes a multi-handle
+ * denial primitive (review finding). Oldest reservations drop first. */
+export const MAX_HANDLE_RESERVATIONS = 3;
+// THE HANDLE IS NOT ON THE TEXT PREDICATE AND MUST NOT BE MOVED ONTO IT.
+// `display_name` and `bio` are things a person WROTE and a person READS, so
+// they take `hasUnsafeDisplayText`, which permits the two orthographic joiners
+// (ZWNJ/ZWJ) because a Persian or Devanagari name needs them. A HANDLE is an
+// identifier people type, compare and trust — the homograph question runs the
+// other way there, and the looser rule must not reach it. It does not: this is
+// a POSITIVE allowlist of 26 letters, 10 digits and `_`, so no Cf character of
+// any kind can enter a handle, joiner or otherwise, and no deny-class change
+// can widen it. Stated here because "same field, same rule" is the mistake
+// this comment exists to prevent (W3-18-R2, after I3-2099).
+const HANDLE_RE = /^[a-z0-9_]{3,20}$/;
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+const LIST_LIMIT = 200;
+const COLLECTION_LIMIT = 200;
+/** F6: how many Scouts a public profile lists. Bounded like COLLECTION_LIMIT —
+ * a profile page is a page, not an export. */
+const PUBLIC_SCOUTS_LIMIT = 50;
+const DISCOVER_LIMIT = 20;
+
+// --- PUBLIC PROFILE READ CEILING (I3-0761, QUEUE #522) ----------------------
+// `GET /u/:handle` takes no session, is keyed on a handle whose keyspace is
+// PUBLISHED (the leaderboards list handles), and is the most expensive read in
+// the anonymous group: the profile row, the collection, the featured set, the
+// achievements, the public recognitions and two follower COUNTs. It consumed no
+// per-caller bucket at all, so the only cost of walking every handle on the
+// platform was the walk.
+//
+// THE POLICY LIVES HERE, NOT AT THE DOOR, and the cap is the number I3-0761's
+// own fix names (600/hr, the `FEED_READS_PER_IP_HOUR` precedent at
+// `index.ts:384`) — a builder does not pick this number. Same shape as
+// `releaseReadGate` (`releases.ts:824`), which closed the OTHER limb of this
+// same register item: changing the ceiling is a table edit in this file and the
+// door names no number.
+export const PROFILE_READ_CAP_PER_HOUR = 600;
+export const PROFILE_READ_WINDOW_MS = 60 * 60 * 1000;
+
+/**
+ * Resolve the read bucket for one public profile fetch.
+ *
+ * AN UNMASKABLE CALLER FALLS BACK TO A PER-HANDLE BUDGET, and is neither pooled
+ * nor refused, for the reason `releases.ts:808-816` records: pooling the
+ * header-less population into one bucket means requests from anybody close the
+ * surface for everybody. The stated cost is that a header-less deployment
+ * bounds re-reads of ONE handle rather than a walk across many; that is weaker,
+ * and it is a real bound rather than none.
+ *
+ * SUBJECT-INDEPENDENT BY CONSTRUCTION: the key is built from the caller and the
+ * REQUESTED handle only, never from anything read out of the database, and the
+ * door spends it BEFORE the lookup — so a handle that exists, a handle that is
+ * private and a handle that was never registered cost the same bucket and
+ * answer in the same order. A ceiling resolved after the read would have been a
+ * new existence oracle on a surface whose whole privacy model is that an
+ * account without a profile is socially invisible.
+ */
+export function profileReadGate(caller: string | null, handle: string): { key: string; cap: number; windowMs: number } {
+  return {
+    key: caller ? `profread:${caller}` : `profreadh:${handle}`,
+    cap: PROFILE_READ_CAP_PER_HOUR,
+    windowMs: PROFILE_READ_WINDOW_MS,
+  };
+}
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Handles that would let a profile impersonate the platform itself. */
+const RESERVED_HANDLES = new Set([
+  "dhwaja", "admin", "administrator", "ops", "root", "support", "official",
+  "help", "mod", "moderator", "staff", "api", "www", "security", "verify",
+  "verified", "system", "team",
+]);
+
+export type Visibility = "public" | "private" | "friends";
+
+export interface ProfileInput {
+  handle: string;
+  display_name: string;
+  bio?: string;
+  visibility: Visibility;
+  /** F11 / #5 — publish a Creator War record on the public page. DEFAULT OFF,
+   * and separate from `visibility` because it is a different category of fact
+   * than the sentence that switch was consented under. Absent leaves it
+   * unchanged, so an ordinary profile edit cannot switch it on by omission. */
+  war_public?: boolean;
+}
+
+export interface Profile {
+  handle: string;
+  display_name: string;
+  bio: string;
+  visibility: Visibility;
+  created_at: string;
+  updated_at: string;
+  /** I3-2163: the persisted War publication consent, so the owner can see what they set. */
+  war_public: boolean;
+}
+
+async function requireAccount(db: DbLike, accountId: string): Promise<void> {
+  const a = await db.prepare("SELECT 1 AS x FROM accounts WHERE account_id = ?").bind(accountId).first();
+  if (!a) throw new SocialError("no such account", 401);
+}
+
+/** Coarse per-account daily throttle (rate_limits table, same pattern as
+ * registration). The increment is a GUARDED UPDATE (count < cap) so concurrent
+ * requests can't both slip under the cap — no check-then-act window. */
+async function dailyThrottle(db: DbLike, key: string, nowMs: number, cap: number, errMsg: string): Promise<void> {
+  // Single atomic windowed counter (reset + increment in one statement) — no
+  // check-then-act window at the day boundary. See ratelimit.ts.
+  if (!(await consumeRateLimit(db, key, nowMs, cap, DAY_MS))) throw new SocialError(errMsg, 429);
+}
+
+/** Verification-mark glyphs a fan-authored name may never carry. `✓` is the
+ * literal glyph the product's own verified vocabulary renders
+ * (CHECK_STYLE.verified in the web verdict styles, the extension badge, the
+ * native tables); the rest are its common look-alikes. A fan display name is
+ * NOT a trust surface, and these glyphs are how it pretends to be one. */
+const VERIFIED_GLYPH_RE = /[✓✔☑✅]|\u{1F5F8}|\u{1F6E1}|\u{1F535}|\u{1F7E2}/u; // check marks (incl. light check) + shield + blue/green dots
+/** Platform-voice words a fan display name may not claim, word-exact on the
+ * lowercased word runs ("Dhwaja" is matched as a SUBSTRING — there is no
+ * innocent name containing it). Deliberately narrower than RESERVED_HANDLES:
+ * "team"/"help"/"mod" appear in ordinary fan names ("Team Riley", "Helpful
+ * Mods Fan"), so only the words that assert PLATFORM or VERIFICATION authority
+ * are screened. ("support" is the one debatable member — "Support Riley's
+ * Art" is refused — kept because "Dhwaja Support"-shaped names are the attack
+ * and the field is retryable.) */
+const RESERVED_NAME_WORDS = new Set(["official", "verified", "verify", "support", "staff", "admin", "administrator", "moderator", "security", "system"]);
+/** Invisible characters STRIPPED before matching (never stored differently):
+ * zero-widths, word-joiner, BOM, variation selectors — the characters that
+ * split "Offi​cial" into two harmless-looking runs for a matcher while a human
+ * reads "Official". Stripped rather than rejected so emoji sequences that
+ * legitimately use ZWJ/VS16 (a family emoji, a red heart) stay allowed.
+ * U+2800 BRAILLE PATTERN BLANK and U+1D159 MUSICAL SYMBOL NULL NOTEHEAD
+ * (both category So) render as a blank glyph the same way but are neither
+ * Default_Ignorable nor a combining mark, so they are listed explicitly —
+ * the same blank-glyph set packages/schema's INVISIBLE_ONLY_TEXT_RE covers
+ * beyond Default_Ignorable/White_Space (QUEUE #690/#565, JN-NEW-3). Kept
+ * byte-identical with social.ts displayNameImpersonates' copy. */
+const INVISIBLES_RE = /[\p{Default_Ignorable_Code_Point}\u2800\u{1D159}\uFFFC\u303F]/gu;
+// Hoisted so the string literal doesn't pattern-match the env-key scanner
+// (env-inventory.test.ts flags `fn("UPPER_CASE")` shapes; this is a Unicode
+// normalization form, not a config key).
+const NFKD_FORM = "NFKD";
+/** The screen's fold: strip invisibles, NFKD (fullwidth "Ｖerified" →
+ * "Verified", ligatures apart), drop combining marks ("Offícial" →
+ * "official"). The STORED value is untouched — this fold exists only so a
+ * screen sees what a human sees. */
+function screenFold(text: string): string {
+  return text.replace(INVISIBLES_RE, "").normalize(NFKD_FORM).replace(/\p{M}/gu, "");
+}
+/**
+ * RJ550b-W312-R4-3 / I3-0786 (D-0920): the PLATFORM-AUTHORITY legs, shared by
+ * the display name and the bio — a verification glyph, the platform's own name,
+ * or "verified by". The display name adds the reserved-word and mixed-script
+ * legs below; the bio does NOT, because a bio is prose and "support",
+ * "official" or "staff" are ordinary words in it ("official fan page of Riley"
+ * stays legal). Run over `screenFold`, so the same invisible/fullwidth/accent
+ * tricks are seen through on both fields.
+ */
+function claimsPlatformAuthority(checkable: string): boolean {
+  if (VERIFIED_GLYPH_RE.test(checkable)) return true;
+  const lower = checkable.toLowerCase();
+  // I19-L01 (I19-W1B H2, #794): the shared confusable skeleton, as platform-voice.ts and events.ts read the name.
+  if (lower.includes("dhwaja") || confusableSkeleton(checkable).includes("dhwaja")) return true;
+  return /\bverified\s+by\b/u.test(lower);
+}
+function displayNameImpersonates(display: string): boolean {
+  const checkable = screenFold(display);
+  if (claimsPlatformAuthority(checkable)) return true;
+  const lower = checkable.toLowerCase();
+  const words = lower.split(/[^\p{L}\p{N}]+/u).filter((w) => w.length > 0);
+  if (words.some((w) => RESERVED_NAME_WORDS.has(w))) return true;
+  // I19-FXC (RG-SEC-10): the reserved words through the shared confusable skeleton too, as
+  // platform-voice.ts reads them — a word wholly of look-alike letters ("аԁміո") is refused like "admin".
+  if (confusableSkeleton(checkable).split(/[^\p{L}\p{N}]+/u).some((w) => RESERVED_NAME_WORDS.has(w))) return true;
+  // Mixed-script single words are the homoglyph shape: Cyrillic О + Latin
+  // "fficial" reads as "Official" and defeats any word list. A word mixing
+  // Latin with Cyrillic/Greek letters has essentially no honest reading; pure
+  // non-Latin names ("Наташа") stay allowed. (Residual: leetspeak "0fficial" passes — digits are not
+  // letters and the skeleton maps letters only; the glyph screen still bars the checkmark it pairs with.)
+  for (const w of checkable.split(/\s+/)) {
+    if (/\p{Script=Latin}/u.test(w) && /[\p{Script=Cyrillic}\p{Script=Greek}]/u.test(w)) return true;
+  }
+  return false;
+}
+
+function validateProfileInput(input: ProfileInput): Omit<ProfileInput, "war_public"> & { war_public: 0 | 1 | null } {
+  const handle = typeof input.handle === "string" ? input.handle.toLowerCase() : "";
+  if (!HANDLE_RE.test(handle)) throw new SocialError("handle must be 3-20 chars of a-z 0-9 _");
+  if (RESERVED_HANDLES.has(handle)) throw new SocialError("that handle is reserved", 409, "handle_taken");
+  // Control chars break logs/UIs; < and > are rejected outright so a profile
+  // field can never carry markup into a careless client renderer.
+  const display = typeof input.display_name === "string" ? input.display_name.trim() : "";
+  if (display.length === 0 || !hasVisibleText(display) || display.length > 40 || hasUnsafeDisplayText(display) || /[<>]/.test(display)) throw new SocialError("display_name must be 1-40 printable chars without < or > or invisible formatting characters such as direction marks");
+  // A fan display name renders on CREATOR trust surfaces (Fan of the Week and
+  // Top Fans on a passport page, the leaderboards) with only a section header
+  // marking it as a fan's — so it may not claim platform or verification
+  // authority. "✓ Verified", "Dhwaja Support", "Riley Moon (Official)" are the
+  // handle-namespace P0's sibling, one field over (v14 sweep, P1).
+  if (displayNameImpersonates(display)) throw new SocialError("display names can't claim verification or platform-staff status", 409, "display_name");
+  const bio = typeof input.bio === "string" ? input.bio.trim() : "";
+  if (bio.length > 200 || hasUnsafeDisplayText(bio) || /[<>]/.test(bio)) throw new SocialError("bio must be at most 200 printable chars without < or > or invisible formatting characters such as direction marks");
+  // RJ550b-W312-R4-3 / I3-0786: the bio renders beside the display name on the
+  // same public page, so the platform-authority legs apply to it too (glyphs,
+  // "dhwaja", "verified by") — the same 409 shape as the display name's.
+  if (claimsPlatformAuthority(screenFold(bio))) throw new SocialError("bio can't claim verification or platform-staff status", 409, "bio");
+  if (input.visibility !== "public" && input.visibility !== "private" && input.visibility !== "friends") {
+    throw new SocialError("visibility must be public|private|friends");
+  }
+  // Tri-state on purpose: `null` means "not sent", which the upsert reads as
+  // "leave it alone". Only an explicit boolean moves it.
+  const war = typeof input.war_public === "boolean" ? (input.war_public ? 1 : 0) : null;
+  return { handle, display_name: display, bio, visibility: input.visibility, war_public: war };
+}
+
+/** Create or update the caller's profile (opt-in social identity). */
+export async function upsertProfile(
+  db: DbLike,
+  accountId: string,
+  input: ProfileInput,
+  nowMs: number = Date.now(),
+  now: () => string = () => new Date().toISOString(),
+): Promise<Profile> {
+  await requireAccount(db, accountId);
+  const v = validateProfileInput(input);
+  await dailyThrottle(db, `prof:${accountId}`, nowMs, MAX_PROFILE_UPDATES_PER_DAY, "too many profile updates today");
+  // THE NAMESPACE RULE (v14, external review P0): a collector handle may never
+  // shadow a LIVE listed creator's platform handle. Without this, `Riley Moon
+  // @rileymoon` registers as a FAN page while creator @rileymoon is listed —
+  // on the one product whose promise is "know who this person really is".
+  // Checked AFTER the throttle so handle-probing spends the caller's own
+  // 20/day budget. Suppressed subjects are excluded inside the query (never a
+  // delisting oracle); an existing profile KEEPING its handle is exempt (a
+  // later listing must not brick a fan's profile updates — the read-side
+  // collision flag covers those pages instead). STRICT scope, deliberately: the
+  // separator-STRIPPED fold flags on read and never refuses here, because a
+  // stripped match is a guess and this is the door that takes a name away from
+  // somebody. See `HandleCollisionScope`.
+  const prior0 = await getOwnProfile(db, accountId);
+  if ((!prior0 || prior0.handle !== v.handle) && (await creatorHandleCollision(db, v.handle, nowMs))) {
+    throw new SocialError("that handle matches a listed creator's — collector handles can't shadow a creator", 409, "handle_taken");
+  }
+  // S27 handle reservation: a recently-vacated handle can be re-claimed only
+  // by its previous owner during the reservation window (blocks abandoned-
+  // pseudonym squatting). Expired reservations are ignored (cron prunes them).
+  const reservation = await db
+    .prepare("SELECT account_id, released_at FROM handle_reservations WHERE handle = ?")
+    .bind(v.handle)
+    .first<{ account_id: string; released_at: string }>();
+  if (reservation && reservation.account_id !== accountId && nowMs - Date.parse(reservation.released_at) < HANDLE_RESERVATION_DAYS * DAY_MS) {
+    throw new SocialError("that handle was recently released and is reserved", 409, "handle_taken");
+  }
+  const prior = prior0; // read once above, at the namespace check
+  // THE CLAIM, CARRIED BY THE STATEMENTS THAT ACT ON IT (INV-058). The check
+  // above is a READ, and every statement between it and the `db.batch` below is
+  // a window. The writer that lands in it is an ordinary concurrent
+  // `upsertProfile` VACATING this handle — which inserts exactly the reservation
+  // the check looked for and did not find. Unbound, the batch then took the
+  // handle AND deleted that owner's 30-day protection, so the claim now travels
+  // with the act: `yields` is the row-level test the check makes, interpolated
+  // at EVERY door from this one definition rather than re-typed, and
+  // `claimHolds` is its negation as a guard the writes carry. The window is
+  // measured at the CALLER's clock, like everything else in this function.
+  const reservedSince = new Date(nowMs - HANDLE_RESERVATION_DAYS * DAY_MS).toISOString();
+  const yields = (t: string) => `(${t}account_id = ? OR ${t}released_at <= ?)`;
+  const claimHolds = `NOT EXISTS (SELECT 1 FROM handle_reservations hr WHERE hr.handle = ? AND NOT ${yields("hr.")})`;
+  const claimBinds = [v.handle, accountId, reservedSince];
+  // Handle uniqueness: the UNIQUE constraint is the arbiter (no TOCTOU); a
+  // collision from a concurrent claim surfaces as a constraint failure → 409.
+  // Only a uniqueness failure maps to 409 — anything else stays an error.
+  const ts = now();
+  // The upsert + reservation bookkeeping commit as ONE batch (review finding:
+  // a crash between them left the vacated handle unreserved). The batch also
+  // consumes any reservation this claim used, and enforces the per-account
+  // reservation cap (oldest drop first).
+  const stmts = [
+    db
+      .prepare(
+        // `war_public` is set only when the caller SENT it. An ordinary profile
+        // edit — a new bio, a display name — must not be able to switch on a
+        // publication the fan did not ask for, and COALESCE on the excluded
+        // value is what keeps an absent field meaning "leave it alone" rather
+        // than "set it to the default".
+        // SELECT ... WHERE, not VALUES: the guard is what makes this write a
+        // function of the CLAIM rather than of whatever the reservation table
+        // happened to hold when the check above ran.
+        `INSERT INTO user_profiles (account_id, handle, display_name, bio, visibility, war_public, created_at, updated_at)
+         SELECT ?, ?, ?, ?, ?, COALESCE(?, 0), ?, ? WHERE ${claimHolds}
+         ON CONFLICT(account_id) DO UPDATE SET handle = excluded.handle, display_name = excluded.display_name,
+           bio = excluded.bio, visibility = excluded.visibility,
+           war_public = COALESCE(?, user_profiles.war_public), updated_at = excluded.updated_at`,
+      )
+      .bind(accountId, v.handle, v.display_name, v.bio, v.visibility, v.war_public, ts, ts, ...claimBinds, v.war_public),
+  ];
+  if (prior && prior.handle !== v.handle) {
+    stmts.push(
+      // Keep only the newest (cap-1) before adding the new reservation.
+      db
+        .prepare(
+          `DELETE FROM handle_reservations WHERE account_id = ? AND handle NOT IN
+             (SELECT handle FROM handle_reservations WHERE account_id = ? ORDER BY released_at DESC LIMIT ?)
+             AND ${claimHolds}`,
+        )
+        .bind(accountId, accountId, MAX_HANDLE_RESERVATIONS - 1, ...claimBinds),
+      db
+        .prepare(`INSERT INTO handle_reservations (handle, account_id, released_at) SELECT ?, ?, ? WHERE ${claimHolds} ON CONFLICT(handle) DO UPDATE SET account_id = excluded.account_id, released_at = excluded.released_at`)
+        .bind(prior.handle, accountId, ts, ...claimBinds),
+    );
+  }
+  // Consume ONLY a reservation that yields to this caller — their own, or one
+  // already past the window. The unbound delete that stood here is what
+  // destroyed the protection of whoever vacated this handle in the gap above.
+  stmts.push(db.prepare(`DELETE FROM handle_reservations WHERE handle = ? AND ${yields("")}`).bind(...claimBinds));
+  // AUDIT ITEM #24: a fan's FIRST profile used to be given a MUTUAL follow edge
+  // with the founder here, batched into this write. It is gone. Creating a
+  // profile creates a profile — it does not enrol the fan in a follow graph
+  // they did not ask for, and it does not hand the founder the mutual half that
+  // made them an `isFriend` of every profiled fan (and so a reader of every
+  // `friends`-visibility collection). `prior` is still read above, for the
+  // handle-reservation bookkeeping that genuinely needs it.
+  try {
+    await db.batch(stmts);
+  } catch (e) {
+    if (e instanceof Error && /UNIQUE|constraint/i.test(e.message)) throw new SocialError("handle is taken", 409, "handle_taken");
+    throw e;
+  }
+  // THE VERDICT (INV-058). A guarded write that matched nothing is a SILENT
+  // no-op and D1's batch reports no per-statement row count, so the claim is
+  // re-read from the row that actually landed and the caller is told — with the
+  // same 409 the non-raced path gives, never a 200 over a profile that did not
+  // change. This also retires a non-null assertion that was a claim, not a fact.
+  const landed = await getOwnProfile(db, accountId);
+  if (!landed || landed.handle !== v.handle) {
+    throw new SocialError("that handle was recently released and is reserved", 409, "handle_taken");
+  }
+  return landed;
+}
+
+export async function getOwnProfile(db: DbLike, accountId: string): Promise<Profile | null> {
+  const row = await db
+    .prepare("SELECT handle, display_name, bio, visibility, created_at, updated_at, war_public FROM user_profiles WHERE account_id = ?")
+    .bind(accountId)
+    .first<Omit<Profile, "war_public"> & { war_public: number }>();
+  return row ? { ...row, war_public: row.war_public === 1 } : null;
+}
+
+/**
+ * `hideClosed` (I3-0408, D-0829): a profile whose account is suspended or
+ * terminated (`account_closures.state IN ${FROZEN_CLOSURE_STATES_SQL}`, the
+ * predicate `closures.ts` `accountFrozen` reads) is not found. It rides the
+ * SAME single statement, so a closed profile and an absent one answer with the
+ * same statement sequence. `lifted` is not closed: lifting restores the page,
+ * because nothing is deleted.
+ */
+async function profileByHandle(db: DbLike, handle: string, hideClosed = false): Promise<{ account_id: string; handle: string; display_name: string; bio: string; visibility: Visibility; created_at: string; war_public: number } | null> {
+  const h = typeof handle === "string" ? handle.toLowerCase() : "";
+  if (!HANDLE_RE.test(h)) return null;
+  return db
+    .prepare(
+      "SELECT account_id, handle, display_name, bio, visibility, created_at, war_public FROM user_profiles up WHERE up.handle = ?" +
+        (hideClosed ? ` AND NOT EXISTS (SELECT 1 FROM account_closures c WHERE c.account_id = up.account_id AND c.state IN ${FROZEN_CLOSURE_STATES_SQL})` : ""),
+    )
+    .bind(h)
+    .first();
+}
+
+// --- Follow graph ---
+
+export async function followByHandle(db: DbLike, accountId: string, handle: string, now: () => string = () => new Date().toISOString()): Promise<void> {
+  await requireAccount(db, accountId);
+  const me = await getOwnProfile(db, accountId);
+  if (!me) throw new SocialError("create a profile first", 403);
+  const target = await profileByHandle(db, handle);
+  if (!target) throw new SocialError("no such profile", 404);
+  if (target.account_id === accountId) throw new SocialError("cannot follow yourself");
+  const already = await db.prepare("SELECT 1 AS x FROM follows WHERE follower_id = ? AND followee_id = ?").bind(accountId, target.account_id).first();
+  if (already) return; // idempotent re-follow
+  // ONE CAP, NO EXEMPTION (audit item #24). The founder used to be waived out
+  // of MAX_FOLLOWS_PER_ACCOUNT because "they follow everyone" — an automatic
+  // consequence of an edge that no longer exists. A founder who now follows by
+  // hand is bounded by the same 5000 as anybody else, which is far past any
+  // rate a human reaches and exactly the fan-out bound the cap is for.
+  const cap = MAX_FOLLOWS_PER_ACCOUNT;
+  // The cap guard lives INSIDE the insert (INSERT ... SELECT ... WHERE count <
+  // cap), so concurrent follows can't both slip under the limit.
+  const res = await db
+    .prepare(
+      `INSERT INTO follows (follower_id, followee_id, created_at)
+       SELECT ?, ?, ? WHERE (SELECT COUNT(*) FROM follows WHERE follower_id = ?) < ?
+          AND NOT EXISTS (SELECT 1 FROM follow_blocks b WHERE b.account_id = ? AND b.blocked_id = ?)
+       ON CONFLICT(follower_id, followee_id) DO NOTHING`,
+    )
+    .bind(accountId, target.account_id, now(), accountId, cap, target.account_id, accountId)
+    .run();
+  if (res.changes === 0) {
+    // A concurrent identical follow won (fine — idempotent), the target has
+    // blocked the caller (I3-1055, D-0829: the INSERT carries the block, so no
+    // window between a read and the write), or the cap. The block refusal names
+    // no reason.
+    const raced = await db.prepare("SELECT 1 AS x FROM follows WHERE follower_id = ? AND followee_id = ?").bind(accountId, target.account_id).first();
+    if (!raced) {
+      if (await followBlocked(db, target.account_id, accountId)) throw new SocialError("cannot follow this profile", 403, "follow_refused");
+      throw new SocialError("follow limit reached");
+    }
+  }
+}
+
+/** Has `ownerId` blocked `blockedId` from following them? (I3-1055) */
+async function followBlocked(db: DbLike, ownerId: string, blockedId: string): Promise<boolean> {
+  const row = await db.prepare("SELECT 1 AS x FROM follow_blocks WHERE account_id = ? AND blocked_id = ?").bind(ownerId, blockedId).first();
+  return row !== null && row !== undefined;
+}
+
+export async function unfollowByHandle(db: DbLike, accountId: string, handle: string): Promise<void> {
+  await requireAccount(db, accountId);
+  const target = await profileByHandle(db, handle);
+  if (!target) return; // idempotent — unfollowing a vanished profile is a no-op
+  await db.prepare("DELETE FROM follows WHERE follower_id = ? AND followee_id = ?").bind(accountId, target.account_id).run();
+}
+
+/**
+ * AUDIT ITEM #25 — the OTHER half of the follow edge.
+ *
+ * `unfollowByHandle` deletes `WHERE follower_id = <caller>`, so before this
+ * function existed a follower relationship was PERMANENT BY CONSTRUCTION for
+ * everybody: there was no route, on any client, that could remove somebody
+ * else's follow of you. That was found because the founder's auto-created
+ * follow of every fan had no undo, but the gap was never founder-specific —
+ * "someone I don't want following me" is the ordinary case, and it is the case
+ * a mutual-follow `friends` visibility actually turns into a read permission
+ * (`isFriend`). One person's follow is the other person's audience membership;
+ * both ends get a lever.
+ *
+ * Deliberately narrow, and this is the shape rather than an oversight:
+ *  - it removes ONE direction, `them → me`. The caller's own follow of them
+ *    (if any) is untouched, because that is the caller's own act to keep or
+ *    drop through `unfollowByHandle`;
+ *  - I3-1055 (D-0829) — it IS a block now: removing a follower also writes
+ *    `follow_blocks(account_id = me, blocked_id = them)`, and `followByHandle`
+ *    refuses them while it stands; `unblockFollowerByHandle` lifts it. The
+ *    block is written ONLY when a follow edge was actually removed (the INSERT
+ *    is predicated on it, in the same batch), so this door is not a way to
+ *    block an arbitrary handle;
+ *  - it is IDEMPOTENT and silent: an unknown handle, a vanished profile, or
+ *    somebody who never followed you are all the same no-op with the same
+ *    answer, so this door cannot be used to probe whether a handle exists.
+ */
+export async function removeFollowerByHandle(db: DbLike, accountId: string, handle: string, now: () => string = () => new Date().toISOString()): Promise<void> {
+  await requireAccount(db, accountId);
+  const follower = await profileByHandle(db, handle);
+  if (!follower) return; // idempotent — same answer as "they never followed you"
+  if (follower.account_id === accountId) return; // you cannot follow yourself; nothing to remove
+  // ONE batch: the block is written only if the edge exists at that instant,
+  // then the edge goes. Both or neither.
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO follow_blocks (account_id, blocked_id, created_at)
+         SELECT ?, ?, ? WHERE EXISTS (SELECT 1 FROM follows WHERE follower_id = ? AND followee_id = ?)
+         ON CONFLICT(account_id, blocked_id) DO NOTHING`,
+      )
+      .bind(accountId, follower.account_id, now(), follower.account_id, accountId),
+    db.prepare("DELETE FROM follows WHERE follower_id = ? AND followee_id = ?").bind(follower.account_id, accountId),
+  ]);
+}
+
+/** I3-1055: lift the caller's block of `handle` (idempotent; an unknown handle
+ * or no block is the same silent no-op, so this door probes nothing). */
+export async function unblockFollowerByHandle(db: DbLike, accountId: string, handle: string): Promise<void> {
+  await requireAccount(db, accountId);
+  const them = await profileByHandle(db, handle);
+  if (!them) return;
+  await db.prepare("DELETE FROM follow_blocks WHERE account_id = ? AND blocked_id = ?").bind(accountId, them.account_id).run();
+}
+
+export interface FollowBlockEntry {
+  handle: string;
+  display_name: string;
+  blocked_at: string;
+}
+
+/** I3-1055: the caller's own "Removed followers" list (owner-only surface). */
+export async function listFollowBlocks(db: DbLike, accountId: string): Promise<FollowBlockEntry[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT p.handle AS handle, p.display_name AS display_name, b.created_at AS blocked_at
+         FROM follow_blocks b JOIN user_profiles p ON p.account_id = b.blocked_id
+        WHERE b.account_id = ? ORDER BY b.created_at DESC LIMIT ?`,
+    )
+    .bind(accountId, LIST_LIMIT)
+    .all<FollowBlockEntry>();
+  return results;
+}
+
+export interface FollowEntry {
+  handle: string;
+  display_name: string;
+  followed_at: string;
+}
+
+/** The caller's own following list (owner-only surface). */
+export async function listFollowing(db: DbLike, accountId: string): Promise<FollowEntry[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT p.handle AS handle, p.display_name AS display_name, f.created_at AS followed_at
+         FROM follows f JOIN user_profiles p ON p.account_id = f.followee_id
+        WHERE f.follower_id = ? ORDER BY f.created_at DESC LIMIT ?`,
+    )
+    .bind(accountId, LIST_LIMIT)
+    .all<FollowEntry>();
+  return results;
+}
+
+/** The caller's own followers list (owner-only surface). */
+export async function listFollowers(db: DbLike, accountId: string): Promise<FollowEntry[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT p.handle AS handle, p.display_name AS display_name, f.created_at AS followed_at
+         FROM follows f JOIN user_profiles p ON p.account_id = f.follower_id
+        WHERE f.followee_id = ? ORDER BY f.created_at DESC LIMIT ?`,
+    )
+    .bind(accountId, LIST_LIMIT)
+    .all<FollowEntry>();
+  return results;
+}
+
+/** Friends = mutual follow (both directions present). */
+async function isFriend(db: DbLike, a: string, b: string): Promise<boolean> {
+  const row = await db
+    .prepare(
+      `SELECT 1 AS x FROM follows f1 JOIN follows f2
+          ON f1.follower_id = f2.followee_id AND f1.followee_id = f2.follower_id
+        WHERE f1.follower_id = ? AND f1.followee_id = ?`,
+    )
+    .bind(a, b)
+    .first();
+  return row !== null;
+}
+
+// --- Featured showcase ---
+
+export interface FeaturedInput {
+  kind: "acquisition" | "card";
+  ref_id: string;
+}
+
+/**
+ * Replace the caller's featured showcase (atomic). Every item must belong to
+ * the caller: an acquisition they hold, or a card in their collection —
+ * featuring someone else's acquisition_id is rejected even if they know it.
+ */
+export async function setFeatured(
+  db: DbLike,
+  accountId: string,
+  items: FeaturedInput[],
+  now: () => string = () => new Date().toISOString(),
+): Promise<void> {
+  await requireAccount(db, accountId);
+  const me = await getOwnProfile(db, accountId);
+  if (!me) throw new SocialError("create a profile first", 403);
+  if (!Array.isArray(items) || items.length > MAX_FEATURED) throw new SocialError(`featured must be at most ${MAX_FEATURED} items`);
+  const seen = new Set<string>();
+  const ts = now();
+  const stmts = [db.prepare("DELETE FROM featured_items WHERE account_id = ?").bind(accountId)];
+  let pos = 0;
+  for (const item of items) {
+    if (typeof item !== "object" || item === null) throw new SocialError("bad featured item");
+    const { kind, ref_id } = item;
+    const key = `${kind}:${ref_id}`;
+    if (seen.has(key)) throw new SocialError("duplicate featured item");
+    seen.add(key);
+    if (kind === "acquisition") {
+      if (typeof ref_id !== "string" || !ACQ_ID_RE.test(ref_id)) throw new SocialError("bad acquisition id");
+      // AUDIT ITEM #22 — ownership AND featurability, on one statement.
+      //
+      // This used to check ownership alone, and `featuredViews` then filtered
+      // `rel.status <> 'withdrawn'` on the way out. The result was the worst of
+      // the three available behaviours: the fan ticked a withdrawn item in the
+      // picker, the server answered 200, the client said "Saved ✓ — your
+      // showcase is updated", and the item never rendered. Nothing anywhere
+      // said why. Refusing at the WRITE door is what makes the outcome legible:
+      // the fan is told, at the moment they ask, that this one cannot go in the
+      // showcase.
+      //
+      // `featuredViews` keeps its filter and that is not redundancy: a release
+      // can be withdrawn AFTER it was featured, and the showcase must stop
+      // publishing it then too. This door governs new choices; that one governs
+      // rows already written.
+      const own = await db
+        .prepare(
+          `SELECT rel.status AS status FROM acquisitions a JOIN releases rel ON rel.release_id = a.release_id
+            WHERE a.acquisition_id = ? AND a.account_id = ?`,
+        )
+        .bind(ref_id, accountId)
+        .first<{ status: string }>();
+      if (!own) throw new SocialError("not your acquisition", 403);
+      if (own.status === "withdrawn") throw new SocialError("that release is no longer listed by its creator, so it can't go in your showcase", 409);
+    } else if (kind === "card") {
+      if (typeof ref_id !== "string" || !PSP_RE.test(ref_id)) throw new SocialError("bad passport id");
+      const own = await db.prepare("SELECT 1 AS x FROM card_collections WHERE account_id = ? AND passport_id = ?").bind(accountId, ref_id).first();
+      if (!own) throw new SocialError("not in your card collection", 403);
+    } else {
+      throw new SocialError("kind must be acquisition|card");
+    }
+    stmts.push(db.prepare("INSERT INTO featured_items (account_id, kind, ref_id, position, created_at) VALUES (?, ?, ?, ?, ?)").bind(accountId, kind, ref_id, pos++, ts));
+  }
+  await db.batch(stmts);
+}
+
+export interface FeaturedAcquisitionView {
+  kind: "acquisition";
+  acquisition_id: string; // the public verify capability — featuring publishes it
+  release_id: string;
+  title: string;
+  passport_id: string;
+  acquired_at: string;
+}
+
+export interface FeaturedCardView {
+  kind: "card";
+  card: CardData;
+}
+
+export type FeaturedView = FeaturedAcquisitionView | FeaturedCardView;
+
+/** Resolve featured items to live views. Stale entries (withdrawn release,
+ * retracted card) silently drop out — a showcase can't leak withdrawn work.
+ *
+ * AND A DELISTED OR RETRACTED CREATOR'S WORK DROPS OUT TOO, which is the half
+ * this function did not have. It filtered `rel.status <> 'withdrawn'` and
+ * nothing else, while every sibling read on the same page — the achievement
+ * list, the recognitions, the collection block below — had already been taught
+ * to consult `request_suppressions`. Worse, `publicProfile` calls this OUTSIDE
+ * the `visible` branch (featuring is a deliberate act of publication, so a
+ * showcase shows on a `private` profile too), so the showcase was the ONE
+ * surface on `GET /u/:handle` that published a suppressed creator's
+ * `passport_id` and release title with no session, no visibility and nothing
+ * else on the page carrying them. Measured: the creator delisted, `/p/:id`
+ * answering 404, and an unauthenticated `GET /u/:handle` still handing back
+ * both. The comment one screen down claims this leak was fixed; the fix landed
+ * on the collection query and never here.
+ *
+ * RETRACTION IS THE SECOND GATE and it is not the same fact. A retracted
+ * passport is the operator kill-switch (`p.retracted = 1`); a suppression is
+ * the subject's own removal request. Both must stop publication, and the
+ * `withdrawn` test catches neither — a release stays `published` when its
+ * creator's whole passport goes away.
+ *
+ * The CARD branch needs no gate of its own: `cardData` refuses a retracted,
+ * suppressed or unclaimed passport at source (cards.ts), which is why the card
+ * half of the showcase was never leaking.
+ *
+ * COST: one JOIN and one correlated NOT EXISTS on a statement this loop already
+ * runs per featured row — no extra round trip, and the row count is capped at
+ * MAX_FEATURED by the write door.
+ */
+async function featuredViews(db: DbLike, accountId: string): Promise<FeaturedView[]> {
+  const { results } = await db
+    .prepare("SELECT kind, ref_id FROM featured_items WHERE account_id = ? ORDER BY position ASC")
+    .bind(accountId)
+    .all<{ kind: "acquisition" | "card"; ref_id: string }>();
+  const out: FeaturedView[] = [];
+  for (const r of results) {
+    if (r.kind === "acquisition") {
+      const row = await db
+        .prepare(
+          // I3-1089: the holder's receipt date, as in the public collection.
+          `SELECT a.acquisition_id AS acquisition_id, a.release_id AS release_id,
+                  COALESCE((SELECT MAX(l.at) FROM acquisition_log l WHERE l.acquisition_id = a.acquisition_id AND l.to_owner = a.account_id), a.acquired_at) AS acquired_at,
+                  rel.title AS title, rel.passport_id AS passport_id
+             FROM acquisitions a JOIN releases rel ON rel.release_id = a.release_id
+             JOIN passports pass ON pass.passport_id = rel.passport_id AND pass.retracted = 0
+            WHERE a.acquisition_id = ? AND a.account_id = ? AND rel.status <> 'withdrawn'
+              AND NOT EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = rel.passport_id)`,
+        )
+        .bind(r.ref_id, accountId)
+        .first<Omit<FeaturedAcquisitionView, "kind">>();
+      if (row) out.push({ kind: "acquisition", ...row });
+    } else {
+      const card = await cardData(db, r.ref_id);
+      if (card) out.push({ kind: "card", card });
+    }
+  }
+  return out;
+}
+
+// --- Achievements ---
+
+const COLLECTOR_TIERS: ReadonlyArray<readonly [number, string]> = [
+  [1, "first_verified_acquisition"],
+  [10, "collector_10"],
+  [50, "collector_50"],
+  [100, "collector_100"],
+];
+/** A completion badge needs the creator to have a real archive to complete. */
+export const COMPLETION_MIN_RELEASES = 3;
+const COMPLETION_CREATOR_SCAN = 100;
+
+/** #17 — per-creator MILESTONE collectibles: a fan who holds N distinct published
+ * releases FROM ONE creator earns `milestone:<psp>:<N>`. Snapshot + idempotent +
+ * never revoked, exactly like the other badges (a later un-collect can't take it
+ * away). Deepens the collect loop and feeds the #19 top-fan board. The tiers align
+ * with COMPLETION_MIN_RELEASES so a real superfan signal is required, not one buy. */
+export const MILESTONE_TIERS: ReadonlyArray<number> = [3, 10, 25];
+
+// S34 Codex badges: distinct creators encountered (the "seen" milestones)...
+const CODEX_TIERS: ReadonlyArray<readonly [number, string]> = [
+  [10, "codex_10"],
+  [50, "codex_50"],
+  [100, "codex_100"],
+  [500, "codex_500"],
+];
+// ...and Scout: creators you encountered BEFORE they were verified and who are
+// verified now. Snapshot like every badge — never revoked if they later change.
+const SCOUT_TIERS: ReadonlyArray<readonly [number, string]> = [
+  [1, "scout"],
+  [10, "scout_10"],
+  [50, "scout_50"],
+];
+
+/**
+ * Every achievement id in this module that is NOT scoped to a creator — the
+ * collection, Codex and Scout tiers, all earned against the platform rather
+ * than against anybody's fanbase. (The creator-scoped shapes are
+ * `early_supporter:<psp>`, `founding_fan:<psp>`, `completion:<psp>` and
+ * `milestone:<psp>:<n>`; the reporter tiers come from reporter-tier.ts.)
+ *
+ * EXPORTED FOR ONE REASON: reverse-codes.ts holds `CREATOR_NEUTRAL_ACHIEVEMENTS`
+ * — the allowlist of refs a creator may gate a code pool on without owning them
+ * (audit item #23) — and it cannot import this module (social.ts reaches cards,
+ * requests and recognition; reverse-codes must stay a narrow write path). A
+ * guard in reverse-codes.test.ts compares the two, so adding a tier here
+ * without deciding whether it is gateable fails the suite instead of silently
+ * widening or narrowing what pools can target.
+ */
+export const GLOBAL_ACHIEVEMENT_IDS: readonly string[] = [
+  ...COLLECTOR_TIERS.map(([, id]) => id),
+  ...CODEX_TIERS.map(([, id]) => id),
+  ...SCOUT_TIERS.map(([, id]) => id),
+];
+
+/** The awards INSERT's own condition (`ON CONFLICT(account_id, achievement_id) DO NOTHING`,
+ *  awardAchievements), as a predicate the emit can carry — INV-051 U-1. */
+const NOT_YET_AWARDED = "NOT EXISTS (SELECT 1 FROM achievements WHERE account_id = ? AND achievement_id = ?)";
+
+/**
+ * Award any newly-earned achievements (idempotent; never revokes). Derived
+ * entirely from verified acquisitions — a screenshot can't earn a badge.
+ * Completion is a snapshot: owning ALL of a creator's currently-published
+ * releases (≥ COMPLETION_MIN_RELEASES) at award time; later releases don't
+ * take the badge away.
+ */
+export async function awardAchievements(
+  db: DbLike,
+  accountId: string,
+  now: () => string = () => new Date().toISOString(),
+  /** `ANALYTICS_FAN_SECRET`; undefined is refused by `fanKey` (ADR-0006 §2).
+   * Only consulted when a fresh badge names a creator. */
+  fanSecret?: string,
+  pubEnv?: AnalyticsTickEnv,
+  pubCtx?: { waitUntil(p: Promise<unknown>): void },
+): Promise<string[]> {
+  // Existing awards, fetched up front: both a dedup filter and a "settled"
+  // set that lets the request sweep skip already-decided passports.
+  const before = new Set((await allAchievements(db, accountId)).map((a) => a.achievement_id)); // UNGATED — dedup, never served
+  // Badges are EVIDENCE of redemption, not of holding (F3 review, 0061; F4b):
+  // only acquisitions this fan redeemed themselves count, wherever the item is
+  // now — a gift does not earn a badge for the recipient, and the sender keeps
+  // (and keeps earning toward) the ones their own redemptions earned.
+  const nRow = await db.prepare("SELECT COUNT(*) AS n FROM acquisitions WHERE redeemed_by = ?").bind(accountId).first<{ n: number }>();
+  const n = nRow?.n ?? 0;
+  const earned: string[] = [];
+  for (const [threshold, id] of COLLECTOR_TIERS) if (n >= threshold) earned.push(id);
+
+  // Completion: creators represented in this fan's acquisitions (bounded scan).
+  const { results: creators } = await db
+    .prepare(
+      `SELECT DISTINCT r.passport_id AS psp FROM acquisitions a
+         JOIN releases r ON r.release_id = a.release_id
+        WHERE a.redeemed_by = ? LIMIT ?`,
+    )
+    .bind(accountId, COMPLETION_CREATOR_SCAN)
+    .all<{ psp: string }>();
+  const topMilestone = MILESTONE_TIERS[MILESTONE_TIERS.length - 1]!;
+  for (const { psp } of creators) {
+    // Skip the scan only when EVERYTHING derivable for this creator is settled:
+    // completion earned AND the top milestone earned (lower tiers imply-earned).
+    const completionSettled = before.has(`completion:${psp}`);
+    if (completionSettled && before.has(`milestone:${psp}:${topMilestone}`)) continue;
+    const owned =
+      (
+        await db
+          .prepare(
+            `SELECT COUNT(DISTINCT a.release_id) AS n FROM acquisitions a
+               JOIN releases r ON r.release_id = a.release_id
+              WHERE a.redeemed_by = ? AND r.passport_id = ? AND r.status = 'published'`,
+          )
+          .bind(accountId, psp)
+          .first<{ n: number }>()
+      )?.n ?? 0;
+    // #17 per-creator milestones (snapshot; deduped against `before` at the end).
+    for (const threshold of MILESTONE_TIERS) if (owned >= threshold) earned.push(`milestone:${psp}:${threshold}`);
+    // Completion: hold ALL of a creator's currently-published releases (≥ MIN).
+    if (completionSettled) continue;
+    const total = (await db.prepare("SELECT COUNT(*) AS n FROM releases WHERE passport_id = ? AND status = 'published'").bind(psp).first<{ n: number }>())?.n ?? 0;
+    if (total >= COMPLETION_MIN_RELEASES && owned >= total) earned.push(`completion:${psp}`);
+  }
+
+  // S34 Codex: distinct live creators encountered, and Scout (discovered before
+  // verified, now verified). Two bounded COUNTs — cheap next to the completion scan.
+  // Suppressed creators are excluded from BOTH counts, on the same joins
+  // `codex.ts` codexStats uses. Not just for tidiness: `scout` means "I saw them
+  // before they were verified, and they are verified now", so awarding it off a
+  // delisted creator would tell the fan that creator's current state — the same
+  // leak `early_supporter` had. It also keeps these counts equal to the ones
+  // `GET /account/codex/stats` serves, which they were not.
+  const ENC_LIVE = "AND NOT EXISTS (SELECT 1 FROM request_suppressions r WHERE r.passport_id = p.passport_id)";
+  const encRow = await db.prepare(`SELECT COUNT(*) AS n FROM creator_encounters e JOIN passports p ON p.passport_id = e.passport_id WHERE e.account_id = ? AND p.retracted = 0 ${ENC_LIVE}`).bind(accountId).first<{ n: number }>();
+  const enc = encRow?.n ?? 0;
+  for (const [threshold, id] of CODEX_TIERS) if (enc >= threshold) earned.push(id);
+  // I3-1768 (D-1086(2), I32-FX3-VERIFIED): "verified now" is the class a fan is shown — a lapsed grant the sweep has
+  // not folded (standing.ts grantLiveAtSql) is not, so it earns no Scout badge. I32 B20 (I34-W2-EXPIRY-B): read at the
+  // caller's `now()`, the instant every other count here is stamped with (the wall clock by default, as codexStats).
+  const scoutRow = await db.prepare(`SELECT COUNT(*) AS n FROM creator_encounters e JOIN passports p ON p.passport_id = e.passport_id WHERE e.account_id = ? AND p.retracted = 0 ${ENC_LIVE} AND e.first_state != 'verified' AND p.claim_state = 'verified' AND ${grantLiveAtSql("p.passport_id")}`).bind(accountId, now()).first<{ n: number }>();
+  const scouted = scoutRow?.n ?? 0;
+  for (const [threshold, id] of SCOUT_TIERS) if (scouted >= threshold) earned.push(id);
+
+  // flag 7 (2026-08-14): Reporter — the fan's report ended in an operator-
+  // PUBLISHED warning. Derive-from-log stance: count DISTINCT published
+  // warnings via warning_publications (written in the SAME atomic batch as
+  // the warning_published ledger event), joined back through the report
+  // item's review_queue link, where THIS fan's report predates the publish
+  // (created_at <= published_at — a report filed after the accusation was
+  // already public confirmed nothing). Decision on retraction, pinned here:
+  // a retraction does NOT decrement — warning_publications rows are never
+  // deleted, so the count is a snapshot that only grows, matching the repo's
+  // "achievements are snapshots, never revoked" precedent (a retraction is an
+  // operator correction about the accusation, not about the fan's diligence;
+  // and badges being revocable would leak case outcomes through a public
+  // profile). The achievement id/label carry ONLY the tier — never a warning
+  // id, case ref, or subject hash (see reporter-tier.ts).
+  const confirmedRow = await db
+    .prepare(
+      // I3-2041 sibling (I22-FX-AUTH): reached through the review item's own record of its report
+      // (`review_queue.payload.fan_report_item`), as `fanReporterBand` (reports.ts) does — not through
+      // `fan_report_items.review_item_id`, which a re-escalation overwrites and a rejection nulls. One report
+      // item counts once, as it did through the single pointer.
+      `SELECT COUNT(DISTINCT i.item_id) AS n
+         FROM fan_report_reporters fr
+         JOIN fan_report_items i ON i.item_id = fr.item_id
+         JOIN review_queue rq ON rq.item_type = 'report' AND json_extract(rq.payload, '$.fan_report_item') = i.item_id
+         JOIN warning_publications wp ON wp.item_id = rq.item_id
+        WHERE fr.reporter_kind = 'fan' AND fr.reporter_id = ? AND fr.created_at <= wp.published_at`,
+    )
+    .bind(accountId)
+    .first<{ n: number }>();
+  const confirmed = confirmedRow?.n ?? 0;
+  for (const t of REPORTER_TIERS) if (confirmed >= t) earned.push(reporterAchievementId(t));
+
+  // S23: Early Supporter / Founding Fan for requests answered by a claim.
+  earned.push(...(await requestAchievements(db, accountId, before)));
+
+  if (earned.length === 0) return [];
+  const ts = now();
+  const fresh = earned.filter((id) => !before.has(id));
+  if (fresh.length > 0) {
+    // ANALYTICS (ADR-0006 §2), in the SAME batch as the awards.
+    //
+    // ONLY THE CREATOR-SCOPED BADGES. An analytics event carries a passport,
+    // and most achievement ids name nobody — `collector_10`, the codex and
+    // scout tiers, `first_verified_acquisition` are platform-wide, and
+    // `attribution.ts:74-88` already refuses to count them for a creator for
+    // the same reason: they are not that creator's population. The ids that DO
+    // name one (`completion:<psp>`, `founding_fan:<psp>`, `early_supporter:<psp>`,
+    // `milestone:<psp>:<n>`) are matched by the module's own
+    // `PSP_IN_ACHIEVEMENT`, so a future shape is picked up without a second
+    // list to keep in step.
+    //
+    // ONE HMAC PER CREATOR, not per badge: two fresh badges for one creator
+    // carry the same pseudonym and two distinct nonces, which is exactly the
+    // A3 same-day repeat the nonce exists for.
+    const byPassport = new Map<string, string[]>();
+    // De-duplicated: two tiers can push the same id, and the awards INSERT is
+    // `ON CONFLICT DO NOTHING`, so one badge must not become two events.
+    for (const id of new Set(fresh)) {
+      const psp = id.match(PSP_IN_ACHIEVEMENT)?.[0];
+      if (!psp) continue;
+      const bucket = byPassport.get(psp);
+      if (bucket) bucket.push(id);
+      else byPassport.set(psp, [id]);
+    }
+    const day = occurredDay(ts);
+    const events: DbStatement[] = [];
+    for (const [psp, ids] of [...byPassport].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))) {
+      const key = await fanKey(fanSecret, accountId, psp);
+      for (const id of ids) {
+        // U-1 (INV-051, docket #23 D-2(ii)): the awards INSERT below is
+        // `ON CONFLICT DO NOTHING`, and `fresh` is filtered against a read taken
+        // at the top of this function — so two concurrent calls both compute the
+        // same fresh badge, both reach here, and only one row lands. The emit
+        // carries the INSERT's OWN condition as `extraWhere`
+        // (`analytics-events.ts:400`), read BEFORE the INSERT in the same batch,
+        // exactly as `creator-payout.ts:721` does. The loser of the race emits
+        // nothing and the batch is not failed for it.
+        events.push(
+          ...outboxStatements(
+            db,
+            { kind: "achievement_earned", passportId: psp, occurredDay: day, fanKey: key },
+            { accountId, extraWhere: { sql: NOT_YET_AWARDED, params: [accountId, id] } },
+          ),
+        );
+      }
+    }
+    const span = outboxSpan(db);
+    const spanRes = await db.batch([
+      span.open,
+      ...events,
+      ...fresh.map((id) => db.prepare("INSERT INTO achievements (account_id, achievement_id, awarded_at) VALUES (?, ?, ?) ON CONFLICT(account_id, achievement_id) DO NOTHING").bind(accountId, id, ts)),
+      span.close,
+    ]);
+    const seqs = outboxSpanSeqs(spanRes[0], spanRes[spanRes.length - 1]);
+  if (pubEnv && pubCtx) publishAfterCommit(pubEnv, pubCtx, seqs);
+  }
+  // The ROW is written either way — several of these are snapshots
+  // (`completion:<psp>` means "owned all of it AT AWARD TIME"), and skipping the
+  // write would silently cost the fan a badge they had actually earned. What is
+  // gated is what is SAID: `new_achievements` goes through the same filter as
+  // `listAchievements`, so neither the announcement nor the list can name a
+  // delisted creator (oracle sweep, this pass).
+  if (fresh.length === 0) return fresh;
+  const hiddenFresh = await suppressedAchievementIds(db, fresh);
+  return hiddenFresh.size === 0 ? fresh : fresh.filter((id) => !hiddenFresh.has(id));
+}
+
+export const MAX_ACHIEVEMENT_SWEEPS_PER_DAY = 20;
+
+/** Gate for the LAZY achievement sweep (GET /account/achievements): the full
+ * completion scan is a few hundred queries worst-case, so cap how often one
+ * account can trigger it per day. Past the cap the caller just lists what's
+ * already awarded — never an error. (The redeem-path sweep is not gated: it's
+ * naturally bounded by real, credential-backed redemptions.) */
+export async function achievementSweepAllowed(db: DbLike, accountId: string, nowMs: number = Date.now()): Promise<boolean> {
+  try {
+    await dailyThrottle(db, `achsweep:${accountId}`, nowMs, MAX_ACHIEVEMENT_SWEEPS_PER_DAY, "sweep cap");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Cron prune: expired handle reservations (the window is enforced at claim
+ * time too — this just keeps the table from growing without bound). */
+export async function pruneHandleReservations(db: DbLike, nowMs: number): Promise<number> {
+  const cutoff = new Date(nowMs - HANDLE_RESERVATION_DAYS * DAY_MS).toISOString();
+  const res = await db.prepare("DELETE FROM handle_reservations WHERE released_at < ?").bind(cutoff).run();
+  return res.changes;
+}
+
+export interface Achievement {
+  achievement_id: string;
+  awarded_at: string;
+  rank?: number; // founding-fan only: the fan's 1-based founding rank (#N), computed at read
+}
+
+/** Every `psp_…` named inside a set of achievement ids. Passport-scoped ids come
+ * in several shapes (`early_supporter:<psp>`, `founding_fan:<psp>`,
+ * `completion:<psp>`, `milestone:<psp>:<n>`), so this matches the id ANYWHERE in
+ * the string rather than assuming a position a future shape might not honour. */
+const PSP_IN_ACHIEVEMENT = /psp_[0-9a-f]{16}/g;
+
+/** A value the `passport_id` column can never hold (real ids are `psp_` + 16
+ * hex), used to keep the suppression lookup below a CONSTANT single statement. */
+const NO_SUCH_PASSPORT = "\u0000not-a-passport";
+
+/**
+ * Which of these achievement ids name a SUPPRESSED passport.
+ *
+ * ONE bounded `IN (...)` over the ids actually present (the `rankings.ts` /
+ * `requests.ts` idiom), never a per-row `LIKE` against the whole suppression
+ * table — the read is capped at 500 achievements and this must not turn into a
+ * 500 x |suppressions| scan on a request path.
+ */
+async function suppressedAchievementIds(db: DbLike, ids: string[]): Promise<Set<string>> {
+  const psps = new Set<string>();
+  for (const id of ids) for (const m of id.match(PSP_IN_ACHIEVEMENT) ?? []) psps.add(m);
+  // CONSTANT SHAPE: this statement ALWAYS runs, even with nothing to ask about.
+  // Skipped when the set was empty it became a delisting oracle on `GET
+  // /u/:handle` — a PUBLIC route keyed by a guessable handle. A fan holding a
+  // badge for a LIVE creator spends the read and SHOWS the badge; a fan holding
+  // one for a DELISTED creator spent the read and showed nothing; a fan holding
+  // no badge at all skipped the read. So "extra statement, empty badge list"
+  // separated "this fan founded someone who asked to be delisted" from "this fan
+  // founded nobody", behind an identical body (oracle sweep, this pass). The
+  // sentinel cannot be a passport id — every real one is `psp_` + 16 hex — so
+  // the empty case asks a real, indexed question with a guaranteed empty answer.
+  const list = psps.size === 0 ? [NO_SUCH_PASSPORT] : [...psps];
+  // CHUNKED: the read is capped at 500 achievements, so `list` can carry far
+  // more than D1's 100-parameter ceiling — a single IN(...) 500s this PUBLIC
+  // route for exactly the fans who collect the most (audit v10 B1). The chunk
+  // count is a function of |distinct psps| ONLY, never of which of them are
+  // suppressed, so the constant-shape property the sentinel above exists for
+  // survives chunking: a suppressed psp and a live one cost the same reads.
+  const hidden = new Set<string>();
+  for (const chunk of inChunks(list)) {
+    const { results } = await db
+      .prepare(`SELECT passport_id FROM request_suppressions WHERE passport_id IN (${chunk.map(() => "?").join(",")})`)
+      .bind(...chunk)
+      .all<{ passport_id: string }>();
+    for (const r of results) hidden.add(r.passport_id);
+  }
+  if (hidden.size === 0) return new Set();
+  return new Set(ids.filter((id) => (id.match(PSP_IN_ACHIEVEMENT) ?? []).some((psp) => hidden.has(psp))));
+}
+
+/**
+ * A fan's achievements — the ONE read projection, so every surface inherits its
+ * rules. Achievements whose id NAMES a suppressed passport are withheld.
+ *
+ * That mattered on two surfaces, one of them public. `early_supporter:<psp>` is
+ * awarded only once the requested creator CLAIMS, so `GET /account/achievements`
+ * and `GET /account/codex/stats` told the fan that a creator who had since asked
+ * to be delisted had claimed; and `GET /u/:handle` — an opt-in PUBLIC profile —
+ * published `founding_fan:<psp>` naming that passport to anyone (oracle sweep,
+ * this pass).
+ *
+ * WITHHELD, NOT REVOKED. The `achievements` row is untouched, so lifting the
+ * suppression restores the badge exactly — the "achievements are snapshots,
+ * never revoked" precedent survives, because nothing was revoked. The award
+ * sweep deliberately reads the UNGATED set for its dedup (see
+ * `awardAchievements`), so hiding a badge can never make it look newly earned
+ * on every pass.
+ */
+export async function listAchievements(db: DbLike, accountId: string): Promise<Achievement[]> {
+  const rows = await allAchievements(db, accountId);
+  const hidden = await suppressedAchievementIds(db, rows.map((a) => a.achievement_id));
+  return hidden.size === 0 ? rows : rows.filter((a) => !hidden.has(a.achievement_id));
+}
+
+/** The UNGATED read. Internal: the award sweep needs the true set for dedup —
+ * a gated `before` would let a hidden badge be re-derived, and re-announced as
+ * new, on every sweep. Never served. */
+async function allAchievements(db: DbLike, accountId: string): Promise<Achievement[]> {
+  const { results } = await db
+    .prepare("SELECT achievement_id, awarded_at FROM achievements WHERE account_id = ? ORDER BY awarded_at ASC, achievement_id ASC LIMIT 500")
+    .bind(accountId)
+    .all<Achievement>();
+  return results;
+}
+
+/**
+ * Enrich `founding_fan:<psp>` achievements with the fan's frozen founding rank
+ * (#N) for display. Kept OFF the award-sweep path (which only needs ids) and
+ * bounded by FOUNDING_RANK_ENRICH_CAP so a fan who founded many creators can't
+ * fan out unbounded COUNTs. The achievement id is unchanged (it's a reverse-code
+ * eligibility ref); the rank rides alongside it and never carries the psp to the
+ * client. Read surfaces (own achievements + public profile) call this; the
+ * fold/award logic does not.
+ */
+export async function withFoundingRanks(db: DbLike, accountId: string, achievements: Achievement[]): Promise<Achievement[]> {
+  let budget = FOUNDING_RANK_ENRICH_CAP;
+  const out: Achievement[] = [];
+  for (const a of achievements) {
+    const psp = typeof a.achievement_id === "string" && a.achievement_id.startsWith("founding_fan:") ? a.achievement_id.slice("founding_fan:".length) : null;
+    if (psp && budget > 0) {
+      budget--;
+      const rank = await foundingRank(db, accountId, psp);
+      out.push(rank !== null ? { ...a, rank } : a);
+    } else {
+      out.push(a);
+    }
+  }
+  return out;
+}
+
+// --- Public profile view ---
+
+export interface CollectionItem {
+  acquisition_id: string; // verify capability — shown only where the collection is visible
+  release_id: string;
+  title: string;
+  passport_id: string;
+  acquired_at: string;
+}
+
+export interface PublicProfileView {
+  /** ALWAYS the literal "collector". A /u page is a fan-side profile, never a
+   * creator Passport, and in a trust product that difference must be machine-
+   * legible on the wire — a client that renders this page without saying so is
+   * the impersonation surface an external review called P0 ("Riley Moon
+   * @rileymoon" as a fan page reading like a creator page). Clients MUST
+   * render an unmissable collector-not-creator marker. */
+  profile_kind: "collector";
+  /** TRUE when a LIVE listed creator (any claim state; suppressed subjects
+   * excluded, so this can never become a delisting oracle) has an ACTIVE
+   * platform account whose handle reads as this one — the exact spelling, a
+   * separator variant, or the SEPARATOR-STRIPPED fold (`rileymoon` vs
+   * `riley.moon`). Deliberately a BOOLEAN, never a platform list: for an
+   * unclaimed subject a platform roster at a handle-addressable URL is the
+   * outing tool seo-page.ts refuses to build, and the client doesn't need it —
+   * it routes the viewer to the creator-check disambiguation, where the viewer
+   * picks the platform themselves.
+   *
+   * READ-SIDE ONLY on the folded leg, deliberately. The stripped form has real
+   * false positives — a genuine `rileymoon` who has never heard of
+   * `riley.moon` — so it FLAGS (a page that says "a listed creator uses this
+   * handle; this page is NOT them") and never REFUSES. `upsertProfile` stays on
+   * the strict variant set, where a match is a spelling of the same string. */
+  creator_collision: boolean;
+  /** RJ550b-W312-R4-4 (D-0920): TRUE when this fan's display name folds to a
+   * LIVE listed creator's public display name (`creatorNameCollision`). The
+   * display-name sibling of `creator_collision`, and a FLAG for the same
+   * reason the folded handle leg is one: names are not unique, so refusing
+   * would take a name off a person on a guess, while the viewer — the person
+   * an impersonation is aimed at — needs only "this is not that creator".
+   * `false` whenever the display name itself is withheld from this viewer
+   * (private / friends-only), so the flag never leaks a hidden name. */
+  creator_name_collision: boolean;
+  handle: string;
+  display_name: string;
+  bio: string;
+  created_at: string;
+  /** F6: the creators this fan Scouted, newest first, visibility-gated with the
+   * rest of the collection. The creator's own page never names a scout; this
+   * page names the creators the FAN scouted — the `founding_fan:<psp>`
+   * asymmetry, for the same reason. */
+  scouts?: { label: string; ordinal: number; cohort: string; creator_name: string; demand_at_scout: number | null; arrived: boolean }[];
+  /** F8 CONSTELLATION (#45) — how many INDEPENDENT external platforms have
+   * vouched, by OAuth, for this being a person. A COUNT, and never which:
+   * `named` holds only the providers the fan opted to publish, per link, and is
+   * usually empty. Unlike the collection this rides beside, it is NOT
+   * visibility-gated — it is the anti-impersonation signal a stranger deciding
+   * whether to trust a profile most needs, and it names nothing. */
+  constellation?: { size: number; named: string[] };
+  /** NULL for the FOUNDER only (founder.ts, exemption `leaderboards_excluded`).
+   *
+   * The ORIGINAL reason — "every fan starts out following them, so it is a
+   * registration count wearing a follower count's label" — DIED with the
+   * auto-edges (audit item #24), and the null is kept on the reason that
+   * outlived it: the SIZE ORACLE. The founder is the platform's own account and
+   * the only one with an operational reason to follow broadly, so a published
+   * following count is a live lower bound on the profiled user base — the
+   * quantity a registry whose third invariant is "cannot enumerate" refuses to
+   * leak everywhere else — and the follower count is operator-movable on the
+   * one profile fans read as the platform speaking. It is withheld rather than
+   * zeroed or approximated: a wrong number is worse than no number. Clients
+   * must render an absent count as "—", never as 0. */
+  follower_count: number | null;
+  following_count: number | null;
+  featured: FeaturedView[];
+  collection_visible: boolean;
+  achievements?: Achievement[];
+  collection?: { items: CollectionItem[]; total: number };
+  recognitions?: PublicRecognition[]; // S90b: signed creator→fan recognitions (when visible)
+  /**
+   * F11 / #5 — the FANDOM PASSPORT's game half: a RECORD, and four things
+   * fewer than the first draft published.
+   *
+   * NO CREDITS, and no proxy for them. The plan lists "war instances, credits,
+   * match history" as the gap. A balance is a financial fact about a person on
+   * a page search engines index, so there is no field for one — and the CARD
+   * COUNT is gone for the same reason rather than a different one: cards come
+   * from packs at a fixed credit price with a cash backing, so "312 cards held"
+   * publishes roughly what somebody has spent, addressable by handle. A badge
+   * saying "big spender" and an integer that divides into dollars are the same
+   * disclosure; only one of them looks like one.
+   *
+   * NO OPPONENT, AND NO JOIN KEY FOR ONE. A match names two people and only one
+   * is on this page. Omitting the opponent's id is not enough: `war_matches` is
+   * ONE ROW, so a millisecond `resolved_at` is the same string on both
+   * profiles — crawl the public handles, group by that timestamp, and the
+   * fan-vs-fan result graph falls out. So the instant is not published at all,
+   * and neither is `rounds`, which sharpens the join. What is left is a record.
+   *
+   * PRACTICE AND GHOST MATCHES ARE EXCLUDED: a practice match is not a result,
+   * and a ghost match had no opponent, so counting either would inflate a
+   * record with things that did not happen to anybody.
+   *
+   * BEHIND ITS OWN CONSENT (`user_profiles.war_public`, default off) — see
+   * `0069_discovery_exposure.sql`. Riding the collection's switch would have
+   * published a new category of fact about every fan who ticked that box when
+   * it said "your profile and your collection".
+   */
+  war?: {
+    matches: number;
+    wins: number;
+  };
+  /** I3-2060 / D-0992(4): the Creator War season ladder (war-ladder.ts), behind the SAME `war_public`
+   * consent as `war`. Points only — no money, no opponent, no per-match time. */
+  war_ladder?: LadderStanding;
+}
+
+/** HOW WIDELY `creatorHandleCollision` reads "the same handle". */
+export type HandleCollisionScope =
+  /** Exact + separator VARIANTS (`_`↔`.`↔`-`). Every match is a respelling of
+   * the same string, so a match is evidence enough to refuse a registration. */
+  | "strict"
+  /** Strict, PLUS the separator-STRIPPED fold. Fan handles are `[a-z0-9_]` only
+   * (HANDLE_RE), so `rileymoon` is the ONLY spelling a fan can use for creator
+   * `riley.moon` — which makes the stripped form the natural squat and the
+   * high-value direction, and is why v14 left it as a stated residual.
+   *
+   * IT IS A FLAG, NEVER A REFUSAL. Stripping loses information, so this set has
+   * genuine false positives: a `rileymoon` who registered years before
+   * `riley.moon` existed, and every short handle whose fold happens to land on
+   * somebody else's. Refusing them would take a name off an innocent fan on a
+   * guess; a banner that says "a listed creator uses this handle — this page is
+   * NOT them, run a creator check" costs that fan a line of text and tells the
+   * VIEWER — the person the squat is aimed at — exactly what they need. So the
+   * widening lands on `publicProfile` only, and `upsertProfile` keeps refusing
+   * on `strict`. */
+  | "folded";
+
+/** A handle with every separator removed — the one spelling `riley.moon`,
+ * `riley-moon`, `riley_moon` and `rileymoon` all share. Exported so the
+ * migration comment, the tests and the query can name the same fold. */
+export function foldedHandle(handle: string): string {
+  return handle.replace(/[._-]/g, "");
+}
+
+/** `foldedHandle`, in SQL, over `passport_accounts.id`.
+ *
+ * MUST STAY STRUCTURALLY IDENTICAL to the expression in
+ * `0018_handle_fold.sql`'s `idx_accounts_by_handle_folded` — same functions,
+ * same order, same literals (the index spells the column bare, `id`, and SQLite
+ * matches it through this query's `a.` alias). SQLite decides an expression
+ * index applies by comparing the expression trees, so reordering the REPLACEs
+ * or renaming the alias silently costs the index and turns `GET /u/:handle`
+ * back into a scan of every listed handle: a performance regression, never a
+ * correctness one — the predicate keeps answering the same. */
+const FOLD_SQL = "REPLACE(REPLACE(REPLACE(a.id, '.', ''), '-', ''), '_', '')";
+
+/**
+ * Does a LIVE listed creator hold this handle on any platform?
+ *
+ * ONE statement — in BOTH scopes — and the suppression fold rides IT (the
+ * `NOT EXISTS` idiom every public read uses; seo-page.ts resolveIsPage is the
+ * model), so a suppressed subject's handle answers exactly like a never-listed
+ * one: same result, same statement count. Retracted passports are out (their
+ * listing is withdrawn); claim state is deliberately NOT filtered — the
+ * confusion this exists to prevent is worst for the big unclaimed listings.
+ * Rides `idx_accounts_by_handle` (0013), and — on the folded scope —
+ * `idx_accounts_by_handle_folded` (0018).
+ *
+ * Two callers, ONE MEANING BUT TWO SCOPES — see `HandleCollisionScope`:
+ *  - `upsertProfile` REFUSES a new/changed fan handle that collides on the
+ *    STRICT set (the refusal reveals "this handle is listed on some platform" —
+ *    the same class of information `/is/:platform/:handle` answers per platform,
+ *    and with the S101 gate below, never for an account /is would refuse to
+ *    serve);
+ *  - `publicProfile` flags the collision on the FOLDED set so the client can say
+ *    "a listed creator uses this handle — this page is NOT them".
+ */
+export async function creatorHandleCollision(
+  db: DbLike,
+  handle: string,
+  nowMs: number = Date.now(),
+  scope: HandleCollisionScope = "strict",
+): Promise<boolean> {
+  // ONE STATEMENT IN BOTH SCOPES — the scope changes the ID LEG of the same
+  // select, never the number of selects. A second lookup for the folded form
+  // would be an automatic failure of the suppression-oracle guard, which pins
+  // the /u probe pair's statement-sequence identity (a suppressed subject and a
+  // never-listed one must issue the same statements in the same order), and it
+  // would cost the hottest public fan page a round trip for a flag.
+  //
+  // STRICT: separator VARIANTS ride along. Fan handles allow only `_`, but the
+  // same person is `riley.moon` on Instagram or `riley-moon` on a link page —
+  // the three spellings read as one identity, which is the whole point of this
+  // rule. Rides `idx_accounts_by_handle` (0013) at `(id_kind=?, id=?)`.
+  //
+  // FOLDED: the fold has to happen on the STORED COLUMN, and once it does it
+  // SUBSUMES the variant list rather than joining it with an OR. `handle`,
+  // `dotted` and `dashed` differ only in separators, so all three — and any
+  // creator id equal to any of them — collapse to the single value
+  // `foldedHandle(handle)`. So the folded leg is one equality against one bound
+  // value, and `idx_accounts_by_handle_folded` (0018) indexes exactly this
+  // REPLACE chain over the same partial rowset (id_kind='handle' AND
+  // status='active') and answers it with an index probe. That the three-way
+  // `IN` had to be an OR-ed sibling was the first shape tried and is worth
+  // recording as refused: SQLite declines the OR-optimization here and falls
+  // back to a covering scan of every handle row (measured ~165x slower on 20k
+  // rows) — the union form is both slower and a wider expression than the
+  // meaning needs.
+  const folded = scope === "folded";
+  const idLeg = folded ? `${FOLD_SQL} = ?` : "a.id IN (?, ?, ?)";
+  const idBinds = folded ? [foldedHandle(handle)] : [handle, handle.replace(/_/g, "."), handle.replace(/_/g, "-")];
+  // THE S101 GATE RIDES THE STATEMENT. `added_by IN ('creator','agency')` rows
+  // are self-ASSERTIONS awaiting a control-proof, and every public surface
+  // (passport view, /is, the registry build) refuses to publish them until the
+  // account proves itself — an unproven assertion must not become a handle-
+  // reservation/griefing primitive here either, nor an existence oracle for
+  // accounts /is deliberately 404s (v14 adversarial review, finding 1). The
+  // proof legs are `accountProofStanding`'s predicate, folded in so this stays
+  // ONE STATEMENT (the suppression-oracle guard asserts statement-count identity
+  // on the /u probe pairs). A NULL added_by is a pre-fold transient within the
+  // append batch and is treated as vetted, matching the fold that is about to
+  // stamp it.
+  //
+  // THREE THINGS RIDE THE SAME LEGS, and every one of them is folded in rather
+  // than fetched, for that reason:
+  //
+  //  1. THE PASSPORT BIND (`cc.passport_id = a.passport_id`). The proof has to
+  //     belong to the passport that holds the row TODAY. Without it, a handle
+  //     that changed hands kept reserving itself against fans on the strength of
+  //     its previous owner's proof — the row now hangs off a different passport,
+  //     and nobody on that passport has proved anything.
+  //  2. FRESHNESS (the two bound instants — see `freshProofBounds`). A proof that
+  //     has aged out is an assertion again, and an assertion does not reserve a
+  //     handle. The creator's route back is `/account/prove/*`, which re-opens
+  //     for exactly this state.
+  //  3. THE PER-ACCOUNT WIDENING, as a correlated read of the SAME ops setting
+  //     the registry and the report shield gate on (`serve_caution` /
+  //     `servingPerAccountStanding`). With it OFF — the default — the first leg
+  //     is satisfied by any non-asserted row and the behaviour is byte-identical
+  //     to before. With it ON, an operator/OSINT seed that nobody has ever
+  //     confirmed stops reserving a handle against fans, for the same reason it
+  //     stops being served at the passport's class: nobody has checked it.
+  //     Reading the setting in a subquery rather than a second `getSetting` call
+  //     is what keeps the promise in the docstring above literally true.
+  //  4. P1 SHIELD. A shielded account is off every public roster, so answering
+  //     "that handle collides with a creator" for it would rebuild the exact
+  //     confirmation the shield removes — and it would be a sharper one than the
+  //     roster was, because a caller can probe a handle they merely SUSPECT.
+  //     Paired with `/is/:platform/:handle` 404ing for the same handle, a
+  //     `true` here would read as "this is a creator account somebody hid".
+  //     The consequence is stated and accepted: a shielded handle no longer
+  //     reserves itself against a fan profile taking the same name. That is the
+  //     trade the creator made by shielding — the account keeps its registry
+  //     verdict and its report shield, and gives up the protections that are
+  //     derived from being ON the public roster.
+  //     Expressed as a LEG on this statement, never a second read: the
+  //     suppression-oracle guard pins this route's D1 statement sequence.
+  //  5. `purpose <> 'contest'` (W-05/IL-02, matching `account-standing.ts`'s
+  //     X1 note on `freshProofPairs`). A contest proof is a CHALLENGER
+  //     demonstrating control to file a case against the INCUMBENT's row — it
+  //     changes nothing on its own (`contested-accounts.ts verifyContest`).
+  //     But if an operator later adjudicates the case and moves the account to
+  //     the challenger, `cc.passport_id = a.passport_id` starts matching: the
+  //     challenger's contest-ceremony proof would otherwise reserve the handle
+  //     against fans without the challenger ever having run the ordinary
+  //     proof door. Every other reader of this union already excludes it.
+  const { nowIso, provedSince } = freshProofBounds(nowMs);
+  const row = await db
+    .prepare(
+      `SELECT 1 AS x FROM passport_accounts a JOIN passports p ON p.passport_id = a.passport_id
+        WHERE a.id_kind = 'handle' AND ${idLeg} AND a.status = 'active' AND p.retracted = 0
+          AND NOT EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = a.passport_id)
+          AND NOT ${shieldedSqlPredicate()}
+          AND ((COALESCE(a.added_by, 'operator') NOT IN ('creator', 'agency')
+                AND NOT (${SERVING_CAUTION_SQL}))
+               OR EXISTS (SELECT 1 FROM claim_challenges cc
+                           WHERE cc.account_key = a.account_key AND cc.status = 'used' AND cc.purpose <> 'contest'
+                             AND cc.passport_id = a.passport_id
+                             AND (cc.valid_until > ? OR (cc.valid_until IS NULL AND COALESCE(cc.proved_at, cc.created_at) > ?)))
+               OR EXISTS (SELECT 1 FROM oauth_challenges oc
+                           WHERE oc.account_key = a.account_key AND oc.status = 'proven'
+                             AND oc.passport_id = a.passport_id
+                             AND (oc.valid_until > ? OR (oc.valid_until IS NULL AND COALESCE(oc.proved_at, oc.created_at) > ?))))
+        LIMIT 1`,
+    )
+    .bind(...idBinds, nowIso, provedSince, nowIso, provedSince)
+    .first();
+  return !!row;
+}
+
+/** The fold `creatorNameCollision` compares on: the screen fold, lower-cased,
+ * whitespace collapsed. Exported so a test names the same fold. */
+export function foldedDisplayName(name: string): string {
+  return screenFold(name).toLowerCase().replace(/\s+/gu, " ").trim();
+}
+
+/**
+ * RJ550b-W312-R4-4 (D-0920): does a LIVE listed creator publish this display
+ * name? ONE statement, issued unconditionally by `publicProfile` (the
+ * suppression-oracle guard pins that route's statement sequence), and the
+ * suppression fold rides it exactly as in `creatorHandleCollision`, so a
+ * suppressed subject's name answers like a never-listed one. Retracted
+ * passports are out (`retracted = 0`, which also selects the partial index
+ * `idx_passports_display_name_lower`, migration 0174).
+ *
+ * TWO BOUND SPELLINGS: SQLite's LOWER folds ASCII only and the column can't be
+ * NFKD-folded in SQL, so the statement compares the column's LOWER against
+ * the fan's FULL fold (catches a fan's accent/fullwidth/invisible respelling
+ * of an ASCII creator name) and against the fan's plain lower-case (catches a
+ * verbatim copy of a non-ASCII creator name).
+ * THIRD TERM (I20-W1D, QUEUE #946 (a), RG-SEC-09): the stored skeleton
+ * `p.display_name_skeleton` (migration 0207, name-fold.ts displayNameSkeleton)
+ * against the fan's skeleton, so a wholly look-alike copy (Cyrillic or Greek
+ * letters spelling `Emma`) is matched in the same ONE statement. A row whose
+ * skeleton is still NULL (written before 0207, until
+ * `backfillDisplayNameSkeletons` reaches it) is matched by the first two terms
+ * only.
+ */
+export async function creatorNameCollision(db: DbLike, displayName: string): Promise<boolean> {
+  const folded = foldedDisplayName(displayName);
+  const plain = displayName.trim().replace(/[A-Z]/g, (ch) => ch.toLowerCase());
+  const row = await db
+    .prepare(
+      `SELECT 1 AS x FROM passports p
+        WHERE p.retracted = 0 AND (LOWER(p.display_name) IN (?, ?) OR p.display_name_skeleton = ?) AND p.display_name <> ''
+          AND NOT EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = p.passport_id)
+        LIMIT 1`,
+    )
+    .bind(folded, plain, displayNameSkeleton(displayName))
+    .first();
+  return !!row;
+}
+
+/** Rows one `backfillDisplayNameSkeletons` call may fill (one D1 batch). */
+export const DISPLAY_NAME_SKELETON_BACKFILL_LIMIT = 200;
+
+/**
+ * I20-W1D (QUEUE #946 (a)): fill `passports.display_name_skeleton` for rows written before migration 0207 (SQLite
+ * cannot compute the skeleton). BOUNDED (`limit` rows per call, at most DISPLAY_NAME_SKELETON_BACKFILL_LIMIT) and
+ * IDEMPOTENT (selects only NULL skeletons of non-empty names; a name with no skeleton is stored as "" so it is not
+ * re-selected). Each UPDATE is bound to the display_name it READ (INV-058): a rename or erasure landing between the
+ * read and the write matches no row, and the next call picks the row up again. Counts RETURNING rows, never
+ * `changes` (db.ts INFLATING_WRITES). Scheduled wiring is the I20-L01 (index.ts) hand-off.
+ */
+export async function backfillDisplayNameSkeletons(db: DbLike, limit = DISPLAY_NAME_SKELETON_BACKFILL_LIMIT): Promise<number> {
+  const { results } = await db
+    .prepare("SELECT passport_id, display_name FROM passports WHERE display_name_skeleton IS NULL AND display_name <> '' ORDER BY passport_id LIMIT ?")
+    .bind(Math.max(1, Math.min(limit, DISPLAY_NAME_SKELETON_BACKFILL_LIMIT)))
+    .all<{ passport_id: string; display_name: string }>();
+  if (results.length === 0) return 0;
+  const out = await db.batch(
+    results.map((r) =>
+      db
+        .prepare("UPDATE passports SET display_name_skeleton = ? WHERE passport_id = ? AND display_name = ? AND display_name_skeleton IS NULL RETURNING passport_id")
+        .bind(displayNameSkeleton(r.display_name) ?? "", r.passport_id, r.display_name),
+    ),
+  );
+  return out.reduce<number>((n, r) => n + ((r as { results?: unknown[] }).results?.length ?? 0), 0);
+}
+
+/**
+ * The profile page for a handle (`publicProfile`, below). Everything personal —
+ * display name, bio, follow counts, the featured showcase, the collection and
+ * achievements — shows per `visibility` (owner always; public → anyone;
+ * friends → mutual follow; private → owner only). A viewer outside that set
+ * gets the handle and the anti-impersonation signals only (I3-0426/I3-1176).
+ */
+/**
+ * The fan's game record: two numbers.
+ *
+ * COMPETITIVE MATCHES ONLY — `practice = 0 AND ghost = 0`. A practice match is
+ * not a result and a ghost match had no opponent on the other side, so counting
+ * either would inflate a record with things that did not happen to anybody.
+ *
+ * The opponent is never selected, not even to be discarded: the columns that
+ * name them appear in the WHERE and nowhere else. And no per-match row is
+ * returned at all — a dated list is both a timeline of when this person plays
+ * and, because `war_matches` holds one row per match, a join key that pairs two
+ * public profiles into "@a beat @b at this instant". Two counts carry the
+ * record without carrying either.
+ */
+/**
+ * I3-0561 — THROWN ALT MATCHES. A result counts only against an opponent whose
+ * `accounts` row exists and was created at least WAR_RECORD_OPPONENT_AGE_MS
+ * before the match resolved (the 7-day Sybil age `supporter-status.ts` uses),
+ * and each opponent counts ONCE: `matches` is distinct qualifying opponents
+ * played, `wins` distinct qualifying opponents beaten. A fresh alt that throws
+ * a match adds nothing; an aged alt adds at most one, ever. An erased opponent
+ * (pseudonymised to `del_…`) has no row and drops out, so erasing the alt after
+ * the throw cannot launder it.
+ */
+const WAR_RECORD_OPPONENT_AGE_MS = 7 * DAY_MS;
+async function warRecord(db: DbLike, accountId: string): Promise<NonNullable<PublicProfileView["war"]>> {
+  const agg = await db
+    .prepare(
+      `SELECT COUNT(DISTINCT m.opp) AS matches, COUNT(DISTINCT CASE WHEN m.won = 1 THEN m.opp END) AS wins
+         FROM (SELECT CASE WHEN a_account = ? THEN b_account ELSE a_account END AS opp,
+                      CASE WHEN (a_account = ? AND winner = 'a') OR (b_account = ? AND winner = 'b') THEN 1 ELSE 0 END AS won,
+                      resolved_ms
+                 FROM war_matches
+                WHERE practice = 0 AND ghost = 0 AND (a_account = ? OR b_account = ?)) m
+         JOIN accounts o ON o.account_id = m.opp
+        WHERE m.opp <> ? AND CAST(strftime('%s', o.created_at) AS INTEGER) * 1000 <= m.resolved_ms - ?`,
+    )
+    .bind(accountId, accountId, accountId, accountId, accountId, accountId, WAR_RECORD_OPPONENT_AGE_MS)
+    .first<{ matches: number; wins: number | null }>();
+  return { matches: agg?.matches ?? 0, wins: agg?.wins ?? 0 };
+}
+
+export async function publicProfile(db: DbLike, handle: string, viewerAccountId?: string, nowMs: number = Date.now()): Promise<PublicProfileView | null> {
+  // I3-0408: a suspended/terminated account's page is the same not-found as an absent one.
+  const p = await profileByHandle(db, handle, true);
+  if (!p) return null;
+  // UNCONDITIONAL, and before any visibility branching: the statement sequence
+  // of this route must not vary with the answer (the suppression-oracle guard
+  // asserts D1-sequence identity across its probe pairs).
+  //
+  // FOLDED scope: this is the READ, where a stripped-form match is a warning on
+  // a page rather than a name taken off a fan. It is still exactly one
+  // statement — the fold is another leg on the same select — so the sequence
+  // identity above is untouched. See `HandleCollisionScope`.
+  const collision = await creatorHandleCollision(db, p.handle, Date.now(), "folded");
+  // RJ550b-W312-R4-4: the display-name sibling, also UNCONDITIONAL and before
+  // the visibility branch (same statement-sequence rule); served only when the
+  // name itself is visible to this viewer (below).
+  const nameCollision = await creatorNameCollision(db, p.display_name);
+  const isOwner = viewerAccountId === p.account_id;
+  let visible = isOwner || p.visibility === "public";
+  if (!visible && p.visibility === "friends" && viewerAccountId) {
+    visible = await isFriend(db, viewerAccountId, p.account_id);
+  }
+
+  // The founder publishes NO follow counts — see PublicProfileView above.
+  // Fails closed: with no founder configured this is false for everyone, so
+  // every profile keeps its ordinary counts.
+  const hideCounts = await isFounderAccount(db, p.account_id);
+  const followers = hideCounts ? null : await db.prepare("SELECT COUNT(*) AS n FROM follows WHERE followee_id = ?").bind(p.account_id).first<{ n: number }>();
+  const following = hideCounts ? null : await db.prepare("SELECT COUNT(*) AS n FROM follows WHERE follower_id = ?").bind(p.account_id).first<{ n: number }>();
+
+  // F8: read UNCONDITIONALLY and before the visibility branch, the same rule
+  // the collision read above follows — the statement sequence of this route must
+  // not vary with the answer (`suppression-oracles.test.ts` asserts D1-sequence
+  // identity across its probe pairs).
+  const stars = await constellation(db, p.account_id);
+
+  // Read UNCONDITIONALLY (statement-sequence identity, as above); what a
+  // viewer who may not see this profile gets is decided at the view below.
+  const featured = await featuredViews(db, p.account_id);
+
+  // I3-0426 / I3-1176: a `private` profile, or a `friends` one to a non-friend,
+  // publishes no identity or activity beyond the handle the URL already names:
+  // no display name, bio, creation instant, follow counts or showcase (whose
+  // rows carry `acquired_at`). Kept for everyone: the collector marker, the
+  // creator-collision flag and the constellation — the anti-impersonation
+  // signals a stranger needs, none of which names anything.
+  const view: PublicProfileView = {
+    profile_kind: "collector",
+    creator_collision: collision,
+    creator_name_collision: visible && nameCollision,
+    handle: p.handle,
+    display_name: visible ? p.display_name : p.handle,
+    bio: visible ? p.bio : "",
+    created_at: visible ? p.created_at : "",
+    follower_count: hideCounts || !visible ? null : (followers?.n ?? 0),
+    following_count: hideCounts || !visible ? null : (following?.n ?? 0),
+    featured: visible ? featured : [],
+    collection_visible: visible,
+    constellation: stars,
+  };
+  if (visible) {
+    view.achievements = await withFoundingRanks(db, p.account_id, await listAchievements(db, p.account_id));
+    // A SUPPRESSED creator's release is not in a fan's PUBLIC collection — the
+    // `founding_fan:<psp>` lesson one row over. This block published the
+    // delisted creator's `passport_id` AND their release title to anyone who
+    // could guess a fan's handle, with no session at all, on the same page whose
+    // achievement list had already been taught to withhold them (found by the
+    // R2/router-derived cost sweep, this pass). The gate rides BOTH existing
+    // statements (`NOT EXISTS`, the `getReleaseProvenance` idiom), so the count
+    // agrees with the list and neither costs a round trip.
+    //
+    // The buyer is not being told a lie about their own holdings: their
+    // owner-scoped surfaces are unchanged. What stops is PUBLICATION.
+    //
+    // …AND THE RETRACTION HALF, which this pair was missing. The suppression
+    // term went in and the operator kill-switch did not, so an operator-
+    // retracted passport kept its title and its id on every fan's public page
+    // — the same bytes, through the other door. `retracted = 0` rides the same
+    // JOIN both statements already make, so the list and the count still agree
+    // (a count that disagreed with its list is itself a counter oracle) and
+    // neither costs a round trip.
+    const { results } = await db
+      .prepare(
+        // I3-1089 (hand-off W3, I4-04-R2): the date shown is when THIS holder
+        // received it — the transfer log's latest arrival to them — falling back
+        // to the redemption instant for a collectible that never moved.
+        `SELECT a.acquisition_id AS acquisition_id, a.release_id AS release_id,
+                COALESCE((SELECT MAX(l.at) FROM acquisition_log l WHERE l.acquisition_id = a.acquisition_id AND l.to_owner = a.account_id), a.acquired_at) AS acquired_at,
+                rel.title AS title, rel.passport_id AS passport_id
+           FROM acquisitions a JOIN releases rel ON rel.release_id = a.release_id
+           JOIN passports pass ON pass.passport_id = rel.passport_id AND pass.retracted = 0
+          WHERE a.account_id = ? AND rel.status <> 'withdrawn'
+            AND NOT EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = rel.passport_id)
+          ORDER BY acquired_at DESC LIMIT ?`,
+      )
+      .bind(p.account_id, COLLECTION_LIMIT)
+      .all<CollectionItem>();
+    const total = await db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM acquisitions a JOIN releases rel ON rel.release_id = a.release_id
+           JOIN passports pass ON pass.passport_id = rel.passport_id AND pass.retracted = 0
+          WHERE a.account_id = ? AND rel.status <> 'withdrawn'
+            AND NOT EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = rel.passport_id)`,
+      )
+      .bind(p.account_id)
+      .first<{ n: number }>();
+    view.collection = { items: results, total: total?.n ?? 0 };
+    // S90b (feature 77): the public recognition section — signed creator→fan
+    // recognitions this fan received, with the recognizing creator's public name.
+    view.recognitions = await publicRecognitionsFor(db, p.account_id);
+    // F11 / #5 — the Fandom Passport's game half. Inside the `visible` branch
+    // with the collection, so ONE switch governs everything a stranger can read
+    // about this fan; a second control for the game would be one a fan has to
+    // discover before it protects them.
+    // BOTH gates. The collection switch says what a stranger may read about
+    // this fan's profile and collection; this one is the consent for a
+    // different category of fact, and it is off until a fan turns it on.
+    if (p.war_public === 1) {
+      view.war = await warRecord(db, p.account_id);
+      const ladder = await warLadderStanding(db, p.account_id, Date.now());
+      if (ladder) view.war_ladder = ladder;
+    }
+    // F6: the fan's SCOUTS — "Scout #73 — Sept 2026", the payoff for spending a
+    // scarce monthly budget on somebody nobody had heard of.
+    //
+    // THE ASYMMETRY IS DELIBERATE AND IT IS `founding_fan:<psp>`'s. A creator's
+    // page publishes a scout COUNT and never a name (`scoutCard`); a fan's own
+    // page publishes WHICH creators they scouted and their number on each. The
+    // fan is the one making the claim, about themselves, and it is the whole
+    // content of "I found them first".
+    //
+    // Suppressed and retracted creators are excluded on the SAME statement, the
+    // idiom the collection block above uses and for the reason it learned the
+    // hard way: a delisted creator must not reappear as a line on a stranger's
+    // public profile.
+    const scoutRows = await db
+      .prepare(
+        // THE NARROW DEMAND OPT-OUT REACHES THE FROZEN NUMBER TOO. Suppression
+        // takes the whole row (the subject is gone); an opt-out is "I stay
+        // listed, the public COUNTER about me comes off" — so the row stays and
+        // `demand_at_scout` reads NULL. Without this, the exact figure a
+        // creator withdrew from /p/:id/requests was still being republished,
+        // by name, on any fan's public profile. On the SAME statement, so the
+        // page cannot drift from the counter it mirrors.
+        `SELECT s.ordinal AS ordinal, s.cohort AS cohort, s.scouted_at AS scouted_at,
+                CASE WHEN EXISTS (SELECT 1 FROM demand_optouts d WHERE d.passport_id = s.passport_id) THEN NULL ELSE s.demand_at_scout END AS demand_at_scout,
+                pass.display_name AS display_name, ${shownClassSql("pass")} AS claim_state
+           FROM scout_ordinals s
+           JOIN passports pass ON pass.passport_id = s.passport_id AND pass.retracted = 0
+          WHERE s.account_id = ?
+            AND NOT EXISTS (SELECT 1 FROM request_suppressions x WHERE x.passport_id = s.passport_id)
+          ORDER BY s.scouted_at DESC LIMIT ?`,
+      )
+      .bind(new Date(nowMs).toISOString(), p.account_id, PUBLIC_SCOUTS_LIMIT) // I34-W3-EXPIRY: the caller's instant (the wall clock when it has none). I3-1768 (D-1084(1), I32-FX2-SERVER): the class a fan is shown — a lapsed grant (standing.ts grantLiveAtSql) reads claimed.
+      .all<{ ordinal: number; cohort: string; scouted_at: string; demand_at_scout: number | null; display_name: string; claim_state: string }>();
+    view.scouts = scoutRows.results.map((r) => ({
+      label: scoutLabel(r.ordinal, r.cohort) ?? `Scout #${r.ordinal}`,
+      ordinal: r.ordinal,
+      cohort: r.cohort,
+      creator_name: r.display_name,
+      demand_at_scout: r.demand_at_scout,
+      arrived: r.claim_state === "verified",
+    }));
+  }
+  return view;
+}
+
+// --- Discovery via verified-acquisition overlap ---
+
+export interface DiscoveryEntry {
+  handle: string;
+  display_name: string;
+  overlap: number; // shared verified releases
+}
+
+// Hard bounds on discovery work: at most RELEASE_SCAN releases considered, at
+// most ACQUIRER_SAMPLE co-acquirers sampled per release → ≤ 16k rows touched
+// per call, regardless of how popular a release is. Sampling means a mega-hit
+// release contributes a bounded (not exhaustive) co-collector set — a coverage
+// trade, never a privacy one.
+const DISCOVER_RELEASE_SCAN = 40;
+const DISCOVER_ACQUIRER_SAMPLE = 400;
+export const MAX_DISCOVER_PER_DAY = 60;
+
+/**
+ * Rank other collectors by overlap with the caller's verified acquisitions.
+ * Only PUBLIC-visibility profiles surface (a friends/private collection never
+ * leaks into discovery), already-followed accounts are excluded, and only the
+ * aggregate overlap count is revealed. Work is hard-bounded (see constants)
+ * and the endpoint is per-account throttled — a fan holding one wildly popular
+ * release can't turn this into a DB-load amplifier.
+ */
+export async function discover(db: DbLike, accountId: string, nowMs: number = Date.now()): Promise<DiscoveryEntry[]> {
+  await requireAccount(db, accountId);
+  await dailyThrottle(db, `disc:${accountId}`, nowMs, MAX_DISCOVER_PER_DAY, "discovery limit reached for today");
+
+  const { results: myReleases } = await db
+    .prepare("SELECT DISTINCT release_id FROM (SELECT release_id, acquired_at FROM acquisitions WHERE account_id = ? ORDER BY acquired_at DESC LIMIT 200) LIMIT ?")
+    .bind(accountId, DISCOVER_RELEASE_SCAN)
+    .all<{ release_id: string }>();
+  if (myReleases.length === 0) return [];
+
+  // Tally co-acquirers with a bounded sample per release.
+  const overlapByAccount = new Map<string, number>();
+  for (const { release_id } of myReleases) {
+    const { results } = await db
+      .prepare("SELECT DISTINCT account_id FROM acquisitions WHERE release_id = ? AND account_id <> ? LIMIT ?")
+      .bind(release_id, accountId, DISCOVER_ACQUIRER_SAMPLE)
+      .all<{ account_id: string }>();
+    for (const r of results) overlapByAccount.set(r.account_id, (overlapByAccount.get(r.account_id) ?? 0) + 1);
+  }
+  if (overlapByAccount.size === 0) return [];
+
+  // Top candidates by overlap, then filter to PUBLIC profiles not yet followed.
+  const candidates = [...overlapByAccount.entries()].sort((a, b) => b[1] - a[1]).slice(0, 100);
+  // CHUNKED, and note the `1`: this statement binds `accountId` for the NOT IN
+  // subquery ALONGSIDE the IN list, so 100 candidates + 1 was 101 parameters —
+  // over D1's ceiling by exactly one, failing at precisely the point the
+  // feature starts working (audit v10 B2). `inChunks(..., 1)` reserves that slot.
+  const profiles: { account_id: string; handle: string; display_name: string }[] = [];
+  for (const chunk of inChunks(candidates.map(([id]) => id), 1)) {
+    const placeholders = chunk.map(() => "?").join(",");
+    const { results } = await db
+      .prepare(
+        `SELECT p.account_id AS account_id, p.handle AS handle, p.display_name AS display_name
+           FROM rankable_profiles p
+          WHERE p.visibility = 'public' AND p.account_id IN (${placeholders})
+            AND p.account_id NOT IN (SELECT followee_id FROM follows WHERE follower_id = ?)`,
+      )
+      .bind(...chunk, accountId)
+      .all<{ account_id: string; handle: string; display_name: string }>();
+    profiles.push(...results);
+  }
+
+  const out: DiscoveryEntry[] = profiles.map((p) => ({ handle: p.handle, display_name: p.display_name, overlap: overlapByAccount.get(p.account_id)! }));
+  out.sort((a, b) => b.overlap - a.overlap || (a.handle < b.handle ? -1 : 1));
+  return out.slice(0, DISCOVER_LIMIT);
+}
+
+// --- Verifiable collectible ---
+
+export interface CollectibleVerification {
+  valid: true;
+  release: {
+    release_id: string;
+    title: string;
+    passport_id: string;
+    manifest_hash: string;
+    /** AUDIT ITEM #22 — `published` | `withdrawn`. The verification is
+     * UNCHANGED by it: the acquisition is a fact and this page still says
+     * "verified collectible" either way. What the status adds is the ONE thing
+     * a holder could not learn anywhere: that the creator has taken the release
+     * off their storefront, which is why it does not appear in the holder's
+     * public collection (`publicProfile` filters `status <> 'withdrawn'`) or in
+     * their showcase (`featuredViews` does the same). This filters on
+     * suppression, NOT on status, and that stays true — withdrawing is the
+     * creator winding a release down, not a delisting, and the buyer's receipt
+     * survives both. */
+    status: string;
+  };
+  acquired_at: string;
+  /** No `holder` (F4b, Jason 2026-09-03): the id is a capability that outlives
+   * ownership — a previous owner keeps it after gifting (F3), so naming the
+   * CURRENT holder to anyone holding the id made the id a tracker on whoever
+   * holds the item next. The receipt verifies the release and the time; who
+   * holds it is the holder's to show (featuring / opening their collection). */
+}
+
+/**
+ * Independently verify a collectible by acquisition id (the capability its
+ * holder shares — never enumerable, never listed publicly except by the holder
+ * featuring it or opening their collection). Ties the claim to the release's
+ * signed provenance via manifest_hash: "this exact registered release was
+ * acquired via a one-time credential at this time". Durable even if the
+ * release is later withdrawn from the storefront — an acquisition is a fact.
+ *
+ * A SUPPRESSED creator's collectible is the same `null` an unknown acquisition
+ * id gets, which `GET /collectible/:id` renders as the identical
+ * `{valid:false}` 404 — the same answer `releases.ts getReleaseProvenance`
+ * already gives `GET /release/:id`. The acquisition id is an unguessable
+ * capability, so this was never a probe; it was residual PUBLICATION of a
+ * delisted person's `passport_id` from the one storefront surface the archive
+ * chokepoint had not covered (review LOW 5, this pass). Redacting only the
+ * `passport_id` and serving the rest was the alternative and is worse: it makes
+ * the payload SHAPE the answer to "is this creator delisted?", for the one
+ * caller who can ask. The gate rides the SAME statement, so it costs no round
+ * trip, and the receipt returns intact the moment the (reversible) suppression
+ * is lifted.
+ *
+ * …AND THE RETRACTION HALF, which this route was the last one missing. Its two
+ * siblings — `publicProfile`'s collection pair and `featuredViews` — took the
+ * `retracted = 0` JOIN in the same pass that gave them the suppression term;
+ * this one kept only the suppression, so an OPERATOR-RETRACTED creator's
+ * `passport_id` and release title were still served here to anyone holding an
+ * acquisition id. A retraction is the operator kill-switch: it means the listing
+ * should not exist on any public surface, and a capability-scoped surface is
+ * still a public one. `retracted = 0` rides the same JOIN the other two make, so
+ * it costs no round trip and the answer stays the identical `{valid:false}` 404
+ * an unknown acquisition id gets.
+ */
+export async function verifyCollectible(db: DbLike, acquisitionId: string): Promise<CollectibleVerification | null> {
+  if (typeof acquisitionId !== "string" || !ACQ_ID_RE.test(acquisitionId)) return null;
+  const row = await db
+    .prepare(
+      `SELECT a.acquired_at AS acquired_at,
+              rel.release_id AS release_id, rel.title AS title, rel.passport_id AS passport_id, rel.manifest_hash AS manifest_hash,
+              rel.status AS status
+         FROM acquisitions a JOIN releases rel ON rel.release_id = a.release_id
+         JOIN passports pass ON pass.passport_id = rel.passport_id AND pass.retracted = 0
+        WHERE a.acquisition_id = ?
+          AND NOT EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = rel.passport_id)`,
+    )
+    .bind(acquisitionId)
+    .first<{ acquired_at: string; release_id: string; title: string; passport_id: string; manifest_hash: string; status: string }>();
+  if (!row) return null;
+  return {
+    valid: true,
+    release: { release_id: row.release_id, title: row.title, passport_id: row.passport_id, manifest_hash: row.manifest_hash, status: row.status },
+    acquired_at: row.acquired_at,
+  };
+}
+===== END FILE: services/trust-core/src/social.ts =====
+
+===== BEGIN FILE: services/trust-core/src/ssr-shell.ts =====
+/**
+ * M9 — THE server-rendered public shell.
+ *
+ * `/p/:id`, `/p/:id/psa`, `/is/:platform/:handle`, `/discover` and
+ * `/browse/:category` are the crawler / no-JS front door: where every share
+ * link, every unfurl and every search result lands. They all wear this one
+ * shell — header, body slot, honest footer strip — so there is exactly one
+ * copy of the tokens, the verdict marks and the honest line, not four drifting
+ * ones (design mock 56, DESIGN-SYSTEM.md v0.2 §3 tokens / §7 voltage).
+ *
+ * THE CONSTRAINTS THIS FILE EXISTS TO SATISFY (all of them structural):
+ *
+ *  - **CSP is `default-src 'none'; style-src 'unsafe-inline'`.** So: ONE inline
+ *    `<style>` block and nothing else. No script. No remote font (there is no
+ *    `font-src`, so even a `data:` font is blocked) — system stack only. No
+ *    remote CSS, no `<img>`, no `url(...)` of any kind, no `@import`. Every
+ *    icon is a literal text glyph. `renderShell` never emits an element that
+ *    can issue a request.
+ *  - **JavaScript entirely off is the normal case.** Every action is an `<a>`;
+ *    there are no tabs, no accordions, no forms (`form-action 'none'` would
+ *    kill them anyway).
+ *  - **Crawler-legible.** One real `<h1>` (supplied by the page body), semantic
+ *    `<h2>`/`<table>`/`<nav>`, a meta description, and a canonical that the
+ *    ROUTE derives from configured env — never the Host header.
+ *  - **Verdict = colour + icon + text label, always** (§4). These pages get
+ *    screenshotted and greyscaled; colour is only ever an accent. Brand magenta
+ *    is identity and action and is NEVER in the verdict table.
+ *  - **Unclaimed reads neutral.** Slate, an outline dot, the literal word, and
+ *    copy that says absence of a claim is evidence of nothing.
+ *
+ * Nothing here touches the database, the ledger or any request-derived value:
+ * it is pure string rendering over already-escaped fragments, which is what
+ * keeps it trivially inside the paywall guard's verdict closure.
+ */
+
+import { type MessageKey, t, translator } from "@dhwaja/i18n";
+import { DECLARABLE_KINDS } from "@dhwaja/schema";
+
+/**
+ * The one HTML escaper for every server-rendered public page. Escapes the five
+ * characters that matter in both element text and quoted attribute values, so
+ * one function is correct in both sinks. `unknown` in, because several call
+ * sites interpolate values whose type is only structurally trusted.
+ */
+export function esc(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
+
+/** The six reserved verdict tokens (DESIGN-SYSTEM.md §4). Brand magenta is
+ * deliberately absent: it is identity/action, never a verdict. */
+export type VerdictKey = "verified" | "claimed" | "unclaimed" | "reported" | "caution" | "notlisted";
+
+export interface VerdictMark {
+  /** The text label — MANDATORY, rendered uppercase so it survives greyscale
+   * and a text-only crawler equally. */
+  word: string;
+  /** The icon — MANDATORY, and always a literal glyph (no image, no font). */
+  icon: string;
+  /** The reserved hue, mirrored BY VALUE from the design tokens (same practice
+   * as card-render/badge.ts, which cannot use CSS variables either). */
+  color: string;
+  /** The pill class in `SSR_STYLE`. */
+  cls: string;
+}
+
+export const VERDICTS: Record<VerdictKey, VerdictMark> = {
+  verified: { word: "VERIFIED", icon: "✓", color: "#18e6a0", cls: "v" },
+  claimed: { word: "CLAIMED", icon: "◐", color: "#ffb020", cls: "c" },
+  unclaimed: { word: "UNCLAIMED", icon: "○", color: "#8b93a7", cls: "u" },
+  reported: { word: "REPORTED", icon: "⚠", color: "#ff3b5c", cls: "r" },
+  caution: { word: "CAUTION", icon: "!", color: "#ff8a3d", cls: "ca" },
+  notlisted: { word: "NOT LISTED", icon: "?", color: "#838aa6", cls: "nl" },
+};
+
+/**
+ * A verdict pill: tinted fill + reserved hue + ICON + TEXT LABEL. Colour is
+ * never the only signal — strip the stylesheet and the glyph and the word are
+ * both still there in the markup, which is the greyscale/screenshot test.
+ * `label` may override the word (e.g. "VERIFIED CREATOR"); it is escaped.
+ */
+/**
+ * WHAT a subject is, as a chip — and deliberately NOT a verdict pill.
+ *
+ * The six verdict tokens own their hues, their icons and their
+ * uppercase-with-letter-spacing shape, and a fan reads that shape as a judgement
+ * about risk. "This is an AI character" is a fact about WHAT the subject is, not
+ * about how trustworthy it is: a verified character is exactly as verified as a
+ * verified person, and colouring the fact like a warning would be a lie in the
+ * one direction this product cannot afford.
+ *
+ * So: its own neutral class, sentence case rather than SHOUTING, and an icon
+ * (`◆`) that is outside the verdict set (`✓ ◐ ○ ⚠ ! ?`). `VerdictKey` is not
+ * widened, which also means every guard that enumerates verdict tokens is
+ * untouched by this and stays exactly as strict as it was.
+ *
+ * Returns "" for a person — there is no chip for the default, and rendering one
+ * would make "human" look like a claim somebody checked.
+ */
+export function kindChip(kind: string, label: string): string {
+  // The list comes from the SCHEMA, not from a second spelling of it here. Every
+  // hand-written `kind === "ai_character" || kind === "brand"` in the tree was a
+  // place a fourth kind would silently fall through to "person" — measured, and
+  // typechecking clean the whole way.
+  if (!(DECLARABLE_KINDS as readonly string[]).includes(kind)) return "";
+  return `<span class="kind"><span class="icon" aria-hidden="true">◆</span> <span class="word">${esc(label)}</span></span>`;
+}
+
+export function verdictPill(key: VerdictKey, label?: string, small = false): string {
+  const m = VERDICTS[key];
+  return `<span class="pill ${m.cls}${small ? " sm" : ""}"><span class="icon" aria-hidden="true">${esc(m.icon)}</span> <span class="word">${esc(label ?? m.word)}</span></span>`;
+}
+
+/**
+ * The honest line that appears on every public page — the sentence that stops
+ * a listing from reading as a judgement. Fixed copy, like the warnings vocab:
+ * there is nowhere to put free text, so a bad day cannot produce a bad public
+ * sentence.
+ *
+ * @deprecated W2 — the English value now lives in `@dhwaja/i18n` as
+ * `shell.honest_line`. Kept as a re-export so callers and the guards that pin
+ * this sentence by value keep working, and so there is exactly one English
+ * string rather than two that can drift.
+ */
+export const HONEST_LINE = t("en", "shell.honest_line");
+
+/**
+ * The small print under it: what Dhwaja actually is, and what it is not.
+ *
+ * @deprecated W2 — the English value now lives in `@dhwaja/i18n` as
+ * `shell.footer_fine`. Kept as a re-export for the same reason as `HONEST_LINE`.
+ */
+export const FOOTER_FINE = t("en", "shell.footer_fine");
+
+/** I3-1167 (D-0920 option A): the fine print for a page whose URL names a profile (`/is/`, `/p/`) — passed by
+ * those pages as `ShellOpts.footerFine`. It drops only "It never sees which profile you checked", which reads
+ * false on the page whose address IS the profile looked up; every other page keeps `shell.footer_fine`. */
+export function profileFooterFine(locale = "en"): string {
+  return translator(locale)("shell.footer_fine_profile");
+}
+
+/** RJb-T2-O-04 (D-0920): where the removal/correction door is. The request form is the SPA's `#/remove`, so the
+ * link needs the app's ORIGIN, taken from the page's own already-validated `appHref` (absolute https). A page
+ * with none links to the how page's `#remove` section, which carries the same door — so every SSR page has one. */
+export function removalHref(appHref: string | null | undefined): string {
+  const origin = typeof appHref === "string" ? /^https:\/\/[a-z0-9.-]+(?::[0-9]+)?(?=[/#?]|$)/i.exec(appHref)?.[0] : undefined;
+  return origin ? `${origin}/#/remove` : "/how-it-works#remove";
+}
+
+export interface ShellOpts {
+  /** `<title>` text (escaped here). */
+  title: string;
+  /** `<meta name="description">` (escaped here); omitted when absent. */
+  description?: string | null;
+  /** Indexability. `noindex,nofollow` for an UNCLAIMED subject: claiming is
+   * the consent signal, so a person who never asked to be listed answers a
+   * direct check but is never marketed into search (ratified 2026-08-15).
+   * `noindex,follow`: a page with nothing to index whose links still lead somewhere (I3-0633, an empty browse board). */
+  robots: "index,follow" | "noindex,nofollow" | "noindex,follow";
+  /** Absolute https canonical, ALREADY validated by the caller from configured
+   * env. Absent → the tag is simply omitted (fail closed, never the Host). */
+  canonicalUrl?: string | null;
+  /** Extra, ALREADY-ESCAPED head markup (the og/twitter block). */
+  headExtra?: string;
+  /** Absolute https deep link into the interactive SPA, already validated.
+   * The one hand-off in the header — the shell has no nav and no search box
+   * (a form would be dead under `form-action 'none'`). */
+  appHref?: string | null;
+  /** ALREADY-ESCAPED page body. Must open with the page's single `<h1>`. */
+  body: string;
+  /** Page-specific extra sentence appended to the footer fine print
+   * (plain text — escaped here). */
+  footerNote?: string | null;
+  /** Page-specific replacement for the footer's LEAD sentence (plain text —
+   * escaped here). `undefined` (every caller but the PSA page) keeps the
+   * default `shell.honest_line`; an explicit string replaces it; `null` omits
+   * the lead paragraph. D-0710(3): the PSA page's warnbar says a warning was
+   * published by a named human operator after review, which the default
+   * honest line ("Dhwaja lists; it does not judge.") contradicts on that page
+   * alone — `psa.ts` passes its own already-shipped, agreeing sentence here. */
+  footerLead?: string | null;
+  /** I3-1167: page-specific replacement for the footer FINE PRINT (plain text — escaped here). `undefined` keeps
+   * `shell.footer_fine`; a string replaces it (`profileFooterFine()` on `/is/` and `/p/`); `null` omits it. */
+  footerFine?: string | null;
+  /**
+   * W2 — the reader's language, already negotiated by the route.
+   *
+   * It sets `<html lang>`, which was hardcoded `"en"` on every server-rendered
+   * page: an accessibility defect before it was an i18n one, because a screen
+   * reader announces the page in whatever that attribute says regardless of what
+   * the words are. Defaulted so every existing caller renders exactly as it did.
+   */
+  locale?: string;
+  /** ALREADY-ESCAPED markup emitted after `</main>` (the JSON-LD block). */
+  tail?: string;
+}
+
+/**
+ * Render one complete public document. Every value it interpolates is either
+ * escaped here (title/description/footer note) or documented above as
+ * already-escaped markup built by the page module.
+ */
+export function renderShell(o: ShellOpts): string {
+  const head = [
+    `<meta name="robots" content="${o.robots}">`,
+    o.description ? `<meta name="description" content="${esc(o.description)}">` : "",
+    o.canonicalUrl ? `<link rel="canonical" href="${esc(o.canonicalUrl)}">` : "",
+    o.headExtra ?? "",
+  ]
+    .filter(Boolean)
+    .join("\n");
+  const locale = o.locale ?? "en";
+  const m = translator(locale);
+  const hand = o.appHref ? `<a class="sshand" href="${esc(o.appHref)}" rel="nofollow">${esc(m("shell.hand_off"))}</a>` : "";
+  // I3-1670: two catalogue sentences are never glued with an English space —
+  // the page note is its own paragraph, so no locale inherits a joining rule.
+  const fineText = o.footerFine === undefined ? m("shell.footer_fine") : o.footerFine;
+  const fine = `${fineText ? `<p class="fine">${esc(fineText)}</p>` : ""}${o.footerNote ? `<p class="fine">${esc(o.footerNote)}</p>` : ""}`;
+  const lead = o.footerLead === undefined ? m("shell.honest_line") : o.footerLead;
+  // I21-Q146 (D-1072(3)): the footer links the About page (about-page.ts ABOUT_PATH), labelled with its own title.
+  // `lang` is an attribute value built from a negotiated tag, and `negotiate`
+  // only ever returns a key that exists in `CATALOGUES` — but it is escaped
+  // anyway, because the one thing a caller could do wrong here is pass a locale
+  // it read off a header itself.
+  return `<!doctype html><html lang="${esc(locale)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+${head}
+<title>${esc(o.title)}</title>
+<style>${SSR_STYLE}</style>
+</head><body>
+<div class="ss">
+<header class="sshead"><span class="sslogo" aria-hidden="true">⚑</span><span class="ssbrand">Dhwaja</span>${hand}</header>
+<main class="ssbody">
+${o.body}
+</main>
+<footer class="ssfoot">${lead ? `<p class="lead">${esc(lead)}</p>` : ""}${fine}<p class="fine"><a href="/how-it-works">${esc(m("is.how_cta"))}</a></p><p class="fine"><a href="/about">${esc(m("about.title"))}</a></p><p class="fine"><a href="${esc(removalHref(o.appHref))}" rel="nofollow">${esc(m("shell.removal_link"))}</a></p></footer>
+</div>
+${o.tail ?? ""}
+</body></html>`;
+}
+
+/**
+ * THE stylesheet — one inline block, no remote anything, system fonts only.
+ * Token values are copied BY VALUE from DESIGN-SYSTEM.md §3.
+ *
+ * Deliberately contains no `url(`, no `@import`, no `@font-face` and no
+ * `expression(` — under `default-src 'none'` any of those is either blocked or
+ * a request this page must never make. `ssr-shell.test.ts` asserts that.
+ */
+export const SSR_STYLE = `:root{color-scheme:dark;
+--bg:#08080f;--bg-2:#0b0b15;--surface:#11111d;--line:rgba(255,255,255,.07);--line-2:rgba(255,255,255,.13);
+--text:#f2f3f8;--muted:#9aa0b4;--faint:#838aa6;--on-brand:#08080f;
+--pink:#ff2d7e;--violet:#a63cff;--brand-grad:linear-gradient(135deg,#ff2d7e,#a63cff);
+--verified:#18e6a0;--claimed:#ffb020;--unclaimed:#8b93a7;--reported:#ff3b5c;--caution:#ff8a3d;--notlisted:#838aa6;
+--r-sm:10px;--r:14px;--r-pill:999px;
+--font:"Inter",system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+*{box-sizing:border-box}
+body{margin:0;background:radial-gradient(1100px 520px at 78% -8%,color-mix(in srgb,var(--violet) 16%,transparent),transparent 60%),radial-gradient(900px 480px at 12% 4%,color-mix(in srgb,var(--pink) 11%,transparent),transparent 55%),var(--bg);background-attachment:fixed;color:var(--text);font-family:var(--font);font-size:1rem;line-height:1.55;-webkit-text-size-adjust:100%}
+.ss{max-width:52rem;margin:0 auto;min-height:100vh;background:var(--bg);border-inline:1px solid var(--line)}
+.sshead{display:flex;align-items:center;gap:.55rem;padding:.7rem 1.2rem;border-bottom:1px solid var(--line)}
+.sslogo{width:22px;height:22px;border-radius:6px;background:var(--brand-grad);color:var(--on-brand);font-weight:800;font-size:.65rem;display:inline-flex;align-items:center;justify-content:center;flex:none}
+.ssbrand{font-weight:800;font-size:.9rem;letter-spacing:-.01em}
+.sshand{margin-inline-start:auto;font-size:.78rem;font-weight:700;color:var(--pink);text-decoration:none}
+.sshand:hover,.sshand:focus{text-decoration:underline}
+.ssbody{display:block;padding:1.2rem 1.2rem 1.6rem}
+.ssfoot{border-top:1px solid var(--line);padding:1rem 1.2rem 1.4rem;background:rgba(255,255,255,.02);font-size:.76rem;line-height:1.6;color:var(--faint)}
+.ssfoot .lead{margin:0;color:var(--muted);font-weight:650}
+.ssfoot .fine{margin:.4rem 0 0}
+.ssfoot a{color:var(--muted)}
+h1{font-size:1.7rem;font-weight:800;letter-spacing:-.02em;line-height:1.15;margin:.1rem 0 .5rem}
+h2{font-size:1.02rem;font-weight:700;margin:1.5rem 0 .5rem;letter-spacing:.01em}
+h3{font-size:.9rem;font-weight:700;margin:0 0 .25rem}
+p{margin:.5rem 0;color:var(--muted);font-size:.9rem}
+p strong,li strong,td strong{color:var(--text)}
+a{color:var(--pink)}
+hr{border:none;border-top:1px solid var(--line);margin:1.4rem 0}
+code,.mono{font-family:var(--mono);font-size:.82em;background:rgba(255,255,255,.06);border:1px solid var(--line);border-radius:6px;padding:.1em .42em;color:var(--text)}
+.eyebrow{font-size:.64rem;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--faint);margin:0}
+.crumbs{font-size:.74rem;color:var(--faint);margin:0 0 .6rem}
+.crumbs a{color:var(--muted);text-decoration:none}
+.handle{font-family:var(--mono);font-size:.76rem;color:var(--faint);margin:.5rem 0 0}
+.lede{color:var(--muted);font-size:.92rem;margin:.4rem 0 .9rem}
+.honest{margin:.6rem 0 0;font-size:.88rem;line-height:1.6;color:var(--muted);max-width:56ch}
+.honest strong{color:var(--text)}
+.note{font-size:.78rem;color:var(--faint);line-height:1.6}
+.pill{display:inline-flex;align-items:center;gap:.4em;font-size:.76rem;font-weight:700;letter-spacing:.06em;border-radius:var(--r-pill);padding:.34em .85em;border:1px solid;max-width:100%;overflow-wrap:anywhere}
+.pill .icon{font-style:normal;line-height:1}
+.pill.sm{font-size:.66rem;padding:.22em .65em}
+/* WHAT a subject is — visually a different KIND of thing from a verdict, on
+   purpose: no reserved hue, no letter-spacing, normal case, lighter weight. A
+   fan must not read it as a risk signal. */
+.kind{display:inline-flex;align-items:center;gap:.4em;font-size:.74rem;font-weight:600;border-radius:var(--r-pill);padding:.3em .8em;border:1px dashed rgba(139,147,167,.45);color:var(--muted);background:rgba(139,147,167,.06);max-width:100%;overflow-wrap:anywhere}
+.kind .icon{font-style:normal;line-height:1}
+.kindnote{margin:.5rem 0 0;font-size:.9rem;line-height:1.45;color:var(--text)}
+.pill.v{color:var(--verified);border-color:rgba(24,230,160,.45);background:rgba(24,230,160,.12)}
+.pill.c{color:var(--claimed);border-color:rgba(255,176,32,.42);background:rgba(255,176,32,.10)}
+.pill.u{color:var(--unclaimed);border-color:rgba(139,147,167,.40);background:rgba(139,147,167,.10)}
+.pill.r{color:var(--reported);border-color:rgba(255,59,92,.45);background:rgba(255,59,92,.10)}
+.pill.ca{color:var(--caution);border-color:rgba(255,138,61,.45);background:rgba(255,138,61,.10)}
+.pill.nl{color:var(--notlisted);border-color:var(--line-2);background:rgba(255,255,255,.03)}
+.pillrow{display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin:.5rem 0 0}
+.top{display:flex;gap:1.4rem;align-items:flex-start;flex-wrap:wrap}
+.idcol{flex:1 1 22rem;min-width:16rem}
+.cardcol{flex:0 0 15rem;max-width:15rem;margin:0}
+.cardcol svg{display:block;width:100%;height:auto}
+.cardcap{font-size:.68rem;color:var(--faint);line-height:1.5;text-align:center;margin:.45rem 0 0}
+.answer{background:var(--surface);border:1px solid var(--line-2);border-radius:var(--r);padding:.95rem 1.1rem;margin:.8rem 0}
+.answer p{margin:.5rem 0 0;font-size:.9rem;color:var(--muted)}
+.answer p:first-child{margin-top:0}
+table{width:100%;border-collapse:collapse;font-size:.86rem;margin:.5rem 0}
+caption{text-align:start;font-size:.7rem;color:var(--faint);padding-bottom:.3rem}
+th{font-size:.6rem;font-weight:700;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);text-align:start;padding:.45rem .55rem;border-bottom:1px solid var(--line-2)}
+td{padding:.55rem .55rem;border-bottom:1px solid var(--line);vertical-align:middle;color:var(--muted)}
+td.num,th.num{text-align:end;font-family:var(--mono)}
+tr.here td{background:rgba(255,255,255,.03)}
+tr.here td:first-child{box-shadow:inset 2px 0 0 var(--pink)}
+tr.inert td{opacity:.72}
+.m{font-size:.72rem;font-weight:700;color:var(--faint)}
+.mark{display:inline-flex;align-items:center;gap:.3em;font-size:.68rem;font-weight:700;border-radius:var(--r-pill);padding:.22em .65em;border:1px solid;max-width:100%;overflow-wrap:anywhere}
+.mark.creator{color:var(--verified);border-color:rgba(24,230,160,.4);background:rgba(24,230,160,.09)}
+.mark.agency{color:var(--claimed);border-color:rgba(255,176,32,.4);background:rgba(255,176,32,.09)}
+.mark.none{color:var(--faint);border-color:var(--line-2);background:rgba(255,255,255,.03)}
+.mark.unconfirmed{color:var(--faint);border-color:var(--line-2)}
+details.alts{border:1px solid var(--line-2);border-radius:var(--r-sm);background:rgba(255,255,255,.02)}
+details.alts summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:.5rem;padding:.5rem .6rem;color:var(--muted);font-size:.82rem}
+details.alts summary::-webkit-details-marker{display:none}
+details.alts summary::before{content:"▸";color:var(--pink);font-size:.72rem;line-height:1;transition:transform .12s ease}
+details.alts[open] summary::before{transform:rotate(90deg)}
+details.alts summary:hover{color:var(--text)}
+details.alts .altbadge{font-weight:700;color:var(--text)}
+details.alts .altcue{font-size:.68rem;color:var(--faint)}
+details.alts[open] summary{border-bottom:1px solid var(--line)}
+ul.rows.alt{margin:0;padding:.2rem .6rem .35rem;padding-inline-start:1.5rem}
+ul.rows.alt li{padding:.5rem .1rem}
+ul.rows.alt .altmarks{margin-inline-start:auto}
+/* F15: the per-account answer-page link. Quiet by default — the row's job is
+   to show WHAT is listed; this is the second question, offered not urged. */
+a.isk{margin-inline-start:.4rem;font-size:.72rem;color:var(--muted);text-decoration:underline;text-underline-offset:2px;white-space:nowrap}
+a.isk:hover{color:var(--text)}
+ol.rows,ul.rows{list-style:none;margin:.3rem 0;padding:0}
+ol.rows li,ul.rows li{display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;padding:.55rem .1rem;border-bottom:1px solid var(--line);font-size:.88rem;color:var(--muted)}
+ol.rows li:last-child,ul.rows li:last-child{border-bottom:none}
+ol.rows a,ul.rows a{color:var(--text);text-decoration:none;font-weight:700}
+ol.rows a:hover,ul.rows a:hover{text-decoration:underline}
+.rank{font-family:var(--mono);font-size:.74rem;color:var(--faint);min-width:1.6em;flex:none}
+.score{margin-inline-start:auto;font-family:var(--mono);font-size:.74rem;color:var(--faint)}
+.cats{margin-top:1.4rem}
+.cats .chips{display:flex;gap:.4rem;flex-wrap:wrap;margin:.3rem 0 0;padding:0;list-style:none}
+.chip{display:inline-block;font-size:.74rem;font-weight:700;color:var(--muted);text-decoration:none;border:1px solid var(--line-2);border-radius:var(--r-pill);padding:.3em .85em}
+.chip:hover{color:var(--text)}
+.warnbar{border:1px solid rgba(255,59,92,.35);background:rgba(255,59,92,.09);border-radius:var(--r-sm);padding:.7rem .95rem;margin:0 0 .9rem;font-size:.86rem;color:#ff8fa3;line-height:1.5}
+.warnbar strong{color:#ff8fa3}
+.fakes,.threat{border-inline-start:3px solid var(--reported);padding-inline-start:.7rem;color:#ff8fa3;font-weight:650;font-size:.84rem}
+.hint{margin:1.2rem 0 0;border:1px solid var(--line);background:rgba(255,255,255,.02);border-radius:var(--r);padding:.85rem 1rem}
+.claimcta{margin:1.2rem 0 0;border:1px solid var(--line);border-inline-start:3px solid var(--pink,#ff2d7e);background:rgba(255,255,255,.03);border-radius:var(--r);padding:.9rem 1.05rem}
+.claimcta h3{margin:0;font-size:.95rem}
+.claimcta p{margin:.35rem 0 0;font-size:.84rem;color:var(--muted)}
+.claimbtn{display:inline-block;margin-top:.2rem;padding:.5rem .95rem;border:1px solid var(--line);border-radius:var(--r-sm);font-size:.85rem;font-weight:650;text-decoration:none;color:var(--text);background:rgba(255,255,255,.05)}
+.hint p{margin:.2rem 0 0;font-size:.82rem}
+.faq{border:1px solid var(--line);border-radius:var(--r-sm);overflow:hidden;margin:.5rem 0}
+.faq .qa{padding:.7rem .9rem;border-bottom:1px solid var(--line)}
+.faq .qa:last-child{border-bottom:none}
+.faq .q{font-weight:700;font-size:.85rem;margin:0;color:var(--text)}
+.faq .a{font-size:.82rem;color:var(--muted);margin:.2rem 0 0}
+.more{margin:.9rem 0 0}
+.more a,.fakes a{font-weight:700;text-decoration:none}
+.more a:hover{text-decoration:underline}
+.linkcta{display:inline-block;margin:1rem .9rem 0 0;font-size:.85rem;font-weight:700;color:var(--pink);text-decoration:none}
+.linkcta.ghost{color:var(--muted)}
+.linkcta:hover{text-decoration:underline}
+.empty{color:var(--muted);font-size:.9rem}
+a:focus-visible,.chip:focus-visible{outline:none;box-shadow:0 0 0 3px rgba(255,45,126,.75);border-radius:6px}
+@media(max-width:640px){.ssbody{padding:1rem .95rem 1.4rem}h1{font-size:1.45rem}.cardcol{flex:1 1 100%;max-width:20rem;margin-inline:auto}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;animation:none!important;scroll-behavior:auto!important}}`;
+
+
+/**
+ * N-02 — the public error page for the three shareable, indexed SSR surfaces
+ * (`/browse/:category`, `/is/:platform/:handle`, `/p/:id`). Before this, a
+ * deliberate 404 on those routes was bare `text/plain` and an unhandled throw
+ * mid-render fell through to the service-wide `app.onError` JSON body — fine
+ * for an API caller, but these three URLs are the ones a fan shares and a
+ * search engine indexes, so a failure on them rendered as a broken page
+ * instead of a page that says what happened.
+ *
+ * ONE render for each `kind`, with NO caller-supplied content of any sort —
+ * not the id, not the category, not the platform, not the reason. That is
+ * what keeps a 404 from becoming an oracle: "no such category" and "category
+ * exists but the read failed" must stay indistinguishable from the outside,
+ * exactly like the "unknown vs suppressed vs retracted" 404s these routes
+ * already collapse to one body (`seo-page.test.ts` pins this for
+ * `/is/:platform/:handle`). Both call sites pass a fixed, literal `kind` —
+ * never a value derived from the request or from what was being looked up.
+ * (I3-1584: the one optional input, `appHref`, is deployment config — APP_ORIGIN
+ * — and is identical for every request, so it adds no oracle.)
+ *
+ * Copy is hardcoded English rather than pulled through `@dhwaja/i18n`:
+ * `packages/i18n`'s closed `MESSAGE_KEYS` vocabulary is outside this room's
+ * file manifest this wave, so adding a key there is not this room's to do
+ * (see OPEN QUESTIONS). `renderShell` still negotiates the surrounding
+ * chrome (footer honest line, hand-off label) through the existing keys —
+ * only the two sentences unique to this page are unlocalized.
+ *
+ * `robots: noindex,nofollow` always: an error page — 404 or 500 — is never
+ * the thing to rank.
+ */
+export function renderErrorHtml(kind: "not_found" | "server_error", locale = "en", appHref: string | null = null): string {
+  // W2 (S-034): the locale is NEGOTIATED and threaded, not defaulted. The first
+  // build of this page hardcoded English and `psa-i18n.test.ts` caught it — a
+  // failure page that is permanently English is the same defect as a success
+  // page that is, and it is the page a reader is most likely to meet on a bad
+  // day. The copy lives in the catalogue with every other page's.
+  const m = translator(locale);
+  const p = kind === "not_found" ? "error.not_found" : "error.server";
+  const code = kind === "not_found" ? "404" : "500";
+  // I3-1584: an onward path. `/discover` is a fixed same-origin literal (existing
+  // key `browse.crumb`); the check-flow hand-off is `appHref`, which a caller
+  // passes from CONFIG (APP_ORIGIN), never from the request — so the page stays
+  // a pure function of (kind, locale, config) and no oracle. Non-https dropped.
+  const app = appHref && /^https:\/\/[a-z0-9._\-/#]+$/i.test(appHref) ? appHref : null;
+  const body = `<p class="eyebrow">${code}</p><h1>${esc(m(`${p}.heading` as MessageKey))}</h1><p class="lede">${esc(m(`${p}.lede` as MessageKey))}</p><nav class="crumbs"><a href="/discover">${esc(m("browse.crumb"))}</a></nav>`;
+  // I3-1167: served at /is/ and /p/ (whose URL names the profile) as well as /browse and /discover; one render for
+  // every caller (no oracle), so always the profile fine print, which only drops "It never sees which profile you checked".
+  return renderShell({ title: m(`${p}.title` as MessageKey), robots: "noindex,nofollow", body, locale, appHref: app, footerFine: profileFooterFine(locale) });
+}
+
+/**
+ * Put `<strong>` around an emphasized run inside an already-escaped message.
+ *
+ * ESCAPE FIRST, THEN SUBSTITUTE. Both the message and the run come from the
+ * catalogue as TEXT and are escaped independently; the only markup introduced is
+ * the tag this function writes. A `{token}` survives escaping untouched (it has
+ * no HTML-significant characters), so replacing it afterwards cannot be steered
+ * by anything a translator wrote — the worst a hostile catalogue value can do is
+ * fail to contain the token, and then no emphasis is applied and the sentence
+ * still reads.
+ *
+ * This exists because deleting the emphasis was the wrong answer to "a catalogue
+ * value must be text". The `<strong>` in "These marks say **who asserted an
+ * account, not that it is true**" is part of what the sentence means.
+ */
+export function withEmphasis(
+  escapedMessage: string,
+  runs: Readonly<Record<string, string>>,
+  tag: "strong" | "em" = "strong",
+  plain: Readonly<Record<string, string>> = {},
+): string {
+  // I3-1995: ONE pass over the message. Text inserted for a token — a run, or a
+  // `plain` value such as a display name — is never re-scanned, so a name
+  // containing a literal `{strong}` cannot inject a second emphasized run. A
+  // caller that interpolates reader-visible text must pass it through `plain`
+  // (leaving its `{name}` token in the message) rather than substituting it first.
+  return escapedMessage.replace(/\{([A-Za-z0-9_]+)\}/g, (whole, token: string) => {
+    if (Object.hasOwn(runs, token)) return `<${tag}>${runs[token]}</${tag}>`;
+    if (Object.hasOwn(plain, token)) return plain[token]!;
+    return whole;
+  });
+}
+===== END FILE: services/trust-core/src/ssr-shell.ts =====
+
+===== BEGIN FILE: services/trust-core/src/standing.ts =====
+import { inChunks, type DbLike, type DbStatement } from "./db.js";
+
+/**
+ * THE ONE PASSPORT-STANDING DERIVATION.
+ *
+ * THE INVARIANT: **current trust is not historical trust.** Everything this
+ * repo publishes about a person is a claim about NOW — "this account is really
+ * them", "this creator is verified" — and every one of those claims is derived
+ * from rows that record something that was true at the moment it was written.
+ * The gap between those two sentences is where every finding in this area has
+ * come from. A passport is verified until it is de-verified; a grant is good
+ * until it expires; a listing exists until its subject asks to be gone. A
+ * reader that asks a narrower question than "what is this passport's standing
+ * right now" gets an answer that used to be true, and serves it as if it still
+ * is.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS FILE EXISTS
+ * ---------------------------------------------------------------------------
+ * There was no single "current standing" function. There were FIVE independent
+ * readers with THREE different predicates, and the differences between them
+ * were not decisions — they were the order the surfaces happened to be written
+ * in:
+ *
+ *   1. `requireVerifiedCreator` (verified-creator.ts) — the mint chokepoint.
+ *      Asks all three questions: `claim_state = 'verified'`, `retracted = 0`,
+ *      and NOT suppressed. The most complete of the five, and the one the
+ *      others should have been.
+ *   2. `requireVerified` (releases.ts) — the release-registration gate. Same
+ *      three questions, a second copy, with its own 404-vs-403 split.
+ *   3. `isVerifiedPassport` (intelligence.ts) — the S25 access gate. It read
+ *      `claim_state` and `retracted` and **not `request_suppressions`**, so a
+ *      delisted creator passed it. HISTORICAL: since D-60 it returns
+ *      `isCurrentlyVerified(passportStanding(...))` (intelligence.ts:336), so a
+ *      suppressed or lapsed passport now fails it like every other door.
+ *   4. `livePassport` (passport-view.ts) — every public `/p/:id…` surface.
+ *      Reads `retracted` and suppression, and returns `claim_state` for the
+ *      CALLER to interpret however it likes — which is how "verified" came to
+ *      mean five slightly different things downstream.
+ *   5. `realEntries` (registry-build.ts) — what the registry actually serves.
+ *      Reads all of it, in bulk, plus the per-account proof gate, and reaches
+ *      its own verdict in a loop.
+ *
+ * …plus roughly 180 raw `claim_state` reads scattered across the tree, each of
+ * which is a sixth reader in embryo.
+ *
+ * THIS FUNCTION IS A STRICT SUPERSET OF ALL FIVE. Everything any of them asks,
+ * it asks. Its return value distinguishes the cases they collapsed, so a caller
+ * that only needs "may this creator mint" can say `isCurrentlyVerified(...)`
+ * and a caller that wants to explain itself to a human ("your verification
+ * needs renewing" vs "this listing was removed") has the distinction available
+ * without a second read.
+ *
+ * **NEW CODE MUST NOT ADD A SIXTH.** If a surface needs to know a passport's
+ * standing, it calls this. If this function cannot express what the surface
+ * needs, the fix is a new member of `PassportStanding` — reviewed once, here —
+ * and never a fresh `SELECT claim_state FROM passports` at the call site. That
+ * is not style. Reader #3 above is one forgotten `EXISTS` clause, and it was
+ * invisible precisely because it looked like ordinary code doing an ordinary
+ * lookup.
+ *
+ * ---------------------------------------------------------------------------
+ * ONE STATEMENT, AND WHY IT IS NOT NEGOTIABLE
+ * ---------------------------------------------------------------------------
+ * Every question rides the SAME read: `claim_state` and `retracted` off the row,
+ * suppression as a correlated `EXISTS`, the grant's expiry as a correlated
+ * scalar subquery. This is the `livePassport` / `poolOffer` idiom and it is a
+ * PRIVACY control, not a performance one. `tests/invariants/suppression-oracles.test.ts`
+ * measures that a suppressed subject and a never-listed one produce the same
+ * statement SEQUENCE on a public read: split across two statements, a
+ * suppressed subject costs 2 round trips where a never-listed one costs 1, and
+ * that difference is a "did this person ask to be delisted?" oracle behind
+ * byte-identical 404s, needing no timing calibration at all. A derivation whose
+ * cost depends on its answer cannot be used on a public surface, so this one's
+ * cost never does: **exactly one statement, for every input, always.**
+ *
+ * That is also why there is no `PSP_RE` fast-reject here, unlike
+ * `livePassport` and `isVerifiedPassport`. A syntactic pre-check would make a
+ * malformed id cost ZERO statements and a well-formed unknown id cost one —
+ * a smaller oracle than the suppression one, but the same shape, and this
+ * function exists to stop that shape recurring. The id is a bound parameter,
+ * so there is nothing to sanitize.
+ *
+ * ---------------------------------------------------------------------------
+ * PRECEDENCE
+ * ---------------------------------------------------------------------------
+ *   retracted  >  suppressed  >  expiry-derived  >  claim_state
+ *
+ * `retracted` first because it is the strongest statement the ledger makes: the
+ * record itself was withdrawn. `suppressed` next because it is the subject's
+ * own request and outranks anything about their trust level — a delisted person
+ * is gone whether or not they were verified. Expiry before `claim_state`
+ * because that is the whole point: the column says what was granted, the expiry
+ * says whether it still holds.
+ *
+ * ---------------------------------------------------------------------------
+ * LIMITS, STATED
+ * ---------------------------------------------------------------------------
+ * - This is PASSPORT standing. It says nothing about whether any individual
+ *   account on that passport is under the holder's control today; that is
+ *   `accountProofStanding` in account-standing.ts, and conflating the two is
+ *   the second half of the same defect.
+ * - `passportStanding` is a READ, and a read is never atomic with whatever the
+ *   caller does next. That window is what `verifiedMintGate` (below) closes,
+ *   and it closes it by NOT being a read: the predicate rides the write's own
+ *   batch and is evaluated at commit time. A caller that needs the answer in
+ *   JS (to render copy, to choose a refusal) still uses the read; a caller
+ *   that needs the answer to be TRUE WHEN THE ROW LANDS uses the gate. They
+ *   ask the same question and must keep asking the same question — see the
+ *   note on `VERIFIED_NOW_SUBQUERY`.
+ * - I34-W3-MONEY (QUEUE #947/d-mint-closure): the gate also refuses a creator who is closed (creator_closures) or under a
+ *   live operator suspension (creator_suspensions) AT COMMIT TIME, so every batch carrying it refuses a close that
+ *   committed after the door's read. The term is credits.ts `CREATOR_CLOSED_SQL` correlated on the admitted id, spelled
+ *   inline because credits.ts and creator-payout.ts import this module (either import is a cycle, i13-arch-cycles).
+ * - Consumers (census 2026-10-21, I32; call and interpolation sites only — the
+ *   command below also prints import and comment lines, which are not counted:
+ *   `grep -rn 'passportStanding(\|verifiedMintGate(\|VERIFIED_NOW_SUBQUERY' services/trust-core/src --include=*.ts | grep -v '^services/trust-core/src/standing.ts'`):
+ *   `passportStanding` — 8: intelligence.ts (`isVerifiedPassport`), payout.ts x5,
+ *   credentials.ts, index.ts;
+ *   `verifiedMintGate` — 10: releases.ts, questions.ts, payout.ts x2,
+ *   reverse-codes.ts x3, credentials.ts, handshake.ts, recognition.ts;
+ *   `VERIFIED_NOW_SUBQUERY` — 1: credentials.ts (beside `verifiedMintGate` in
+ *   the same batch); `VERIFIED_AT_SUBQUERY` — 6: payout.ts x3, reverse-codes.ts,
+ *   media.ts x2 (I32-CORE2, D-1079(2)).
+ *   `grantLiveAtSql` / `lapsedGrantIds` (I32-FX1-VERIFIED, D-1082(1); D-1083(1); I32-FX2-SERVER, D-1084(1); I34-W2-EXPIRY-B;
+ *   census `grep -rn 'grantLiveAtSql(\|lapsedGrantIds(' services/trust-core/src --include=*.ts | grep -v '^services/trust-core/src/standing.ts'`,
+ *   import and comment lines not counted) — 33, in 17 files. Money, award and standing doors (20): tips.ts (TIPPABLE),
+ *   credits.ts (WAR_ELIGIBLE_SQL), packs.ts x3 (selectOddsCandidates, grantLiveNow, LIVE_STANDING_SQL), creator-payout.ts
+ *   x3 (STANDING_EXISTS, RELEASE_STANDING_WHERE, releaseStanding), payout.ts (CURRENTLY_VERIFIED), ratings.ts x3
+ *   (populationValues, isSuppressed, freezeWeeklyEditionsStep), rewards.ts x3 (grantFanReferralIfDue x2,
+ *   creditCreatorReferral), reward-policy.ts (applyRewardPolicies), founding.ts (sweepFounding), events.ts x3 (the
+ *   question_answered and handshake_answered guards, at the event's instant, and accountableOperatorSql's person
+ *   operator, at the action's instant, I34-FX2-EXPIRY, D-1116(2)). The class a fan, creator
+ *   or agency is shown (13): `lapsedGrantIds` in cards.ts x2 (cardData, cardDataMany) and caution.ts (resolvePointers);
+ *   `grantLiveAtSql` in passport-view.ts (verifiedNamesake), rankings.ts x2 (the Breakout board, answerAccounts),
+ *   founding.ts (foundingRank), digest.ts x2 (buildDigestContent's PSA link and verified total), social.ts
+ *   (awardAchievements' Scout count) and codex.ts x3 (codexStats x3). Not counted, because they are defined in this file: `CLAIM_STATE_AT_SQL` (I32-LAND7,
+ *   D-1087(1)), the same rule as a SELECT-list term, interpolated 11 times outside it: passport-view.ts x2
+ *   (livePassportAt, livePassportWithDemand), scouts.ts x2 (scoutCreator's verified check and allocation guard),
+ *   war-consent.ts x3 (warOptedIn, allWarOptedIn, warOptedInIds), protection.ts x2 (protectionState), founding.ts
+ *   (awardFoundingIfEligible) and rewards.ts (creditCreatorReferral); and `shownClassSql` (I32 B7), the same term over
+ *   any alias, called 11 times: rankings.ts x2 (passportMetaByIds, ineligibleSet), ratings.ts (buildWeeklyEditions),
+ *   scouts.ts (listOwnScouts), social.ts (publicProfile's scouts), requests.ts (listOwnRequests), accounts.ts
+ *   (listSaves), agencies.ts x2 (agencyGrantedCreators, agencyCreatorView), account-standing.ts (creatorAccountStandings) and codex.ts
+ *   (listCodex), plus `shownClassValueSql`, its bound-value form, once: codex.ts (recordEncounter's first_state)
+ *   (EXPB-26, I34-W3-EXPIRY, D-1117(5)).
+ *   A census is a claim; re-run the command before relying on it.
+ */
+
+/**
+ * A passport's standing RIGHT NOW.
+ *
+ * `unclaimed` / `claimed` / `verified` are the three `claim_state` values the
+ * schema allows (0001_ledger.sql). The other three are derived, and exist
+ * because collapsing them into the schema's three is what made the old readers
+ * disagree:
+ *
+ *   reverification_required  was verified; the grant's `expires_at` has passed.
+ *                            Distinct from `claimed` because the person DID
+ *                            pass verification — the honest sentence is "this
+ *                            needs renewing", not "this never happened".
+ *   retracted                the passport record itself was withdrawn.
+ *   suppressed               the subject asked to be delisted. NEVER show this
+ *                            value, or anything derived from it, on a public
+ *                            surface: the distinction between `suppressed` and
+ *                            `null` is exactly the oracle removal exists to
+ *                            deny. It is here so operator-side callers (who
+ *                            must see suppressed subjects — that is how a
+ *                            suppression gets lifted) do not need a second
+ *                            read, and so a public caller that treats anything
+ *                            other than an explicit allowlist as "gone" is
+ *                            correct by default.
+ */
+export type PassportStanding =
+  | "unclaimed"
+  | "claimed"
+  | "verified"
+  | "reverification_required"
+  | "retracted"
+  | "suppressed";
+
+interface StandingRow {
+  claim_state: string;
+  retracted: number;
+  suppressed: number;
+  /**
+   * The raw payload of the LATEST `verification_granted` **or**
+   * `verification_renewed` event for this subject, or NULL if there has never
+   * been one.
+   */
+  grant_payload: string | null;
+}
+
+/**
+ * WHERE THE GRANT'S EXPIRY ACTUALLY LIVES.
+ *
+ * It is in the ledger and nowhere else. `review.ts` writes
+ * `verification_granted` with a payload of exactly `{ expires_at }`; the fold
+ * (`events.ts`) moves `passports.claim_state` to `'verified'` and does not
+ * project the expiry onto any column, and `verification_refs` records the KYC
+ * reference rather than the deadline. So the only place to read it from is
+ * `trust_events`, which is why the subquery below reaches into the log — and
+ * that is fine to do in one statement: `idx_trust_events_subject` serves the
+ * `subject` equality, `seq DESC LIMIT 1` takes the most recent of them, and
+ * `badge.ts` already reads the same event the same way for "verified since".
+ *
+ * GRANT **OR** RENEWAL. A renewal moves the deadline and leaves `claim_state`
+ * at `'verified'` (events.ts, `verification_renewed`), so a subquery that read
+ * only `verification_granted` would keep answering with the ORIGINAL deadline
+ * and report `reverification_required` for a creator who has just renewed. The
+ * two-element `IN` list is a LITERAL, not an interpolated placeholder list, so
+ * there is nothing here for `inChunks` to bound. This is the same read
+ * `verification-sweep.ts` performs in bulk, deliberately — the sweep is the
+ * enforcement and this is the point-read that has to agree with it.
+ *
+ * The payload is parsed HERE and never leaves this function. It is a
+ * one-field JSON object in practice, and keeping the parse local means no
+ * caller ever gets handed a raw ledger payload by accident.
+ *
+ * DELIBERATELY NOT `json_extract`. The codebase convention is to fetch the
+ * payload and fold it in JS (`rankings.ts`, `roi.ts` both say so), and here it
+ * also fails soft: `json_extract` raises on malformed JSON and would take the
+ * whole standing read down with it, whereas a `try/catch` degrades to "no
+ * readable expiry", which is the safe answer.
+ *
+ * ABSENT, EMPTY AND UNPARSEABLE ALL MEAN **UNKNOWN**, NEVER "LONG PAST".
+ * `review.ts` wrote `String(item.payload.expires_at ?? "")` into every grant it
+ * ever approved, so `""` is a real, already-committed expiry in real ledgers and
+ * `Date.parse("")` is NaN. Reading "cannot parse" as "expired" would de-badge
+ * that entire legacy population at once. Such a grant states no deadline and the
+ * standing stays `verified`.
+ *
+ * D-1112(8) (I34-FX1-CORE, RGC-N1): THE DEADLINE IS READ BY `grantDeadlineMs`
+ * BELOW, the parse `grantLiveAtSql`'s SQL applies, not by `Date.parse`. A
+ * deadline `Date.parse` reads and `julianday` does not (`+0530`) lapsed the JS
+ * doors while every SQL door still paid; one parse is what makes one creator one
+ * class at one instant on every door.
+ */
+function grantExpiryMs(payload: string | null): number | null {
+  if (payload === null) return null;
+  let raw: unknown;
+  try {
+    raw = (JSON.parse(payload) as Record<string, unknown>).expires_at;
+  } catch {
+    return null; // a payload that will not parse states no deadline
+  }
+  return grantDeadlineMs(raw);
+}
+
+/** The six characters `GRANT_LIVE_HEAD` trims (`char(32, 9, 10, 11, 12, 13)`), and the whitespace SQLite's date
+ * parser skips. */
+const DEADLINE_WS = " \t\n\v\f\r";
+const dlSpace = (c: string | undefined): boolean => c !== undefined && c !== "" && DEADLINE_WS.includes(c);
+const dlDigit = (c: string | undefined): boolean => c !== undefined && c >= "0" && c <= "9" && c.length === 1;
+/** `n` digits at `s[i]`, inside [min, max], else null (SQLite date.c `getDigits`). */
+function dlDigits(s: string, i: number, n: number, min: number, max: number): number | null {
+  let v = 0;
+  for (let k = 0; k < n; k++) {
+    const c = s[i + k];
+    if (!dlDigit(c)) return null;
+    v = v * 10 + (s.charCodeAt(i + k) - 48);
+  }
+  return v < min || v > max ? null : v;
+}
+
+/**
+ * D-1112(8) (I34-FX1-CORE, RGC-N1): A GRANT DEADLINE, AS EVERY DOOR READS IT — the instant in ms, or null (UNKNOWN,
+ * still verified). It is `grantLiveAtSql`'s reading spelled in JS, step for step: trim the six characters
+ * `GRANT_LIVE_HEAD` trims; 1..64 characters; `YYYY-MM-DD` first; a trailing `+HHMM`/`-HHMM` after a digit is read as
+ * `+HH:MM` (`GRANT_LIVE_TAIL` rewrites it the same way); then SQLite's own date grammar, which is what `julianday`
+ * accepts (date.c parseYyyyMmDd / parseHhMmSs / parseTimezone, computeJD), in UTC. Anything else is UNKNOWN on both
+ * sides. `test/i34-fx1core-expiry.test.ts` holds the two to the same answer over a corpus run through the test DB's
+ * `julianday`. `review.ts` writes every new deadline as `toISOString()`, which both read identically.
+ */
+export function grantDeadlineMs(raw: unknown): number | null {
+  if (typeof raw !== "string") return null;
+  let a = 0;
+  let b = raw.length;
+  while (a < b && dlSpace(raw[a])) a++;
+  while (b > a && dlSpace(raw[b - 1])) b--;
+  const t = raw.slice(a, b);
+  // The SQL's `GLOB 'YYYY-MM-DD*'` shape gate is the grammar's own first ten characters below.
+  if (t.length < 1 || t.length > 64) return null;
+  const s = /[0-9][+-][0-9]{4}$/.test(t) ? `${t.slice(0, -2)}:${t.slice(-2)}` : t;
+  const y0 = dlDigits(s, 0, 4, 0, 9999);
+  const mo0 = dlDigits(s, 5, 2, 1, 12);
+  const d = dlDigits(s, 8, 2, 1, 31);
+  if (y0 === null || mo0 === null || d === null || s[4] !== "-" || s[7] !== "-") return null;
+  let i = 10;
+  while (dlSpace(s[i]) || s[i] === "T") i++;
+  let hms = 0;
+  let tz = 0;
+  if (i < s.length) {
+    const h = dlDigits(s, i, 2, 0, 24);
+    const m = dlDigits(s, i + 3, 2, 0, 59);
+    if (h === null || m === null || s[i + 2] !== ":") return null;
+    i += 5;
+    let sec = 0;
+    if (s[i] === ":") {
+      const whole = dlDigits(s, i + 1, 2, 0, 59);
+      if (whole === null) return null;
+      i += 3;
+      sec = whole;
+      if (s[i] === "." && dlDigit(s[i + 1])) {
+        let frac = 0;
+        let scale = 1;
+        i++;
+        while (dlDigit(s[i])) {
+          frac = frac * 10 + (s.charCodeAt(i) - 48);
+          scale *= 10;
+          i++;
+        }
+        frac /= scale;
+        sec += frac > 0.999 ? 0.999 : frac;
+      }
+    }
+    while (dlSpace(s[i])) i++;
+    const c = s[i];
+    if (c === "+" || c === "-") {
+      const th = dlDigits(s, i + 1, 2, 0, 14);
+      const tm = dlDigits(s, i + 4, 2, 0, 59);
+      if (th === null || tm === null || s[i + 3] !== ":") return null;
+      tz = (c === "-" ? -1 : 1) * (tm + th * 60);
+      i += 6;
+    } else if (c === "Z" || c === "z") {
+      i++;
+    }
+    if (i !== s.length) return null;
+    hms = h * 3_600_000 + m * 60_000 + Math.trunc(sec * 1000 + 0.5);
+  }
+  let y = y0;
+  let mo = mo0;
+  if (mo <= 2) {
+    y--;
+    mo += 12;
+  }
+  const A = Math.trunc(y / 100);
+  const B = 2 - A + Math.trunc(A / 4);
+  const jdMs = Math.trunc((Math.trunc((36525 * (y + 4716)) / 100) + Math.trunc((306001 * (mo + 1)) / 10000) + d + B - 1524.5) * 86_400_000);
+  // 210866760000000 = the Unix epoch's Julian day (2440587.5) in ms.
+  return jdMs + hms - tz * 60_000 - 210_866_760_000_000;
+}
+
+/**
+ * I3-1341 / I3-1768: has the grant behind a still-`verified` row lapsed at `nowMs`?
+ * `grantExpiryMs` above decides what the payload states; this decides the
+ * threshold (`expiry <= nowMs` is spent). ONE spelling, used by `passportStanding`
+ * and by the registry publisher (`registry-build.ts` realEntriesFrom), so the page
+ * and the registry cannot disagree about the same creator at the same instant.
+ */
+export function grantLapsed(payload: string | null, nowMs: number): boolean {
+  const expiry = grantExpiryMs(payload);
+  return expiry !== null && expiry <= nowMs;
+}
+
+/**
+ * I3-1768 (I32-FX1-VERIFIED): which of `passportIds` are `verified` rows whose latest grant or renewal has lapsed at
+ * `nowMs` (`grantLapsed`, the same rule `passportStanding` and the registry publisher apply). One statement per
+ * `IN_CHUNK` ids. For a JS reader that renders a class (the badge, the share card, the caution pointer): a lapsed id
+ * renders as the sweep's fold will render it, `claimed`.
+ */
+/** I32 B9 (I34-W2-EXPIRY-B): `nowMs` as the ISO instant the JS doors order their grant read by (the latest grant or
+ * renewal created at or before it first, as `grantLiveAtSql`); null for a value no Date can hold, which orders nothing. */
+function instantIso(nowMs: number): string | null {
+  const d = new Date(nowMs);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/** I34-FX2-EXPIRY (D-1117(8)): THE GRANT IN FORCE AT AN INSTANT, as the ORDER BY of a one-row grant read over the
+ * `trust_events` alias `alias` (rows already filtered to the subject's `verification_granted`/`verification_renewed`):
+ * the latest created at or before `instantExpr` first, then by seq, so an instant earlier than every grant falls back to
+ * the latest grant (`grantLiveAtSql`'s rank, as a sort). `instantExpr` is `?` (the caller binds the ISO instant) or an
+ * `instantSqlLiteral` result; anything else is refused, because it is interpolated. */
+export function grantInForceOrderSql(alias: string, instantExpr: string): string {
+  if (!/^[a-z][a-z0-9_]*$/.test(alias) || !(instantExpr === "?" || instantExpr === "NULL" || /^'[+-]?\d{4,6}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z'$/.test(instantExpr))) {
+    throw new Error("grantInForceOrderSql: alias must be an identifier and the instant `?` or an instantSqlLiteral");
+  }
+  return `ORDER BY julianday(${alias}.created_at) <= coalesce(julianday(${instantExpr}), 1e300) DESC, ${alias}.seq DESC`;
+}
+
+export async function lapsedGrantIds(db: DbLike, passportIds: readonly string[], nowMs: number): Promise<Set<string>> {
+  const out = new Set<string>();
+  const ids = [...new Set(passportIds)];
+  for (const chunk of inChunks(ids)) {
+    const { results } = await db
+      .prepare(
+        `SELECT p.passport_id AS passport_id,
+                (SELECT e.payload FROM trust_events e
+                  WHERE e.subject = p.passport_id AND e.event_type IN ('verification_granted', 'verification_renewed')
+                  ${grantInForceOrderSql("e", instantSqlLiteral(nowMs))} LIMIT 1) AS grant_payload
+           FROM passports p
+          WHERE p.passport_id IN (${chunk.map(() => "?").join(",")}) AND p.claim_state = 'verified'`,
+      )
+      .bind(...chunk) // the instant is a literal: every bind is an id, at most IN_CHUNK of them (I32-FX3-GATE)
+      .all<{ passport_id: string; grant_payload: string | null }>();
+    for (const r of results) if (grantLapsed(r.grant_payload, nowMs)) out.add(r.passport_id);
+  }
+  return out;
+}
+
+/**
+ * The passport's standing at `nowMs`, or `null` when there is no such passport.
+ *
+ * ONE statement, always — see the file docblock. `nowMs` is passed in rather
+ * than read from the clock so the caller's notion of "now" is the one that
+ * decides, and so the expiry branch is testable without faking time.
+ *
+ * THE EXPIRY BRANCH IS BELT AND BRACES, ON PURPOSE. Enforcement of `expires_at`
+ * belongs to the LEDGER, not to this read: `verification-sweep.ts` appends
+ * `verification_expired` and the fold walks `claim_state` back to `'claimed'`,
+ * so every standing reader converges at the same instant with no per-read-site
+ * change (docs/VERIFIED-MINT.md, "Known gaps" #1). A passport the sweep has
+ * already processed therefore reads `claimed` off the column and never reaches
+ * this branch at all.
+ *
+ * What this branch covers is the gap BETWEEN ticks — and any row the sweep's
+ * per-run budget has not reached yet. It fires only in the narrow case it can
+ * see for itself: a row that is STILL `verified` whose latest grant-or-renewal
+ * carries a READABLE `expires_at` at or before `nowMs`. It never invents an
+ * expiry, never turns a grant that states no deadline into one, and its
+ * threshold is the sweep's threshold exactly (`expiry <= now` here, `expiry >
+ * now` is "still good" there), so the two can never disagree about a creator.
+ */
+export async function passportStanding(db: DbLike, passportId: string, nowMs: number): Promise<PassportStanding | null> {
+  const row = await db
+    .prepare(
+      `SELECT p.claim_state AS claim_state,
+              p.retracted   AS retracted,
+              EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = p.passport_id) AS suppressed,
+              (SELECT e.payload
+                 FROM trust_events e
+                WHERE e.subject = p.passport_id
+                  AND e.event_type IN ('verification_granted', 'verification_renewed')
+                ${grantInForceOrderSql("e", "?")}
+                LIMIT 1) AS grant_payload
+         FROM passports p
+        WHERE p.passport_id = ?`,
+    )
+    .bind(instantIso(nowMs), passportId)
+    .first<StandingRow>();
+
+  // Decided in JS, not in the WHERE clause. An `AND claim_state = 'verified'`
+  // would answer the same empty result for "not verified" and for "no such
+  // passport" — the distinction this function's `null` exists to make — and it
+  // would hide the check from any guard that drives a route through a DB
+  // double. Same reasoning as `requireVerifiedCreator`.
+  if (!row) return null;
+  if (Number(row.retracted) !== 0) return "retracted";
+  if (Number(row.suppressed) !== 0) return "suppressed";
+
+  const state = row.claim_state;
+  if (state === "verified") return grantLapsed(row.grant_payload, nowMs) ? "reverification_required" : "verified";
+  if (state === "claimed") return "claimed";
+  // FAIL CLOSED. `claim_state` is CHECK-constrained to three values, so the
+  // only way to reach this line is a value the schema does not allow — which
+  // is not a reason to guess upward. The least-trusted answer is the safe one.
+  return "unclaimed";
+}
+
+/**
+ * The one-liner the mint/serve gates want: is this passport verified RIGHT NOW?
+ *
+ * Exactly `s === "verified"`, and nothing else — `reverification_required` is
+ * NOT verified (that is the entire reason the value exists), `null` is not
+ * verified, and neither is `suppressed`, whatever the underlying column says.
+ * It is a function rather than a comparison at each call site so that widening
+ * the enum later cannot silently widen what counts as verified: a new member
+ * has to be considered here, once.
+ */
+export function isCurrentlyVerified(s: PassportStanding | null): boolean {
+  return s === "verified";
+}
+
+// ===========================================================================
+// THE SAME QUESTION, ASKED BY THE WRITE (audit item #29)
+// ===========================================================================
+//
+// Everything above is a READ, and docs/VERIFIED-MINT.md §2 measured what a read
+// costs: between `requireVerifiedCreator` returning and the row landing there is
+// a window, barrier-forced at 1.50 ms / 28.47 ms / 213.89 ms for 1 / 100 / 1000
+// credentials, and a downgrade or a suppression that commits inside it still
+// mints. That is inherent to a witness obtained by a separate statement, and no
+// amount of moving the read earlier or later removes it.
+//
+// THERE IS NO `BEGIN` ANYWHERE IN THIS TREE, and there cannot be: on D1 the only
+// atomic units are ONE statement and ONE `db.batch`. So the fix is CAS-shaped,
+// not transaction-shaped — fold the standing predicate into the mutating
+// statement's own `WHERE`, or into a `db.batch` that fails as a unit, and check
+// what the write actually did.
+//
+// Two shapes, and which one a call site needs is decided by whether its write is
+// a single statement or a batch:
+//
+//   SINGLE STATEMENT — `VERIFIED_NOW_SUBQUERY` goes in the statement's WHERE and
+//   `changes === 0` is the refusal. This is the ordinary cap-in-the-INSERT idiom
+//   the repo already uses in eight places.
+//
+//   BATCH — `verifiedMintGate` rides in the batch. A conditional statement that
+//   matches no row does NOT fail a D1 batch, so a cap-in-the-INSERT inside a
+//   signed append would refuse silently and leave the ledger event committed
+//   with nothing behind it. The gate converts "the predicate was false" into a
+//   NOT NULL violation, which fails the batch as a unit. See
+//   `0022_atomic_gates_store_rails.sql` for the mechanism in full.
+
+/**
+ * The passport is verified RIGHT NOW, as a correlated subquery that SELECTS THE
+ * PASSPORT ID. One bound parameter (the passport id). Two uses:
+ *
+ *   `WHERE EXISTS ${VERIFIED_NOW_SUBQUERY}` — as a predicate.
+ *   `VALUES (…, ${VERIFIED_NOW_SUBQUERY}, …)` — as a NOT NULL value, which is
+ *   what makes the batch gate below fail instead of no-op.
+ *
+ * IT ASKS EXACTLY `requireVerifiedCreator`'s THREE QUESTIONS — verified,
+ * unretracted, unsuppressed — AND NOT GRANT EXPIRY, because it has ONE bound
+ * parameter and expiry needs an instant. Its one remaining reader (credentials.ts —
+ * census in the module header) therefore re-checks the column only, and a lapsed
+ * grant the cursor-windowed expiry sweep has not reached still passes it there;
+ * `verifiedMintGate` in the same batch refuses it. The
+ * instant-bound twin below, `VERIFIED_AT_SUBQUERY`, asks the fourth question;
+ * `verifiedMintGate` uses it, and a reader moves to it by binding its own write
+ * instant after the passport id (I3-1768; six of the seven readers moved in I32,
+ * D-1079(2)).
+ *
+ * The alias is `pv_std` / `sv_std` / `ev_std` / `gx_std` so this text can be
+ * pasted into a statement that already names `p`, `s` or `e` without capturing
+ * the outer query's row.
+ */
+const VERIFIED_HEAD =
+  "(SELECT pv_std.passport_id FROM passports pv_std " +
+  "  WHERE pv_std.passport_id = ? AND pv_std.claim_state = 'verified' AND pv_std.retracted = 0 " +
+  "    AND NOT EXISTS (SELECT 1 FROM request_suppressions sv_std WHERE sv_std.passport_id = pv_std.passport_id)";
+export const VERIFIED_NOW_SUBQUERY = `${VERIFIED_HEAD})`;
+
+/**
+ * `VERIFIED_NOW_SUBQUERY` plus `passportStanding`'s fourth question: the latest
+ * grant or renewal has not lapsed AT THE BOUND INSTANT (I3-1341 / I3-1768). TWO
+ * bound parameters, in this order: the passport id, then the instant (ISO-8601,
+ * the write's own clock — the same value the caller stamps on the row, so a test
+ * clock and production agree with the witness read). The deadline is read the
+ * way `grantExpiryMs` reads it: the latest `verification_granted` /
+ * `verification_renewed` payload's `expires_at`, trimmed, 1..64 characters;
+ * absent, empty or unparseable is UNKNOWN (still verified), a payload that is not
+ * JSON is never handed to `json_extract` (which would raise), and `expiry <=
+ * instant` is spent — the same threshold. Two deliberate limits:
+ *   - IT READS ONLY ISO-8601 DATE-SHAPED DEADLINES (`YYYY-MM-DD…`, the shape
+ *     `review.ts` writes; a non-string `expires_at` can never have that shape).
+ *     SQLite's `julianday` would read `now` or a bare number as a date where
+ *     `Date.parse` reads neither, so anything not date-shaped is UNKNOWN here. A
+ *     `+HHMM` offset is read as `+HH:MM` (D-1112(8)). JS readers use the same
+ *     parse (`grantDeadlineMs` above), so a deadline only `Date.parse` can read
+ *     (`Oct 21 2026`) is UNKNOWN at every door alike until the sweep folds it.
+ *   - AN INSTANT IT CANNOT READ FAILS CLOSED: every readable deadline counts as
+ *     passed.
+ */
+/**
+ * I3-1768 (I32-FX1-VERIFIED, D-1082(1)): THE FOURTH QUESTION ALONE — the latest grant or renewal of the passport
+ * `passportExpr` names has not lapsed at the bound instant — as a boolean SQL term. ONE bound parameter, the instant
+ * (`passportExpr` is a correlated column such as `p.passport_id`, or `?` when the caller binds the id first). It is
+ * the text `VERIFIED_AT_SUBQUERY` below is built from, so a door that already holds the passport row (a money door, a
+ * payout read, a release whose passport must BE suppressed) asks the same deadline rule with the same threshold.
+ */
+export const grantLiveAtSql = (passportExpr: string): string => GRANT_LIVE_HEAD + passportExpr + GRANT_LIVE_TAIL;
+/** `grantLiveAtSql`'s text either side of the passport expression: plain consts, so `CLAIM_STATE_AT_SQL` below is
+ * built from the same two pieces as a const a source scan can fold (I32-LAND7, D-1087(3)). */
+// I32 B9 / FX3V-07 (I34-W2-EXPIRY-B): the grant read is the latest grant or renewal CREATED AT OR BEFORE the bound
+// instant, so a read between a lapsed grant and a later renewal is true to that instant: `gx_std` holds the subject's
+// grant rows and the one asked is the row no other grant of the subject outranks on (created by the instant, seq). An
+// instant earlier than every grant (no grant then existed) falls back to the latest grant, the reading before this
+// change. Still ONE bound parameter, still textually after the passport expression (`(SELECT ? AS t_std) at_std` is
+// joined after `gx_std`), so no caller's bind list changes, and the text still opens `NOT EXISTS (SELECT 1 FROM (SELECT
+// CASE WHEN json_valid(ev_std.payload)`. An instant `julianday` cannot read ranks nothing first and every readable
+// deadline counts as passed, as before (fails closed).
+const GRANT_LIVE_HEAD =
+  "NOT EXISTS (SELECT 1 FROM (SELECT CASE WHEN json_valid(ev_std.payload) " +
+  "          THEN trim(json_extract(ev_std.payload, '$.expires_at'), char(32, 9, 10, 11, 12, 13)) END AS x_std, " +
+  "          ev_std.subject AS sj_std, ev_std.seq AS sq_std, ev_std.created_at AS c_std " +
+  "        FROM trust_events ev_std WHERE ev_std.subject = ";
+const GRANT_LIVE_TAIL =
+  " " +
+  "          AND ev_std.event_type IN ('verification_granted', 'verification_renewed')) gx_std, (SELECT ? AS t_std) at_std " +
+  "      WHERE NOT EXISTS (SELECT 1 FROM trust_events ew_std WHERE ew_std.subject = gx_std.sj_std " +
+  "          AND ew_std.event_type IN ('verification_granted', 'verification_renewed') " +
+  "          AND (coalesce(julianday(ew_std.created_at) <= coalesce(julianday(at_std.t_std), 1e300), -1), ew_std.seq) " +
+  "            > (coalesce(julianday(gx_std.c_std) <= coalesce(julianday(at_std.t_std), 1e300), -1), gx_std.sq_std)) " +
+  "        AND length(gx_std.x_std) BETWEEN 1 AND 64 AND gx_std.x_std GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' " +
+  "        AND julianday(CASE WHEN gx_std.x_std GLOB '*[0-9][+-][0-9][0-9][0-9][0-9]' " +
+  "          THEN substr(gx_std.x_std, 1, length(gx_std.x_std) - 2) || ':' || substr(gx_std.x_std, -2) ELSE gx_std.x_std END) " +
+  "          <= coalesce(julianday(at_std.t_std), 1e300))";
+/** The instant as a SQL literal, for a statement whose bind list is fixed by its own shape (an `IN (...)` chunk held
+ * to `IN_CHUNK` binds, a delta query whose plan is pinned): the canonical ISO of `nowMs`, or `NULL` when no Date can
+ * hold it (which, like an unreadable bound instant, fails closed). Only `toISOString` output is ever inlined. */
+export function instantSqlLiteral(nowMs: number): string {
+  const iso = instantIso(nowMs);
+  return iso === null ? "NULL" : `'${iso}'`;
+}
+/** `grantLiveAtSql(expr)` with its one instant parameter replaced by `instantSqlLiteral(nowMs)`: the same rule, no bind. */
+export const withInstantLiteral = (grantLiveSql: string, nowMs: number): string => {
+  const parts = grantLiveSql.split("(SELECT ? AS t_std) at_std");
+  if (parts.length !== 2) throw new Error("withInstantLiteral: not one grantLiveAtSql term");
+  return parts.join(`(SELECT ${instantSqlLiteral(nowMs)} AS t_std) at_std`);
+};
+export const VERIFIED_AT_SUBQUERY = `${VERIFIED_HEAD}    AND ${grantLiveAtSql("pv_std.passport_id")})`;
+
+/**
+ * D-1083(1) (I3-1768; I32-FX1-VERIFIED FX1V-10): THE CLAIM STATE A FAN IS SHOWN, as a SELECT-list term over `p`. A
+ * `verified` row whose latest grant or renewal has lapsed at the bound instant (`grantLiveAtSql` above, the rule the
+ * money doors and `VERIFIED_AT_SUBQUERY` use) reads `claimed`, the class the expiry sweep's fold will give it. ONE bound
+ * parameter, the instant (ISO-8601), riding the reader's own statement. Readers: passport-view.ts `livePassportAt`
+ * (getPassportView) and `livePassportWithDemand`, and scouts.ts `scoutCreator` (its verified check and its allocation
+ * guard). passport-view.ts `livePassport` keeps the stored column. I32-LAND7 (D-1087(1)) moved it here from
+ * passport-view.ts, a page renderer whose literals psa-i18n reads for prose.
+ */
+export const CLAIM_STATE_AT_SQL = `CASE WHEN p.claim_state = 'verified' AND NOT (${GRANT_LIVE_HEAD}p.passport_id${GRANT_LIVE_TAIL}) THEN 'claimed' ELSE p.claim_state END`;
+
+/**
+ * I32 B7 (I34-W2-EXPIRY-B): `CLAIM_STATE_AT_SQL` for the passport row `alias` — the one copy of the shown-class CASE
+ * every column-shaped reader interpolates (ONE bound parameter, the instant). `CLAIM_STATE_AT_SQL` is
+ * `shownClassSql("p")`, kept as a plain const for the source scans that fold it.
+ */
+export const shownClassSql = (alias: string): string =>
+  `CASE WHEN ${alias}.claim_state = 'verified' AND NOT (${GRANT_LIVE_HEAD}${alias}.passport_id${GRANT_LIVE_TAIL}) THEN 'claimed' ELSE ${alias}.claim_state END`;
+/**
+ * EXPB-26 (I34-W3-EXPIRY, D-1117(5)): `shownClassSql` over BOUND VALUES instead of a row: each `<alias>.claim_state`
+ * and `<alias>.passport_id` of the term is a `?`, for a writer that holds the class and passport id as values
+ * (codex.ts recordEncounter's `first_state`). Built from `shownClassSql` itself, so there is still one CASE text. FOUR
+ * bound parameters, in order: the claim state, the passport id, the instant, the claim state again.
+ */
+export const shownClassValueSql = (): string =>
+  shownClassSql("cv_std").split("cv_std.claim_state").join("?").split("cv_std.passport_id").join("?");
+
+/**
+ * THE BATCH GATE. Put this statement in a `db.batch` and the whole batch commits
+ * only if `passportId` is verified, unretracted and unsuppressed AT COMMIT TIME,
+ * and its latest grant or renewal has not lapsed at `now()` — the instant this
+ * statement also stamps as `admitted_at` (I3-1768).
+ *
+ * How it works, in one sentence: `write_admissions.subject` is NOT NULL and its
+ * value is the result of `VERIFIED_AT_SUBQUERY`, so a passport that fails the
+ * predicate supplies NULL, the constraint fires, and D1 rolls the batch back —
+ * the signed ledger event, the release row, the pool, the codes, all of it.
+ *
+ * WHERE IN THE BATCH IT GOES DOES NOT MATTER for correctness (a batch is
+ * all-or-nothing either way); it is written FIRST where the caller controls the
+ * order, because failing before the expensive writes is cheaper and reads
+ * better. On the passkey path `appendCreatorSigned` appends `extraStatements`
+ * after the event inserts, which is fine — the rollback covers them.
+ *
+ * `ref` is audit only: the id of the write this admission was granted for. It is
+ * never read to decide anything.
+ *
+ * WHAT THIS IS NOT. It is not a replacement for `requireVerifiedCreator`. The
+ * witness is still taken first, because it is what produces a clean 403 with the
+ * right sentence before any work happens; this is the re-check that makes the
+ * answer still true when the row lands. Belt AND braces, deliberately: the
+ * witness is the UX and the type-level discipline, the gate is the guarantee.
+ */
+export function verifiedMintGate(db: DbLike, passportId: string, ref: string | null, now: () => string = () => new Date().toISOString()): DbStatement {
+  const at = now(); // ONE instant: the expiry re-check's and the admission row's
+  return db
+    .prepare(
+      `INSERT INTO write_admissions (gate, subject, ref, admitted_at)
+       VALUES ('verified_mint', (SELECT v FROM (SELECT ${VERIFIED_AT_SUBQUERY} AS v) WHERE NOT EXISTS (SELECT 1 FROM (SELECT cc.passport_id AS pid FROM creator_closures cc UNION ALL SELECT cs.passport_id FROM creator_suspensions cs WHERE cs.state = 'suspended') u WHERE u.pid = v)), ?, ?)
+       ON CONFLICT(gate, subject) DO UPDATE SET ref = excluded.ref, admitted_at = excluded.admitted_at`,
+    )
+    .bind(passportId, at, ref, at);
+  // I34-W3-MONEY (QUEUE #947/d-mint-closure): the closure term is credits.ts CREATOR_CLOSED_SQL("v") spelled inline — see the
+  // module docblock's Consumers note; test/i34-w3money-mint-gate-closure.test.ts pins the two byte-equal.
+}
+
+/**
+ * Did this error come from the gate above refusing a batch?
+ *
+ * Matched on the EXACT column, the same way `DUPLICATE_EVENT_RE`
+ * (entitlements-store.ts) matches exactly `stripe_events.event_id` rather than
+ * `/UNIQUE|constraint/i`. A broad match would swallow every other constraint
+ * failure in the batch — a duplicate release id, a CHECK, an FK — and report a
+ * lost write as a standing refusal, which is the false-200 shape that module
+ * spells out at length.
+ *
+ * better-sqlite3 says `NOT NULL constraint failed: write_admissions.subject`;
+ * D1 wraps the same sentence in `D1_ERROR: … : SQLITE_CONSTRAINT`. The substring
+ * is present in both, which is why this is a `test` and not an equality.
+ */
+const GATE_REFUSED_RE = /NOT NULL constraint failed:\s*write_admissions\.subject/i;
+
+export function isWriteAdmissionRefusal(e: unknown): boolean {
+  return e instanceof Error && GATE_REFUSED_RE.test(e.message);
+}
+
+/**
+ * THE RECOGNITION-QUOTA GATE (audit item #28), the same mechanism with a
+ * different predicate.
+ *
+ * The S90 recognition caps are enforced by a cap-in-the-INSERT on the projection
+ * row itself (recognition.ts `buildRecognitionGrantStatements`). That INSERT
+ * rides the passkey-signed batch, so when the cap refuses it, it matches no row
+ * — and a no-match does not fail a batch, which is exactly why the caps were
+ * documented as a raceable residual rather than fixed with the idiom that closed
+ * the save/collection/passkey caps.
+ *
+ * This statement is the missing half: it reads the projection row back BY ID, in
+ * the same transaction, and supplies its `passport_id` as the NOT NULL
+ * `subject`. The row is there ⇒ the cap admitted the grant ⇒ the batch commits.
+ * The row is absent ⇒ NULL ⇒ the batch fails and the signed
+ * `recognition_granted` event never lands. There is no interleaving in which the
+ * event exists without the grant, and none in which the grant exists over cap.
+ */
+export function recognitionQuotaGate(db: DbLike, recognitionId: string, now: () => string = () => new Date().toISOString()): DbStatement {
+  return db
+    .prepare(
+      `INSERT INTO write_admissions (gate, subject, ref, admitted_at)
+       VALUES ('recognition_quota', (SELECT rq_std.passport_id FROM recognitions rq_std WHERE rq_std.recognition_id = ?), ?, ?)
+       ON CONFLICT(gate, subject) DO UPDATE SET ref = excluded.ref, admitted_at = excluded.admitted_at`,
+    )
+    .bind(recognitionId, recognitionId, now());
+}
+===== END FILE: services/trust-core/src/standing.ts =====
+
+===== END OF CHUNK 72 OF 75 =====

@@ -1,0 +1,2934 @@
+DHWAJA CODE REVIEW — server — CHUNK 58 OF 75
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (index*)
+Files in this chunk (1):
+  - services/trust-core/src/index.ts [PART 2/2, lines 4540-7460]
+
+
+===== BEGIN FILE: services/trust-core/src/index.ts [PART 2/2, lines 4540-7460] =====
+app.get("/collectible/:id", async (c) => {
+  const v = await verifyCollectible(d1(c.env.TRUST_DB), c.req.param("id"));
+  // Misses are cached too — random-id probing hits the edge cache, not D1.
+  if (!v) return c.json({ valid: false }, 404, { "Cache-Control": "public, max-age=60" });
+  return c.json(v, 200, { "Cache-Control": "public, max-age=60" });
+});
+
+// Mount the Access-gated console. deps read bindings per request.
+const consoleApp = makeConsole({
+  db: (env) => d1((env as unknown as Env).TRUST_DB),
+  store: (env) => r2Store((env as unknown as Env).REGISTRY_BUCKETS),
+  mediaStore: (env) => mediaStore((env as unknown as Env).MEDIA_BUCKET),
+  evidenceStore: (env) => evidenceStore(env as unknown as Env),
+  jwks: async (env, nowMs, wantKid) => {
+    const domain = (env as ConsoleEnv).ACCESS_TEAM_DOMAIN?.trim() ?? "";
+    if (!domain || /TODO/i.test(domain)) return [];
+    return jwksFor(domain, nowMs, wantKid);
+  },
+});
+app.route("/", consoleApp);
+
+// Fail closed: anything unrouted is 404 JSON, never a passthrough.
+// I3-1645: a case or trailing-slash variant of a public board page is the SAME
+// page — 301 it to the canonical path instead of a 404 (no new route: this runs
+// only for what nothing else matched). Only a valid category key is redirected,
+// so junk under /browse/ stays the same 404 it was.
+app.notFound((c) => {
+  if (c.req.method === "GET" || c.req.method === "HEAD") {
+    const path = c.req.path;
+    const canon = path.toLowerCase().replace(/\/+$/, "");
+    const m = /^\/browse\/([^/]+)$/.exec(canon);
+    if (canon !== path && (canon === "/discover" || (m && isCategoryKey(m[1]!)))) {
+      const q = new URL(c.req.url).search;
+      return c.redirect(`${canon}${q}`, 301);
+    }
+  }
+  return c.json({ error: "not_found" }, 404);
+});
+const STACK_FRAME_RE = /^\s*at .*(?::\d+:\d+\)?|\((?:native|<anonymous>)\))\s*$/;
+function stackFrames(stack: string, header: string): string {
+  const body = stack.startsWith(header) ? stack.slice(header.length) : stack;
+  return body.split("\n").filter((l) => STACK_FRAME_RE.test(l)).map((l) => l.trim()).join(" | ");
+}
+app.onError((err, c) => {
+  // I3-2066: the stack FRAMES go to the log (never the response), so an
+  // operator can see where; the first stack line repeats `err.message` and is
+  // dropped so the message is logged once, in `err`: only `at …` frame lines
+  // are kept, so a multi-line message cannot ride along. `stack` is carried
+  // only once log.ts's ALLOWED_KEYS names it (REAL — WRONG OWNER hand-off).
+  // FX-I16-RG-PRIVACY:4: a message line can itself begin "at ", so the `${name}: ${message}` header is cut off
+  // first (whatever its lines look like), and only FRAME-SHAPED lines (a `:line:col` tail, or `(native)`) survive.
+  const stack = typeof err.stack === "string" ? stackFrames(err.stack, `${err.name}: ${err.message}`) : undefined;
+  // I3-1753 b (I22-L01): the route TEMPLATE that failed (`routePath`, never the resolved path — log.ts `route`).
+  logError({ cid: c.get("cid"), hop: "http", route: `${c.req.method} ${c.req.routePath}`, msg: "unhandled", err: err instanceof Error ? err.name : typeof err, stack }); // no stack traces in responses
+  return c.json({ error: "internal" }, 500);
+});
+
+
+/** I4-07-R1 hand-off (I3-2012): the runtime shape of `OutboxMessage`. Nullable
+ * columns accept an absent field (read as null by the consumer). */
+function outboxBodyShaped(b: Partial<OutboxMessage> | null): boolean {
+  if (!b) return false;
+  const strOrNull = (v: unknown) => v == null || typeof v === "string";
+  const intOrNull = (v: unknown) => v == null || Number.isSafeInteger(v);
+  return (
+    Number.isSafeInteger(b.seq) &&
+    typeof b.passport_id === "string" &&
+    typeof b.event_type === "string" &&
+    typeof b.occurred_day === "string" &&
+    strOrNull(b.fan_key) &&
+    strOrNull(b.scope_kind) &&
+    strOrNull(b.scope_id) &&
+    strOrNull(b.dims) &&
+    intOrNull(b.fan_key_v) &&
+    intOrNull(b.amount_cents)
+  );
+}
+
+/** I4-05-R8 hand-off (I3-0898): the one-shot legacy top-fans purge. The done
+ * marker is written only after a complete pass, so a failed pass retries on
+ * the next sweep. A psp is "boarded" if its id appears anywhere in the
+ * discovery artifact (a superset, so the purge can only under-empty). */
+export const TOPFANS_LEGACY_PURGE_MARKER = "rankings/topfans-legacy-purge.done";
+/** I4-RG2-RANK lead: the last key a bounded pass reached. A pass that hits the
+ * page bound saves it and the next sweep lists `startAfter` it, so a bucket over
+ * TOPFANS_LEGACY_PURGE_PAGES pages is finished across sweeps instead of re-scanning
+ * its first pages forever. Deleted with the marker's write. */
+export const TOPFANS_LEGACY_PURGE_PROGRESS = "rankings/topfans-legacy-purge.progress";
+export const TOPFANS_LEGACY_PURGE_PAGES = 50;
+/** I14-FX2 (QUEUE #912, I14-CAPS HANDOFF-2): the R2 calls one pass may make — its three reads, its list pages, its
+ * puts and the closing write(s); a pass that reaches it saves its place in TOPFANS_LEGACY_PURGE_PROGRESS. Its share
+ * of ARTIFACTS_LEGS_AFTER_PURGE. */
+export const TOPFANS_LEGACY_PURGE_BUDGET = 20;
+export async function purgeLegacyTopFans(bucket: R2Bucket): Promise<number> {
+  if (await bucket.get(TOPFANS_LEGACY_PURGE_MARKER)) return 0;
+  const discovery = await bucket.get("rankings/discovery.json");
+  if (!discovery) return 0; // nothing built yet: no boarded set to compare against
+  const boarded = new Set((await discovery.text()).match(/psp_[0-9a-f]{16}/g) ?? []);
+  const generatedAt = new Date().toISOString();
+  const saved = await bucket.get(TOPFANS_LEGACY_PURGE_PROGRESS);
+  const resumeAfter = saved ? (await saved.text()) || undefined : undefined;
+  let emptied = 0;
+  let cursor: string | undefined;
+  let lastKey = resumeAfter;
+  let spent = 3; // the marker, discovery and progress reads
+  for (let page = 0; page < TOPFANS_LEGACY_PURGE_PAGES; page++) {
+    if (spent + 1 + 2 > TOPFANS_LEGACY_PURGE_BUDGET) break; // a list, then room to close
+    const listed = await bucket.list(
+      cursor ? { prefix: "rankings/topfans/", cursor } : resumeAfter ? { prefix: "rankings/topfans/", startAfter: resumeAfter } : { prefix: "rankings/topfans/" },
+    );
+    spent++;
+    for (const o of listed.objects) {
+      if (spent + 1 + 2 > TOPFANS_LEGACY_PURGE_BUDGET) {
+        if (lastKey !== undefined) await bucket.put(TOPFANS_LEGACY_PURGE_PROGRESS, lastKey);
+        return emptied;
+      }
+      lastKey = o.key;
+      const psp = /^rankings\/topfans\/(psp_[0-9a-f]{16})\.json$/.exec(o.key)?.[1];
+      if (!psp || boarded.has(psp)) continue;
+      await bucket.put(o.key, JSON.stringify({ passport_id: psp, generated_at: generatedAt, fans: [] }));
+      spent++;
+      emptied++;
+    }
+    if (!listed.truncated) {
+      await bucket.put(TOPFANS_LEGACY_PURGE_MARKER, generatedAt);
+      if (saved) await bucket.delete(TOPFANS_LEGACY_PURGE_PROGRESS);
+      return emptied;
+    }
+    cursor = (listed as { cursor?: string }).cursor;
+  }
+  // page bound hit: no marker; save the place so the next sweep continues from it
+  if (lastKey !== undefined) await bucket.put(TOPFANS_LEGACY_PURGE_PROGRESS, lastKey);
+  return emptied;
+}
+
+/** I4-03-R8 hand-off (I3-1975): the face-triage gate as one testable predicate —
+ * the operator setting AND the binding AND a usable internal secret. Any
+ * missing term leaves the sweep on the human triage path.
+ * D-0911(4B) (I3-0027): the exact-photo check needs no face model, so it stays
+ * automatic and the gate no longer waits on one. The image service decides the
+ * stages: `/internal/triage-find` runs the embedding stage only when its own
+ * embedder reports a real, wired model. `embedderWired` is that service's
+ * readiness answer (`checks.embedder_wired === true`, services/image/src/http.ts
+ * `/health?ready=1`), read on every call and false on a throw, a timeout, a
+ * non-2xx, an unparseable body or a missing/non-boolean field; the sweep only
+ * logs it. */
+export async function faceTriageArmed(
+  setting: string | null | undefined,
+  env: Pick<Env, "IMAGE_SERVICE" | "FACE_TRIAGE_SECRET">,
+  probeTimeoutMs = 5_000,
+): Promise<{ svc: NonNullable<Env["IMAGE_SERVICE"]>; secret: string; embedderWired: boolean } | null> {
+  if (setting !== "1" || !env.IMAGE_SERVICE) return null;
+  const secret = faceTriageSecretFromEnv(env); // >= 16 characters, not blank, no TODO (INV-091; admin.ts)
+  if (secret === null) return null;
+  const svc = env.IMAGE_SERVICE;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), probeTimeoutMs);
+  const probe = (async (): Promise<boolean> => {
+    const res = await svc.fetch("https://image.internal/health?ready=1", { method: "GET", redirect: "manual", signal: ctrl.signal }); // #611 (D-0930(3))
+    if (!res.ok) return false;
+    const body = (await res.json()) as { checks?: { embedder_wired?: unknown } } | null;
+    return body?.checks?.embedder_wired === true;
+  })();
+  // The race bounds the body read too, and a double that ignores the signal.
+  const timedOut = new Promise<boolean>((resolve) => ctrl.signal.addEventListener("abort", () => resolve(false)));
+  let wired = false;
+  try {
+    wired = await Promise.race([probe, timedOut]);
+  } catch {
+    wired = false;
+  } finally {
+    clearTimeout(timer);
+    probe.catch(() => {});
+  }
+  return { svc, secret, embedderWired: wired };
+}
+
+/** #609a: the face-triage sweep's call to the image service. Every failure is
+ * still `null` (stage unavailable — the human path), but the two kinds are now
+ * told apart in the log: a non-2xx answer is `image_triage_status` with the status
+ * (503 unconfigured, 4xx unprocessable), a throw or the 10 s abort is
+ * `image_triage_error`, and an answer with no boolean `matched` is
+ * `image_triage_bad_body`. */
+export function faceTriageMatcher(svc: NonNullable<Env["IMAGE_SERVICE"]>, secret: string, cid: string): FaceMatcher {
+  return async (bytes, contentType) => {
+    // Bound the internal call so a hung image service can't stall the
+    // sweep item indefinitely (review hardening #3).
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10_000);
+    try {
+      const res = await svc.fetch("https://image.internal/internal/triage-find", {
+        method: "POST",
+        headers: { "X-Internal-Auth": secret, "Content-Type": contentType ?? "application/octet-stream" },
+        body: bytes,
+        // #611 (D-0930(3)): never follow — a followed 3xx would carry X-Internal-Auth to wherever it points.
+        redirect: "manual",
+        signal: ctrl.signal,
+      });
+      if (!res.ok) {
+        logError({ cid, hop: "cron", msg: "image_triage_status", status: res.status });
+        return null;
+      }
+      const body = (await res.json().catch(() => null)) as FaceMatch | null;
+      if (body && typeof body.matched === "boolean") return body;
+      logError({ cid, hop: "cron", msg: "image_triage_bad_body", status: res.status });
+      return null;
+    } catch (e) {
+      logError({ cid, hop: "cron", msg: "image_triage_error", err: e instanceof Error ? e.name : typeof e });
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+}
+
+/** I3-2064: the durable half of a stop-the-world ledger verdict. A log line
+ * ages out and a thrown cron pages nobody; this object survives both and turns
+ * `/health?ready=1` red for whatever monitor watches it. Best effort: a store
+ * fault here must not mask the throw that follows. */
+async function markLedgerBroken(env: Env, record: Record<string, unknown>, cid: string): Promise<void> {
+  try {
+    await env.REGISTRY_BUCKETS.put(LEDGER_INTEGRITY_KEY, JSON.stringify(record));
+  } catch (e) {
+    logError({ cid, hop: "cron", msg: "ledger_integrity_marker_unwritten", err: e instanceof Error ? e.name : typeof e });
+  }
+}
+
+/**
+ * I3-0010 / I3-0275 b / I3-1403 a (D-0982(4), I22-FX-HUB): THE PRODUCTION CHECK OF THE HOURLY ANCHOR. Compares the live
+ * D1 ledger head, seals, audit-log seal and `seal_anchors` row against the newest anchor preimage held OUTSIDE D1 (the
+ * SEAL_WITNESS copy anchoring.ts writes at anchor time; anchoring.ts verifyAnchorCopy). A MISMATCH is the
+ * signed-checkpoint disagreement's answer: logged, and the durable broken-ledger marker is written, which shuts every
+ * tail's publishing (tailChainGateOpen) and turns `/health?ready=1` red; true is returned so the head also withholds
+ * its 'ok' and stops. An unreadable copy or a failed read is a fact about R2, not D1: logged, never a stop (§3e).
+ */
+async function anchorCopyMismatch(db: DbLike, env: Env, cid: string): Promise<boolean> {
+  if (!env.SEAL_WITNESS) return false;
+  let v: Awaited<ReturnType<typeof verifyAnchorCopy>>;
+  try {
+    v = await verifyAnchorCopy(db, anchorCopyStoreFromR2(env.SEAL_WITNESS as unknown as R2Bucket));
+  } catch (e) {
+    logError({ cid, hop: "cron", msg: "seal_anchor_copy_unavailable", err: e instanceof Error ? e.name : typeof e });
+    return false;
+  }
+  if (v.outcome === "unverifiable") logError({ cid, hop: "cron", msg: "seal_anchor_copy_unverifiable", detail: `${v.anchor_id ?? ""}: ${v.reasons.join("; ")}`.slice(0, 500) });
+  if (v.outcome !== "mismatch") return false;
+  logError({ cid, hop: "cron", msg: "seal_anchor_mismatch", detail: `${v.anchor_id ?? ""}: ${v.reasons.join("; ")}`.slice(0, 500) });
+  await markLedgerBroken(env, { breach: "anchor_copy", at: new Date().toISOString(), detail: v }, cid);
+  return true;
+}
+
+/**
+ * Q974-B15 (I28-TEACHBACK U7): call creator-close.ts oweClosedCreatorFaceErasures (CLOSED_CREATOR_FACE_ERASURE_LIMIT
+ * per call) again while it reports `more`, the call wrote marks, and `inBudget()` holds. One `face_erasure_backlog`
+ * line per call carries `owed` and `face_erasure_more`; the last line says whether rows remained when the loop ended.
+ */
+export async function drainClosedCreatorFaceErasures(db: DbLike, cid: string, inBudget: () => boolean): Promise<{ calls: number; owed: number; more: boolean }> {
+  const { oweClosedCreatorFaceErasures } = await import("./creator-close.js");
+  let calls = 0;
+  let owed = 0;
+  for (;;) {
+    const r = await oweClosedCreatorFaceErasures(db);
+    calls++;
+    owed += r.owed;
+    logInfo({ cid, hop: "cron", msg: "face_erasure_backlog", owed: r.owed, face_erasure_more: r.more });
+    // No progress (every selected row's batch wrote nothing) would re-select the same rows: stop, the next pass retries.
+    if (!r.more || r.owed === 0 || !inBudget()) return { calls, owed, more: r.more };
+  }
+}
+
+/**
+ * The weekly payout leg's summary line, or null when the tick has nothing to
+ * report. I3-2189: `revoked_before_reserve` is in the CONDITION as well as the
+ * body — a tick whose only event is declining a destination that moved under
+ * the page otherwise logged nothing. (log.ts must name the key in
+ * ALLOWED_KEYS for the count itself to survive `redact`; hand-off.)
+ */
+export function payoutSummaryFields(pr: PayoutRunResult, cid: string): LogFields | null {
+  // I15 (H-W1-LOG): a reconcile hold (creator-payout.ts, I15-PAYOUT) is in the condition and the body too.
+  if (!(pr.paid.length || pr.failed.length || pr.held || pr.retry_truncated || pr.deadline_abandoned || pr.revoked_before_reserve || pr.stalled.length || pr.reconcile_holds.length || pr.connect_unfinished)) return null;
+  return {
+    cid,
+    hop: "cron",
+    msg: "creator_payouts_summary",
+    paid: pr.paid.length,
+    failed: pr.failed.length,
+    stalled: pr.stalled.length,
+    held: pr.held,
+    retry_truncated: pr.retry_truncated,
+    deadline_abandoned: pr.deadline_abandoned,
+    revoked_before_reserve: pr.revoked_before_reserve,
+    reconcile_holds: pr.reconcile_holds.length,
+    connect_unfinished: pr.connect_unfinished ?? 0,
+    skipped_below_min: pr.skipped_below_min,
+    examined: pr.examined,
+    wrapped: pr.wrapped,
+    // Q102 (D-1030 (a)): the window `held` was counted over, on the line itself (log.ts ALLOWED_KEYS names the key).
+    // D-1059(15): keyed on the window the run actually counted (creator-payout.ts `held_to_table_end`), never on `wrapped`.
+    held_window: pr.held_to_table_end ? "cursor_to_table_end" : "cursor_to_page_end",
+  };
+}
+
+/** Q974-B8: what `scheduled()` takes from its caller beyond the runtime's three arguments. Absent in production. */
+export interface ScheduledDeps {
+  fetch?: typeof fetch;
+}
+
+/**
+ * I21-Q27 (I34-W2-ALARM, operator-alarm.ts flushOperatorAlarms): at the END of every handler (fetch, queue, scheduled) the
+ * alarm markers this instance buffered are mailed to the operators (OPERATOR_EMAILS), once per marker per UTC hour, under
+ * ctx.waitUntil. Nothing buffered: no env read, no DB touch. Never throws into the handler.
+ * I34-FX2-ALARM (I34-RG-W2M TC:16): when the handler's work handed promises to waitUntil (`deferred`, operator-alarm.ts
+ * trackWaitUntil), the flush runs after they settle, so a marker that deferred work logs is mailed by this invocation.
+ */
+export function flushOperatorAlarmsAfter(env: Env, ctx?: { waitUntil(p: Promise<unknown>): void }, deferred?: Pick<DeferredWork<unknown>, "handed" | "settled">): void {
+  const flush = (): Promise<unknown> => {
+    try {
+      if (pendingOperatorAlarms().length === 0) return Promise.resolve();
+      const e = env as unknown as Record<string, unknown>;
+      return flushOperatorAlarms(
+        d1(env.TRUST_DB),
+        { send: httpEmailFromEnv(e), mailer: mailerFromEnv(e), html: (t) => wrapHtml(textToHtml(t), "") },
+        accessConfigFromEnv(e)?.operatorEmails ?? [],
+      );
+    } catch {
+      return Promise.resolve();
+    }
+  };
+  try {
+    if (ctx && deferred && deferred.handed() > 0) {
+      ctx.waitUntil(deferred.settled().then(flush));
+      return;
+    }
+    if (pendingOperatorAlarms().length === 0) return;
+    ctx?.waitUntil(flush());
+  } catch {
+    // the record of an alarm must never fail the handler it rode on
+  }
+}
+
+export default {
+  // I34-FX2-ALARM: a property, and `req`, so tests/invariants/evidence-scan-gate.test.ts reads neither line as an outbound fetch.
+  fetch: async (req: Request, env: Env, ctx?: Parameters<typeof app.fetch>[2]): Promise<Response> => {
+    const deferred = ctx ? trackWaitUntil(ctx) : undefined; // the flush waits for the waitUntil work of the route
+    try {
+      return await app.fetch(req, env, deferred?.ctx ?? ctx);
+    } finally {
+      flushOperatorAlarmsAfter(env, ctx, deferred);
+    }
+  },
+
+  /**
+   * THE QUEUE CONSUMER AND ITS DEAD-LETTER TWIN (ADR-0006 §2, S-6).
+   *
+   * ONE handler, two consumers: `wrangler.jsonc` declares this worker on both
+   * `dhwaja-analytics-<env>` and `dhwaja-analytics-<env>-dlq`, and `batch.queue`
+   * is the only thing that tells them apart at runtime.
+   *
+   * Everything with a decision in it is in `analytics-consumer.ts` and is pure
+   * over `DbLike`. What is left here is the part that cannot be: reading the
+   * bodies and calling `ack()`/`retry()` per message (A6 — an explicit
+   * disposition per message, so one bad message never drops its batch-mates).
+   *
+   * A body with no `event_key` is ACKed and never enters the consumer: the key
+   * is the idempotency ledger's primary key and the handle every result is
+   * returned under, so a message without one cannot be processed and cannot be
+   * fixed by redelivery either.
+   *
+   * THE ACK IS RIGHT; THE SILENCE WAS NOT (FINDING-0010-A-6). INV-051's last
+   * clause is "never lost between the outbox and the consumer WITHOUT A
+   * RECORD", and this branch left none: no `processed_events` row (there is no
+   * key to write one under), no dead row, no flag, no log line. So it now marks
+   * the ARRIVAL day incomplete — the same disposition `consumeBatch` gives its
+   * own unusable message (`analytics-consumer.ts:865`), and the only day such a
+   * body can be attributed to, since its `occurred_day` is as untrustworthy as
+   * the rest of it — and logs under `QUEUE_KEYLESS_MARKER` with the count.
+   * The flag write is best-effort in the direction that matters: if it throws,
+   * the ack still happens (a keyless body is unprocessable either way) and the
+   * marker line is the remaining record.
+   */
+  async queue(batch: MessageBatch<unknown>, env: Env, ctx?: { waitUntil(p: Promise<unknown>): void }): Promise<void> {
+    try {
+      await (async (): Promise<void> => {
+    const analytics = d1(env.ANALYTICS_DB);
+    const messages: OutboxMessage[] = [];
+    const byKey = new Map<string, { ack(): void; retry(): void }[]>();
+    const keyless: { ack(): void; retry(): void }[] = [];
+    for (const m of batch.messages) {
+      const body = m.body as Partial<OutboxMessage> | null;
+      const key = typeof body?.event_key === "string" ? body.event_key : "";
+      // I4-07-R1 hand-off (I3-2012 arrival limb): a body whose fields are not
+      // the outbox row's types is not handed to the consumer as one; it takes
+      // the keyless ack + incomplete-day marker path.
+      if (!key || !outboxBodyShaped(body)) {
+        keyless.push(m);
+        continue;
+      }
+      // AC-12 / D-0731: the runtime's delivery count rides into `consumeDead`'s
+      // dead row (`OutboxMessage.attempts`); it always overwrites a body-borne
+      // value. On the DLQ that count is DLQ deliveries — always 1, since the DLQ
+      // consumers are `max_retries: 0` — not the main queue's retries.
+      messages.push({ ...(body as OutboxMessage), attempts: m.attempts });
+      const seen = byKey.get(key);
+      if (seen) seen.push(m);
+      else byKey.set(key, [m]);
+    }
+    // PS-089 hop 2/3 IS DARK ON PURPOSE (D-0772, QUEUE #216). No request
+    // correlation id rides an analytics queue message and this consumer reads
+    // none: putting one there would let request logs be joined to the fan's
+    // analytics key, the join INV-051's pseudonymous key exists to prevent, and
+    // `s002-outbox.test.ts` pins the message's exact field set for that reason.
+    // The fresh per-batch id below is the design, not a fallback.
+    const batchCid = crypto.randomUUID();
+    if (keyless.length > 0) {
+      const today = new Date().toISOString().slice(0, 10);
+      logError({ cid: batchCid, hop: "queue", msg: QUEUE_KEYLESS_MARKER, marker: QUEUE_KEYLESS_MARKER, queue: batch.queue, day: today, count: keyless.length });
+      try {
+        await analytics.prepare("INSERT OR IGNORE INTO platform_incomplete_days (day) VALUES (?)").bind(today).run();
+      } catch (e) {
+        logError({ cid: batchCid, hop: "queue", msg: QUEUE_KEYLESS_MARKER, marker: QUEUE_KEYLESS_MARKER, day: today, err: e instanceof Error ? e.name : typeof e });
+      }
+      for (const m of keyless) m.ack();
+    }
+    if (messages.length === 0) return;
+
+    const opts = { now: () => new Date().toISOString(), dlqName: settingValue(env.ANALYTICS_DLQ_NAME) ?? undefined, queueName: batch.queue }; // I62 P12: trimmed; blank or TODO is unset
+    const result = isDeadLetterQueue(batch.queue, opts.dlqName)
+      ? await consumeDead(analytics, d1(env.TRUST_DB), messages, opts)
+      : await consumeBatch(analytics, messages, opts);
+
+    // I3-2195: ONE call per delivery. A key delivered twice in a batch comes
+    // back from the consumer once per copy (the second as already-processed),
+    // so the key lists are deduplicated; an ack for a key outranks a retry of
+    // it, because the ack means its batch committed.
+    const acked = new Set(result.ack);
+    for (const key of acked) for (const m of byKey.get(key) ?? []) m.ack();
+    for (const key of new Set(result.retry)) if (!acked.has(key)) for (const m of byKey.get(key) ?? []) m.retry();
+      })();
+    } finally {
+      flushOperatorAlarmsAfter(env, ctx); // I21-Q27
+    }
+  },
+
+  async scheduled(event: unknown, env: Env, ctx0?: { waitUntil(p: Promise<unknown>): void }, deps: ScheduledDeps = {}): Promise<void> {
+    const deferred = ctx0 ? trackWaitUntil(ctx0) : undefined; // I34-FX2-ALARM: the ticks below hand ctx to their work
+    const ctx = deferred?.ctx ?? ctx0;
+    try {
+      await (async (): Promise<void> => {
+    const db = d1(env.TRUST_DB);
+    // Q974-B8, D-1122(3): the fetch the checkpoint signer, the anchor calendars, the media screener, the registry signer,
+    // the DoH resolver, the Stripe checkout and owed-refund sweeps, the mailer and every push, email and edge-purge sender
+    // built in this tick are handed (registrySignerFor, dohTxtAnswer, sweepCreditCheckoutPending, refundOwedStripe and
+    // mailerFromEnv among them), and D-1126(6) the helpers retryCompromiseStripePauses, settleErasedStripeCustomers and
+    // retryCreatorStripePauses (as their billing's fetchImpl) and retryCreatorClosureNotices (as its rail's fetchImpl) are
+    // handed it too, and D-1127(5) so is the Connect account read of weeklyPayouts and of sweepCreatorWipes' residual pay
+    // (weeklyPayouts' opts.fetchImpl and the pay's accountFetch, which creator-payout.ts accountReadFor hands
+    // getConnectAccount, so this file names no Connect read: tests/invariants/paywall.test.ts), and D-1126(6) so is
+    // weeklyPayouts' Connect transfer (as its opts.fetchImpl, which creator-payout.ts runWeeklyPayouts hands
+    // createConnectTransfer; INV-033 keeps that call in creator-payout.ts, tests/invariants/s027-money-stance.test.ts).
+    // I38-TICK-3: so is the residual pay's Connect transfer: creator-payout.ts payThroughRelease hands the pay's accountFetch
+    // to both of its transfer calls as their fetchImpl, so payErasureResidual's transfer no longer reads the global fetch.
+    // The runtime passes no deps, so production reads the global here, and a test injects its own
+    // (test/i34-fx3inv-tick-fetch.test.ts). The image peer calls the IMAGE_SERVICE binding. A leg this comment does not
+    // name has not been checked.
+    const outFetch: typeof fetch = deps.fetch ?? ((input, init) => globalThis.fetch(input, { ...init, redirect: "manual" })); // D-0930(3): never follows a redirect
+    // I29-RECORDS H-2 (landed by I29-INT): the cron's journaled acts (events.ts retractions) write to the same store.
+    bindRestoreJournal(restoreJournalStore(env as unknown as Record<string, unknown>));
+
+    // I3-0205 (D-0992(2)): THE EMERGENCY READ-ONLY STOP, cron door. Every trigger returns here
+    // while the switch is on (no sweep, delivery, payout or checkpoint leg runs). A failed read
+    // runs the tick, as the request door lets a request through.
+    if (await platformReadonly(db).catch(() => false)) {
+      logError({ cid: crypto.randomUUID(), hop: "cron", msg: "platform_readonly_cron_skipped", detail: `cron=${typeof (event as { cron?: unknown } | null)?.cron === "string" ? (event as { cron: string }).cron : ""}` });
+      return;
+    }
+
+    // TWO TRIGGERS, TWO JOBS (wrangler.jsonc `triggers.crons`). The 6-hourly
+    // expression drives the artifact sweep below; `DELIVERY_CRON` drives the
+    // alert delivery legs and NOTHING else, in its own invocation with its own
+    // ~1000-subrequest budget. Delivery was tied to the 6-hourly cadence only
+    // because it lived in this handler, and that capped the deployment at ~400
+    // pushes and ~400 mails a day — a payout-change alert exists to be seen
+    // inside a 24-hour cooling-off window, so a backlog deeper than a day's
+    // throughput delivered it after the window it protects.
+    //
+    // `runDeliverySweep` takes the SAME cron lease this sweep takes (with a
+    // shorter TTL matched to the 5-minute cadence), so the two triggers can
+    // never hand the same rows to APNs/FCM/the mailer. An UNRECOGNISED cron
+    // string falls through to the artifact sweep, which is the fail-safe
+    // direction: a mistyped expression runs the old behaviour, not nothing. The
+    // artifact sweep still runs the delivery legs as a backstop, so removing
+    // this trigger degrades throughput instead of stopping delivery.
+    if ((event as { cron?: string } | null)?.cron === DELIVERY_CRON) {
+      // I3-0462: CREATE before delivering, so an alert made this tick is sent this
+      // tick. Bounded (alerts.ts SOLO_CREATE_BUDGET / SOLO_FANOUT_BUDGET), behind
+      // the tails' chain gate and DELIVERY_CREATE_LEASE; isolated (never throws).
+      await deliveryTailCreationOnly(db, env, { createBudget: SOLO_CREATE_BUDGET, fanoutBudget: SOLO_FANOUT_BUDGET, label: "delivery_tick_creation" });
+      await runDeliverySweep(
+        db,
+        pushSenderFromEnv(env as unknown as Record<string, unknown>, outFetch),
+        httpEmailFromEnv(env as unknown as Record<string, unknown>, outFetch),
+        appOrigin(env) ?? undefined,
+        // The one-click base is THIS Worker, not the app origin above: RFC 8058
+        // POSTs to it, and a POST to the Pages app is a 405.
+        { email: { oneClickBase: publicBase(env), postalAddress: senderPostalAddressFromEnv(env as unknown as Record<string, unknown>) } },
+      );
+      // ADR-0012 §8: THE STEP DRIVER. A registry generation is now assembled a
+      // few buckets at a time, and this is the tick that advances it — no new
+      // Cloudflare product and no new cron, just the trigger that already runs
+      // every five minutes. It runs AFTER the delivery sweep, which is the
+      // time-critical leg here, and inside its own try/catch (in
+      // `registryAdvanceLeg`), so a storage fault costs this tick's progress and
+      // nothing else. It never PLANS: the six-hourly sweep below does that, so
+      // that "a generation starts every 6 hours" stays a statement about one
+      // trigger. The publication-age alarm rides along, because this is the only
+      // leg that runs often enough to notice a build that has stopped.
+      const seed = registryDecoySeedFromEnv(env as unknown as Record<string, unknown>);
+      if (seed) {
+        await registryAdvanceLeg(d1(env.TRUST_DB), registryR2Store(env.REGISTRY_BUCKETS), {
+          decoySeed: seed,
+          signer: registrySignerFor(env as unknown as Record<string, unknown>, outFetch),
+          cid: "registry-tick",
+        });
+      }
+      // I4-09-R4 hand-off (I3-0647): an hourly backstop for the 6-hourly
+      // sweep's `rate_limits` prune (the tick landing in :00-:04 UTC). One
+      // DELETE past 2x the longest window (ratelimit.ts): idempotent,
+      // decision-neutral, isolated.
+      if (new Date().getUTCMinutes() < 5) {
+        try {
+          await pruneRateLimits(db, Date.now());
+        } catch (e) {
+          logError({ cid: "delivery-tick", hop: "cron", msg: "hygiene_step_failed", detail: "pruneRateLimits", err: e instanceof Error ? e.name : typeof e });
+        }
+      }
+      // D-1073(5) (I21-Q97): sign-in codes go within one tick of their hour, every tick (fan-auth.ts pruneFanOtp; the
+      // 6-hourly head still runs it inside pruneFanAuth). One indexed DELETE (0162 idx_fan_otp_issued). Isolated.
+      try {
+        await pruneFanOtp(db, Date.now());
+      } catch (e) {
+        logError({ cid: "delivery-tick", hop: "cron", msg: "hygiene_step_failed", detail: "pruneFanOtp", err: e instanceof Error ? e.name : typeof e });
+      }
+      // I3-1270 (I4-13-R13): retry the edge purge of takedowns whose purge failed (media.ts, <=20/run, >5 min old). Isolated.
+      const mstore = mediaStore(env.MEDIA_BUCKET);
+      if (mstore) {
+        try {
+          await sweepUnpurgedTakedowns(db, mstore, edgePurgerFromEnv(env as unknown as Record<string, unknown>, outFetch), undefined, "delivery-tick");
+        } catch (e) {
+          logError({ cid: "delivery-tick", hop: "cron", msg: "hygiene_step_failed", detail: "sweepUnpurgedTakedowns", err: e instanceof Error ? e.name : typeof e });
+        }
+        // I30-SAFETY H2: screen media stored unscreened (media.ts). With no MEDIA_SCREEN_PROVIDER this fails closed every
+        // tick by design, logged here as hygiene_step_failed (DEPLOY.md). Isolated.
+        try {
+          await screenPendingMedia(db, mstore, mediaScreenerFromEnv(env as unknown as Record<string, unknown>, outFetch), edgePurgerFromEnv(env as unknown as Record<string, unknown>, outFetch));
+        } catch (e) {
+          logError({ cid: "delivery-tick", hop: "cron", msg: "hygiene_step_failed", detail: "screenPendingMedia", err: e instanceof Error ? e.name : typeof e });
+        }
+      }
+      // I3-0799: purge the edge copies of passports hidden by a ledger retraction or a
+      // suppression whose door did not purge (media.ts, HIDDEN_MEDIA_PURGE_BUDGET/run). Isolated.
+      // Gated like the takedown retry: a deployment with no media bucket serves no media.
+      if (mstore) {
+        try {
+          const r = await sweepHiddenPassportMedia(db, edgePurgerFromEnv(env as unknown as Record<string, unknown>, outFetch), undefined, "delivery-tick");
+          if (r.purged + r.failed > 0) logInfo({ cid: "delivery-tick", hop: "cron", msg: "media_hidden_purge", count: r.purged, failed: r.failed });
+        } catch (e) {
+          logError({ cid: "delivery-tick", hop: "cron", msg: "hygiene_step_failed", detail: "sweepHiddenPassportMedia", err: e instanceof Error ? e.name : typeof e });
+        }
+      }
+      // I3-0603 (D-0838(1)): owed creator likeness revokes toward the image
+      // service (likeness.ts, <=50/run, least recently attempted first). Isolated.
+      const imagePeer = imageConsentPeerFromEnv(env as unknown as Record<string, unknown>);
+      if (imagePeer) {
+        try {
+          const r = await drainImageConsentRevokeOutbox(db, imagePeer);
+          if (r.attempted > 0) logInfo({ cid: "delivery-tick", hop: "cron", msg: "image_consent_revoke_sweep", scanned: r.attempted, count: r.synced, backlog_capped: r.more });
+        } catch (e) {
+          logError({ cid: "delivery-tick", hop: "cron", msg: "hygiene_step_failed", detail: "drainImageConsentRevokeOutbox", err: e instanceof Error ? e.name : typeof e });
+        }
+      }
+      return;
+    }
+
+    // THE THIRD TRIGGER (ADR-0006 §2/§8, S-9). Same shape and same reason as
+    // the delivery branch above: the outbox publisher and the erasure drain get
+    // their own invocation and their own ~1000-subrequest budget, rather than
+    // spending the artifact sweep's on a 100-row drain. Both legs, both leases
+    // and both try/catches live in `analytics-outbox.ts`; what is here is the
+    // binding wiring and the early return, so an unrecognised cron string still
+    // falls through to the artifact sweep.
+    if ((event as { cron?: string } | null)?.cron === ANALYTICS_CRON) {
+      // QUEUE #526 (D-0819(5), Option A+): count, once, the saves of fans who
+      // have qualified since they saved. BEFORE the publisher, so the rows it
+      // writes leave on this same tick (and it publishes them itself on waitUntil,
+      // E-1); in its own try/catch, so a fault here
+      // costs this tick's catch-up and never the drain.
+      try {
+        await sweepQualifiedFollows(
+          db,
+          env.ANALYTICS_FAN_SECRET,
+          undefined,
+          undefined,
+          env.ANALYTICS_DB && ctx ? { prod: db, analytics: d1(env.ANALYTICS_DB), queue: env.ANALYTICS_QUEUE } : undefined,
+          ctx,
+        );
+      } catch (e) {
+        logError({ cid: crypto.randomUUID(), hop: "cron", msg: "qualified-follow catch-up failed", err: e instanceof Error ? e.name : typeof e });
+      }
+      await runAnalyticsTick(
+        { prod: db, analytics: d1(env.ANALYTICS_DB), queue: env.ANALYTICS_QUEUE, secret: env.ANALYTICS_FAN_SECRET, secretPrevious: env.ANALYTICS_FAN_SECRET_PREVIOUS, creatorPurge: (leaseLost) => drainCreatorErasureOrder(db, r2Store(env.REGISTRY_BUCKETS), d1(env.ANALYTICS_DB), undefined, leaseLost) },
+        () => new Date().toISOString(),
+        // The retention sweep this trigger runs, named HERE for the same reason
+        // every `step(...)` below names one: `scheduled()` is where the caller
+        // closure looks, and a sweep whose only call site is two files away is
+        // the shape that left three of them uninvoked for a whole phase.
+        // AF-05 (S-048): the 4th argument is `runAnalyticsTick`'s own
+        // before/after on the watermark (`analytics-outbox.ts:819` passes it;
+        // `pruneOutbox`'s `watermarkAdvanced` defaults to TRUE at
+        // `analytics-outbox.ts:516`). This closure declared THREE parameters,
+        // so JS call semantics dropped the 4th before it reached the gate and
+        // the dead-letter DELETE at `analytics-outbox.ts:538` ran on a stalled
+        // watermark — the one state it must not run in — in the deployed
+        // `scheduled()` path only. Forwarded explicitly.
+        (prod, watermark, at, advanced) => pruneOutbox(prod, watermark, at, advanced),
+        // The SECOND store's four retention legs (FINDING-0010-D-1, INV-004
+        // clause 3, ADR-0006 O-21): `analytics_membership` 91 d,
+        // `analytics_erased` 90 d, `analytics_erasure_sentinels` 90 d — the
+        // durable half of the same erasure fact, swept on the SAME `erasedCut`
+        // as its twin (docket #24 (a), 2026-09-07) — and `processed_events`
+        // 7 d. Named HERE for the same reason the outbox prune is —
+        // `scheduled()` is the one place a reader and
+        // `tests/invariants/i13-cron-reachability.test.ts` can see every sweep a cron trigger runs,
+        // and these retentions had shipped their prune INDEXES and no prune at
+        // all.
+        // I4-07-R1 hand-off (I3-1957): forward the tick's ledger hold, or the
+        // processed_events prune runs on a lagging watermark in production.
+        // I19-FXB (RG-MONEY-08): and TRUST_DB, so the prune keeps every ledger key a re-drivable erasure row holds.
+        (analytics, at, keepProcessed, prod) => pruneAnalyticsRetention(analytics, at, undefined, keepProcessed, prod ?? null),
+      );
+      // I15-ANCHOR (I3-0010, D-0911(5)): THE FIVE-MINUTE SEAL. The head of the ledger is
+      // signed and published to the SEAL_WITNESS bucket (witness.ts) on every tick, behind
+      // the tails' chain gate (this cycle's head verified the chain and nothing marked it
+      // broken), so a rewrite after the six-hourly anchor has at most five minutes before a
+      // witnessed seal pins it. Isolated; a failed publish is retried on the next tick.
+      const sealWitness = sealWitnessFromEnv(env as unknown as Record<string, unknown>);
+      if (sealWitness) {
+        try {
+          if (await tailChainGateOpen(db, env, Date.now())) {
+            const sealCfg = env as unknown as Record<string, unknown>;
+            const sealKeys = checkpointKeysFromEnv(sealCfg);
+            const sealSignerCfg = checkpointSignerFromEnv(sealCfg);
+            const r = await sealTick(db, sealWitness, sealSignerCfg && sealKeys ? remoteCheckpointSigner(sealSignerCfg, sealKeys, outFetch, checkpointDeploymentIdFromEnv(sealCfg)) : null);
+            // I30-FX-OPS (D-1059(9), I22-Q12e): a witness mismatch on this tick fails closed exactly as the six-hourly head
+            // does: the durable broken-ledger marker, a 'broken' tail verdict (tailChainGateOpen shuts), and no anchor below.
+            const disputed = r.verdict.mismatches.length > 0;
+            if (disputed) {
+              logError({ cid: "seal-tick", hop: "cron", msg: "ledger_witness_mismatch", ...witnessLogFields(r.verdict) });
+              await markLedgerBroken(env, { breach: "seal_witness", at: new Date().toISOString(), detail: r.verdict }, "seal-tick");
+              await writeSweepCursorRow(db, "seal-tick", TAIL_CHAIN_VERDICT_CURSOR, 0, "broken");
+            } else if (!r.verdict.ok) logError({ cid: "seal-tick", hop: "cron", msg: r.verdict.nothing_compared ? "seal_witness_nothing_compared" : "seal_witness_unreadable", ...witnessLogFields(r.verdict) });
+            if (r.outcome === "failed" || r.outcome === "conflict") logError({ cid: "seal-tick", hop: "cron", msg: "seal_witness_publish_failed", detail: `${r.outcome}:${r.seq}` });
+            // I22-L01 (LEDGER H-5, I3-0010 a, D-0977/D-0978): the hourly OpenTimestamps anchor (self-gated by
+            // ANCHOR_INTERVAL_MS) and the daily proof upgrade, behind the same chain gate. Budget per tick: anchor
+            // <= 2 D1 reads + 2x WITNESS_LIST_PAGES listings + 3 calendar POSTs + 1 batch + 4 store puts, once an hour;
+            // upgrade <= 1 read + UPGRADE_BATCH (6) GETs + 6 UPDATEs + 6 puts — tens, well inside the paid 1,000.
+            // I22-FX-HUB (D-0982(4)): FIRST the newest anchor against its copy outside D1 (2 listings + 1 GET + a few
+            // D1 reads). A mismatch marks the ledger broken and takes no new anchor, which would vouch for the rewrite.
+            // D-1059(9): the copy is still compared on a `disputed` tick, but a witness mismatch takes no new anchor either.
+            if (!(await anchorCopyMismatch(db, env, "seal-anchor")) && !disputed) {
+              const anchorStore = witnessStoreFromR2(env.SEAL_WITNESS as unknown as R2Bucket);
+              const a = await anchorTick(db, sealWitness, anchorStore, outFetch);
+              if (a.outcome === "failed" || a.failures.length > 0) logError({ cid: "seal-anchor", hop: "cron", msg: a.outcome === "failed" ? "seal_anchor_failed" : "seal_anchor_partial", detail: a.failures.join(" | ").slice(0, 500) });
+              const u = await upgradeTick(db, anchorStore, outFetch);
+              if (u.failures.length > 0) logError({ cid: "seal-anchor", hop: "cron", msg: "seal_anchor_upgrade_failed", detail: u.failures.join(" | ").slice(0, 500) });
+            }
+          }
+        } catch (e) {
+          logError({ cid: "seal-tick", hop: "cron", msg: "seal_witness_publish_failed", err: e instanceof Error ? e.name : typeof e });
+        }
+      }
+      // QUEUE #774 (D-0858(10)): the weekly-edition freeze for the creators the
+      // six-hourly batch does not reach. AFTER the drains, so they spend this
+      // invocation's subrequest budget first; its own lease, its own try/catch.
+      if (env.REGISTRY_BUCKETS) {
+        try {
+          await withCronLease(db, "ratings-editions", (lease) => freezeWeeklyEditionsStep(db, r2Store(env.REGISTRY_BUCKETS), Date.now(), undefined, undefined, lease), Date.now(), ANALYTICS_LEASE_TTL_MS); // I38-TICK-5: the guard stops the step on a lost lease
+        } catch (e) {
+          logError({ cid: crypto.randomUUID(), hop: "cron", msg: "weekly edition freeze step failed", err: e instanceof Error ? e.name : typeof e });
+        }
+        // QUEUE #774-C (D-0859(1)): the weekly anchor also runs here, with a
+        // small member budget, its OWN lease and its own checkpoint slot
+        // (ratings.ts ANCHOR_CHECKPOINT_SLOTS), so it adds to the six-hourly
+        // sweep's capacity without either erasing the other's progress.
+        try {
+          await withCronLease(db, ANCHOR_TICK_LEASE, (lease) => anchorEditionsTickStep(db, r2Store(env.REGISTRY_BUCKETS), Date.now(), editionSetAnchorAppender(db), undefined, undefined, undefined, lease), Date.now(), ANALYTICS_LEASE_TTL_MS); // I38-TICK-5
+        } catch (e) {
+          logError({ cid: crypto.randomUUID(), hop: "cron", msg: "weekly edition anchor step failed", err: e instanceof Error ? e.name : typeof e });
+        }
+        // I14-CRON (QUEUE #916, D-0904(1)): DIGEST GENERATION KEEPS UP. Eight digests-tail runs a day (TAIL_DIGESTS_CRON,
+        // every 3 h) cannot generate a 1,000-creator deployment's digests (digest.ts DIGEST_TICK_GENERATE_BUDGET), so every tick
+        // also generates, metered at DIGEST_TICK_GENERATE_BUDGET: the owed periods, yesterday, and the week only
+        // while a creator still lacks it. Behind the tails' chain gate, under the digests tail's own generation
+        // lease (one writer of the owed cursor), last on the tick, isolated.
+        try {
+          if (await tailChainGateOpen(db, env, Date.now())) {
+            await withCronLease(db, DIGEST_GENERATE_LEASE, (lease) => generateDigestPass(db, r2Store(env.REGISTRY_BUCKETS), DIGEST_TICK_GENERATE_BUDGET, "digest-tick", Date.now(), { backfillDays: 1, weeklyOnlyIfPending: true, lease }), Date.now(), ANALYTICS_LEASE_TTL_MS);
+          }
+        } catch (e) {
+          logError({ cid: crypto.randomUUID(), hop: "cron", msg: "digest generation tick failed", err: e instanceof Error ? e.name : typeof e });
+        }
+      }
+      return;
+    }
+
+    // I3-1902: a cron string that is none of the three triggers is a drift
+    // between `wrangler.jsonc` and this file; it runs nothing rather than the
+    // full artifact sweep on another trigger's cadence.
+    const cron = (event as { cron?: unknown } | null)?.cron;
+    // I13-CRON: a TAIL_*_CRON selects ONE tail group; SWEEP_CRON runs the head only.
+    const tailOnly: TailGroup | null = typeof cron === "string" ? (TAIL_GROUP_BY_CRON.get(cron) ?? null) : null;
+    const headOnly = cron === SWEEP_CRON;
+    if (typeof cron === "string" && cron !== SWEEP_CRON && tailOnly === null) {
+      logError({ cid: crypto.randomUUID(), hop: "cron", msg: "cron_unrecognised", detail: cron.slice(0, 64) });
+      return;
+    }
+
+    const store = r2Store(env.REGISTRY_BUCKETS);
+
+    // ONE SWEEP AT A TIME. Cloudflare does not serialize cron invocations (a
+    // retry, a manual run, or a sweep that overruns the next tick all give two
+    // handlers over one D1), and the delivery legs below are read-then-send:
+    // both runs select the same `delivered = 0` / `emailed = 0` rows and both
+    // hand them to APNs/FCM/the mailer, so a fan gets the push and the mail
+    // twice. Creation was already idempotent; delivery was not. The lease is a
+    // single-statement acquire with a bounded TTL — see cron-lease.ts for why
+    // both "never expires" and "expires too early" are the same bug.
+    // I13-CRON: the delivery group hands rows to APNs/FCM/the mailer like
+    // `runDeliverySweep` does, so it shares that sweep's lease; every other tail
+    // group excludes only another run of itself.
+    // I14-CRON (QUEUE #916, D-0904(1)): the SWEEP_CRON head runs none of the delivery legs (no push to APNs/FCM, no
+    // `delivered = 0` / `emailed = 0` rows handed to the mailer: those legs are tails), so it takes its OWN lease
+    // (HEAD_LEASE) instead of `scheduled`, which the five-minute delivery tick holds while it sends: a slow delivery
+    // tick no longer skips the head, and with it every tail of the cycle (they wait for its chain verdict).
+    // I32-FX2-SERVER (D-1084(1)): the head does send mail of its own in its hygiene rotation: operator mail
+    // (credentials.ts redemptionAbuseWatch, admin.ts peerAuditDigest) and re-sent creator closure notices
+    // (creator-close.ts retryCreatorClosureNotices). HEAD_LEASE is what keeps two heads from sending those at once.
+    // I62 P11 (W0-16/17): `scheduled` is the five-minute delivery tick's lease, so every holder of it (the delivery tail and
+    // the manual run) takes, renews and re-times it on the tick's TTL; the head and group leases keep CRON_LEASE_TTL_MS.
+    const onScheduled = !headOnly && (tailOnly === null || tailOnly === "delivery");
+    const leaseTtlMs = onScheduled ? SCHEDULED_LEASE_TTL_MS : CRON_LEASE_TTL_MS;
+    const leaseRenewMs = onScheduled ? SCHEDULED_LEASE_RENEW_MS : GROUP_LEASE_RENEW_MS;
+    const lease = await acquireCronLease(db, headOnly ? HEAD_LEASE : onScheduled ? "scheduled" : `scheduled-${tailOnly}`, Date.now(), leaseTtlMs);
+    if (!lease) {
+      logError({ cid: crypto.randomUUID(), hop: "cron", msg: "scheduled sweep SKIPPED - lease held" });
+      // I13-FX1 (I13-RG-OPS-05): the SENDING legs wait for the holder (the five-minute
+      // delivery tick sends), but alert CREATION runs nowhere else, so it is not lost.
+      if (tailOnly === "delivery") await deliveryTailCreationOnly(db, env);
+      return;
+    }
+    // I14-CRON: a manual run (no cron) runs the head AND the delivery sends, so it holds `scheduled` AND the head's
+    // lease: two heads never overlap. Renewed by the timer below and released in the same `finally`.
+    // I14-FX2 (RG-CRON-S2): the second acquire is inside its own try — a throw there releases `scheduled` and
+    // the head lease under the holder minted here (holder-guarded DELETE, a no-op if the insert never landed).
+    const headHolder = newLeaseHolder();
+    let headLease: CronLease | null = null;
+    if (tailOnly === null && !headOnly) {
+      try {
+        headLease = await acquireCronLease(db, HEAD_LEASE, Date.now(), CRON_LEASE_TTL_MS, headHolder);
+      } catch (e) {
+        await Promise.allSettled([releaseCronLease(db, lease), releaseCronLease(db, { name: HEAD_LEASE, holder: headHolder })]);
+        throw e;
+      }
+    }
+    if (tailOnly === null && !headOnly && headLease === null) {
+      logError({ cid: lease.holder, hop: "cron", msg: "scheduled sweep SKIPPED - head lease held" });
+      await releaseCronLease(db, lease);
+      return;
+    }
+    /**
+     * THE FENCING CHECK the lease never had.
+     *
+     * `cron-lease.ts` bounds its TTL at 30 minutes on the STATED ASSUMPTION that
+     * a real sweep finishes well inside it, and nothing enforced that: a slow
+     * provider on the delivery legs could push this run past thirty minutes, at
+     * which point the NEXT tick acquires the lease and starts a second sweep
+     * while this one is still handing rows to APNs/FCM and the mailer. That is
+     * the duplicate push and duplicate mail the lease exists to prevent.
+     *
+     * A holder that has lost its lease has no business continuing, so it is
+     * asked between the expensive legs. One holder- and expiry-guarded
+     * statement (it renews, D-0844(9) below), and it fails SAFE: an unreadable answer stops this run rather than letting two run.
+     */
+    // D-0844(9) (rg2c-03): each fence RENEWS rather than reads — renewCronLease is
+    // one holder- and expiry-guarded UPDATE, so "still mine" and "extended" are the
+    // same statement — and, as withCronLease does, a timer renews every TTL/3 while
+    // a single leg is in flight. Both stop in the `finally` below, before release.
+    // RGOPS-04 (D-1154(2)): a renewal the timer below saw refused or thrown marks the lease lost for the rest of the
+    // run, and every later fence answers false without asking again.
+    let leaseLost = false;
+    // I41-LEASE (I40FX2L-02): a renewal a FENCE saw refused (no row changed; it cannot later succeed) is recorded too, for
+    // the retracted lap, which asks no fence of its own; the fence's own answer is unchanged.
+    let fenceLost = false;
+    // I43-LEASE (D-1248(3), W0-LS-02): a renewal a fence saw THROW is a lost lease: it latches `leaseLost`, as the timer's
+    // throw does, so every later fence answers false without asking again (and the retracted lap, which reads
+    // `leaseLost || fenceLost`, stops); logged once, by error kind.
+    const fenceThrew = (e: unknown): false => {
+      leaseLost = true;
+      logError({ cid: lease.holder, hop: "cron", msg: "scheduled_lease_renewal_threw", err: e instanceof Error ? e.name : typeof e });
+      return false;
+    };
+    // I46-FX2 (I43-RJ-08/FINDINGS.jsonl:2): on a manual run the fence renews the head lease too, as the timer does, so a
+    // head lease another live holder took ends the run at the next fence; a throw from either renewal is fenceThrew's.
+    const stillLeased = async (): Promise<boolean> => {
+      if (leaseLost) return false;
+      try {
+        const ok = (await renewCronLease(db, lease, Date.now(), leaseTtlMs)) && (headLease === null || (await renewCronLease(db, headLease, Date.now(), CRON_LEASE_TTL_MS)));
+        if (!ok) fenceLost = true;
+        return ok;
+      } catch (e) {
+        return fenceThrew(e);
+      }
+    };
+    let leaseStopped = false;
+    let leaseTimer: ReturnType<typeof setTimeout> | undefined;
+    const scheduleLeaseRenew = (): void => {
+      if (leaseStopped) return;
+      leaseTimer = setTimeout(() => {
+        Promise.all([renewCronLease(db, lease, Date.now(), leaseTtlMs), headLease === null ? true : renewCronLease(db, headLease, Date.now(), CRON_LEASE_TTL_MS)])
+          .then(
+            ([own, head]) => {
+              if (!own || !head) leaseLost = true;
+            },
+            () => {
+              leaseLost = true;
+            },
+          )
+          .finally(scheduleLeaseRenew);
+      }, leaseRenewMs);
+    };
+    scheduleLeaseRenew();
+    try {
+    /**
+     * ONE ISOLATED STEP. Each item below is a single bounded statement or two
+     * against an independent table, so a failure in one says nothing about the
+     * next — and before this the whole run was one unguarded sequence, which is
+     * how a single throw took fourteen prunes with it. Logged by name, never
+     * fatal, and the names stay literal at the call sites so the cron-
+     * reachability guard still sees every sweep it is meant to see.
+     */
+    const runStep = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
+      try {
+        await fn();
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "hygiene_step_failed", detail: name, err: e instanceof Error ? e.name : typeof e });
+      }
+    };
+    /**
+     * I3-0182 — THE HYGIENE BLOCK IS A RESUMABLE ROTATION, not a fixed run from
+     * the top. While `hygieneSteps` is non-null, `step` only COLLECTS; the
+     * rotation (`runHygieneRotation`, after the last hygiene site) runs them from
+     * the `sweep_cursor` row HYGIENE_ROTATION_CURSOR, wrapping round, writing
+     * cursor = i+1 BEFORE step i (an invocation killed inside step i resumes at
+     * i+1, so one step that never finishes cannot starve the rest), stopping at
+     * HYGIENE_BUDGET_MS so the legs below keep their share of the invocation, and
+     * resetting the cursor to 0 once every step ran (canonical order again).
+     * Later `step` sites (after `hygieneSteps = null`) run immediately.
+     *
+     * I12-RG-PRIVACY-06 — A STEP THAT KILLS THE INVOCATION IS HELD, NOT RETRIED
+     * FIRST. Resuming at i+1 still reached the killer every tick (last, after the
+     * wrap) and before the legs below, so those legs never ran again. The cursor
+     * write before step i also records the step's NAME (cursor_id) and the
+     * rotation clears it when it ends (finished or deferred); a tick that finds a
+     * name left behind knows that step's invocation died inside it, logs
+     * `hygiene_step_killed`, and holds that step for HYGIENE_SUSPECT_HOLD_TICKS
+     * ticks (row HYGIENE_SUSPECT_CURSOR) before retrying it. Keyed by name, so a
+     * conditional step that shifts the indices cannot misdirect the hold.
+     */
+    let hygieneSteps: { name: string; fn: () => Promise<unknown> }[] | null = [];
+    /** Q974-B15: when the rotation began, so a step can spend what is left of HYGIENE_BUDGET_MS. 0 = no rotation running. */
+    let hygieneBegan = 0;
+    const step = async (name: string, fn: () => Promise<unknown>): Promise<void> => {
+      if (hygieneSteps) hygieneSteps.push({ name, fn });
+      else await runStep(name, fn);
+    };
+    const runHygieneRotation = async (): Promise<void> => {
+      const steps = hygieneSteps ?? [];
+      hygieneSteps = null;
+      const n = steps.length;
+      if (n === 0) return;
+      // I43-FX-LEASE (D-1254(2), D-1255 D2): every hygiene cursor write is this ONE statement. I47-CODE (I47-B02/B05/B30,
+      // D-1315 R2): it writes only while the rotation's head-lease row is still THIS run's (name and holder), lapsed or not;
+      // a successor's acquire overwrites that row (cron-lease.ts:69-77) and its release deletes it (:87), so a stale run's
+      // write is refused in both cases, and a lapsed lease with no successor keeps its row and still writes. I43-FX2-LEASE
+      // (D-1257(3)): the head lease only (HEAD_LEASE on a manual run and on the head cron); `scheduled` alone does not block,
+      // since the five-minute delivery tick takes it and never runs the rotation.
+      const head = headLease ?? lease;
+      const writeRow = async (name: string, seq: number, id: string): Promise<void> => {
+        try {
+          const nowIso = new Date().toISOString();
+          await db
+            .prepare("INSERT INTO sweep_cursor (name, cursor_seq, cursor_id, updated_at) SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM cron_leases WHERE name = ? AND holder = ?) ON CONFLICT(name) DO UPDATE SET cursor_seq = excluded.cursor_seq, cursor_id = excluded.cursor_id, updated_at = excluded.updated_at")
+            .bind(name, seq, id, nowIso, head.name, head.holder)
+            .run();
+        } catch (e) {
+          logError({ cid: lease.holder, hop: "cron", msg: "hygiene_rotation_cursor", err: e instanceof Error ? e.name : typeof e });
+        }
+      };
+      /** `inFlight` is the step about to run (its name), or "" once the rotation has ended. */
+      const setCursor = (next: number, inFlight: string): Promise<void> => writeRow(HYGIENE_ROTATION_CURSOR, next, inFlight);
+      let start = 0;
+      let held = "";
+      try {
+        const { results } = await db
+          .prepare("SELECT name, cursor_seq, cursor_id FROM sweep_cursor WHERE name IN (?, ?)")
+          .bind(HYGIENE_ROTATION_CURSOR, HYGIENE_SUSPECT_CURSOR)
+          .all<{ name: string; cursor_seq: number; cursor_id: string | null }>();
+        const rot = results.find((r) => r.name === HYGIENE_ROTATION_CURSOR);
+        const sus = results.find((r) => r.name === HYGIENE_SUSPECT_CURSOR);
+        const c = Number(rot?.cursor_seq ?? 0);
+        start = Number.isInteger(c) && c >= 0 ? c % n : 0;
+        let suspect = sus?.cursor_id ?? "";
+        let holds = Number(sus?.cursor_seq ?? 0);
+        const died = rot?.cursor_id ?? "";
+        if (died !== "") {
+          logError({ cid: lease.holder, hop: "cron", msg: "hygiene_step_killed", detail: died });
+          suspect = died;
+          holds = HYGIENE_SUSPECT_HOLD_TICKS;
+        }
+        if (suspect !== "" && Number.isInteger(holds) && holds > 0) {
+          held = suspect;
+          await writeRow(HYGIENE_SUSPECT_CURSOR, holds - 1, suspect);
+        }
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "hygiene_rotation_cursor", err: e instanceof Error ? e.name : typeof e });
+      }
+      const began = Date.now();
+      hygieneBegan = began;
+      for (let k = 0; k < n; k++) {
+        if (k > 0 && Date.now() - began >= HYGIENE_BUDGET_MS) {
+          logError({ cid: lease.holder, hop: "cron", msg: "hygiene_rotation_deferred", count: n - k, detail: steps[(start + k) % n]!.name });
+          await setCursor((start + k) % n, "");
+          return;
+        }
+        const i = (start + k) % n;
+        if (steps[i]!.name === held) {
+          logError({ cid: lease.holder, hop: "cron", msg: "hygiene_step_held", detail: held });
+          continue;
+        }
+        // RGOPS-04 (W0 amendment 6): no step starts once the lease is lost; the cursor resumes at this step. I43-FX-LEASE
+        // (D-1254(2)): writeRow writes nothing once the HEAD lease row is not this run's (I47-CODE; I43-FX2-LEASE, D-1257(3)), so a
+        // lapsed lease with no successor, or a `scheduled` lease the delivery tick took while the head lease stays this run's,
+        // clears the in-flight name here (the step before this one finished).
+        if (!(await stillLeased())) {
+          logError({ cid: lease.holder, hop: "cron", msg: "hygiene_rotation_lease_lost", count: n - k, detail: steps[i]!.name });
+          await setCursor(i, "");
+          return;
+        }
+        await setCursor((i + 1) % n, steps[i]!.name);
+        await runStep(steps[i]!.name, steps[i]!.fn);
+      }
+      await setCursor(0, "");
+    };
+    /**
+     * I13-CRON (QUEUE #900) — ONE TAIL LEG. It runs only when its group runs
+     * (`tailOnly` null is a manual run: every group). The leg's name is written to
+     * its group's in-flight row BEFORE it runs and cleared after it, so a tick that
+     * finds a name left behind knows that leg's invocation died inside it: it logs
+     * `tail_leg_killed` and holds the leg for HYGIENE_SUSPECT_HOLD_TICKS ticks (the
+     * I12-RG-PRIVACY-06 rule of the hygiene rotation, keyed by name), and the legs
+     * after it run on those ticks. A thrown leg is logged here and costs nothing else.
+     */
+    const runs = (g: TailGroup): boolean => tailOnly === null || tailOnly === g;
+    // I13-FX1 (I13-RG-OPS-04, D-0889(3)): the artifacts trigger's legs run on METERED handles
+    // (every D1 statement and R2 operation charged before it is sent, refused past
+    // TAIL_ARTIFACTS_LEG_BUDGET), so the invocation keeps TAIL_OVERHEAD_SUBREQUESTS for its
+    // own scaffolding under the ceiling. A manual run (no cron) is unmetered, as before.
+    const art = tailOnly === "artifacts" ? tailMeter(TAIL_ARTIFACTS_LEG_BUDGET, db, env) : { metered: false as const, db, env, store, exhausted: () => false, spent: () => 0, share: (_c?: number): void => {}, left: () => TAIL_ARTIFACTS_LEG_BUDGET };
+    let artCut = false;
+    let artCarry: string | undefined;
+    let artFirst: string | undefined;
+    // I47-FXR-CODE (F7, D-1319 C1): the tail legs' and the chain verdict's cursors under the hygiene rotation's guard lease.
+    const writeCursorRow = (name: string, seq: number, id: string): Promise<void> => writeSweepCursorRow(db, lease.holder, name, seq, id, headLease ?? lease);
+    const tailHeld = new Map<TailGroup, string>();
+    // I13-FX1 (I13-RG-OPS-01, D-0889(2)): the hold RELEASES after its ticks whatever the
+    // group's size. A fresh kill clears the in-flight row here, at detection, instead of
+    // waiting for a later leg of the group to run (a one-leg group has none). And an
+    // in-flight name equal to the suspect, last written NO LATER than the suspect row, is
+    // the kill already detected (its clear failed): it never re-arms the hold. A real
+    // re-kill rewrote the in-flight row when the leg ran again, after the hold was spent.
+    const tailHoldOf = async (g: TailGroup): Promise<string> => {
+      try {
+        const { results } = await db
+          .prepare("SELECT name, cursor_seq, cursor_id, updated_at FROM sweep_cursor WHERE name IN (?, ?)")
+          .bind(tailInflightCursor(g), tailSuspectCursor(g))
+          .all<{ name: string; cursor_seq: number; cursor_id: string | null; updated_at: string | null }>();
+        const inflight = results.find((r) => r.name === tailInflightCursor(g));
+        const died = inflight?.cursor_id ?? "";
+        const sus = results.find((r) => r.name === tailSuspectCursor(g));
+        let suspect = sus?.cursor_id ?? "";
+        let holds = Number(sus?.cursor_seq ?? 0);
+        const stale = died !== "" && died === suspect && Date.parse(inflight?.updated_at ?? "") <= Date.parse(sus?.updated_at ?? "");
+        if (died !== "" && !stale) {
+          logError({ cid: lease.holder, hop: "cron", msg: "tail_leg_killed", detail: `${g}:${died}` });
+          suspect = died;
+          holds = HYGIENE_SUSPECT_HOLD_TICKS;
+        }
+        if (died !== "") await writeCursorRow(tailInflightCursor(g), 0, "");
+        if (suspect !== "" && Number.isInteger(holds) && holds > 0) {
+          await writeCursorRow(tailSuspectCursor(g), holds - 1, suspect);
+          return suspect;
+        }
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "tail_cursor", detail: g, err: e instanceof Error ? e.name : typeof e });
+      }
+      return "";
+    };
+    const tailLeg = async (g: TailGroup, name: string, fn: () => Promise<unknown>): Promise<void> => {
+      if (!runs(g)) return;
+      // I13-FX1 (I13-RG-OPS-04): a METERED group (artifacts, on its own trigger) stops at its
+      // budget and carries the rest: the run after starts at the carried leg.
+      // I13-FX7 (QUEUE #515, D-0653): a PINNED leg (the retraction purge) is never carried and
+      // never cut: it runs on every metered tick, on the budget buildSweep's share left it.
+      const pinned = g === "artifacts" && ARTIFACT_PINNED_LEGS.includes(name);
+      if (art.metered && g === "artifacts" && !pinned) {
+        if (artCut) {
+          logError({ cid: lease.holder, hop: "cron", msg: "tail_leg_carried", detail: `${g}:${name}` });
+          return;
+        }
+        if (artCarry === undefined) artCarry = await readTailCarry(db, g);
+        if (artCarry !== "" && artCarry !== name) {
+          logError({ cid: lease.holder, hop: "cron", msg: "tail_leg_carried", detail: `${g}:${name}` });
+          return;
+        }
+        if (artCarry === name) {
+          artCarry = "";
+          await writeCursorRow(tailCarryCursor(g), 0, "");
+        }
+        artFirst ??= name;
+      }
+      let held = tailHeld.get(g);
+      if (held === undefined) {
+        held = await tailHoldOf(g);
+        tailHeld.set(g, held);
+      }
+      if (held === name) {
+        logError({ cid: lease.holder, hop: "cron", msg: "tail_leg_held", detail: `${g}:${name}` });
+        return;
+      }
+      await writeCursorRow(tailInflightCursor(g), 0, name);
+      try {
+        await fn();
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "tail_leg_failed", detail: `${g}:${name}`, err: e instanceof Error ? e.name : typeof e });
+      }
+      await writeCursorRow(tailInflightCursor(g), 0, "");
+      if (art.metered && g === "artifacts" && !artCut && art.exhausted()) {
+        // The leg the budget cut is retried first next run — unless it was this run's
+        // FIRST leg (it alone outspends the budget), then the next leg is, so the group turns.
+        artCut = true;
+        // A pinned leg is never the carry: the next unpinned leg after it is.
+        const i = ARTIFACT_TAIL_LEGS.indexOf(name);
+        const carry = !pinned && name !== artFirst ? name : nextUnpinnedArtifactLeg(i + 1);
+        await writeCursorRow(tailCarryCursor(g), 0, carry);
+        logError({ cid: lease.holder, hop: "cron", msg: "tail_budget_carried", detail: `${g}:${name}->${carry}`, spent: art.spent() });
+      }
+    };
+    /** I13-CRON: the head records its chain verdict for the tail triggers (see TAIL_CHAIN_VERDICT_CURSOR). */
+    const writeChainVerdict = (v: "pending" | "ok" | "broken"): Promise<void> => writeCursorRow(TAIL_CHAIN_VERDICT_CURSOR, 0, v);
+    const chainVerdictFresh = (): Promise<boolean> => tailChainGateOpen(db, env, Date.now());
+    // Captured at the head's verdict-removing sweeps (below); a tail-only run uses its own start.
+    let nowMs = Date.now();
+    // I13-CRON: THE HEAD — everything down to the hygiene rotation. A tail-only run skips it.
+    if (tailOnly === null) {
+    // I13-FX1 (I13-RG-OPS-02, D-0889(2)): 'pending' FIRST, so a head that throws before
+    // its verdict (a failed chain read, a failed 'broken' write) leaves no 'ok' behind for
+    // the tails of this cycle; tailChainGateOpen also refuses an 'ok' from an earlier cycle.
+    await writeChainVerdict("pending");
+    // 1. Internal chain integrity. Corrupt log → do NOT rebuild or re-anchor.
+    const chain = await verifyChainTick(db); // I3-2157 + QUEUE #903: bounded per tick; the rolling full walk (`VERIFY_CHAIN_WINDOW_TICKS` ticks) resumes across ticks (checkpoint.ts)
+    if (!chain.ok) {
+      logError({ cid: lease.holder, hop: "cron", msg: "ledger_chain_corrupt", ...chainLogFields(chain) });
+      await markLedgerBroken(env, { breach: "chain", at: new Date().toISOString(), detail: chain }, lease.holder);
+      await writeChainVerdict("broken");
+      throw new Error(`ledger chain corrupt at seq ${chain.brokenAtSeq}: ${chain.reason}`);
+    }
+
+    // 2. Anchor check. Proven tamper → hard stop. Missing anchor → chain is
+    //    sound, so proceed + re-export (a bad anchor file can't freeze rebuilds).
+    //    Item 12: `keys` is the PUBLISHED verification set. Absent ⇒ the
+    //    signature axis reports "disabled" and this behaves exactly as it did
+    //    before signing existed.
+    //
+    //    WHAT STOPS THE WORLD, decided explicitly (see checkpoint.ts BreachAxis).
+    //    "broken" is the right VERDICT for every one of these — the console and
+    //    /v1/info are unchanged and still say broken — but halting the safety
+    //    machinery on all of them is a SEPARATE decision, and it was previously
+    //    being made by accident:
+    //
+    //      breach "chain"  / "ledger" → STOP. The log does not recompute, or an
+    //        anchor's pin disagrees with it, or nothing signed vouches for it at
+    //        all. Everything below publishes something DERIVED from the log —
+    //        the registry buckets fans read, the rankings, the digests — and
+    //        publishing from a log that may have been rewritten launders the
+    //        rewrite. Refusing to publish is the whole point of the anchor.
+    //
+    //      breach "store" → ALARM, and RUN. The log recomputes, a signature
+    //        under a published key vouches for it, every signed anchor agrees —
+    //        and some other object under `checkpoints/` does not verify. That is
+    //        a fact about R2, not about D1: one bad restore, one partial write,
+    //        one key re-issued under a reused key_id. Nothing about the log
+    //        became less true, so the registry rebuild, the alert/email
+    //        delivery, the expiry sweep and the payout-tag promotion have the
+    //        same inputs they had a minute ago. Stopping them instead traded a
+    //        storage fault for a fan-safety outage — fans pinned to a stale
+    //        bucket and newly published warnings never reaching them, with no
+    //        recovery path in code — and handed anyone who can write ONE junk
+    //        object into the checkpoint prefix a permanent kill switch on the
+    //        safety pipeline, at strictly less access than writing D1.
+    //
+    //    Recovery for BOTH stopping axes is an operator act, not an automatic
+    //    one, and it is written down: DEPLOY.md §3e (quarantine the object,
+    //    never delete it — the bytes are the evidence).
+    //
+    //    A READ FAILURE IS NOT A BREACH — the catch policy, decided explicitly.
+    //    This whole leg reaches R2, and R2 can fail for reasons that say nothing
+    //    whatever about the log: a listing error, a GET that times out, a
+    //    transient 5xx. Until this change the call was UNCAUGHT and sat ABOVE the
+    //    registry rebuild, so any one of those threw the cron and took the
+    //    rebuild, the delivery legs, the expiry sweep and fourteen retention
+    //    prunes with it — fans pinned to a stale bucket and newly published
+    //    warnings never reaching them. That is the same reasoning DEPLOY.md §3e
+    //    already applies to `breach === "store"` (a fact about R2 is not a fact
+    //    about D1), so it gets the same answer: LOG LOUDLY AND CONTINUE. What is
+    //    NOT swallowed is a genuine verdict — `breach` "chain"/"ledger" still
+    //    throws below and still stops the world, because that IS a fact about
+    //    the log. The chain itself was already verified from D1 above, so
+    //    continuing past a failed anchor read never publishes from an
+    //    unverified log.
+    const cfg = env as unknown as Record<string, unknown>;
+    const keys = checkpointKeysFromEnv(cfg);
+    const anchorCursor = (await db.prepare("SELECT cursor_seq FROM sweep_cursor WHERE name = 'checkpoint_anchors'").first<{ cursor_seq: number }>())?.cursor_seq ?? 0;
+    let verdict = null as Awaited<ReturnType<typeof verifyAgainstCheckpoint>> | null;
+    try {
+      // `chain` is handed in rather than re-derived: `verifyAgainstCheckpoint`
+      // called `verifyChain(db)` itself, so every cron run walked the entire
+      // ledger TWICE — one D1 query per 1000 rows plus a SHA-256 per row, each
+      // time — and the first walk's result was used only for an early-out the
+      // second one re-computed. At 2M rows that was 4,000 queries and 4M hashes
+      // spent before the sweep did anything useful.
+      verdict = await verifyAgainstCheckpoint(db, store, keys, { chain, tailCursor: anchorCursor, deploymentId: checkpointDeploymentIdFromEnv(cfg) });
+    } catch (e) {
+      logError({ cid: lease.holder, hop: "cron", msg: "CHECKPOINT VERIFICATION UNAVAILABLE", err: e instanceof Error ? e.name : typeof e });
+    }
+    if (verdict) {
+      if (verdict.anchored && !verdict.ok && verdict.breach !== "store") {
+        logError({ cid: lease.holder, hop: "cron", msg: "ledger_tamper_detected", ...anchorLogFields(verdict) });
+        await markLedgerBroken(env, { breach: verdict.breach ?? "anchor", at: new Date().toISOString(), detail: verdict }, lease.holder);
+        await writeChainVerdict("broken");
+        throw new Error(`ledger tamper: ${verdict.anchorReason ?? verdict.signatureReason}`);
+      }
+      if (verdict.breach === "store") {
+        // Loud, and every sweep below still runs. See DEPLOY.md §3e.
+        logError({ cid: lease.holder, hop: "cron", msg: "checkpoint_object_unverifiable", ...anchorLogFields(verdict) });
+      }
+      if (!verdict.anchored) {
+        logError({ cid: lease.holder, hop: "cron", msg: "checkpoint_anchor_missing", ...anchorLogFields(verdict) });
+      }
+      // Rotate the tail window so the anchors this run did NOT read are the ones
+      // the next run does. Best-effort: a cursor that fails to persist costs a
+      // repeated window, never a missed verdict.
+      try {
+        // I47-FXR-CODE (F7): only while this run's guard lease row (`headLease ?? lease`, name and holder) exists.
+        const anchorLease = headLease ?? lease;
+        await db
+          .prepare("INSERT INTO sweep_cursor (name, cursor_seq, cursor_id, updated_at) SELECT 'checkpoint_anchors', ?, '', ? WHERE EXISTS (SELECT 1 FROM cron_leases WHERE name = ? AND holder = ?) ON CONFLICT(name) DO UPDATE SET cursor_seq = excluded.cursor_seq, updated_at = excluded.updated_at")
+          .bind(verdict.nextTailCursor ?? 0, new Date().toISOString(), anchorLease.name, anchorLease.holder)
+          .run();
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "checkpoint_anchor_cursor", err: e instanceof Error ? e.name : typeof e });
+      }
+    }
+
+    // I3-0010 / I3-0275 b / I3-1403 a (D-0982(4), I22-FX-HUB): the newest hourly anchor against its copy outside D1.
+    // A mismatch stops the world exactly as a signed-checkpoint disagreement does above.
+    if (await anchorCopyMismatch(db, env, lease.holder)) {
+      await writeChainVerdict("broken");
+      throw new Error("ledger tamper: D1 disagrees with the newest anchor held outside D1");
+    }
+
+    // I15-ANCHOR (I3-0010, D-0911(5)): the witnessed seals against the ledger. A
+    // difference is a rewrite under a seal the main keys cannot reach: ALERT. Whether it
+    // also stops the sweep (markLedgerBroken) is not decided here (open question).
+    // I15-FX1 (RGI-ANCHOR-HEAD-RESEAL): the verdict is KEPT, because a mismatch also
+    // withholds the 'ok' below and the witness seal further down — sealTick's rule.
+    const verdictWitness = sealWitnessFromEnv(cfg);
+    let headWitnessVerdict: WitnessVerdict | null = null;
+    if (verdictWitness) {
+      try {
+        const w = await verifyAgainstWitness(db, verdictWitness, Date.now(), SEAL_HEAD_VERIFY_READS);
+        headWitnessVerdict = w;
+        if (w.mismatches.length > 0) logError({ cid: lease.holder, hop: "cron", msg: "ledger_witness_mismatch", ...witnessLogFields(w) });
+        else if (w.nothing_compared && !w.ok) logError({ cid: lease.holder, hop: "cron", msg: "seal_witness_nothing_compared", ...witnessLogFields(w) });
+        else if (w.unreadable > 0 || w.truncated) logError({ cid: lease.holder, hop: "cron", msg: "seal_witness_unreadable", ...witnessLogFields(w) });
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "seal_witness_unreadable", err: e instanceof Error ? e.name : typeof e });
+      }
+    }
+
+    // I13-CRON: the chain passed and no anchor proved tamper (an unreadable anchor
+    // is not a breach, above), so the tail triggers may publish from this log.
+    // I15-FX1: NOT over a witness mismatch — the 'pending' written at the top of this
+    // run stands, so tailChainGateOpen keeps the tails (and the five-minute seal) shut.
+    // I3-0010 b (I23-W1-HUB): ONE predicate for both doors that must not act over a disputed head —
+    // the 'ok' verdict here and the re-signed export below.
+    const witnessDisputesHead = headWitnessVerdict !== null && headWitnessVerdict.mismatches.length > 0;
+    // I22-Q12e (D-1030: "stop the whole sweep and alert"): a witness mismatch fails closed exactly as the signed-checkpoint
+    // breach above does: the durable broken-ledger marker, a 'broken' verdict (the tails stay shut) and a throw before
+    // any later step. Nothing is signed or exported over the disputed head.
+    if (witnessDisputesHead) {
+      logError({ cid: lease.holder, hop: "cron", msg: "checkpoint_export_skipped_witness_mismatch" });
+      await markLedgerBroken(env, { breach: "seal_witness", at: new Date().toISOString(), detail: headWitnessVerdict }, lease.holder);
+      await writeChainVerdict("broken");
+      throw new Error("ledger tamper: the seal witness disputes the ledger head");
+    }
+    await writeChainVerdict("ok");
+
+    // 3. Re-anchor, signed by a key this Worker does not hold. Signing is a
+    //    NETWORK HOP and the signer can be down: a failed signature yields an
+    //    UNSIGNED checkpoint (logged, and read back as "unverified"), never a
+    //    thrown cron and never a fake "signed" state. Nothing on the ledger
+    //    APPEND path calls any of this.
+    //
+    //    ONLY WHEN THERE IS SOMETHING NEW TO ANCHOR. The history key is
+    //    `taken_at`, so this used to write a new object every run whether or not
+    //    the chain had moved — four a day, forever, on a prefix nothing prunes
+    //    and `allAnchors()` reads. Same head + already signed ⇒ skip (including
+    //    the signer's network hop); unsigned at the current head ⇒ retry, which
+    //    is the self-healing the module's header promises.
+    //
+    //    ISOLATED for the same reason the verification above is: writing the
+    //    anchor is an R2 WRITE, and an R2 fault is not a reason to stop
+    //    publishing warnings to fans. A run that cannot write its anchor simply
+    //    has not anchored; the next one anchors a higher seq and covers the gap,
+    //    which is the self-healing this module's header already relies on.
+    // I3-0973: a run that lost its lease while verifying the chain must not write
+    // the anchor (or seal it on the witness) on the new holder's watch. One fence,
+    // the same renew-and-check every later fence uses.
+    if (!(await stillLeased())) {
+      logError({ cid: lease.holder, hop: "cron", msg: "checkpoint export SKIPPED - lease lost" });
+    } else try {
+      const signerCfg = checkpointSignerFromEnv(cfg);
+      const signer = signerCfg && keys ? remoteCheckpointSigner(signerCfg, keys, outFetch, checkpointDeploymentIdFromEnv(cfg)) : null;
+      // `keys` is the 5th argument, added by W3-04 I3-1620/I3-2063: exportCheckpointIfChanged
+      // used to skip re-anchoring on the mere PRESENCE of a sig block on latest.json, so an
+      // unverifiable signature suppressed re-signing. It now verifies and only skips on
+      // state === "verified" -- but only when it is given the keys. Without this argument the fix
+      // is dormant and the old behaviour stands, which is how it shipped from the owning room
+      // (the call site is outside that room's ownership list, so it flagged it instead).
+      const { record: written, written: didWrite } = await exportCheckpointIfChanged(db, store, undefined, signer, keys);
+      if (didWrite && written && signer && !written.sig) {
+        logError({ cid: lease.holder, hop: "cron", msg: "checkpoint_written_unsigned", seq: written.seq });
+      }
+      // I15-ANCHOR (D-0911(5)): every anchor is also a seal on the witness. AFTER the anchor
+      // write, and publishSeal never throws, so the witness can never cost the anchor.
+      // I15-FX1 (RGI-ANCHOR-HEAD-RESEAL): only over a witness compare that was `ok`, the
+      // rule sealTick applies — never a seal over a mismatch, an empty window after a
+      // seal was published, or a compare that did not run.
+      const headWitness = sealWitnessFromEnv(cfg);
+      if (headWitness && written) {
+        if (headWitnessVerdict === null) {
+          logError({ cid: lease.holder, hop: "cron", msg: "seal_witness_publish_failed", detail: `compare_unavailable:${written.seq}` });
+        } else if (!headWitnessVerdict.ok) {
+          logError({ cid: lease.holder, hop: "cron", msg: "seal_witness_refused", detail: `${written.seq}` });
+        } else {
+          const published = await publishSeal(headWitness, written);
+          if (published === "failed" || published === "conflict") logError({ cid: lease.holder, hop: "cron", msg: "seal_witness_publish_failed", detail: `${published}:${written.seq}` });
+          await noteSealPublished(db, headWitnessVerdict, published).catch((e: unknown) => logError({ cid: lease.holder, hop: "cron", msg: "seal_witness_publish_failed", err: e instanceof Error ? e.name : typeof e }));
+        }
+      }
+    } catch (e) {
+      logError({ cid: lease.holder, hop: "cron", msg: "checkpoint_not_written", err: e instanceof Error ? e.name : typeof e });
+    }
+    // Retention on the anchor prefix — the other half of the read bound. See
+    // checkpoint.ts for what is kept and why deleting old anchors does not
+    // weaken the pin (the chain is what carries history; an anchor at seq M
+    // commits to everything under it). Isolated: a retention failure must never
+    // cost the sweeps below.
+    // I40-FX2-LEASE (RGOPS-04, I40TER-P5): the anchor fence's shape; a lost lease skips this step only, never returns.
+    if (!(await stillLeased())) {
+      logError({ cid: lease.holder, hop: "cron", msg: "checkpoint retention SKIPPED - lease lost" });
+    } else try {
+      // I3-1279: with the published keys, only a VERIFIED anchor counts as a bucket's signed survivor.
+      const pruned = await pruneCheckpoints(store, Date.now(), undefined, keys);
+      if (pruned.undeletable > 0) {
+        logError({ cid: lease.holder, hop: "cron", msg: "checkpoint_retention_inert", undeletable: pruned.undeletable, scanned: pruned.scanned });
+      }
+    } catch (e) {
+      logError({ cid: lease.holder, hop: "cron", msg: "checkpoint_retention", err: e instanceof Error ? e.name : typeof e });
+    }
+    // SLICE 25 — the published directory, rebuilt AFTER the write and the
+    // retention sweep so it describes the prefix as it now stands rather than as
+    // it stood at the start of the tick. Built from object NAMES only (`seq` and
+    // `taken_at` are both in the key), so it costs one listing and zero gets.
+    //
+    // Isolated like every leg around it: a directory that fails to rebuild is a
+    // stale directory, and a stale directory still points at real anchors that
+    // are still individually fetchable and still individually verifiable. It
+    // must never cost the registry rebuild below it.
+    //
+    // Written whether or not signing is configured. The ROUTES fail closed on an
+    // absent key set; the artifact is not the gate, and building it
+    // unconditionally means turning signing on publishes history immediately
+    // instead of six hours later.
+    // I40-FX2-LEASE (RGOPS-04, I40TER-P5): the anchor fence's shape; a lost lease skips this step only, never returns.
+    if (!(await stillLeased())) {
+      logError({ cid: lease.holder, hop: "cron", msg: "checkpoint index SKIPPED - lease lost" });
+    } else try {
+      await exportCheckpointIndex(store);
+    } catch (e) {
+      logError({ cid: lease.holder, hop: "cron", msg: "checkpoint_index", err: e instanceof Error ? e.name : typeof e });
+    }
+    // I3-1010: THE TWO VERDICT-REMOVING SWEEPS RUN BEFORE THE REGISTRY PLAN.
+    // A plan freezes the published member set for the next six hours; planned
+    // before the expiry and lapse sweeps, it froze a passport this same tick was
+    // about to de-verify, and the extension served it as verified until the next
+    // plan. Both are isolated (try/catch), so neither can cost the rebuild.
+    nowMs = Date.now();
+    // Enforce `verification_granted.expires_at`. Appends `verification_expired`
+    // for grants past their stated deadline; the fold moves the passport
+    // verified → claimed, so the registry verdict, the badge, the card, payout
+    // presentation and every verified-only write path change together. A grant
+    // with an absent/empty/unparseable expiry is NEVER expired — see
+    // verification-sweep.ts. Isolated: a sweep failure must not take the hygiene
+    // sweeps below with it.
+    // I40-FX2-LEASE (RGOPS-04, I40TER-P5): the anchor fence's shape; a lost lease skips this step only, never returns.
+    if (!(await stillLeased())) {
+      logError({ cid: lease.holder, hop: "cron", msg: "verification expiry SKIPPED - lease lost" });
+    } else try {
+      const vsweep = await sweepExpiredVerifications(db, nowMs);
+      // F-01: DEPLOY.md §7 tells the operator to monitor the ONE cron that
+      // de-badges creators with no human in the loop by
+      // `wrangler tail --search "VERIFICATION EXPIRY"` (DEPLOY.md:3484). That
+      // string was printed nowhere in the tree, and the only line this leg DID
+      // write fired solely when `unreadable_expiry > 0` — so on an ordinary
+      // tick the documented monitoring surface was empty. Printed EVERY tick,
+      // counters only (INV-061: no passport id, no handle, no free text).
+      // I3-0257-b: all four DEPLOY.md counters (log.ts ALLOWED_KEYS carries expired/warned since I16-W07A).
+      logError({ cid: lease.holder, hop: "cron", msg: "VERIFICATION EXPIRY", scanned: vsweep.scanned, expired: vsweep.expired, warned: vsweep.warned, unreadable_expiry: vsweep.unreadable_expiry, no_grant: vsweep.no_grant });
+    } catch (e) {
+      logError({ cid: lease.holder, hop: "cron", msg: "verification_expiry_sweep", err: e instanceof Error ? e.name : typeof e });
+    }
+
+    // THE CHARACTER LAPSE SWEEP — the other way a Verified badge stops being
+    // true. The verification sweep above enforces a DEADLINE; this one enforces
+    // the accountability rule after the claim, which slice 14 could only enforce
+    // at the write. Isolated for the same reason and in the same shape: one
+    // sweep failing must not take the others with it.
+    //
+    // AFTER the expiry sweep on purpose. A character whose grant has ALSO run
+    // out should lapse for the reason with a date on it — `verification_expired`
+    // carries the deadline it enforced, which an operator can dispute; a lapse
+    // event carries only when we noticed. Both walk verified → claimed, so
+    // whichever lands first makes the other a no-op for that passport.
+    // BEHIND A LEASE FENCE. The lease is acquired before both sweeps, so a
+    // simultaneous start is already excluded — but a predecessor that blew the
+    // TTL is not, and this is the one sweep on the tick that REMOVES a public
+    // verdict. Two overlapping runs take independent scan snapshots, and the
+    // loser's rolled-back batch leaves a watch row the winner has already acted
+    // on. Cheap to check; the alternative is a de-badge decided by a run that no
+    // longer holds the lease.
+    // I3-1010: moved ABOVE the registry plan, so its lease check can no longer
+    // RETURN (that would cost the registry plan, which asks no fence and still
+    // runs on a lost lease); a lost lease skips THIS sweep only, the hygiene
+    // rotation below asks its own fence before each step (runHygieneRotation),
+    // and the returning fence it used to be is kept below, in front of the artifact legs.
+    if (!(await stillLeased())) {
+      logError({ cid: lease.holder, hop: "cron", msg: "character lapse SKIPPED - lease lost" });
+    } else {
+    try {
+      const lsweep = await sweepLapsedOperators(db, nowMs, undefined, undefined, undefined, undefined, lease.holder);
+      if (lsweep.lapsed > 0 || lsweep.opened > 0 || lsweep.failed > 0) {
+        logError({
+          cid: lease.holder,
+          hop: "cron",
+          msg: "character_lapse_sweep_summary",
+          opened: lsweep.opened,
+          notified: lsweep.notified,
+          recovered: lsweep.recovered,
+          voided: lsweep.voided,
+          in_grace: lsweep.in_grace,
+          deferred: lsweep.deferred,
+          lapsed: lsweep.lapsed,
+          refused: lsweep.refused,
+          failed: lsweep.failed,
+        });
+      }
+    } catch (e) {
+      logError({ cid: lease.holder, hop: "cron", msg: "character_lapse_sweep", err: e instanceof Error ? e.name : typeof e });
+    }
+    }
+
+    // Registry rebuild. REGISTRY_DECOY_SEED is a REQUIRED secret: the decoy
+    // padding is derived from it, and a build padded with fresh random decoys
+    // lets an observer intersect two consecutive builds down to the real member
+    // set. Absent or placeholder => SKIP the rebuild — the last-published
+    // buckets keep serving (stale but consistent) — rather than publish an
+    // unsafe one. Skipping, not throwing: an unset secret must not take the
+    // rest of the scheduled sweep down with it. See DEPLOY.md §3d.
+    //
+    // ISOLATED. The rebuild is the most safety-critical leg here and it is also
+    // an unbounded series of R2 writes, so it is the likeliest to fail on a
+    // storage fault — and it used to be UNCAUGHT, which meant every sweep below
+    // it (now including the retention prunes and the expiry sweep) died with it.
+    // A failed rebuild leaves the last-published buckets serving, exactly as the
+    // absent-secret path does; it must not also cost the hygiene work.
+    const decoySeed = registryDecoySeedFromEnv(cfg);
+    // The registry build flips its pointer with a CONDITIONAL put, so it takes
+    // the adapter that has one (ADR-0012 §2) rather than the plain `store` every
+    // other sweep in this handler shares. Same bucket, same objects.
+    const registryStore = registryR2Store(env.REGISTRY_BUCKETS);
+    if (decoySeed) {
+      try {
+        // ADR-0012: this tick PLANS a generation — it does not build one. A plan
+        // freezes every global quantity and the per-bucket steps run across this
+        // and the following five-minute ticks, so a build that outgrows one
+        // invocation finishes instead of restarting from zero. A generation is
+        // planned only when none is open, which is what keeps "starts every 6
+        // hours" true; `advanceRegistryBuild` then spends what is left of THIS
+        // invocation on steps rather than leaving the first one five minutes away.
+        //
+        // The publication signer, when one is provisioned. Absent keys or an
+        // absent endpoint => the build publishes an UNSIGNED root and says so;
+        // it is never skipped for want of a signature, because an unsigned
+        // registry still serves every client and no registry serves none.
+        const advanced = await advanceRegistryBuild(db, registryStore, {
+          decoySeed,
+          signer: registrySignerFor(cfg, outFetch),
+          plan: true,
+          cid: lease.holder,
+        });
+        const built = advanced.result;
+        if (built) {
+          // THE DELISTING BACKLOG. Every bucket sheds a fixed number of published
+          // hashes per build so that a build which delisted somebody is shaped
+          // like one that did not (registry-build.ts, THE CHURN QUOTA), which caps
+          // real departures at that quota per bucket. It is not reached in
+          // ordinary operation; a non-zero number here means removals are queued
+          // behind it and the published SLA (LISTING-POLICY.md 5.1) is being
+          // spent. Log it so it is not invisible — the quota must NEVER be raised
+          // in response, because a churn that answers removal pressure is a churn
+          // that reports it.
+          if (built.spilledOut > 0) {
+            logError({ cid: lease.holder, hop: "cron", msg: "registry_delisting_backlog", spilled: built.spilledOut, quota: built.churn });
+          }
+          // AND THE RETRACTION LANE, WHICH IS A DIFFERENT NUMBER. Retractions have
+          // their own lane, ahead of removals and EXEMPT from the real-churn cap,
+          // so this is 0 by construction today. It is logged anyway, separately,
+          // because the alternative is reporting a stuck retraction — an accusation
+          // we have withdrawn but are still publishing — inside a counter an
+          // operator reads as "people waiting to be delisted".
+          if (built.spilledOutRetractions > 0) {
+            logError({ cid: lease.holder, hop: "cron", msg: "registry_retraction_backlog", spilled: built.spilledOutRetractions });
+          }
+          // OR-01: a safety entry the reserved lane could not fit is pending, and
+          // steps the rung at the next plan rather than evicting anybody.
+          if (built.safetyPending > 0) {
+            logError({ cid: lease.holder, hop: "cron", msg: "registry_safety_backlog", pending: built.safetyPending, seq: built.seq });
+          }
+        }
+        // "Live within 12 hours, or an alarm fires" — the served generation's age
+        // is checked here as well as on the five-minute tick, so a deployment
+        // whose step driver never runs still raises it.
+        await registryPublicationAlarm(registryStore, Date.now(), lease.holder);
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "registry_rebuild_failed", err: e instanceof Error ? e.name : typeof e });
+      }
+    } else {
+      logError({ cid: lease.holder, hop: "cron", msg: "registry_decoy_seed_missing_skip" });
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // HYGIENE FIRST, ARTIFACTS AND DELIVERY SECOND.
+    // ─────────────────────────────────────────────────────────────────────────
+    // Everything from here to the end of the prune block is CHEAP (a bounded D1
+    // statement or two each) and touches no network. It used to sit at the very
+    // BOTTOM of this handler, below the alert fan-out — which was itself the one
+    // expensive leg with no try/catch around it — so a single throw up there
+    // silently took fourteen retention prunes and the verification-expiry sweep
+    // with it, every tick, forever. Table growth and an unenforced `expires_at`
+    // are exactly the failures that do not announce themselves.
+    //
+    // The order is now: things that must not be starved, then things that can
+    // afford to be. Each expensive leg below is individually isolated, so no
+    // rearrangement is load-bearing for correctness — but ordering means the
+    // cheap work is already DONE when an expensive leg exhausts the invocation.
+
+
+    // Billing hygiene: downgrade subscriptions that lapsed at their period end
+    // with no cancel webhook (keeps the cached accounts.tier honest), and prune
+    // old webhook-dedup rows so billing_events can't grow without bound.
+    await step("sweepExpiredSubscriptions", () => sweepExpiredSubscriptions(db, nowMs));
+    // I3-1691: credit checkouts the webhook never resolved (stripe.ts). D-0843(1): a
+    // paid but ungranted attempt leaves the open set as `reconciled` (operator review).
+    await step("sweepCreditCheckoutPending", async () => {
+      const cfg = stripeConfigFromEnv(env as unknown as Record<string, unknown>);
+      if (!cfg) return;
+      const r = await sweepCreditCheckoutPending(db, cfg, nowMs, outFetch);
+      // Counts only (log.ts allowlist): the rows themselves are the operator's
+      // worklist — `state = 'reconciled'` (D-0843(1)).
+      if (r.paid_ungranted > 0) logError({ cid: lease.holder, hop: "cron", msg: "credit_checkout_paid_ungranted", count: r.paid_ungranted });
+      if (r.checked > 0) logInfo({ cid: lease.holder, hop: "cron", msg: "credit_checkout_reconcile", scanned: r.checked, voided: r.expired, paid: r.paid_ungranted });
+    });
+    // S-2 (I23-RG-MONEY, D-0995(11); I23-FX-TC hand-off, landed by I23-FX-INT): the Stripe collection steps still owed,
+    // retried from their own audit rows (closures.ts retryCompromiseStripePauses), in four passes: the PAUSE of a
+    // compromise suspension (failed, never asked, or skipped while Stripe was unconfigured — JA-05); the RESUME after a
+    // lift (failed, or skipped — D-1005(b), RG-05); and the termination CANCEL and the erasure CANCEL skipped while
+    // Stripe was unconfigured (D-1010(6), JN-02 item 3). Each pass takes up to STRIPE_PAUSE_RETRY_ACCOUNTS rows; never
+    // throws per account; with no Stripe config the step returns before any pass runs. Counts only in the log
+    // (log.ts allowlist).
+    await step("retryCompromiseStripePauses", async () => {
+      const cfg = stripeConfigFromEnv(env as unknown as Record<string, unknown>);
+      if (!cfg) return;
+      const r = await retryCompromiseStripePauses(db, { stripe: cfg, fetchImpl: outFetch });
+      if (r.failed > 0) logError({ cid: lease.holder, hop: "cron", msg: "stripe_pause_retry_failed", count: r.failed, scanned: r.accounts });
+      // I21-Q49: an erasure that kept the Stripe customer because a cancel failed deletes it once that retry above has
+      // cancelled every failed subscription (account_data.ts settleErasedStripeCustomers; its second row is the record).
+      const cu = await settleErasedStripeCustomers(db, { stripe: cfg, fetchImpl: outFetch });
+      if (cu.failed > 0) logError({ cid: lease.holder, hop: "cron", msg: "erased_stripe_customer_delete_failed", count: cu.failed });
+    });
+    // BILLING-05 (D-1037; I29-FX-BILLING H1, wired by I29-FX-INT): the creator twin — a FAILED Creator Pro pause of a
+    // still-suspended creator is retried from its own audit rows (creator-close.ts retryCreatorStripePauses, <=
+    // STRIPE_PAUSE_RETRY_ACCOUNTS episodes, never throws per creator; its rows are the record). No Stripe config: not run.
+    // The same call also retries a failed Creator Pro cancel at termination (D-1051(3)) and, OPEN-ROWS B3 (I31), a failed
+    // Creator Pro RESUME after a lift (<= STRIPE_PAUSE_RETRY_ACCOUNTS lifted episodes a pass).
+    await step("retryCreatorStripePauses", async () => {
+      const cfg = stripeConfigFromEnv(env as unknown as Record<string, unknown>);
+      if (cfg) await (await import("./creator-close.js")).retryCreatorStripePauses(db, { stripe: cfg, fetchImpl: outFetch });
+    });
+    // I32 (I3-0040, D-1082(10); I32-FX1-DATA H1): a creator closure notice whose mail failed is re-sent from its own
+    // audit rows until sent or dead-lettered (creator-close.ts retryCreatorClosureNotices: <= STRIPE_PAUSE_RETRY_ACCOUNTS
+    // episodes a run, never throws per episode; CREATOR_CLOSURE_NOTICE_DEAD is the operator alert). No mail rail: nothing sent.
+    await step("retryCreatorClosureNotices", async () => {
+      const r = await (await import("./creator-close.js")).retryCreatorClosureNotices(db, { env: env as unknown as Record<string, unknown>, fetchImpl: outFetch });
+      if (r.failed > 0) logError({ cid: lease.holder, hop: "cron", msg: "creator_closure_notice_retry", count: r.failed, scanned: r.scanned });
+    });
+    // QUEUE #418 (D-0776): rows an erasure race left naming an account that no
+    // longer exists — bounded per table per run (collections.ts ORPHAN_SWEEPS).
+    await step("sweepOrphanAccountRows", () => sweepOrphanAccountRows(db));
+    // I29-MONEYKEEP H2 (I21-Q26/I20-Q3, I21-Q75, I24-Q1; landed by I29-INT): money records of erased accounts past their
+    // retention (<= MONEY_SWEEP_GROUPS_PER_RUN 50 groups), lifted closures past 6 years (<= ACCOUNT_CLOSURE_PRUNE_LIMIT 500)
+    // and supporter day snapshots past 90 days (one DELETE) — money-retention.ts, supporter-status.ts.
+    await step("sweepMoneyRecords", () => sweepMoneyRecords(db, nowMs));
+    await step("pruneAccountClosures", () => pruneAccountClosures(db, nowMs));
+    await step("pruneSupporterSnapshots", () => pruneSupporterSnapshots(db, nowMs));
+    // I29-CREATORERASE H1 (landed by I29-INT): creator wipes past their due instant (creator-erasure.ts, CREATOR_WIPE_LIMIT).
+    // D-1113(3) / D-1112(5) (I34-FX1-MONEY H1): the payout dependencies, so a residual is paid once before the wipe.
+    // D-1127(5), D-1126(6): the residual's Connect account read is handed the tick's fetch (its transfer is not: see outFetch).
+    await step("sweepCreatorWipes", () => sweepCreatorWipes(db, nowMs, CREATOR_WIPE_LIMIT, { env: env as unknown as Record<string, unknown>, accountFetch: outFetch }));
+    // I29-OPS H-INT (I21-Q82; landed by I29-INT): closed agencies' member emails and domains 30 days after closure,
+    // at most 4 batches of AGENCY_CLOSURE_SWEEP_BATCH per run, stopping when one reports nothing more.
+    await step("sweepClosedAgencies", async () => {
+      for (let i = 0; i < 4; i++) if (!(await sweepClosedAgencies(db, nowMs)).more) break;
+    });
+    // I39-OPS (D-1158 answer 4): move the one-signature account transfers that are due (console.ts
+    // runDueScheduledTransfers: at most 50 a run, oldest due first; a failed row stays scheduled for the next run).
+    await step("runDueScheduledTransfers", async () => {
+      const r = await runDueScheduledTransfers(db, mailerFromEnv(env as unknown as Record<string, unknown>, outFetch), nowMs, { env: env as unknown as Record<string, unknown> });
+      if (r.failed > 0) logError({ cid: lease.holder, hop: "cron", msg: "scheduled_transfers_failed", count: r.failed });
+    });
+    // I20-W1D (QUEUE #946 (a)), landed by I20-L01: fill passports.display_name_skeleton for rows written before
+    // migration 0207. Budget: one SELECT (<= DISPLAY_NAME_SKELETON_BACKFILL_LIMIT = 200 rows) + one batch per run;
+    // idempotent, a no-op once every live row is filled (population: passports rows predating 0207, finite and shrinking).
+    await step("backfillDisplayNameSkeletons", async () => (await import("./social.js")).backfillDisplayNameSkeletons(db));
+    // D-1025(3) (I28-FX-ERASE H1, landed by I28-FX-INT): creators closed before D-1024(4), and founding accounts
+    // terminated before D-1025(3), owe the face-enrolment erasure (creator-close.ts oweClosedCreatorFaceErasures).
+    // Budget: one SELECT (<= CLOSED_CREATOR_FACE_ERASURE_LIMIT = 100 passports) + one batch per run; idempotent, a no-op
+    // once every such passport carries its owed-mark (population: those pre-rule rows, finite and not growing).
+    // Q974-B15 (I28-TEACHBACK U7): the backlog drains in ONE pass while the rotation's budget lasts, each call logged.
+    await step("oweClosedCreatorFaceErasures", () => drainClosedCreatorFaceErasures(db, lease.holder, () => Date.now() - hygieneBegan < HYGIENE_BUDGET_MS));
+    // QUEUE #236 (D-0871(1)): a pre-removal stake whose war_queue row is gone
+    // (erasure, or the step above) goes back to its owner. Dynamic import: this
+    // change is scoped to scheduled() (war-instances.ts sweepOrphanEscrow).
+    // RJb-T-AS-016 / I3-0320 (D-0920; I16-W09C H-1, landed by I16-L10): waiting war_queue entries older than 24 h
+    // are voided (<=50/run) and any legacy escrow released, BEFORE the orphan-escrow sweep below.
+    await step("sweepStaleWarQueue", async () => (await import("./war-match.js")).sweepStaleWarQueue(db, nowMs));
+    await step("sweepOrphanEscrow", async () => (await import("./war-instances.js")).sweepOrphanEscrow(db));
+    // #241 (D-0920, I16-W05C H3): recon windows past their deadline that nobody came back to resolve with the
+    // standing champions (never voided on timeout). No publish binding: the outbox rows it writes go out on the cron drain.
+    await step("sweepWarRecon", async () => (await import("./war-match.js")).sweepWarRecon(db, r2Store(env.REGISTRY_BUCKETS)));
+    // I30-WAR: the weekly war flags (idempotent per kind and week, so every tick is safe).
+    await step("sweepWarFlags", async () => (await import("./war-match.js")).sweepWarFlags(db, nowMs));
+    // I3-1701 (I4-13-R13): R2 media objects no media_assets row references (>24h old, <=200/run, cursor in sweep_cursor).
+    await step("sweepMediaOrphans", async () => {
+      const s = mediaStore(env.MEDIA_BUCKET);
+      if (s) await sweepMediaOrphans(db, s);
+    });
+    await step("pruneBillingEvents", () => pruneBillingEvents(db, new Date(nowMs - 90 * 24 * 60 * 60 * 1000).toISOString()));
+    // M7: same hygiene for the Stripe dedup table. NOTE there is deliberately
+    // no entitlement sweep — the lapse is computed at READ time from
+    // paid_through + grace, so there is no stale tier column to fix.
+    await step("pruneStripeEvents", () => pruneStripeEvents(db, new Date(nowMs - 90 * 24 * 60 * 60 * 1000).toISOString()));
+    // I29-BILLING (I21-Q72; landed by I29-INT): unmatched early-refund notes past 400 days (entitlements-store.ts, bounded).
+    await step("pruneUnmatchedReversals", () => pruneUnmatchedReversals(db, nowMs));
+    // I29-BILLING (I21-Q80; landed by I29-INT): refund_owed rows on the Stripe rail are refunded from their own row
+    // (stripe.ts refundOwedStripe, <= REFUND_OWED_BATCH 10 rows, 2 subrequests each). No Stripe config: nothing runs.
+    await step("refundOwedStripe", async () => {
+      const cfg = stripeConfigFromEnv(env as unknown as Record<string, unknown>);
+      if (cfg) await refundOwedStripe(db, cfg, outFetch);
+    });
+    // Claim/proof challenges: expire live rows past their TTL (a live row holds
+    // the per-(account, caller) slot in `idx_claim_live`, and until this sweep
+    // existed nothing ever moved one out of 'issued'), then drop terminal rows
+    // past the retention window. `used` rows are never dropped — they ARE the
+    // control proof. See claims.ts `pruneClaimChallenges`.
+    // UI-AUDIT F-P4: unopened pack commitments that aged out. Housekeeping only
+    // — an expired commitment already refuses at open, so this is about the
+    // table not growing, never about correctness.
+    await step("pruneExpiredPackCommitments", () => pruneExpiredPackCommitments(db, nowMs));
+    await step("pruneClaimChallenges", () => pruneClaimChallenges(db, nowMs));
+    // Passkey challenges are short-lived and single-use; drop consumed/expired.
+    await step("prunePasskeyChallenges", () => prunePasskeyChallenges(db, nowMs));
+    // Expired OAuth session-handoff codes (2-min TTL; redeemed ones self-delete).
+    await step("pruneOAuthHandoffs", () => pruneOAuthHandoffs(db, nowMs));
+    // OAuth CHALLENGES — the twin of pruneClaimChallenges, and for the same
+    // reason: this table held the PKCE `code_verifier` indefinitely past the one
+    // moment it can be read (the 'issued' row completeOAuthClaim loads before
+    // flipping it to 'spent'), including on the `proven` rows that are kept
+    // forever. The sweep expires live rows past TTL, BLANKS the verifier on every
+    // settled row, and drops settled non-proven rows past retention. `proven` is
+    // never deleted — it IS the control proof.
+    await step("pruneOAuthChallenges", () => pruneOAuthChallenges(db, nowMs));
+    // Redemption-attempt log only needs a recent window for the abuse signal.
+    await step("pruneRedemptionAttempts", () => pruneRedemptionAttempts(db, new Date(nowMs - 180 * 24 * 60 * 60 * 1000).toISOString()));
+    // I3-0846 / RJ550b-W314-R8-7 (D-0920 option A): the cross-account dead-attempt watch (credentials.ts
+    // redemptionAbuseWatch); mails each operator at most once per UTC day. The operator list is the SAME
+    // accessConfigFromEnv predicate alertExplainRefusals reads (one source, not a re-parse of OPERATOR_EMAILS).
+    await step("redemptionAbuseWatch", () =>
+      redemptionAbuseWatch(db, httpEmailFromEnv(env as unknown as Record<string, unknown>, outFetch), accessConfigFromEnv(env as unknown as Record<string, unknown>)?.operatorEmails ?? [], nowMs),
+    );
+    // 0075 - archive-request tombstones whose day has passed. TIMING IS
+    // IRRELEVANT HERE, which is unusual enough to say: both readers require
+    // `erased_day >= today` and this deletes `erased_day < today`, so the two
+    // predicates are disjoint and no served value can depend on whether this
+    // step has run yet. See `pruneArchiveTombstones`.
+    await step("pruneArchiveTombstones", () => pruneArchiveTombstones(db, nowMs));
+    // 0157 (QUEUE #793) - the community-rating twin, same disjoint predicates.
+    await step("pruneCommunityTombstones", () => pruneCommunityTombstones(db, nowMs));
+    await step("settleArchivePublications", () => settleArchivePublications(db, nowMs));
+    // Expired handle reservations (the claim-time check ignores them anyway).
+    await step("pruneHandleReservations", () => pruneHandleReservations(db, nowMs));
+    // Spent OAuth nonces: keep a window well past an ID token's lifetime (24h),
+    // so an in-window replay is still caught by the single-use set.
+    await step("pruneNonces", () => pruneNonces(db, new Date(nowMs - 24 * 60 * 60 * 1000).toISOString()));
+    // Expired device-attach challenges (short-lived; the redeem check ignores
+    // them anyway — this just bounds the table).
+    await step("pruneDeviceChallenges", () => pruneDeviceChallenges(db, new Date(nowMs).toISOString()));
+    // I3-0203 b (I25-W1-IDENTITY H4): expired creator push-possession challenges (5-min TTL; the redeem ignores them anyway).
+    await step("pruneCreatorPushChallenges", () => pruneCreatorPushChallenges(db, new Date(nowMs).toISOString()));
+    // I30-OWNER: pending creator-device removals past their hold (digest.ts).
+    await step("pruneExpiredPushRemovals", () => pruneExpiredPushRemovals(db, new Date(nowMs).toISOString()));
+    // M2 fan-auth hygiene: used/expired WebAuthn challenges + dead OTP rows.
+    await step("pruneFanAuth", () => pruneFanAuth(db, nowMs));
+    // 0043 — the creator recovery OTPs. A code is dead at ten minutes and the
+    // rate-limit window looks back an hour, so nothing older is load-bearing —
+    // and `creator_otp` is a table an UNAUTHENTICATED caller can grow (every
+    // blocked and every unknown-address attempt writes a sentinel row, which is
+    // exactly what makes the route constant-shape). Left unswept it is an
+    // outsider-controlled table that only ever grows.
+    await step("pruneCreatorRecovery", () => pruneCreatorRecovery(db, nowMs));
+    // D-0939(7) (I17-J02): used / expired creator_reentry_grants, 90 days after use or expiry (<=100/run, recovery.ts).
+    await step("pruneReentryGrants", () => pruneReentryGrants(db, nowMs));
+    // 0044 — X1's assertion gate. One INSERT-only row per assertion, keyed by
+    // account_key, and dead the moment the fold no longer holds that key. See
+    // `pruneAssertionGate` for why the promise is asserted rather than inherited.
+    await step("pruneAssertionGate", () => pruneAssertionGate(db));
+    // 0051 — spent and expired one-click unsubscribe tokens. Not
+    // outsider-growable (only our own send path writes it), but a spent token is
+    // a record of one recipient having been mailed, and a row that decides
+    // nothing is a row not to keep. Swept past TWICE the TTL so the sweep can
+    // never be what makes a live unsubscribe stop working.
+    await step("pruneUnsubscribeTokens", () => pruneUnsubscribeTokens(db, nowMs));
+    // QUEUE #237 (W0-05(2)): an unconfirmed newsletter request leaves once its confirmation token has expired.
+    await step("pruneNewsletterPending", () => pruneNewsletterPending(db, nowMs));
+    // GROWTH-ONLY, not secrets. `rate_limits` takes one row per key and, apart
+    // from a creator releasing their own broadcast slot, never gave one back —
+    // so `fanreg:<masked-ip>` alone meant "every /24 that ever touched fan
+    // sign-up, forever". A row past twice the LONGEST window in use is already
+    // indistinguishable from an absent row for every caller (consumeRateLimit
+    // resets it, rateLimitCount reports 0), so dropping it cannot change an
+    // allow/deny decision. See ratelimit.ts for the full argument.
+    await step("pruneRateLimits", () => pruneRateLimits(db, nowMs));
+    // Dual-control sign-offs past `PENDING_SIGNOFF_TTL_MS`. The GATE already
+    // refuses to count them (same cutoff function), so this reclaims rows and
+    // changes no approve/deny decision — the same property `pruneRateLimits`
+    // has, for the same reason. See dual_control.ts.
+    await step("pruneStaleSignoffs", () => pruneStaleSignoffs(db, nowMs));
+    // I3-0275 (I16-W01C): seal the operator audit log forward from its last seal
+    // (admin.ts sweepAuditLogSeal); nothing else calls it, so without this step
+    // nothing is ever sealed.
+    await step("sweepAuditLogSeal", () => sweepAuditLogSeal(db, nowMs));
+    // I3-0858 (D-0920 option C, I16-W08A H3): mail every OTHER operator the single-operator actions in
+    // PEER_AUDIT_ACTIONS (admin.ts peerAuditDigest). The digest holds its cursor on any failed send, so a
+    // failure loses nothing; it is logged here with its counts so it is not silent.
+    await step("peerAuditDigest", async () => {
+      const r = await peerAuditDigest(db, env as unknown as Record<string, unknown>, mailerFromEnv(env as unknown as Record<string, unknown>, outFetch));
+      if (r.failed > 0) logError({ cid: lease.holder, hop: "cron", msg: "peer_audit_digest_failed", count: r.rows, sent: r.sent, failed: r.failed, pending: r.more }); // log.ts ALLOWED_KEYS: count = rows in the batch, pending = more rows wait
+    });
+    // F3: close gift offers past expiry (lazy expiry-on-read already refuses
+    // them; the sweep frees the sender's open-offer cap slots).
+    await step("sweepExpiredOffers", () => sweepExpiredOffers(db, nowMs));
+    await step("sweepExpiredHolds", () => sweepExpiredHolds(db, nowMs));
+    // D-0812(2): Ignore rows no offer can still be hidden by (bounded per run).
+    await step("pruneExpiredGiftBlocks", () => pruneExpiredGiftBlocks(db, nowMs));
+    // F7: lapse handshakes nobody answered. It writes NO ledger event and sends
+    // NO notification, on purpose — an expiry is the ABSENCE of an act, and
+    // minting a record of somebody not doing something is how "did not answer"
+    // becomes a number a fan or an operator later reads as a score. The sweep
+    // exists so an open row stops occupying the fan's and the creator's caps,
+    // and for nothing else.
+    await step("sweepExpiredHandshakes", () => sweepExpiredHandshakes(db, nowMs));
+    // F8: drop lapsed relink holds. Table hygiene only — a hold past its
+    // `until` already decides nothing, because `completeFanConnection` ignores
+    // one — so this never changes an answer, exactly like `pruneRateLimits`.
+    await step("sweepFanConnectionHolds", () => sweepFanConnectionHolds(db, nowMs));
+    // I3-1360 (I4-13-R12): re-send fan-report outcome notices a warning publish/retract left unsent (bounded, reports.ts).
+    await step("sweepReportOutcomeNotices", () => sweepReportOutcomeNotices(db, nowMs, evidenceStore(env)));
+    // F9: lapse questions nobody answered. No ledger event, no notification —
+    // F7's reasoning: an expiry is the absence of an act, and a record of
+    // somebody not doing something is how "did not answer" becomes a score.
+    await step("sweepExpiredQuestions", () => sweepExpiredQuestions(db, nowMs));
+    // F10 / #52: drop region counts past the 13-month window. No ledger event
+    // and nobody to notify — nothing in that table was ever about a person.
+    await step("sweepOldRegions", () => sweepOldRegions(db, nowMs));
+    // S-041 (C-45), wired in W2: `creator_day_claims` had no retention sweep at
+    // all. A claim gates the per-day increment of the region counts swept just
+    // above, so the two sit together; the windows differ. This one drops every
+    // claim from before the start of today's UTC day (codex.ts sweepOldDayClaims,
+    // `claimed_day < dayOf(now)`; Q143), not the 13-month window above.
+    await step("sweepOldDayClaims", () => sweepOldDayClaims(db, nowMs));
+    // F11 / #39: drop exposure rows for retracted or delisted passports. The
+    // row records that a creator was under the small-creator size ceiling on
+    // given dates, which is not something to keep about somebody who asked to
+    // be gone.
+    await step("sweepDiscoveryExposure", () => sweepDiscoveryExposure(db));
+    // F13 / HANDOFF §1.1: fold the listed domains and names whose skeletons are
+    // missing or stale, so the lookalike gate stops re-folding unchanged rows on
+    // every verify. A cache of a pure function keyed on its own input — a stale
+    // entry is ignored, never trusted, so no verdict depends on this running.
+    await step("buildBrandIndex", () => buildBrandIndex(db, nowMs));
+    await step("sweepBrandIndex", () => sweepBrandIndex(db));
+    // F14 / HANDOFF §1.2: re-check the TXT record on every agency-proven apex,
+    // oldest first. This is the AGENCY'S REMEDY made real — drop the record and
+    // the apex stops relaxing the subdomain rule within the window — and it is
+    // the reason the window is a window rather than a promise. Fail-closed the
+    // other way round from the rest of this block: a resolver outage must not
+    // delete everybody's authorization, so absence only lapses a row that is
+    // ALREADY past the window (`agency-domains.ts sweepAgencyDomains`). Skipped
+    // rather than half-run without a resolver, for the same reason the start
+    // door 503s: an unverifiable proof is not a proof.
+    {
+      const resolver = dohResolverFromEnv(env as unknown as Record<string, unknown>);
+      // I3-0660: `dohTxtAnswer` keeps "no answer" as null, so a resolver outage is UNCHECKED, never absence.
+      if (resolver) await step("sweepAgencyDomains", () => sweepAgencyDomains(db, dohTxtAnswer(resolver, outFetch), nowMs));
+    }
+    // The broadcast cap log is read only inside a creator's frequency window (a
+    // week at most) and written once per send, forever; the durable RECORD is
+    // the `creator_broadcast` ledger event each row points at. Retention is
+    // deliberately ~13x the longest read window: a cap log pruned too eagerly
+    // hands a creator a second broadcast to every follower.
+    await step("pruneBroadcastLog", () => pruneBroadcastLog(db, nowMs));
+    // NOTIFICATIONS — the table with the most writers and, until now, no
+    // retention at all. One row per notable ledger event per saver, `delivered`
+    // and `emailed` only ever moving a row between states, nothing ever removing
+    // one. Both delivery legs scan it. See alerts.ts `pruneNotifications`.
+    await step("pruneNotifications", () => pruneNotifications(db, new Date(nowMs - NOTIFICATION_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString()));
+    // I4-08-R7 hand-off: creator digests carry the same retention duty.
+    await step("pruneCreatorDigests", () => pruneCreatorDigests(db, new Date(nowMs - CREATOR_DIGEST_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString()));
+    // M28 RETENTION: a closed removal request's requester-supplied PII (contact
+    // email + free-text detail) is scrubbed after the window; the case-file row
+    // (state/intent/path) is kept for the operator audit. Personal data with no
+    // decision left to inform must not sit in the table forever.
+    await step("pruneRemovalPii", () => pruneRemovalPii(db, new Date(nowMs - REMOVAL_PII_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString()));
+    // I54-FX-PRIV REQ-02: a subject's own delisting under a hold owes its name erase; re-asks the hold every run (requests.ts).
+    await step("sweepSubjectEraseOwed", () => sweepSubjectEraseOwed(db, new Date(nowMs).toISOString())); await step("sweepImageFaceEraseOwed", async () => { const peer = imageFaceErasePeer(env as unknown as Record<string, unknown>); if (peer) await sweepImageFaceEraseOwed(db, peer, new Date().toISOString()); }); // I65-HOLD H1, I65-FX-FACE R1: one line; no IMAGE_SERVICE binding = no peer = nothing attempted, the owed markers stay
+    // I30-PRIVACY H1: nomination notes past the same window as removal PII (nominations.ts).
+    await step("pruneNominationNotes", () => pruneNominationNotes(db, new Date(nowMs - REMOVAL_PII_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString()));
+    // I29-PRUNES (landed by I29-INT), each bounded by its module's limit: creator profile history past 90 days (I23-Q8b),
+    // decided recovery cases' PII past RECOVERY_CASE_PII_RETENTION_DAYS (I21-Q93), likeness prompts and, once a vendor is
+    // configured, finished jobs (I22-Q6/I6-Q6), and corrupt analytics day events on ANALYTICS_DB.
+    await step("pruneCreatorProfileHistory", () => pruneCreatorProfileHistory(db, nowMs));
+    await step("pruneRecoveryCasePii", () => pruneRecoveryCasePii(db, new Date(nowMs - RECOVERY_CASE_PII_RETENTION_DAYS * 24 * 60 * 60 * 1000).toISOString()));
+    await step("pruneLikenessPrompts", () => pruneLikenessPrompts(db, nowMs, likenessVendorConfigured(env)));
+    if (env.ANALYTICS_DB) {
+      const adb = d1(env.ANALYTICS_DB);
+      await step("pruneCorruptDayEvents", () => pruneCorruptDayEvents(adb, nowMs));
+    }
+    // D-0647 / D-0685 (QUEUE #562): published report evidence past
+    // PUBLISHED_EVIDENCE_RETENTION_DAYS is DELETED, R2 object then row, not
+    // merely unreadable. Bounded per run (PUBLISHED_EVIDENCE_SWEEP_LIMIT, oldest
+    // first); a missing bucket with rows due throws and is logged by `step`.
+    await step("purgeExpiredPublishedEvidence", () => purgeExpiredPublishedEvidence(db, evidenceStore(env), new Date(nowMs).toISOString()));
+    // QUEUE #564 (D-0686, D-0848(3)): an erased account's evidence objects whose
+    // post-commit delete failed (or never ran) are carried in
+    // `erasure_evidence_purges`; this is the only path that still reaches them.
+    // Its OWN step, not the analytics tick. No bucket bound: logged, rows kept.
+    await step("drainErasedEvidence", () => drainErasedEvidence(db, evidenceStore(env), () => new Date(nowMs).toISOString()));
+    // I29-FANERASE H4 (I21-Q101, I20-Q4; landed by I29-INT): scan-match links of closed evidence released, and pending
+    // dispute fingerprints past their hold dropped (evidence.ts, account_data.ts; each bounded).
+    await step("releaseClosedEvidenceScanLinks", () => releaseClosedEvidenceScanLinks(db));
+    await step("dropExpiredPendingFingerprints", () => dropExpiredPendingFingerprints(db, nowMs));
+    // I29-RECORDS H-2 (landed by I29-INT): fan reports tombstoned 180 days after closing (I21-Q91), decision trails
+    // reduced to hashes (I21-Q103), sealed audit ranges pruned and recorded (I4-Q9), and the restore journal past its
+    // window (only when ERASURE_JOURNAL_BUCKET is bound).
+    await step("sweepFanReportTombstones", () => sweepFanReportTombstones(db, nowMs));
+    await step("sweepDecisionTrails", () => sweepDecisionTrails(db, nowMs));
+    await step("pruneSealedAuditRanges", () => pruneSealedAuditRanges(db, nowMs));
+    await step("pruneRestoreJournal", async () => {
+      const js = restoreJournalStore(env as unknown as Record<string, unknown>);
+      if (js) await pruneRestoreJournal(db, js, nowMs);
+    });
+    // D-1043(1) (I30-CLOSE H1): re-put restore-journal acts whose R2 write failed (restore_journal_pending, 0251).
+    await step("sweepRestoreJournalPending", async () => {
+      const js = restoreJournalStore(env as unknown as Record<string, unknown>);
+      if (js) await sweepRestoreJournalPending(db, js);
+    });
+
+    // Award Founding badges to any newly-qualifying creators (bounded sweep),
+    // then allocate registry join numbers in CLAIM order (window item 9).
+    await step("sweepFounding", () => sweepFounding(db));
+    await step("sweepJoinNumbers", () => sweepJoinNumbers(db));
+    // Audit #19 — materialise Founding Fan ranks for any newly-claimed passport
+    // (bounded, idempotent, deterministic: every row is a function of the
+    // ledger's claim instant and the already-frozen request set).
+    await step("sweepFoundingFanRanks", () => sweepFoundingFanRanks(db));
+
+    // Promote payout tags whose cooling-off elapsed (the public presentation
+    // read is read-only, so cron owns the actual row promotion).
+    await step("sweepDuePayoutTags", () => sweepDuePayoutTags(db, nowMs));
+    // I3-0182: every hygiene site above only COLLECTED; this runs them.
+    await runHygieneRotation();
+    }
+    // A tail-only run never ran the rotation, so `step` is still collecting: run at once from here.
+    hygieneSteps = null;
+    // I13-CRON: SWEEP_CRON ends with the head; the legs below run on their own
+    // TAIL_*_CRON triggers. A tail runs only on a fresh 'ok' chain verdict.
+    if (headOnly) return;
+    if (tailOnly !== null && !(await chainVerdictFresh())) {
+      logError({ cid: lease.holder, hop: "cron", msg: "tail_refused_chain_unverified", detail: tailOnly });
+      return;
+    }
+
+    // ADR-0006: the day object is a FUNCTION OF (creator, UTC day), so nothing
+    // here rations a compute any more. F12's slot machinery existed because the
+    // RESULT depended on when the builder ran; a day object contains exactly the
+    // cells that have sealed, so two builds at two instants emit identical bytes
+    // and the creator's own read builds their own day (`analytics-read.ts`).
+    //
+    // WHAT IS LEFT ON THE TICK is the one thing a creator read cannot cover: an
+    // AGENCY read never builds (O-18/C5), so a bounded, round-robin pre-build
+    // keeps the agency mirror answerable for creators who have not opened their
+    // own dashboard since the day turned.
+    //
+    // BEHIND A LEASE FENCE, unchanged, and asked before BOTH steps: the sweep
+    // DELETES objects, and a pre-build long enough to lapse the lease is long
+    // enough to lapse it here. Placed AFTER the hygiene sweeps (RUN-0004 L0):
+    // this is the first fence on the tick that ENDS the run; every fence above it
+    // skips only its own step (scheduled-isolation.test.ts pins that a run which
+    // has lost its lease skips the verification-expiry sweep and the steps beside it).
+    // `stillLeased` is passed DOWN so a lapse mid-sweep stops it where it is.
+    if (!(await stillLeased())) {
+      logError({ cid: lease.holder, hop: "cron", msg: "scheduled sweep STOPPING - before day-object prebuild" });
+      return;
+    }
+    // I13-FX1 (I13-RG-OPS-04): THE ARTIFACTS LEGS SEE THE METERED HANDLES. `db`, `store` and
+    // `env` are shadowed for this block only (on the artifacts trigger they are `art`'s metered
+    // ones; on a manual run `art` hands back the originals), so the leg call sites read as
+    // before. The scaffolding — tailLeg, the lease fences, the in-flight rows — was bound
+    // above to the UNMETERED handles and keeps its headroom.
+    {
+    const db = art.db;
+    const store = art.store;
+    const env = art.env;
+    // I13-FX7 (D-0891(1), JA-09): buildSweep asks its lease fence once per creator, so on the
+    // artifacts trigger the fence is the METERED renewal (`db` is art.db here) — charged like
+    // every other statement of the leg, not to the scaffolding's fixed allowance — and the leg
+    // runs under a SHARE of the budget that leaves ARTIFACTS_PURGE_RESERVE for the purge below.
+    // It stops before a creator once less than BUILD_SWEEP_CREATOR_HEADROOM is left, so the
+    // report is still recorded; the share's hard refusal is the backstop. Manual run: as before.
+    const buildOwned = art.metered
+      ? async (): Promise<boolean> => {
+          if (leaseLost) return false; // I43-FX-LEASE (D-1254, RG-6): a latched loss answers false, as stillLeased does
+          try {
+            const ok = await renewCronLease(db, lease, Date.now(), leaseTtlMs);
+            if (!ok) fenceLost = true; // I41-LEASE: as stillLeased records it
+            return ok;
+          } catch (e) {
+            return fenceThrew(e);
+          }
+        }
+      : stillLeased;
+    await tailLeg("artifacts", "buildSweep", () => step("buildSweep", async () => {
+      art.share(TAIL_ARTIFACTS_LEG_BUDGET - ARTIFACTS_PURGE_RESERVE);
+      try {
+        const report = await buildSweep(db, d1(env.ANALYTICS_DB), r2Store(env.REGISTRY_BUCKETS), nowMs, undefined, buildOwned, () => art.left() >= BUILD_SWEEP_CREATOR_HEADROOM, undefined, lease); // I67 O5: the report write is bound to this leg's lease
+        logInfo({ cid: lease.holder, hop: "cron", msg: BUILD_SWEEP_MARKER, marker: BUILD_SWEEP_MARKER, ...buildSweepLogFields(report) });
+        return report;
+      } finally {
+        art.share();
+      }
+    }));
+    // QUEUE #515 (D-0653, "stamp it the moment it commits"), W3-11-R10's residual
+    // retraction window: the retraction purge runs IMMEDIATELY after the build,
+    // with no lease fence between them, so `passports.retracted` is read AFTER
+    // every day-object write of this tick has resolved and no early return can
+    // leave an object built for a creator who retracted during the build until
+    // the next tick. (It used to sit behind the "before frozen snapshot" fence.)
+    // THE ERASURE RECORD NAMES ITS SUBJECT (W3-10 item 2, closing FX2's
+    // `onSubjectFailed`, `analytics-build.ts:330`, whose production door count
+    // was ZERO until this line). `purgeFrozenAnalytics` throwing on one
+    // retracted creator is recorded in the sweep as a COUNT, and a count does
+    // not tell an operator WHICH creator still has day objects in the bucket —
+    // so erasure could not be re-run for them. The id cannot go where the count
+    // goes (it is a platform log; erasure does not reach it), so it goes to an
+    // `audit_log` row keyed on `item_id`, in the DB, inside the erasure
+    // perimeter, which is what `deleteAccount`'s post-erasure `subscriptionAudit`
+    // (`account_delete:post_erasure_failed`, account_data.ts) does for the same residual
+    // on the account-deletion path.
+    // I13-FX7: the pinned purge spends at most ARTIFACTS_PURGE_SHARE a tick, so a purge that
+    // cannot finish (a large retracted set) never starves the legs after it of every tick.
+    await tailLeg("artifacts", "sweepFrozenSnapshots", () => step("sweepFrozenSnapshots", async () => {
+      // I13-FX12 (D-0894(2)(3)): the share ends at `purgeEnd`, and the lap stops short of it by two reserves —
+      // ARTIFACTS_RETENTION_RESERVE for the retention phase, and one statement per REAL failure so far for that
+      // subject's audit row. Retention runs up to `purgeEnd - unerased.length`; the audit rows run up to `purgeEnd`.
+      // I14-FX2 (QUEUE #912, I14-CAPS HANDOFF-1): nor past what the legs after it are owed (ARTIFACTS_LEGS_AFTER_PURGE). I14-FX5: no floor —
+      // art.spent() here is buildSweep's spend (<= BUILD_SWEEP_SUBREQUEST_CAP), so 960 - 452 - 270 >= ARTIFACTS_PURGE_RESERVE (i14-fx5-reserves.test.ts).
+      // MEASURED (I34-W3-MONEY, test/i34-w3money-purge-reserve.test.ts): buildSweep stopped at its cap, the share is 264
+      // (art.spent() 244); the tail scaffolding's statements before buildSweep are not on this meter.
+      const purgeEnd = Math.min(TAIL_ARTIFACTS_LEG_BUDGET, art.spent() + ARTIFACTS_PURGE_SHARE, TAIL_ARTIFACTS_LEG_BUDGET - ARTIFACTS_LEGS_AFTER_PURGE);
+      const unerased: string[] = [];
+      const lap = (): void => art.share(purgeEnd - ARTIFACTS_RETENTION_RESERVE - unerased.length);
+      lap();
+      let removed = 0;
+      try {
+        // I13-FX11 (FX10-lead1): the share refusing a statement defers the rest of the lap; it is not a creator's failure.
+        removed = await sweepFrozenSnapshots(db, r2Store(env.REGISTRY_BUCKETS), nowMs, d1(env.ANALYTICS_DB), (psp) => {
+          unerased.push(psp);
+          lap();
+        }, (e) => e instanceof TailBudgetExhausted, () => art.share(purgeEnd - unerased.length), () => leaseLost || fenceLost, lease); // I40TER-P8, I41-LEASE: lost by the timer or at a fence; I67 O5: the cursor write is bound to this leg's lease
+      } finally {
+        // I13-FX13 (I13-FX12-c): the audit rows are written whether the sweep returned or threw (a retention listing
+        // error is rethrown); `recordUnerasedSubject` swallows its own failure, so it cannot mask that throw.
+        try {
+          art.share(purgeEnd);
+          for (const psp of unerased) await recordUnerasedSubject(db, lease.holder, psp, new Date(nowMs).toISOString());
+        } finally {
+          art.share();
+        }
+      }
+      return removed;
+    }));
+    // 0080 - the two ROI tombstone tables. MUST run AFTER `buildSweep`
+    // (RUN-0012 C-3): the sweep's own day objects are built at `T =
+    // shiftDay(today, -1)` (`analytics-build.ts:149`), one day BEHIND this
+    // prune's `erased_day < today` cutoff, so `readLegacyFacts`'s
+    // `erased_day >= T` reader and this delete are NOT disjoint when a fan
+    // erased late on `T` — see `analytics-read.ts:515-523`. Running this
+    // AFTER the buildSweep leg above means this tick's own round-robin
+    // pre-builds (`buildDayIfMissing`'s `putIfAbsent`, sealed once) read the
+    // tombstone before it can be deleted; a (creator, T) buildSweep does not
+    // touch this tick is unaffected by the reorder either way, same as
+    // before.
+    await tailLeg("artifacts", "pruneRoiTombstones", () => step("pruneRoiTombstones", () => pruneRoiTombstones(db, nowMs)));
+    // The fence that stood in front of the character-lapse sweep before I3-1010
+    // moved that sweep above the registry plan: the artifact legs below are
+    // expensive, and a run that lost its lease has no business starting them.
+    if (!(await stillLeased())) {
+      logError({ cid: lease.holder, hop: "cron", msg: "scheduled sweep STOPPING - before artifact legs" });
+      return;
+    }
+
+    // WORDING DRIFT — the OTHER mutable projection. The chain proves nothing was
+    // rewritten in `trust_events`; a published warning's accusatory SENTENCE
+    // lives in the mutable `wordings` table and the ledger commits to its bytes.
+    // The detector existed and had no callers, so "one UPDATE rewrote a published
+    // accusation" was as undetected as it was before the commitment was built.
+    // Isolated: a drift alarm must never be able to take the sweep down.
+    await tailLeg("artifacts", "wordingDrift", async () => {
+      try {
+        const drift = await wordingDrift(db);
+        if (drift.rows.length > 0) {
+          logError({ cid: lease.holder, hop: "cron", msg: "wording_drift", count: drift.rows.length });
+        }
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "wording_drift_sweep", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+
+    // Most Requested ranking + leaderboards — precomputed here so the public
+    // routes are reads. ISOLATED like every other artifact leg: these are R2
+    // writes, and a discovery artifact failing to rebuild must not cost the
+    // alert, digest and delivery legs below it. (They were the last two
+    // unguarded artifact calls in this handler.)
+    await tailLeg("artifacts", "discoveryArtifacts", async () => {
+      try {
+        await buildTopRequested(db, store);
+        await buildLeaderboards(db, store, Date.now());
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "discovery_artifacts", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+    // S81 discovery rankings + impersonation intelligence — ISOLATED so an
+    // aggregate failure never kills the hygiene sweeps below.
+    await tailLeg("artifacts", "buildRankings", async () => {
+      try {
+        await buildRankings(db, store, Date.now());
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "rankings_sweep", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+    // #240a/#240b (D-0920(3), I16-W04F HO-1): this week's Creator Wars standings artifact
+    // (war-match.ts buildWarStandings), served by GET /war/standings — ISOLATED like the legs above.
+    await tailLeg("artifacts", "warStandings", async () => {
+      try {
+        await buildWarStandings(db, store, Date.now());
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "war_standings", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+    // I4-05-R8 hand-off (I3-0898 legacy residue): once, empty every top-fans
+    // artifact written before buildRankings' tombstones for a creator the
+    // current discovery artifact does not board. Isolated like the leg above.
+    await tailLeg("artifacts", "purgeLegacyTopFans", async () => {
+      try {
+        await purgeLegacyTopFans(env.REGISTRY_BUCKETS);
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "topfans_legacy_purge", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+
+    // Power Ratings + weekly editions. The live card is published WHOLE every
+    // sweep as RATINGS_SHARDS shard objects (QUEUE #126 L4, D-0710: always
+    // current); the per-creator objects stay batched (RATINGS_BATCH creators per
+    // sweep, cursor-rotated) so the per-invocation subrequest cap can't be blown
+    // at scale. This sweep freezes its own batch's editions; the rest of the
+    // population is frozen by `freezeWeeklyEditionsStep` on the analytics
+    // trigger above (QUEUE #774). ISOLATED so an artifact failure
+    // never kills the hygiene sweeps below (review finding).
+    await tailLeg("artifacts", "ratings", async () => {
+      try {
+        const { batch } = await buildPowerRatings(db, store, Date.now());
+        await buildWeeklyEditions(db, store, batch, Date.now());
+        // Anchor completed weeks' edition sets into the hash-chained ledger
+        // (tamper-evidence for "old editions never change").
+        // The appender rides a UNIQUE(week) lock row into the same atomic batch as
+        // the event, and answers null when this week is already anchored — which
+        // is what makes `anchorCompletedWeeks` SKIP the week rather than append a
+        // second `edition_set_anchored` for it. See edition-anchor.ts.
+        // THE LEDGER HANDLE IS THE RECOVERY ARM (S-070 SJ-07). `appendAnchor`
+        // rides the `edition_set_anchors` UNIQUE(week) row into the same atomic
+        // batch as the event, so a crash between that commit and the R2 put
+        // leaves the week anchored with no public artifact — and every later
+        // sweep loses the same row, gets `null`, and skips the week forever. The
+        // repair (ratings.ts: read the committed row back, require it to be
+        // byte-identical to the recomputed set, then finish the object write)
+        // needs a READ of the already-committed row, which is why the parameter
+        // exists. It is OPTIONAL and last, so omitting it compiled, typechecked
+        // and passed every test while `if (db === null) continue` was what
+        // actually ran in production. `undefined` for the two defaults in
+        // between, so `now` and `weeksBack` keep the values they had.
+        // I14-FX2 (QUEUE #912, I14-CAPS HANDOFF-4): member reads are held to RATINGS_ANCHOR_MEMBER_BUDGET, inside the
+        // leg's RATINGS_ANCHOR_ALLOWANCE (ratings.ts), not the default 400; a partial week resumes from its checkpoint.
+        // I19-FXB (JN-B02 W1D:5): and its whole spend to RATINGS_ANCHOR_ALLOWANCE (the meter in anchorCompletedWeeks).
+        await anchorCompletedWeeks(store, Date.now(), editionSetAnchorAppender(db), undefined, undefined, db, lease.holder, RATINGS_ANCHOR_MEMBER_BUDGET, undefined, RATINGS_ANCHOR_ALLOWANCE); // I4-04-R5 hand-off (I3-0949): the sweep's cid
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "ratings_sweep", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+
+    }
+    // Fold new events into Save Creator alerts and attempt push delivery via
+    // the real APNs/FCM adapters. Each provider self-disables if its secret is
+    // absent/placeholder, in which case that platform's alerts stay pullable
+    // via /account/notifications and retry once the secret is supplied.
+    //
+    // ISOLATED, LIKE EVERY OTHER LEG HERE — and it was the ONE that was not.
+    // Every neighbouring sweep had its own try/catch and this call, the most
+    // expensive and least bounded of them, had none; `scheduled()` is
+    // `try{}finally{}` with no catch, so a throw here killed the email leg,
+    // face triage, the digests and (before the reorder above) fourteen retention
+    // prunes and the verification-expiry sweep. The fan-out itself is bounded now
+    // (alerts.ts), so a throw is unlikely — which is exactly the argument that
+    // was made for not needing a catch here in the first place.
+    // I3-1123: LEASE RE-ASSERT BEFORE THE PUSH LEG. It is read-then-send, like
+    // the email leg below, and the artifact legs above it can run long enough to
+    // lapse the lease; a successor would then push the same rows a second time.
+    if (!(await stillLeased())) {
+      logError({ cid: lease.holder, hop: "cron", msg: "scheduled sweep STOPPING - before push" });
+      return;
+    }
+    const sender: PushSender = pushSenderFromEnv(env as unknown as Record<string, unknown>, outFetch);
+    await tailLeg("delivery", "processNewEvents", async () => {
+      try {
+        const alerts = await processNewEvents(db, sender, undefined, { cid: lease.holder });
+        if (alerts.truncated) {
+          logError({ cid: lease.holder, hop: "cron", msg: "alert_backlog", seq: alerts.watermark });
+        }
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "alert fan-out", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+    // The saver half of a payout-change alert, off the money write and onto the
+    // cron. `payout.ts` commits ONE marker row inside the atomic batch that
+    // carries the signed payout events; this turns it into notifications in
+    // bounded pages. See alerts.ts `sweepPayoutChangeFanout` for why an
+    // unbounded fan-out inside that batch made the emergency retraction FAIL for
+    // exactly the accounts with the most followers.
+    await tailLeg("delivery", "sweepPayoutChangeFanout", async () => {
+      try {
+        const fan = await sweepPayoutChangeFanout(db);
+        if (fan.markers > 0) {
+          logError({ cid: lease.holder, hop: "cron", msg: "payout_change_fan_out", notified: fan.notified, markers: fan.markers });
+        }
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "payout_change_fan_out", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+    // Second channel: email un-emailed alerts to opted-in accounts with a
+    // verified email. Self-disables when EMAIL_* secrets are absent (null
+    // sender), so alerts stay pullable + retry once configured.
+    //
+    // LEASE RE-ASSERT. The push leg above just spent up to DELIVERY_BUDGET_MS
+    // talking to APNs/FCM; if that (or anything before it) pushed this run past
+    // the lease TTL, a successor is already running and mailing the same rows
+    // twice is the exact failure the lease was bought to prevent. Stop instead.
+    if (!(await stillLeased())) {
+      logError({ cid: lease.holder, hop: "cron", msg: "scheduled sweep STOPPING - midrun" });
+      return;
+    }
+    await tailLeg("delivery", "deliverPendingEmail", async () => {
+      try {
+        const emailSender = httpEmailFromEnv(env as unknown as Record<string, unknown>, outFetch);
+        // appOrigin(), not the raw var: env-config.ts already names alert mail as
+        // an APP_ORIGIN consumer whose links are OMITTED when the value is absent
+        // or misshapen, and alertEmail puts this straight into an href.
+        await deliverPendingEmail(db, emailSender, appOrigin(env) ?? undefined, { oneClickBase: publicBase(env), postalAddress: senderPostalAddressFromEnv(env as unknown as Record<string, unknown>) });
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "email_alerts", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+
+    // S66 face-triage sweep (docs/FAN-REPORT-TRIAGE-PLAN.md Stage 4). Runs
+    // ONLY when the operator has flipped the ops setting AND the image-service
+    // binding + internal secret are configured — every leg fails closed to the
+    // human triage path. With no wired embedder the image service answers from
+    // the exact-photo check alone (D-0911(4B), I3-0027). Batched + isolated: a
+    // failure never kills the sweeps below.
+    await tailLeg("digests", "faceTriageSweep", async () => {
+      try {
+        const triageSetting = await getSetting(db, FACE_TRIAGE_ENABLED);
+        // I21-Q15 (D-1030; I34-NJ item 7): off as a RULE until counsel's answer is recorded (face-triage.ts faceTriageOn),
+        // whatever the setting and the secret say; the probe is not even made. Said once per sweep, like not-armed.
+        const on = faceTriageOn(triageSetting);
+        if (!on && triageSetting === "1") logError({ cid: lease.holder, hop: "cron", msg: "face_triage_held_for_counsel" });
+        const armed = on ? await faceTriageArmed(triageSetting, env) : null;
+        // I3-0027 detection: the operator asked for triage and it did not arm
+        // (missing binding/secret). One line per sweep, so the console's "on" is
+        // never silently a no-op. D-0911(4B): armed with no wired embedder runs
+        // the exact-photo check only, and says so once per sweep.
+        if (!armed && on) logError({ cid: lease.holder, hop: "cron", msg: "face_triage_not_armed" });
+        if (armed && !armed.embedderWired) logError({ cid: lease.holder, hop: "cron", msg: "face_triage_exact_only" });
+        if (armed) {
+          const { svc, secret } = armed;
+          const matcher = faceTriageMatcher(svc, secret, lease.holder);
+          const wordingId = await getSetting(db, FACE_TRIAGE_WORDING);
+          // I38-TICK (I34 census B19, JA-03; D-1122(3)): the page and image fetches go on the tick's fetch.
+          await faceTriageSweep(db, { matcher, wordingId: wordingId && wordingId.length > 0 ? wordingId : null, cid: lease.holder, fetchImpl: outFetch });
+        }
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "face_triage_sweep", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+
+    // S68 creator roundup digests: generate (idempotent per period — daily
+    // covers yesterday, only stored as deliverable when notable; weekly covers
+    // the prior completed week, always) then deliver on all three channels
+    // (in-app = the rows themselves; email = verified contacts; push =
+    // registered creator tokens). Batched + isolated.
+    //
+    // Second lease re-assert, for the same reason as the first: `deliverDigests`
+    // mails and pushes, and doing that from two overlapping runs is the
+    // duplicate-send `cron-lease.ts` exists to stop.
+    if (!(await stillLeased())) {
+      logError({ cid: lease.holder, hop: "cron", msg: "scheduled sweep STOPPING - before digests" });
+      return;
+    }
+    // I13-CRON: generation and delivery are two legs, so a generation that kills
+    // the invocation is held (tailLeg) and delivery still runs on the next ticks.
+    await tailLeg("digests", "generateDigests", async () => {
+      try {
+        // I13-FX1 (D-0889(3)): ONE budget (DIGEST_GENERATE_BUDGET) for every call this run makes, owed periods first.
+        // I14-CRON (QUEUE #916): the body is `generateDigestPass`, shared with the five-minute leg, under ONE lease.
+        await withCronLease(db, DIGEST_GENERATE_LEASE, (guard) => generateDigestPass(db, store, DIGEST_GENERATE_BUDGET, lease.holder, Date.now(), { lease: guard }), Date.now(), ANALYTICS_LEASE_TTL_MS);
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "digest_sweep", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+    await tailLeg("digests", "deliverDigests", async () => {
+      try {
+        const digestEmail = httpEmailFromEnv(env as unknown as Record<string, unknown>, outFetch);
+        // PC-05: delivery's batch is 100. I13-CRON correction: generation is NOT
+        // "100 rows/tick" as this said — each generateDigests call reads up to
+        // `maxPages` (default 40) pages of `batch` (50) creators. Since I13-FX1 every
+        // call of a run is charged against ONE DIGEST_GENERATE_BUDGET (generateDigestPass;
+        // alerts.ts THE BUDGETS).
+        await deliverDigests(db, digestEmail ?? (async () => false), sender, publicBase(env), { consoleOrigin: consoleOrigin(env), batch: DIGEST_RUN_CAPACITY, cid: lease.holder, postalAddress: senderPostalAddressFromEnv(env as unknown as Record<string, unknown>) });
+        logInfo({ cid: lease.holder, hop: "cron", msg: "digest_backlog", ...(await digestBacklogFields(db)) });
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "digest_sweep", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+    // I3-0598 (D-0920 B, D-0922(6)): yesterday's platform-wide explain-outcome counters; over the threshold every
+    // operator is mailed ONCE (alerts.ts alertExplainRefusals claims the day first). 3 D1 statements + one send per
+    // operator, on its own leg so a fault here never costs the digests above it.
+    await tailLeg("digests", "alertExplainRefusals", async () => {
+      try {
+        const yesterday = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10);
+        const ops = accessConfigFromEnv(env as unknown as Record<string, unknown>)?.operatorEmails ?? [];
+        await alertExplainRefusals(db, httpEmailFromEnv(env as unknown as Record<string, unknown>, outFetch), ops, yesterday);
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "explain_refusal_alert", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+    // I3-0567 a (I22-FX-HUB): open data-subject requests within 7 days of their statutory deadline, or past it, are
+    // mailed to every operator (alerts.ts alertDsrDeadlines: due-soon once per request, overdue once per request per
+    // day). 1 read + at most DSR_ALERT_SCAN (50) claim writes + one send per operator, on its own leg.
+    await tailLeg("digests", "alertDsrDeadlines", async () => {
+      try {
+        const ops = accessConfigFromEnv(env as unknown as Record<string, unknown>)?.operatorEmails ?? [];
+        await alertDsrDeadlines(db, httpEmailFromEnv(env as unknown as Record<string, unknown>, outFetch), ops, Date.now());
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "dsr_deadline_alert", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // OUTBOUND MONEY AND THE WEEKLY ODDS TABLE RUN LAST — and the argument.
+    // ─────────────────────────────────────────────────────────────────────────
+    // These are the two legs in this handler whose cost scales with a population
+    // nobody in the handler bounds, and whose work is OUTBOUND: N Stripe
+    // transfers, and 5 subrequests per opted-in creator. The merge resolution
+    // put both of them AHEAD of delivery — the payout run in the hygiene group
+    // beside `sweepDuePayoutTags`, and pack odds between the ratings sweep and
+    // `processNewEvents` — and that is the wrong side of the line in three
+    // separate ways:
+    //
+    //  1. WHAT DIES WHEN THE BUDGET RUNS OUT. One invocation gets ~1000
+    //     subrequests for every leg in it. Measured (test/payout-run-bounds.test.ts),
+    //     the unpaged payout run spent 2402 of them at 400 connected creators and
+    //     1202 with nothing owed at all, against the ~585 `alerts.ts` already
+    //     budgets for the alert legs alone — so past ~80-130 connected creators
+    //     this leg exhausted the invocation, and running FIRST meant what died was
+    //     the safety pushes, the payout-change fan-out and the mails. Starvation
+    //     has to fall on the leg that can afford it. This is that leg: a payout is
+    //     a weekly obligation with 28 ticks to land it in, and the odds table is
+    //     create-if-absent with the same 28 — while a Save-Creator push and a
+    //     payout-destination-change notice exist to be seen inside a 24-hour
+    //     cooling-off window.
+    //
+    //  2. THE LEASE. `createConnectTransfer` now has a 10 s AbortController
+    //     deadline and the run has a 20 s wall clock, but N serial outbound calls
+    //     in front of the FIRST `stillLeased()` fence could still push the run past
+    //     the 30-minute lease TTL before anything checked — at which point a
+    //     successor sweep starts and both run `processNewEvents`, the duplicate
+    //     push the lease was bought to prevent. Behind the last fence, a run that
+    //     has lost its lease transfers nothing at all.
+    //
+    //  3. WHAT IS SAFE TO SKIP, WHICH IS NOT THE SAME QUESTION. Delivery is
+    //     read-then-send and must not run twice; the payout run is
+    //     reserve-then-send and CANNOT pay twice (UNIQUE(passport, period)
+    //     reserves before the transfer, and the payout id is the Stripe
+    //     idempotency key), and the odds table is written putIfAbsent. Both are
+    //     therefore safe to drop for a tick and safe to run twice — which is
+    //     exactly the property that says they belong behind the fence rather than
+    //     in front of it.
+    //
+    // Both are individually isolated, as every expensive leg here is. Neither
+    // uses `step()`: `step()` is for the cheap hygiene sequence, and its one-line
+    // log is not enough for a leg that moves money — a run that stops on a
+    // ceiling says so by name, with the counters, below.
+    if (!(await stillLeased())) {
+      logError({ cid: lease.holder, hop: "cron", msg: "scheduled sweep STOPPING - before payouts" });
+      return;
+    }
+    // S-CW6b: publish this week's PACK ODDS table (heat-weighted, from the live
+    // ratings artifacts), create-if-absent so it is frozen once written and an
+    // opened pack's odds_hash stays verifiable. ISOLATED — a failure here never
+    // takes the rest of the sweep down; packs simply 503 until it lands.
+    //
+    // BOUNDED — the OTHER unbounded leg the merge left in this handler.
+    // `buildPackOdds` spends 5 subrequests per candidate (`warOptedIn` reads
+    // the opt-in fold and the passport; `serveRatings` is a suppression check
+    // and two R2 GETs — I13-CRON measured), and the candidate list was `SELECT DISTINCT subject
+    // FROM trust_events WHERE event_type = 'war_opt_in'` with no ceiling at all.
+    // Nothing here can be PAGED the way the payout run is: the table is written
+    // create-if-absent and frozen for the ISO week so an opened pack's
+    // odds_hash stays verifiable, which means the whole set has to be priced in
+    // ONE tick or not at all. So the bound is a cap on the candidates, ordered
+    // by FIRST OPT-IN — a rule that can be stated to a creator ("the first
+    // WAR_ODDS_MAX_CREATORS to opt in are in this week's packs") rather than an
+    // arbitrary slice of a hash order — and the cap is LOGGED LOUDLY when it
+    // binds, because a creator silently missing from a week's odds table is
+    // exactly the kind of exclusion nobody discovers from a green cron.
+    await tailLeg("odds", "packOdds", async () => {
+      try {
+        const sel = await selectOddsCandidates(db, WAR_ODDS_MAX_CREATORS, Date.now());
+        if (sel.total > WAR_ODDS_MAX_CREATORS) {
+          // Still logged when it binds — a creator missing from a week's table is
+          // exactly the kind of exclusion nobody discovers from a green cron. But
+          // the sentence has changed with the rule: the window ROTATES, so this is
+          // now "who is in this week", not "who is permanently out".
+          logError({
+            cid: lease.holder,
+            hop: "cron",
+            msg: "pack_odds_cap_binding",
+            opted_in: sel.total,
+            cap: WAR_ODDS_MAX_CREATORS,
+            subjects: sel.subjects.length,
+            window_offset: sel.offset,
+          });
+        }
+        const pk = await buildPackOdds(store, db, sel.subjects, Date.now());
+        if (pk.written) logError({ cid: lease.holder, hop: "cron", msg: "pack_odds_published", opted_in: sel.total, window_offset: sel.offset });
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "pack_odds_sweep", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+
+    // S-CW6c: the WEEKLY creator payout run. Safe to call every tick — it
+    // self-limits to one payout per creator per ISO week (UNIQUE(passport,
+    // period)) and is idempotent on the payout id (the Stripe transfer key), so
+    // a retry or overrun cannot double-pay. Absent Connect config → no-op (the
+    // config read fails closed). PAGED, transfer-capped and deadline-bounded —
+    // see creator-payout.ts THE BOUNDS for the arithmetic and for what stopping
+    // early costs.
+    await tailLeg("money", "weeklyPayouts", async () => {
+      try {
+        const connectCfg = connectConfigFromEnv(env as unknown as Record<string, unknown>);
+        if (connectCfg) {
+          // D-1127(5), D-1126(6): the Connect account read and the Connect transfer on the tick's fetch (see outFetch).
+          const pr = await runWeeklyPayouts(
+            db,
+            connectCfg,
+            nowMs,
+            () => "pay_" + crypto.randomUUID().replace(/-/g, "").slice(0, 20),
+            undefined,
+            undefined,
+            { fetchImpl: outFetch },
+            env.ANALYTICS_DB && ctx ? { prod: db, analytics: d1(env.ANALYTICS_DB), queue: env.ANALYTICS_QUEUE } : undefined,
+            ctx,
+          );
+          // Docket #43 (a): `held` stays the standing PREDICATE's decline count,
+          // unchanged. `retry_truncated` and `deadline_abandoned` are logged
+          // alongside it, named so a 3 a.m. reader can tell "we declined these"
+          // (held) from "we ran out of budget before reading these" (retry_
+          // truncated) from "we ran out of time on these" (deadline_abandoned)
+          // — the next operator action differs for each.
+          //
+          // Docket #58 (b): `held` is COUNTED CURSOR-RELATIVE (`creator-payout.ts`
+          // `pendWindow`) — it is the decline count for THIS TICK'S window
+          // (cursor forward to the page end, or to the end of the table on the
+          // last page), never a table-wide total. Left as PAYOUT23 (S-032) found
+          // it: not mine to widen, and docket #43 (a) already rejected that
+          // reading twice. What changes here is only the log line's claim about
+          // itself — `wrapped` (already computed, already free) is logged
+          // alongside `held` so a reader is not left inferring scope from
+          // silence: `wrapped: false` means more of the connected set remains
+          // for a later tick and this number is a partial count; `wrapped: true`
+          // means this window closed out the table, but STILL only counts what
+          // was forward of the cursor when the tick started — a `held` row
+          // sitting BEHIND that cursor (already passed in a prior tick, as an
+          // empty-page tick's window is) is invisible to it. `held: 0` is
+          // therefore "nothing held in this window", never "nothing held" —
+          // that reading needs a full lap (cursor `''` to `''`) with `held`
+          // summed across every tick in it, which no single line here reports.
+          //
+          // I3-0062 / W3-09a item 5: `stalled` is ALSO logged, and is ALSO a
+          // reason to emit the line at all. It counts the rows this tick refused
+          // for at least `PAYOUT_STALL_ATTEMPTS` re-attempts (`creator-payout.ts`
+          // `runWeeklyPayouts`) — money that is owed and has stopped moving,
+          // which is the one number here whose next operator action is "go and
+          // look at this creator". It was computed and dropped: until this line
+          // the field had no reader anywhere in the tree. Added to the CONDITION
+          // as well as the body deliberately — a tick that stalls rows is never
+          // a tick that paid or failed none of them today, but the condition is
+          // what decides whether a human ever sees the number, and a count that
+          // can only be logged when some OTHER count is non-zero is not a
+          // reported count. Tick-shaped: a row whose backoff has grown to a week
+          // appears in at most one tick in seven, which is why the standing
+          // population read is the other half of this and belongs on the
+          // operator console. THAT HALF IS NOT WIRED: `creator-payout.ts`
+          // `stalledPayouts` still has NO CALLER — this line is a comment, not
+          // one, and a caller-count grep on the symbol must not read it as one.
+          // Its door is `/ops/payouts` in `console.ts`, outside W3-09a-FR3's
+          // ownership list; the exact edit is in that room's report.
+          const summary = payoutSummaryFields(pr, lease.holder);
+          if (summary) logError({ ...summary });
+          // A ceiling that binds is NOT a clean run. Without this the leg reports
+          // nothing while paying a shrinking fraction of what it owes, which is
+          // the failure mode that does not announce itself.
+          if (pr.stopped !== null) {
+            logError({ cid: lease.holder, hop: "cron", msg: "payout_run_stopped", stopped: pr.stopped, transfers: pr.transfers });
+          }
+        } else {
+          // I3-1161: no Connect config means no creator is paid this week. Said
+          // every run, and recorded ONCE per UTC day as a `payout:run_skipped`
+          // audit row, which GET /ops/payouts counts (`skipped_no_connect_7d`).
+          logError({ cid: lease.holder, hop: "cron", msg: "payout_run_skipped_no_connect" });
+          const skipped = `no_connect day=${new Date(nowMs).toISOString().slice(0, 10)}`;
+          await db
+            .prepare("INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT 'system', 'payout:run_skipped', ?, ?, NULL, 'system' WHERE NOT EXISTS (SELECT 1 FROM audit_log WHERE action = 'payout:run_skipped' AND detail = ?)")
+            .bind(skipped, new Date(nowMs).toISOString(), skipped)
+            .run();
+        }
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "creator_payout_run", err: e instanceof Error ? e.name : typeof e });
+      }
+      // I29-STANDING H3 (I20-Q2, D-1031; landed by I29-INT): a closed creator's unrecoverable debt, AFTER the payout run and
+      // in its own try, on the money group's ONE leg. At most 4 calls of CREATOR_DEBT_SWEEP_LIMIT (50) per tick, stopping
+      // when one reports nothing more; the sweep counts each creator once per ISO week itself.
+      try {
+        for (let i = 0; i < 4; i++) if (!(await sweepUnrecoverableCreatorDebt(db, nowMs)).more) break;
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "creator_debt_sweep", err: e instanceof Error ? e.name : typeof e });
+      }
+      // #489a (D-0920, I16-W06C H-489-wire): the cash-outflow register's identity against the ledger, once per money
+      // tick, AFTER the payout run and in its own try (a fault here costs only this check). It rides the money group's
+      // ONE leg rather than adding a second: the group's kill-hold is pinned as a one-leg group (i13-fx1-tails.test.ts).
+      // A mismatch is an ALARM line for an operator to investigate before the next repayment: `count` is the number of
+      // mismatched rows and `scanned` the rows examined (log.ts ALLOWED_KEYS; no ref or account id leaves the worker).
+      try {
+        const rc = await reconcileCashOutflows(db);
+        if (!rc.ok) {
+          logError({
+            cid: lease.holder,
+            hop: "cron",
+            msg: "cash_outflow_reconcile_mismatch",
+            // + the payout arm (D-0928(2); I16-L09 H4, landed by I16-L10): paid payouts vs kind 'payout' register rows;
+            // + the voided arm (I17-J01 H3, D-0938(1a)): voided payouts vs the register row voidPayout writes.
+            count: rc.ledger_without_outflow.length + rc.outflow_without_ledger.length + rc.cents_mismatch.length + rc.payouts.paid_without_outflow.length + rc.payouts.voided_without_outflow.length + rc.payouts.outflow_without_payout.length + rc.payouts.cents_mismatch.length,
+            scanned: rc.checked.ledger_repayments + rc.checked.register_rows + rc.payouts.checked.paid_payouts + rc.payouts.checked.voided_payouts + rc.payouts.checked.register_rows,
+          });
+        }
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "cash_outflow_reconcile_failed", err: e instanceof Error ? e.name : typeof e });
+      }
+      // I53-RECONCILE (D-1383(3)): the money books' conservation identities, read-only, AFTER the cash-outflow reconcile
+      // and in its own try on the same ONE leg; a drift is ONE `money_reconcile_drift` line (an operator alarm, counts only).
+      try {
+        await (await import("./money-reconcile.js")).runMoneyReconcile(db, nowMs, lease.holder);
+      } catch (e) {
+        logError({ cid: lease.holder, hop: "cron", msg: "money_reconcile_failed", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+
+    } finally {
+      // The ordinary path (including a thrown sweep) gives the lease back at
+      // once. A Worker evicted mid-sweep runs no `finally` — that case is what
+      // the lease's TTL is for, and why it must be bounded.
+      leaseStopped = true;
+      if (leaseTimer !== undefined) clearTimeout(leaseTimer);
+      // I14-FX2 (RG-CRON-S2): each lease is released on its own — a throw releasing one never keeps the other.
+      try {
+        await releaseCronLease(db, lease);
+      } finally {
+        if (headLease !== null) await releaseCronLease(db, headLease);
+      }
+    }
+      })();
+    } finally {
+      flushOperatorAlarmsAfter(env, ctx0, deferred); // I21-Q27
+    }
+  },
+};
+
+
+
+/**
+ * I13-CRON (QUEUE #900, #885; D-0888(2)): THE TAIL TRIGGERS. SWEEP_CRON runs the
+ * HEAD of the six-hourly sweep only (chain verify, anchors, checkpoint export,
+ * registry plan, the verdict-removing sweeps, the hygiene rotation). The legs
+ * that followed it in the same invocation run in five groups, each on its own
+ * trigger five or ten minutes after the last, with its own lease and its own
+ * ~1000-subrequest invocation (alerts.ts THE BUDGETS), so a leg that kills an
+ * invocation costs its own group and nothing after it. Minute 2 mod 5: never the
+ * five-minute delivery tick (minute 0 mod 5) nor the analytics tick (3 mod 5).
+ * A manual run (no cron) runs the head and every group, in this order, in one
+ * invocation under one lease. Declared at the end of the module; read only when
+ * `scheduled()` runs.
+ */
+/** I14-CRON (QUEUE #916, D-0904(1)): the SWEEP_CRON head's own lease — never `scheduled`, which the five-minute delivery tick holds while it sends. A manual run holds both. */
+export const HEAD_LEASE = "scheduled-head";
+/** I62 P11 (W0-16): the TTL every scheduled() touch of `scheduled` uses — the delivery tick's (alerts.ts), so a dead
+ * delivery-tail or manual-run holder blocks the tick for one delivery TTL, never CRON_LEASE_TTL_MS. */
+export const SCHEDULED_LEASE_TTL_MS = DELIVERY_LEASE_TTL_MS;
+/** I62 P11: scheduled()'s renewal-timer delay while it holds `scheduled` (TTL/3, as withCronLease) … */
+export const SCHEDULED_LEASE_RENEW_MS = Math.floor(SCHEDULED_LEASE_TTL_MS / 3);
+/** … and while it holds HEAD_LEASE alone or a `scheduled-<group>` lease (CRON_LEASE_TTL_MS / 3, unchanged). */
+export const GROUP_LEASE_RENEW_MS = Math.floor(CRON_LEASE_TTL_MS / 3);
+export const TAIL_ARTIFACTS_CRON = "27 */6 * * *";
+export const TAIL_DELIVERY_CRON = "37 */6 * * *";
+export const TAIL_DIGESTS_CRON = "47 */3 * * *"; // I23-Q4 (D-1030 (a)): 8 runs a day
+export const TAIL_ODDS_CRON = "52 */6 * * *";
+export const TAIL_MONEY_CRON = "57 */6 * * *";
+/** D-0927(2) (#925 A, D-0926(4)): the artifacts group again every 30 minutes — same `scheduled-artifacts` lease and carry cursor, buildSweep then the #515 purge. Minutes 11 and 41 (1 mod 5): never delivery (0) nor analytics (3); no comma, so a comma-split count of a crons list stays one per trigger. */
+export const TAIL_ARTIFACTS_HALFHOUR_CRON = "11-41/30 * * * *";
+export type TailGroup = "artifacts" | "delivery" | "digests" | "odds" | "money";
+export const TAIL_GROUP_BY_CRON: ReadonlyMap<string, TailGroup> = new Map<string, TailGroup>([
+  [TAIL_ARTIFACTS_CRON, "artifacts"],
+  [TAIL_ARTIFACTS_HALFHOUR_CRON, "artifacts"],
+  [TAIL_DELIVERY_CRON, "delivery"],
+  [TAIL_DIGESTS_CRON, "digests"],
+  [TAIL_ODDS_CRON, "odds"],
+  [TAIL_MONEY_CRON, "money"],
+]);
+/** I13-CRON: the head's last chain verdict (`cursor_id` 'pending' | 'ok' | 'broken', `updated_at` its instant). I13-FX1: a tail runs only on an 'ok' written in the CURRENT SWEEP_CRON cycle (tailChainGateOpen). */
+export const TAIL_CHAIN_VERDICT_CURSOR = "scheduled_chain_verdict";
+/** I13-FX1 (D-0889(2)): the SWEEP_CRON cycle, 6 h. An 'ok' older than the start of the current cycle (tailCycleStartMs) is never accepted, so no 'ok' is ever older than this. */
+export const TAIL_CHAIN_VERDICT_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+/** I13-FX1: SWEEP_CRON's minute past the hour ("17 *\/6 * * *"). */
+const SWEEP_CRON_MINUTE = 17;
+/** I13-FX1 (D-0889(2)): the instant the current SWEEP_CRON cycle began — the latest hh:17 UTC with hh % 6 = 0 at or before `nowMs`. */
+export function tailCycleStartMs(nowMs: number): number {
+  const offset = SWEEP_CRON_MINUTE * 60 * 1000;
+  return Math.floor((nowMs - offset) / TAIL_CHAIN_VERDICT_MAX_AGE_MS) * TAIL_CHAIN_VERDICT_MAX_AGE_MS + offset;
+}
+/**
+ * I13-FX1 (I13-RG-OPS-02, D-0889(2)): THE TAIL GATE FAILS CLOSED. A tail group runs only
+ * when (1) the head's verdict row says 'ok' and was written at or after the start of the
+ * current cycle, and (2) the durable broken-ledger marker (LEDGER_INTEGRITY_KEY, the
+ * object `/health?ready=1` reads) is absent. Any read that fails answers "closed".
+ */
+/** One `sweep_cursor` row, upserted; a failed write is logged, never thrown (the head's cursors, and the five-minute
+ * seal tick's 'broken' verdict on a witness mismatch, I30-FX-OPS D-1059(9)). I47-FXR-CODE (F7, D-1319 C1): with `lease`
+ * it writes only while that lease row (name and holder) exists, the hygiene writeRow guard; the seal tick passes none. */
+async function writeSweepCursorRow(db: DbLike, cid: string, name: string, seq: number, id: string, lease?: CronLease): Promise<void> {
+  try {
+    const nowIso = new Date().toISOString();
+    await (lease
+      ? db
+          .prepare("INSERT INTO sweep_cursor (name, cursor_seq, cursor_id, updated_at) SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM cron_leases WHERE name = ? AND holder = ?) ON CONFLICT(name) DO UPDATE SET cursor_seq = excluded.cursor_seq, cursor_id = excluded.cursor_id, updated_at = excluded.updated_at")
+          .bind(name, seq, id, nowIso, lease.name, lease.holder)
+      : db
+          .prepare("INSERT INTO sweep_cursor (name, cursor_seq, cursor_id, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET cursor_seq = excluded.cursor_seq, cursor_id = excluded.cursor_id, updated_at = excluded.updated_at")
+          .bind(name, seq, id, nowIso)
+    ).run();
+  } catch (e) {
+    logError({ cid, hop: "cron", msg: "tail_cursor", detail: name, err: e instanceof Error ? e.name : typeof e });
+  }
+}
+export async function tailChainGateOpen(db: DbLike, env: Env, nowMs: number): Promise<boolean> {
+  try {
+    const row = await db.prepare("SELECT cursor_id, updated_at FROM sweep_cursor WHERE name = ?").bind(TAIL_CHAIN_VERDICT_CURSOR).first<{ cursor_id: string; updated_at: string }>();
+    const at = Date.parse(row?.updated_at ?? "");
+    if (!(row?.cursor_id === "ok" && Number.isFinite(at) && at >= tailCycleStartMs(nowMs) && at <= nowMs + 60_000)) return false;
+    return !(await ledgerIntegrityBroken(env.REGISTRY_BUCKETS));
+  } catch {
+    return false;
+  }
+}
+/** I13-FX1 (I13-RG-OPS-04): the artifacts legs' per-run budget — the ceiling less the tail's own scaffolding. */
+export const TAIL_ARTIFACTS_LEG_BUDGET = INVOCATION_SUBREQUEST_CEILING - TAIL_OVERHEAD_SUBREQUESTS;
+/** I13-FX1: the artifacts group's legs, in run order (the carry names one; i13-fx1-artifacts-budget.test.ts checks this list against the tailLeg call sites). */
+export const ARTIFACT_TAIL_LEGS: readonly string[] = ["buildSweep", "sweepFrozenSnapshots", "pruneRoiTombstones", "wordingDrift", "discoveryArtifacts", "buildRankings", "warStandings", "purgeLegacyTopFans", "ratings"];
+/**
+ * I13-FX7 (QUEUE #515, D-0653; D-0891(1)): the artifacts legs that run on EVERY metered tick —
+ * never skipped by a carry or a cut, never a carry target. The retraction purge sits right after
+ * the build so an object built for a creator who retracted mid-build is collected on the same tick.
+ */
+export const ARTIFACT_PINNED_LEGS: readonly string[] = ["sweepFrozenSnapshots"];
+/** I13-FX7: the first unpinned artifacts leg at or after index `j` ('' past the end). */
+function nextUnpinnedArtifactLeg(j: number): string {
+  return ARTIFACT_TAIL_LEGS.slice(j).find((l) => !ARTIFACT_PINNED_LEGS.includes(l)) ?? "";
+}
+/**
+ * I13-FX7 (QUEUE #515): the part of TAIL_ARTIFACTS_LEG_BUDGET buildSweep may not spend, so the
+ * pinned purge after it always has at least this much. Sized in i13-fx1-artifacts-budget.test.ts.
+ */
+export const ARTIFACTS_PURGE_RESERVE = 232;
+/**
+ * I13-FX12 (D-0894(3)): the part of the purge's share held for the 30-day retention phase, so a retracted backlog
+ * larger than one share cannot starve it. Retention's fixed cost is one DELETE and one list per prefix (11); the
+ * rest deletes aged objects, and a refusal ends retention for the tick keeping what it deleted. Part of
+ * ARTIFACTS_PURGE_RESERVE (168 for the purge + this; 160 until I3-0356 added analytics_follow_net to the per-creator
+ * deletes, I22-GATEFIX), sized in i13-fx1-artifacts-budget.test.ts.
+ */
+export const ARTIFACTS_RETENTION_RESERVE = 64;
+/** I13-FX7: the most the pinned purge may spend in one tick (half the legs' budget), so the legs after it keep the rest. */
+export const ARTIFACTS_PURGE_SHARE = Math.floor(TAIL_ARTIFACTS_LEG_BUDGET / 2);
+/**
+ * I14-FX2 (QUEUE #912, I14-CAPS HANDOFF-1): what the artifacts legs after the pinned purge are owed — the rankings
+ * and ratings caps, buildTopRequested's 2, and the allowances i14-artifacts-leg-caps.test.ts sums for
+ * buildLeaderboards (16), pruneRoiTombstones (4) and wordingDrift (40), plus TOPFANS_LEGACY_PURGE_BUDGET. The purge's
+ * share ends at TAIL_ARTIFACTS_LEG_BUDGET minus this (960 - 452 = 508; with buildSweep at its cap the purge keeps at least
+ * 238 = 508 - 270, measured 264 with art.spent() 244 in test/i34-w3money-purge-reserve.test.ts, which covers ARTIFACTS_PURGE_RESERVE — I14-FX5 removed the unreachable runtime floor; test/i14-fx5-reserves.test.ts pins the relation).
+ */
+export const ARTIFACTS_LEGS_AFTER_PURGE = RANKINGS_LEG_CAP + RATINGS_LEG_CAP + 2 + 16 + 4 + 40 + TOPFANS_LEGACY_PURGE_BUDGET;
+/** I13-FX7 (JA-09): buildSweep starts no creator with less than this left of its share (the most one creator measured, with slack, plus the report write). */
+export const BUILD_SWEEP_CREATOR_HEADROOM = 60;
+/** I14-FX2 (QUEUE #912, I14-CAPS HANDOFF-4): member-edition reads the ratings leg lets anchorCompletedWeeks spend in one
+ * artifacts run (ratings.ts readWeeklySet), out of RATINGS_ANCHOR_ALLOWANCE. */
+export const RATINGS_ANCHOR_MEMBER_BUDGET = 16;
+/** I13-FX1: per group, the leg the next run starts at after a budget cut (cursor_id; '' = from the top). */
+export const tailCarryCursor = (g: TailGroup): string => `tail_carry_${g}`;
+async function readTailCarry(db: DbLike, g: TailGroup): Promise<string> {
+  try {
+    const v = (await db.prepare("SELECT cursor_id FROM sweep_cursor WHERE name = ?").bind(tailCarryCursor(g)).first<{ cursor_id: string }>())?.cursor_id ?? "";
+    // I13-FX7: a carry naming a pinned leg (written before pinning) resumes at the next unpinned leg.
+    return ARTIFACT_PINNED_LEGS.includes(v) ? nextUnpinnedArtifactLeg(ARTIFACT_TAIL_LEGS.indexOf(v) + 1) : ARTIFACT_TAIL_LEGS.includes(v) ? v : "";
+  } catch {
+    return "";
+  }
+}
+class TailBudgetExhausted extends Error {}
+/**
+ * I13-FX1 (I13-RG-OPS-04): metered handles for one tail group. Every D1 statement (a batch
+ * per statement), every raw-D1 statement on ANALYTICS_DB and every R2 call on REGISTRY_BUCKETS
+ * is charged BEFORE it is sent; one that would cross `budget` is refused with a throw, which
+ * the leg's own catch logs — the platform's own "too many subrequests" behaviour, at a line
+ * that leaves the scaffolding (in-flight clear, carry write, lease release) its headroom.
+ */
+function tailMeter(
+  budget: number,
+  db: DbLike,
+  env: Env,
+): { metered: true; db: DbLike; env: Env; store: ReturnType<typeof r2Store>; exhausted: () => boolean; spent: () => number; share: (c?: number) => void; left: () => number } {
+  let n = 0;
+  let out = false;
+  // I13-FX7: one leg may run under a lower ceiling (`share`); `share()` restores the budget. A
+  // refusal under a share stops that leg only: `exhausted` (the group's cut) is the BUDGET's.
+  let ceiling = budget;
+  const charge = (k: number): void => {
+    if (n + k > ceiling) {
+      if (ceiling >= budget) out = true;
+      throw new TailBudgetExhausted("tail subrequest budget spent");
+    }
+    n += k;
+  };
+  const targets = new WeakMap<object, unknown>();
+  const counted = (o: object, chargeOn: ReadonlySet<PropertyKey>, rewrap: ReadonlySet<PropertyKey> = new Set()): unknown => {
+    const p = new Proxy(o, {
+      get(t, k) {
+        const v = Reflect.get(t, k) as unknown;
+        if (typeof v !== "function") return v;
+        if (k === "batch") return (sts: unknown[]) => (charge(sts.length), (v as (x: unknown[]) => unknown).call(t, sts.map((x) => (typeof x === "object" && x !== null ? (targets.get(x) ?? x) : x))));
+        if (rewrap.has(k)) return (...a: unknown[]) => counted((v as (...x: unknown[]) => object).apply(t, a), STATEMENT_CHARGED, STATEMENT_REWRAP);
+        if (chargeOn.has(k) || chargeOn.has("*"))
+          return (...a: unknown[]) => {
+            charge(1);
+            return (v as (...x: unknown[]) => unknown).apply(t, a);
+          };
+        return (v as (...x: unknown[]) => unknown).bind(t);
+      },
+    });
+    targets.set(p, o);
+    return p;
+  };
+  const mdb = counted(db as unknown as object, new Set(), new Set(["prepare"])) as DbLike;
+  const menv = new Proxy(env, {
+    get(t, k) {
+      const v = Reflect.get(t, k) as unknown;
+      if (k === "REGISTRY_BUCKETS" && v) return counted(v as object, new Set(["*"]));
+      if (k === "ANALYTICS_DB" && v) return counted(v as object, new Set(), new Set(["prepare"]));
+      return v;
+    },
+  }) as Env;
+  return {
+    metered: true,
+    db: mdb,
+    env: menv,
+    store: r2Store(menv.REGISTRY_BUCKETS),
+    exhausted: () => out,
+    spent: () => n,
+    share: (c?: number) => {
+      ceiling = Math.min(budget, c ?? budget);
+    },
+    left: () => ceiling - n,
+  };
+}
+const STATEMENT_CHARGED: ReadonlySet<PropertyKey> = new Set(["first", "all", "run", "raw"]);
+const STATEMENT_REWRAP: ReadonlySet<PropertyKey> = new Set(["bind"]);
+/** I13-FX1 (I13-RG-OPS-04): `sweep_cursor` row carrying the digest periods a spent budget cut short (cursor_id: JSON array). */
+export const DIGEST_OWED_CURSOR = "digests_generate_owed";
+/**
+ * I3-1354 (I22-L01): the digest_backlog gauge. `pending` counts only digest ROWS not yet delivered
+ * (pendingDigestCount); periods the generation budget cut short have NO row yet and live in the owed cursor, so
+ * `pending` can read 0 while digests were never created. `owed` is that cursor's live (not dropped) period count;
+ * absent when the cursor is unreadable (readOwedDigestPeriods' null), never a guessed 0.
+ */
+export async function digestBacklogFields(db: DbLike): Promise<{ pending: number; owed?: number }> {
+  const pending = await pendingDigestCount(db);
+  const owed = await readOwedDigestPeriods(db);
+  return owed === null ? { pending } : { pending, owed: owed.filter((p) => p.dropped !== true).length };
+}
+/** I13-FX1: at most this many owed periods are carried (14 daily backfill days + the week + slack). */
+const DIGEST_OWED_MAX = 20;
+interface OwedDigestPeriod {
+  kind: "daily" | "weekly";
+  key: string;
+  startIso: string;
+  endIso: string;
+  /** I14-FX2 (RG-CRON-S1): passes that retried this period after a creator failed in it. */
+  retries?: number;
+  /** I14-FX6 (D-0907(2)): when a creator first failed in this period (ISO); the retry window runs from here. */
+  first_failed_at?: string;
+  /** I14-FX6: no pass attempts the period before this instant (ISO) — the backoff. */
+  next_at?: string;
+  /** I14-FX6: the marker of a dropped period (never attempted again). */
+  dropped?: boolean;
+}
+/**
+ * I13-FX1: the owed periods, oldest first; a malformed row reads as none (the backfill walk still covers
+ * whole-skipped days). I14-FX2 (RG-CRON-L3): a read that THROWS returns null — the caller must not write
+ * the cursor from it, or the periods it could not read are overwritten.
+ */
+async function readOwedDigestPeriods(db: DbLike, seen?: { raw?: string }): Promise<OwedDigestPeriod[] | null> {
+  let row: { cursor_id: string } | null;
+  try {
+    row = await db.prepare("SELECT cursor_id FROM sweep_cursor WHERE name = ?").bind(DIGEST_OWED_CURSOR).first<{ cursor_id: string }>();
+  } catch {
+    return null;
+  }
+  // I38-TICK (L39-C1-L2): the cursor_id as read, for generateDigestPass's compare-and-set; left undefined when no row.
+  if (seen && row) seen.raw = row.cursor_id;
+  try {
+    const parsed = JSON.parse(row?.cursor_id || "[]") as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (p): p is OwedDigestPeriod =>
+        typeof p === "object" && p !== null && (p.kind === "daily" || p.kind === "weekly") && typeof p.key === "string" && typeof p.startIso === "string" && typeof p.endIso === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+/** I14-CRON (QUEUE #916): the lease every digest-generation pass takes (digests tail and ANALYTICS_CRON tick), so the owed cursor has one writer at a time. */
+export const DIGEST_GENERATE_LEASE = "digests-generate";
+/**
+ * I14-CRON (QUEUE #916, D-0904(1)): ONE digest-generation pass, as the digests tail ran it since I13-FX1 —
+ * the owed periods first (DIGEST_OWED_CURSOR), then the daily periods with no row at all in the last
+ * `backfillDays` days (oldest first; the tail walks DAILY_BACKFILL_MAX_DAYS, the five-minute tick 1), then the
+ * week — every generateDigests call charged against ONE `budget`, and a period the budget cut short carried as
+ * owed. `weeklyOnlyIfPending` (the tick) asks `periodHasPendingCreator` first, so a finished week costs one read,
+ * not the weekly call's proof scan and warning context every five minutes. Probe, owed read and owed write sit
+ * outside `budget` (the caller's scaffolding: tail 14 + 2, tick 1 + 1 + 2).
+ * I14-FX2 (RG-CRON-L3, -S1): THE CURSOR IS WRITTEN AHEAD. A pass that adds a period the cursor does not carry
+ * writes the whole list BEFORE it generates (a throw there: nothing generated); otherwise it writes the shrunk
+ * list after. Still one owed write a pass. So a failed write, a throw out of generateDigests or an evicted
+ * invocation leaves a superset of the unfinished periods recorded, never a subset; a period added and finished
+ * in one pass stays listed one pass longer (a no-op call). A period a creator FAILED in (not truncated) stays
+ * owed and is retried with backoff (I14-FX6, D-0907(2): `next_at`, DIGEST_FAILED_BACKOFF_MS doubling to
+ * DIGEST_FAILED_BACKOFF_MAX_MS) until DIGEST_FAILED_RETRY_WINDOW_MS (24 h) after its first failure and at least
+ * DIGEST_FAILED_RETRIES retries, then is dropped with a `digest_creator_failed` error line.
+ * I14-FX5 (QUEUE #916, D-0906(1)): a pass that wrote ahead holds 1 of `budget` back and writes the list AGAIN after
+ * generating when a retry advanced or a period was dropped, so the counter advances and a drop is saved (and logged)
+ * once on every pass; the total stays `budget` + the one scaffolding write. A dropped period stays in the list as a
+ * marker (`dropped`; a pre-I14-FX6 marker is retries > DIGEST_FAILED_RETRIES with no first_failed_at), never attempted, while this pass would re-add it (the current week, a day in
+ * the backfill walk), so the tail cannot re-add a dropped weekly with its counter reset.
+ * I38-TICK (L39-C1-L2): every owed write is COMPARE-AND-SET on the cursor_id this pass read or last wrote (the upsert's
+ * DO UPDATE ... WHERE sweep_cursor.cursor_id = it, or DO NOTHING when no row was read). A pass whose lease lapsed and was re-taken finds the
+ * successor's list there and does not overwrite it (a `tail_cursor` warn line; the write reports false). `opts.lease`
+ * (withCronLease's guard): once `lost`, the pass makes no further write — not the write-ahead, no generateDigests
+ * call, not the final write.
+ */
+export async function generateDigestPass(
+  db: DbLike,
+  store: Parameters<typeof generateDigests>[1],
+  budget: number,
+  cid: string,
+  nowMs: number,
+  opts: { backfillDays?: number; weeklyOnlyIfPending?: boolean; lease?: CronLeaseGuard } = {},
+): Promise<{ spent: number; generated: number; owed: number }> {
+  const weekly = weeklyPeriod(nowMs);
+  const seen: { raw?: string } = {};
+  // A call, not a property read: the guard's `lost` flips between awaits, which TypeScript's narrowing cannot see.
+  const leaseLost = (): boolean => opts.lease?.lost === true;
+  const recorded = await readOwedDigestPeriods(db, seen);
+  if (recorded === null) {
+    logError({ cid, hop: "cron", msg: "tail_cursor", detail: `${DIGEST_OWED_CURSOR} unreadable; pass skipped` });
+    return { spent: 0, generated: 0, owed: 0 };
+  }
+  const periods: OwedDigestPeriod[] = [...recorded];
+  const add = (p: OwedDigestPeriod): void => {
+    if (!periods.some((q) => q.kind === p.kind && q.key === p.key)) periods.push(p);
+  };
+  // I4-08-R7 hand-off: every daily period a >24 h outage skipped, oldest first (dailyPeriodsToBackfill bounds the walk).
+  const backfill = await dailyPeriodsToBackfill(db, nowMs, opts.backfillDays);
+  for (const p of backfill) add({ kind: "daily", ...p });
+  if (!periods.some((q) => q.kind === "weekly" && q.key === weekly.key) && (opts.weeklyOnlyIfPending !== true || (await periodHasPendingCreator(db, "weekly", weekly.key)))) add({ kind: "weekly", ...weekly });
+  // I14-FX5: a dropped period's marker is kept only while this pass would re-add the period, and is never attempted.
+  const isDropped = (p: OwedDigestPeriod): boolean => p.dropped === true || (p.first_failed_at === undefined && (p.retries ?? 0) > DIGEST_FAILED_RETRIES);
+  const readdable = new Set([`weekly:${weekly.key}`, ...backfill.map((p) => `daily:${p.key}`)]);
+  const dropped = periods.filter((p) => isDropped(p) && readdable.has(`${p.kind}:${p.key}`));
+  // Only what the cursor can carry is attempted; a row-less day past it is found again by the backfill walk.
+  const attempt = periods.filter((p) => !isDropped(p)).slice(0, DIGEST_OWED_MAX);
+  const writeOwed = async (list: OwedDigestPeriod[]): Promise<boolean> => {
+    const next = JSON.stringify(list);
+    try {
+      const res =
+        seen.raw === undefined
+          ? await db.prepare("INSERT INTO sweep_cursor (name, cursor_seq, cursor_id, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(name) DO NOTHING").bind(DIGEST_OWED_CURSOR, list.length, next, new Date().toISOString()).run()
+          : await db.prepare("INSERT INTO sweep_cursor (name, cursor_seq, cursor_id, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET cursor_seq = excluded.cursor_seq, cursor_id = excluded.cursor_id, updated_at = excluded.updated_at WHERE sweep_cursor.cursor_id = ?").bind(DIGEST_OWED_CURSOR, list.length, next, new Date().toISOString(), seen.raw).run();
+      if (res.changes !== 1) {
+        logWarn({ cid, hop: "cron", msg: "tail_cursor", detail: `${DIGEST_OWED_CURSOR} moved by another pass; not overwritten` });
+        return false;
+      }
+      seen.raw = next;
+      return true;
+    } catch (e) {
+      logError({ cid, hop: "cron", msg: "tail_cursor", detail: DIGEST_OWED_CURSOR, err: e instanceof Error ? e.name : typeof e });
+      return false;
+    }
+  };
+  const writtenAhead = attempt.some((p) => !recorded.some((q) => q.kind === p.kind && q.key === p.key));
+  if (leaseLost()) return { spent: 0, generated: 0, owed: attempt.length };
+  if (writtenAhead && !(await writeOwed([...attempt, ...dropped]))) return { spent: 0, generated: 0, owed: attempt.length };
+  const genBudget = writtenAhead ? budget - 1 : budget;
+  let left = genBudget;
+  let generated = 0;
+  let changed = false;
+  const stillOwed: OwedDigestPeriod[] = [];
+  for (const p of attempt) {
+    if (leaseLost()) return { spent: genBudget - left + (writtenAhead ? 1 : 0), generated, owed: attempt.length };
+    // I14-FX6: a failed period waits out its backoff; it stays owed and costs nothing this pass.
+    if (left <= 0 || (p.next_at !== undefined && nowMs < Date.parse(p.next_at))) {
+      stillOwed.push(p);
+      continue;
+    }
+    const r = await generateDigests(db, store, p.kind, p.key, p.startIso, p.endIso, { nowMs, budget: left });
+    left -= r.spent ?? 0;
+    generated += r.generated;
+    if (r.truncated === true) stillOwed.push(p);
+    else if ((r.failed ?? 0) > 0) {
+      const retries = (p.retries ?? 0) + 1;
+      changed = true;
+      const first = p.first_failed_at !== undefined && Number.isFinite(Date.parse(p.first_failed_at)) ? p.first_failed_at : new Date(nowMs).toISOString();
+      if (retries <= DIGEST_FAILED_RETRIES || nowMs - Date.parse(first) < DIGEST_FAILED_RETRY_WINDOW_MS) {
+        const wait = Math.min(DIGEST_FAILED_BACKOFF_MS * 2 ** Math.min(retries - 1, 20), DIGEST_FAILED_BACKOFF_MAX_MS);
+        stillOwed.push({ ...p, retries, first_failed_at: first, next_at: new Date(nowMs + wait).toISOString() });
+      } else {
+        logError({ cid, hop: "cron", msg: "digest_creator_failed", detail: `${p.kind}:${p.key}`, failed: r.failed });
+        if (readdable.has(`${p.kind}:${p.key}`)) dropped.push({ ...p, retries, first_failed_at: first, dropped: true });
+      }
+    }
+  }
+  const rewrite = !writtenAhead || changed;
+  if (leaseLost()) return { spent: genBudget - left + (writtenAhead ? 1 : 0), generated, owed: attempt.length };
+  if (rewrite) await writeOwed([...stillOwed, ...dropped]);
+  if (stillOwed.length > 0) logInfo({ cid, hop: "cron", msg: "digest_generation_carried", detail: stillOwed.map((p) => `${p.kind}:${p.key}`).join(",") });
+  return { spent: genBudget - left + (writtenAhead && rewrite ? 1 : 0), generated, owed: stillOwed.length };
+}
+/** I13-FX1 (I13-RG-OPS-05): the lease the delivery tail's creation-only fallback takes, so two fallbacks never overlap. */
+export const DELIVERY_CREATE_LEASE = "scheduled-delivery-create";
+/**
+ * I13-FX1 (I13-RG-OPS-05): the delivery tail found the shared `scheduled` lease held (the
+ * five-minute delivery tick, or a manual run; since I14 the SWEEP_CRON head holds HEAD_LEASE, not
+ * `scheduled`). The two CREATION legs run here,
+ * behind the same chain gate, under DELIVERY_CREATE_LEASE: `processNewEvents` with a
+ * delivery batch of 0 (it creates rows and sends nothing) and `sweepPayoutChangeFanout`.
+ * Both only INSERT notification rows under unique keys (`ON CONFLICT DO NOTHING`), so
+ * overlapping a holder that is creating too costs a repeated read, never a duplicate row;
+ * every SEND stays behind the `scheduled` lease. Budget: creation 351 + the batch-0 delivery read 1 + fan-out 60 +
+ * gate, lease and fallback reads, inside TAIL_DELIVERY_SUBREQUESTS (alerts.ts THE BUDGETS).
+ */
+async function deliveryTailCreationOnly(
+  db: DbLike,
+  env: Env,
+  caps: { createBudget?: number; fanoutBudget?: number; label?: string } = {},
+): Promise<void> {
+  const label = caps.label ?? "delivery_tail_creation_only";
+  const cid = crypto.randomUUID();
+  if (!(await tailChainGateOpen(db, env, Date.now()))) {
+    logError({ cid, hop: "cron", msg: "tail_refused_chain_unverified", detail: "delivery" });
+    return;
+  }
+  try {
+    const r = await withCronLease(db, DELIVERY_CREATE_LEASE, async (lease) => {
+      try {
+        const alerts = await processNewEvents(db, undefined, undefined, { deliver: { batch: 0 }, cid, ...(caps.createBudget === undefined ? {} : { createBudget: caps.createBudget }) });
+        if (alerts.truncated) logError({ cid, hop: "cron", msg: "alert_backlog", seq: alerts.watermark });
+      } catch (e) {
+        logError({ cid, hop: "cron", msg: "alert fan-out", err: e instanceof Error ? e.name : typeof e });
+      }
+      // I38-TICK: the lease's renewal was refused or threw during creation (cron-lease.ts withCronLease logged it).
+      if (lease.lost) return;
+      try {
+        const fan = await sweepPayoutChangeFanout(db, undefined, caps.fanoutBudget === undefined ? {} : { budget: caps.fanoutBudget });
+        if (fan.markers > 0) logError({ cid, hop: "cron", msg: "payout_change_fan_out", notified: fan.notified, markers: fan.markers });
+      } catch (e) {
+        logError({ cid, hop: "cron", msg: "payout_change_fan_out", err: e instanceof Error ? e.name : typeof e });
+      }
+    });
+    if (r.ran) logInfo({ cid, hop: "cron", msg: label });
+  } catch (e) {
+    logError({ cid, hop: "cron", msg: label, err: e instanceof Error ? e.name : typeof e });
+  }
+}
+/** I13-CRON: per group, the `sweep_cursor` row naming the leg in flight (cursor_id; '' between legs). */
+export const tailInflightCursor = (g: TailGroup): string => `tail_inflight_${g}`;
+/** I13-CRON: per group, the leg held after it killed an invocation (cursor_id) and the ticks it is still held (cursor_seq). */
+export const tailSuspectCursor = (g: TailGroup): string => `tail_suspect_${g}`;
+
+// I65-IMAGE (Jason D-1569): POST /internal/face-hold, the image service's legal-hold ask before it erases face data
+// (internal-face-hold.ts). Appended at the end of the file so that no line docs or tests cite in this file moves; Hono
+// matches it like any other route (app.notFound above runs only for what nothing matched).
+import { faceHoldAskAnswer, imageFaceErasePeerFromEnv as imageFaceErasePeer } from "./internal-face-hold.js";
+import { sweepImageFaceEraseOwed } from "./requests.js";
+export { FACE_ERASE_OWED_DETAIL, FACE_ERASE_OWED_REVIEWS_DETAIL, faceEraseHoldAnswer, faceHoldAskAnswer, imageFaceErasePeerFromEnv } from "./internal-face-hold.js"; // the door tests and the I65-HOLD arm read (.dependency-cruiser.cjs tests-import-doors-only)
+app.post("/internal/face-hold", anonBodyLimit, async (c) => {
+  const r = await faceHoldAskAnswer(c.env.SESSION_SECRET, c.req.header("X-Internal-Auth") ?? "", () => c.req.text(), () => d1(c.env.TRUST_DB));
+  return c.json(r.body, r.status);
+});
+===== END FILE: services/trust-core/src/index.ts [PART 2/2, lines 4540-7460] =====
+
+===== END OF CHUNK 58 OF 75 =====

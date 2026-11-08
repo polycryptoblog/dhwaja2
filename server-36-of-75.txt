@@ -1,0 +1,3147 @@
+DHWAJA CODE REVIEW — server — CHUNK 36 OF 75
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (alerts*)
+Files in this chunk (1):
+  - services/trust-core/src/alerts.ts
+
+
+===== BEGIN FILE: services/trust-core/src/alerts.ts =====
+import { subjectForAccount } from "@dhwaja/canonical";
+import { shieldedKeysForSubjects } from "./account-visibility.js";
+import { unprovenAssertionEvents } from "./assertions.js";
+// The single-holder lease over a scheduled sweep. `runDeliverySweep` takes the
+// SAME lease the 6-hourly sweep takes, so a delivery-only tick can never
+// double-send against it — see that function for why the TTL differs.
+import { acquireCronLease, releaseCronLease } from "./cron-lease.js";
+import { type DbLike, type DbStatement, IN_CHUNK, inChunks } from "./db.js";
+// The creator-directed channel. `digest.ts` owns `creator_digests` and the
+// content shape, so it owns the write; this is the only runtime edge between the
+// two modules and it is one-way (#902a: the push types and retry constants digest.ts used to import from here
+// now live in digest.ts).
+import {
+  DELIVERY_RETRY_BASE_S,
+  DELIVERY_RETRY_CAP_S,
+  DELIVERY_RETRY_MAX_ATTEMPTS,
+  type DeviceTarget,
+  payoutChangeNoticeStatement,
+  type PushOutcome,
+  type PushPayload,
+  type PushSender,
+} from "./digest.js";
+// #902a (D-0920): the push adapter contract and the per-row retry schedule are declared in digest.ts (the module this
+// one already imports) so the two no longer import each other; re-exported here for every existing importer.
+export { DELIVERY_RETRY_BASE_S, DELIVERY_RETRY_CAP_S, DELIVERY_RETRY_MAX_ATTEMPTS };
+export type { DeviceTarget, PushOutcome, PushPayload, PushSender };
+import { alertEmail, emailAddressHash, escapeHtml, NEVER_ASK_LINE, recordEmailSuppressions, retiredSuppressionLookup, sendOnce, suppressedAddressHashes, suppressionKeyOf, textToHtml, wrapHtml, type EmailMessage, type EmailOutcome, type EmailSender } from "./email.js";
+import { mintUnsubscribeTokens, unsubscribeUrl } from "./unsubscribe.js";
+import { logError, logInfo } from "./log.js";
+import { FROZEN_CLOSURE_STATES_SQL } from "./credits.js";
+
+/**
+ * Save Creator change alerts. A pure FOLD over trust_events: on each pass we
+ * read events newer than a watermark whose subject is a saved passport and
+ * whose type is "notable", create one notification per saver (dedup by a
+ * (account,event) unique), attempt delivery via an injected PushSender, and
+ * advance the watermark. No new trust authority — a notification can only
+ * restate a ledger event.
+ *
+ * Durability split: notification CREATION is the durable step (advances the
+ * watermark); DELIVERY is best-effort and retryable (undelivered rows are
+ * retried when due — per-row backoff, settled at DELIVERY_RETRY_MAX_ATTEMPTS),
+ * so a flaky push provider never duplicates an alert and cannot wedge the queue.
+ */
+
+/**
+ * I3-0912: the notification KIND an event type is written as, where it is not
+ * the event type itself. `operator_lapsed` is the badge walking back exactly as
+ * `verification_expired` does, so it rides that kind — its push line, email
+ * subject, SAFETY_KINDS lane and the fan's chip — rather than minting a kind
+ * every client would have to learn first. Parsed by
+ * tests/invariants/notification-vocabulary.test.ts (the kinds the server writes).
+ */
+const NOTIFICATION_KIND: Readonly<Record<string, string>> = {
+  operator_lapsed: "verification_expired",
+};
+
+/** Events that matter to a fan following a creator. Warnings are NOT here —
+ * they target impersonator hashes, not the creator's passport. */
+const NOTABLE: Record<string, (payload: Record<string, unknown>) => string> = {
+  verification_granted: () => "is now Verified on Dhwaja",
+  // LIVE AS OF THE EXPIRY SWEEP. This template sat here unreachable for the
+  // whole time `verification_expired` was an unappendable vocabulary entry — the
+  // product shipped a fan-facing sentence about a thing that could not happen.
+  // `verification-sweep.ts` appends the event and the fold moves the badge, so
+  // the sentence now fires the moment the badge goes.
+  verification_expired: () => "verification has expired",
+  // I3-0912: a character whose operator stopped answering for it loses the badge
+  // (character-lapse-sweep.ts). Same fact for a saver as an expiry, so it is
+  // written AS the expiry kind — see NOTIFICATION_KIND.
+  operator_lapsed: () => "verification has lapsed",
+  verification_renewed: () => "renewed their verification",
+  account_added: (p) => `added a ${String(p.platform ?? "new")} account`,
+  // "REMOVED", NOT "REVOKED", and the wording is now load-bearing rather than
+  // cosmetic. This event has two producers with opposite stories: a creator
+  // signing off an account they really had (CREATOR_SIGNABLE), and an operator
+  // executing a `correct` request from a creator saying an account Dhwaja
+  // attached to them was never theirs (removal.ts `resolveRemoval`). "Revoked"
+  // asserts the first — that the creator once used it — which is exactly false
+  // in the second, and the second is the one that reaches a fan who may have
+  // saved the wrong account. "Removed an account from their passport" is true of
+  // both and still tells the fan the only thing they need: stop trusting it.
+  account_revoked: () => "removed an account from their passport",
+  // I3-0911: announced to the savers of `from_passport` — the passport that LOST
+  // the account (`fanPassportOf`). Names no account, platform or handle.
+  account_transferred: () => "had an account moved to another passport",
+  claim_proven: () => "claimed their profile",
+  correction: () => "had a listing correction",
+  // S71 one-way signed broadcast: the summary IS the creator's (sanitized)
+  // message. The `name` prefix in processNewEvents makes it read
+  // `<Creator>: "<message>"`.
+  creator_broadcast: (p) => `says: "${typeof p.message === "string" ? p.message : ""}"`,
+};
+
+/**
+ * The NOTABLE templates that are about ONE ACCOUNT rather than the passport as a
+ * whole. Derived by hand and kept next to `NOTABLE` on purpose: a new template
+ * that names an account must be added here, and the guard in alerts.test.ts
+ * asserts every member is a real NOTABLE key so a rename cannot leave a stale
+ * entry silently doing nothing.
+ */
+const ACCOUNT_SCOPED = new Set<string>(["account_added", "account_revoked"]);
+
+/**
+ * Is the account this event is about currently shielded?
+ *
+ * `account_revoked` carries the key. `account_added` does
+ * NOT — its payload is {platform, id_kind, id} and the key is derived, so it is
+ * derived here the same way `events.ts` derives it for the INSERT. An event
+ * whose payload cannot yield a key is treated as SHIELDED: this decides whether
+ * to publish, so the unknown case must not publish.
+ */
+function isShielded(shields: Map<string, ReadonlySet<string>>, e: { event_type: string; subject: string; payload: string }): boolean {
+  const set = shields.get(e.subject);
+  if (!set || set.size === 0) return false;
+  let p: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(e.payload);
+    if (parsed === null || typeof parsed !== "object") return true;
+    p = parsed as Record<string, unknown>;
+  } catch {
+    return true;
+  }
+  if (typeof p.account_key === "string") return set.has(p.account_key);
+  if (e.event_type !== "account_added") return true;
+  try {
+    return set.has(subjectForAccount(String(p.platform), String(p.id_kind), String(p.id)).canonical);
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * I3-0911: the passport whose SAVERS an event is announced to. Every NOTABLE
+ * event goes to its subject's savers except `account_transferred`, whose ledger
+ * subject is the DESTINATION: the fans owed that notice saved the SOURCE
+ * (`from_passport`). null = no usable source, so the event is announced to nobody.
+ */
+function fanPassportOf(e: { event_type: string; subject: string; payload: string }): string | null {
+  if (e.event_type !== "account_transferred") return e.subject;
+  try {
+    const p = JSON.parse(e.payload) as Record<string, unknown> | null;
+    return p !== null && typeof p.from_passport === "string" && p.from_passport.startsWith("psp_") ? p.from_passport : null;
+  } catch {
+    return null;
+  }
+}
+
+/** I3-0911: a transfer is announced only when its key is shielded on NEITHER passport, and never without a source (fail closed). */
+function transferWithheld(shields: Map<string, ReadonlySet<string>>, e: { event_type: string; subject: string; payload: string }): boolean {
+  const from = fanPassportOf(e);
+  return from === null || isShielded(shields, e) || isShielded(shields, { ...e, subject: from });
+}
+
+
+
+/**
+ * The name-free alert line for a notification kind. One fixed string per kind,
+ * chosen from a frozen table rather than built from data, so no creator name,
+ * handle, broadcast message or passport id can reach a provider by accident.
+ * An unknown kind falls back to the most generic line there is.
+ */
+const PUSH_NOTICES: Readonly<Record<string, string>> = Object.freeze(Object.assign(Object.create(null) as Record<string, string>, {
+  verification_granted: "A creator you saved is now Verified.",
+  // N-08: these three used to share one byte-identical line even though two of
+  // them are SAFETY_KINDS (fast-laned, no-action-needed-vs-act-now matters) and
+  // the third is deliberately not. Every OTHER kind in this table has its own
+  // sentence; these three did not, and "lost the badge" vs "just renewed it"
+  // are opposite news reduced to one indistinguishable push. Still name-free —
+  // no creator, handle or date, matching every other line here.
+  verification_expired: "A creator you saved lost their Verified badge.",
+  verification_renewed: "A creator you saved renewed their verification.",
+  verification_expiring: "A creator you saved will lose their Verified badge soon.",
+  account_added: "A creator you saved added an account.",
+  account_revoked: "A creator you saved removed an account.",
+  account_transferred: "A creator you saved had an account moved to another passport.",
+  claim_proven: "A creator you saved claimed their profile.",
+  correction: "A creator you saved has a listing correction.",
+  creator_broadcast: "A creator you saved posted an update.",
+  payout_changed: "A creator you saved changed their payout destination — open Dhwaja before you send anything.",
+}));
+
+export function pushNotice(kind: string): string {
+  return PUSH_NOTICES[kind] ?? "You have a new Dhwaja update.";
+}
+
+
+/** No-op sender: pipeline runs, nothing delivered (dev default). */
+export const nullSender: PushSender = async () => "retry";
+
+interface EventRow {
+  seq: number;
+  event_id: string;
+  event_type: string;
+  subject: string;
+  payload: string;
+  /** The event's OWN instant. Bounds the fan-out's save set (`:874`, `:974`). */
+  created_at: string;
+}
+
+export interface ProcessResult {
+  processed_events: number;
+  notifications_created: number;
+  delivered: number;
+  watermark: number;
+  /** The creation leg stopped on its statement budget with page left to read.
+   * The watermark is durable at that point; the next tick resumes there. */
+  truncated: boolean;
+}
+
+const BATCH = 1000;
+
+/** I3-0278: pages of BATCH one creation tick may read (each only after the
+ * previous came back full and was consumed whole). 10 x 1000 x 4 ticks/day is
+ * 40,000 ledger events a day through the fold, where one page made it 4,000. */
+export const ALERT_CREATE_PAGES = 10;
+
+/**
+ * ───────────────────────────────────────────────────────────────────────────
+ * THE BUDGETS — why every leg in this file has a ceiling, and where the
+ * ceiling now sits.
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * A Cloudflare invocation has a HARD subrequest budget (~1000 on the paid plan,
+ * 50 on the free one). A D1 binding call spends one of them AND SO DOES AN
+ * OUTBOUND `fetch` — the push to APNs/FCM and the POST to the mail API are
+ * subrequests exactly like a SELECT is. Everything in this module used to scale
+ * with a number nobody bounded — savers per creator, undelivered rows in the
+ * table — inside a `scheduled()` handler that had no catch around this call.
+ * Measured with `test/db-recorder.ts`: 1000 savers on one notable event cost
+ * 3006 D1 statements, of which 2001 were `deliverPending` walking `BATCH = 1000`
+ * undelivered rows at two statements each. Blow the budget and the invocation
+ * throws; the watermark was committed only AFTER the whole loop, so the next
+ * tick replayed the same page and threw at the same index — FOREVER — taking the
+ * email leg, the digests, the expiry sweep and fourteen retention prunes with
+ * it. `alerts_seq` is a single global row, so one hot creator wedged alerts for
+ * the entire deployment.
+ *
+ * Three changes closed that, and none of them is sufficient alone:
+ *
+ *  1. SET-BASED FAN-OUT. One `INSERT … SELECT … FROM saves` per event instead of
+ *     one INSERT per saver, so the CREATION leg no longer scales with followers
+ *     at all: a creator with 200,000 savers costs the same one statement as a
+ *     creator with three.
+ *  2. PER-EVENT WATERMARK. `alerts_seq` advances after each event completes, so
+ *     partial progress is durable and a replay can never be permanent. A single
+ *     event that keeps failing is logged and STEPPED OVER (see the loop) rather
+ *     than retried until the end of time.
+ *  3. THESE BUDGETS. Each leg stops cleanly at a statement ceiling and (for the
+ *     two legs that talk to a provider) an OUTBOUND-FETCH ceiling and a
+ *     wall-clock deadline, leaving its cursor/watermark where it can resume.
+ *     Stopping early costs latency; not stopping costs the whole sweep.
+ *
+ * ───────────────────────────────────────────────────────────────────────────
+ * WHAT THE FIRST VERSION OF THIS BLOCK GOT WRONG, AND THE CEILING IT LEFT.
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * It added up 120 + 250 + 150 + 60 = "~580 subrequests worst case" and COUNTED
+ * ONLY THE D1 STATEMENTS. The ≤100 pushes and ≤100 mails those legs also issue
+ * are subrequests too, and the pushes are per DEVICE, not per row — and nothing
+ * caps devices per account (`accounts.registerDevice` has no such limit), so the
+ * true worst case was not 580 but unbounded in a column no reader bounded. That
+ * is the same class of defect the block was written to close.
+ *
+ * It also wrote down the throughput ceiling as a known gap: at four ticks a day,
+ * `DELIVER_BATCH`/`EMAIL_BATCH` of 100 cap DELIVERY at ~400 pushes and ~400
+ * mails a day, deployment-wide, with creation unbounded above it. A
+ * payout-destination-change alert exists to be seen inside a 24-hour cooling-off
+ * window; a backlog deeper than a day's throughput delivers it after the window
+ * it was bought to protect. Same for verification-expiry and every other safety
+ * notice.
+ *
+ * ───────────────────────────────────────────────────────────────────────────
+ * WHAT ACTUALLY BINDS — measured, because the answer is not the obvious one.
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * Raising `DELIVER_BATCH` alone would have bought nothing. The sends were
+ * SERIAL awaits on a `fetch` whose own deadline is `PUSH_TIMEOUT_MS` (10 s), so
+ * the pass cost `rows × latency` against `DELIVERY_BUDGET_MS` (20 s): at a
+ * healthy 150 ms per provider call a batch of 100 already spends 15 s of a 20 s
+ * budget, and 133 rows is the whole of it. The wall clock bound the leg at
+ * roughly the batch size it already had. THE SERIALISATION WAS THE CEILING.
+ *
+ * So the fix is three-sided, and the sides multiply:
+ *
+ *  A. BOUNDED-CONCURRENCY SENDS. `DELIVER_CONCURRENCY` provider calls in flight
+ *     at once, in fixed-width waves — the shape `checkpoint.ts` already uses to
+ *     bound its R2 reads (`ANCHOR_READ_CONCURRENCY`). Wall-clock cost per pass
+ *     falls by that factor. An overrun is still bounded: the deadline is checked
+ *     BEFORE each wave and a wave cannot outlive one `PUSH_TIMEOUT_MS`, so the
+ *     worst overshoot past the deadline is 10 s, not `rows × 10 s`.
+ *  B. SET-BASED PER-WAVE STATEMENTS. A wave costs THREE statements whatever its
+ *     width — one `SELECT … devices WHERE account_id IN (…)`, one
+ *     `UPDATE … WHERE notif_id IN (…)` to settle, and at most one
+ *     `DELETE … devices WHERE device_id IN (…)` for tokens the provider called
+ *     dead — instead of two-plus per row. The push leg's D1 cost drops from
+ *     `1 + 2N` to `1 + 3⌈N/W⌉`, which is what makes a bigger batch affordable at
+ *     all.
+ *  C. A DELIVERY-ONLY CRON. The 6-hourly cadence is set by the checkpoint and
+ *     registry work, not by delivery, and those legs are the expensive
+ *     co-tenants that force delivery to be small. `DELIVERY_CRON` runs
+ *     `runDeliverySweep` — the two delivery legs and NOTHING else — in its own
+ *     invocation with its own ~1000-subrequest budget, under the SAME cron lease
+ *     so it can never double-send against the 6-hourly sweep.
+ *
+ * ───────────────────────────────────────────────────────────────────────────
+ * THE ARITHMETIC, per invocation, worst case. Statements + outbound fetches.
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * I13-CRON (QUEUE #885): THE SIX-HOURLY SWEEP NO LONGER CARRIES ITS TAIL.
+ * Its head (chain verify, anchors, registry plan, hygiene rotation) stays on
+ * SWEEP_CRON and every leg that followed it runs on a trigger of its own
+ * (index.ts TAIL_*_CRON), so each sum below is one invocation's. Every capped
+ * leg charges its cap BEFORE it spends, so a sum of caps is a ceiling, not an
+ * estimate. `test/i13-cron-budget.test.ts` adds these from the exported caps
+ * (TAIL_*_SUBREQUESTS, at the end of this module) AND measures the delivery
+ * and odds tails with every leg saturated past its cap.
+ *
+ * THE DELIVERY TAIL (TAIL_DELIVERY_CRON) — delivery is a BACKSTOP here:
+ *
+ *     creation      ≤ ALERT_CREATE_BUDGET + 1 watermark read              351
+ *     push          ≤ 60 statements (DELIVER_STATEMENT_BUDGET) + ≤ 200 pushes  260
+ *     payout fanout ≤ 60 statements (PAYOUT_FANOUT_BUDGET)                 60
+ *     email         ≤ 40 statements (EMAIL_STATEMENT_BUDGET) + ≤ 150 mails    190
+ *     tail scaffolding (TAIL_OVERHEAD_SUBREQUESTS)                          40
+ *                                                                       ────
+ *                                                                        901   (of ~1000)
+ *
+ *   Measured with every leg saturated (i13-cron-budget.test.ts, I32): creation
+ *   351 + its batch-0 delivery read 1 (charged to the push term) + push 17 + 200 pushes + fan-out 58 + email 24 + 150 mails +
+ *   scaffolding 4 = 805 against the cap sum of 901 (at the old ALERT_CREATE_BUDGET of 120:
+ *   creation 111, total 583 against 671).
+ *
+ *   Why the push and email terms are their STATEMENT budgets and not the wave
+ *   arithmetic below (43 and 24 statements at these batches): the budgets are
+ *   what the legs charge before a wave, so they are the bound a reader can
+ *   rely on; the wave figures are what a healthy pass happens to spend. The
+ *   scaffolding term is lease acquire and release, the chain-verdict read,
+ *   the group's hold read, two in-flight writes per leg and the lease fences
+ *   (index.ts `tailLeg`). Units: one D1 statement, one push, one mail and one
+ *   R2 operation are one subrequest each; a D1 batch is counted per statement,
+ *   which over-counts it.
+ *
+ * THE PAYOUTS TAIL (TAIL_MONEY_CRON): creator-payout.ts THE BOUNDS, 951 worst
+ *   case — the MIXED tick, PAYOUT_RETRY_BUDGET paid retries at 6 + 16 and the rest (PAYOUT_TRANSFER_BUDGET 43 - 15) new
+ *   at 6 + 16 (5 + 16 until each reservation gained its audit row, I56), a dispatch being PAYOUT_DISPATCH_SUBREQUESTS = 16 Stripe calls since I29-PAYOUT
+ *   (payout-run-bounds.test.ts; 305 until a dispatch became 3 Stripe calls, I15; 355 until each
+ *   paid transfer wrote its own audit row, I19 #936(c); 405, the all-new tick, until I19-FXA;
+ *   420 until I22, 620 until I22-FX-MONEY, 870 until I29-PAYOUT, 944 until I56) + 40 scaffolding = 991 (TAIL_MONEY_SUBREQUESTS below).
+ *
+ * THE PACK-ODDS TAIL (TAIL_ODDS_CRON), first tick of an ISO week: 3 selection
+ *   statements + the odds-key GET + the conditional PUT + 5 per candidate x 150
+ *   + 40 = 795. This block used to say ~4 per candidate (600). MEASURED it is 5
+ *   — 452 statements + 302 R2 operations = 754 for 150 candidates — because
+ *   `serveRatings` reads the per-creator object unconditionally (QUEUE #778).
+ *   Odds and payouts in one invocation would be 1,060, which does not fit, so
+ *   they are two triggers.
+ *
+ * THE ARTIFACTS TAIL (TAIL_ARTIFACTS_CRON), I13-FX1 (D-0889(3)): its legs run on
+ *   METERED handles (index.ts `tailMeter`) — every D1 statement and R2 operation
+ *   charged before it is sent and refused past TAIL_ARTIFACTS_LEG_BUDGET
+ *   (= INVOCATION_SUBREQUEST_CEILING - TAIL_OVERHEAD_SUBREQUESTS = 960) — so the
+ *   invocation is ceiling-bounded: 960 + 40 = 1000. MEASURED over 600 verified
+ *   creators, all agency-granted (buildSweep examining, its per-creator lease fence
+ *   metered): at most 989 per invocation over 4 ticks; 1,029 before I13-FX7
+ *   (i13-fx1-artifacts-budget.test.ts). The retraction purge runs on every artifacts
+ *   run (ARTIFACT_PINNED_LEGS) and rotates (analytics-build.ts FROZEN_PURGE_CURSOR).
+ *   The legs the budget did not reach run first next run (`tail_carry_artifacts`).
+ *   I14-CAPS (QUEUE #912): the legs end on their OWN caps — buildSweep
+ *   BUILD_SWEEP_SUBREQUEST_CAP 270, buildRankings RANKINGS_LEG_CAP 120, the ratings leg
+ *   RATINGS_LEG_CAP 250 (buildPowerRatings sizes its batch from it; its anchor reads held to
+ *   index.ts RATINGS_ANCHOR_MEMBER_BUDGET), buildTopRequested 2, purgeLegacyTopFans
+ *   TOPFANS_LEGACY_PURGE_BUDGET 20 (I14-FX2) — and with ARTIFACTS_PURGE_RESERVE they sum
+ *   under 960 (i14-artifacts-leg-caps.test.ts); the pinned purge's share ends before
+ *   index.ts ARTIFACTS_LEGS_AFTER_PURGE (I14-FX2). wordingDrift ends on its own cap since I14-FX5 (warnings.ts
+ *   WORDING_DRIFT_WORDING_READS 37 wording reads + cursor read, page read, cursor write = at most 40, its allowance in that sum); this meter is the backstop for every leg. MEASURED (I14-CAPS), 600 granted creators on full
+ *   boards: ~495, no cut.
+ *
+ * THE DIGESTS TAIL (TAIL_DIGESTS_CRON): `deliverDigests` 380 (DIGEST_STATEMENT_BUDGET
+ *   260 + DIGEST_FETCH_BUDGET 120) + generation DIGEST_GENERATE_BUDGET 400 (digest.ts;
+ *   I13-FX1, metered, all of a run's calls together) + the backfill probe
+ *   (DAILY_BACKFILL_MAX_DAYS = 14) + the owed-period read and write 2 + the generation
+ *   lease (index.ts DIGEST_GENERATE_LEASE) acquire and release 2 + 40 scaffolding = 838,
+ *   leaving 162 for the face leg: its 3 index.ts calls (two setting reads, the image
+ *   service health fetch) and `faceTriageSweep`, which stops at whole items inside its
+ *   FACE_TRIAGE_SUBREQUEST_BUDGET 160 — 1 + 6 x FACE_TRIAGE_ITEM_MAX_SUBREQUESTS 24 = 145
+ *   at most (face-triage.ts), so 148 of the 162. MEASURED over 600 claimed
+ *   creators with the whole backfill owed: 437 (7,216 in generation alone before the
+ *   cap); periods the budget cut short are carried (`digests_generate_owed`).
+ *   PER DAY (I23-Q4, D-1030 (a): "run 8 times a day"): every figure above is per invocation and does not move with the
+ *   cadence. At TAIL_DIGESTS_CRON every third hour (index.ts, I29-INT) a day is 8 invocations: at most 8 x 1,000
+ *   subrequests, 8 x DIGEST_RUN_CAPACITY (25, digest.ts) = 200 digest rows delivered, 8 x DIGEST_GENERATE_BUDGET 400
+ *   generation calls and 8 face-triage passes — twice the 4-run day (100 rows) it was.
+ *
+ * THE ANALYTICS_CRON TICK's digest leg (I14-CRON, QUEUE #916): `generateDigestPass` at
+ *   DIGEST_TICK_GENERATE_BUDGET 80 (metered) + 4 pass scaffolding (owed read, one-day
+ *   probe, weekly-pending read, one owed write — written ahead or behind, I14-FX2; a pass that wrote ahead and then advanced a retry or dropped a period writes once more, out of the 80, I14-FX5) + 2 chain
+ *   gate (verdict read, integrity-marker head) + 2 lease = at most 88, plus one lease renewal
+ *   per ANALYTICS_LEASE_TTL_MS / 3 of wall clock (cron-lease.ts withCronLease).
+ *
+ * NOT BOUNDED, written down rather than rounded off — "cannot exceed the ceiling"
+ * is NOT shown for these:
+ *   - THE HEAD (SWEEP_CRON): the chain walk, anchors and the registry steps,
+ *     which spend what is left of the invocation by wall clock, not by count.
+ *
+ * BEFORE THE SPLIT, ONE INVOCATION: this block said 597 + 154 + 600 + ~325 =
+ * 1,676 on the first tick of an ISO week. With the payout leg at 305 and the
+ * odds leg measured at 754 the capped legs alone were 597 + 305 + 754 + 380 =
+ * 2,036, before the head and the uncapped legs above — about twice the ceiling.
+ *
+ * IN THE DELIVERY-ONLY TICK (`SOLO_*`, nothing else in the invocation):
+ *
+ *     push          3 + 4⌈300/16⌉ = 79 statements + ≤340 pushes          419
+ *     email         4 + 2⌈300/16⌉ = 42 statements + ≤300 mails           342
+ *     lease acquire + re-assert + release                                  3
+ *                                                                       ────
+ *                                                                        764   (of ~1000)
+ *
+ * THE PAGE-READ TERM IS 3, NOT 2, AND THE EMAIL WAVE TERM IS 2, NOT 1. Both of
+ * these blocks stated the old sums for a slice after the change that moved them
+ * (slice 21 added the one-click mint to every email wave; slice 23 added the
+ * safety arm to both legs), which is why the arithmetic is now restated in the
+ * SAME change every time a term moves. A budget nobody re-derives is a ceiling
+ * that binds silently: at the old email figure of 40 the pass stopped 12 rows
+ * short of its own batch and reported success.
+ *
+ * WHICH LIMIT BINDS, at the solo numbers: 300 rows is ⌈300/16⌉ = 19 waves, so
+ * the wall clock binds when a wave averages more than
+ * `SOLO_DELIVERY_BUDGET_MS / 19` ≈ 2.4 s — i.e. when the provider is roughly 16×
+ * slower than healthy. Below that, THE FETCH BUDGET BINDS and the pass delivers
+ * its whole batch. The two bounds cross at a provider latency of ~2.4 s; a
+ * pathological provider sitting on the 10 s timeout gets four waves (≤64 rows)
+ * and the pass stops cleanly with everything else still `delivered = 0`.
+ *
+ * THROUGHPUT, which is the number this whole block exists to move:
+ *
+ *     before   4 ticks/day × 100 =    400 pushes/day and    400 mails/day
+ *     after    4 × 150  (backstop)  +  288 × 300 (solo)
+ *              =                     87,000 pushes/day and 87,000 mails/day
+ *
+ * — 217×, at 75% of one invocation's subrequest budget. The FREE plan's
+ * 50-subrequest ceiling cannot run either cron and never could; that is
+ * unchanged.
+ *
+ * WHAT IS STILL NOT SOLVED, written down rather than papered over: this is
+ * bounded pull, not a queue. A deployment that needs more than ~87,000
+ * deliveries a day wants Cloudflare Queues with this module reduced to
+ * enqueueing, and the knobs below cannot be raised past one invocation's
+ * subrequest budget. `PRIORITY_SCAN` is the partial answer in the meantime — see
+ * `SAFETY_KINDS`.
+ */
+/**
+ * I13-CRON (QUEUE #901): the statements the alert CREATION leg may spend per
+ * tick. SIZED FROM THE DELIVERY TAIL'S BUDGET, not from volume — there is no
+ * production volume to size from. Creation's watermark read, the other
+ * delivery-tail legs and the tail scaffolding take 551 of the ~1000 ceiling
+ * (TAIL_DELIVERY_SUBREQUESTS minus this budget), which leaves 449; 350 keeps 99 (~10%) of the
+ * ceiling as headroom for what the sum cannot see. It was 120 while creation
+ * shared one invocation with every other leg. At 2 statements a notable event
+ * after page 1's lookups (measured: 111 statements at 120), that is roughly 150
+ * notable events a tick instead of ~55, four ticks a day. Re-size it from real
+ * volumes once there are any; the delivery tail's cap sum is the upper bound.
+ */
+export const ALERT_CREATE_BUDGET = 350;
+
+/** Statements ONE notable event costs the creation leg: the fan-out insert and
+ * the watermark commit that makes it durable. */
+const PER_EVENT_STATEMENTS = 2;
+/** SJ-17: how many durable dead letters one tick will retry before new work. */
+const DEAD_LETTER_RETRY_BUDGET = 5;
+/** I3-1602: a dead letter that has failed this many times is PARKED — no longer
+ * replayed, logged once as `alert_fan_out_dead_letter_parked`, counted by
+ * `pruneNotifications` every day, and deleted with the retention window. */
+export const DEAD_LETTER_MAX_ATTEMPTS = 10;
+
+/**
+ * Provider calls in flight at once, and the width of one statement wave.
+ *
+ * THE NUMBER THAT REPLACED A SERIAL AWAIT. Sixteen is chosen against three
+ * ceilings, not picked: it is the factor the wall clock falls by (a 150-row push
+ * pass goes from 150 serial round trips to 10 waves); it is small enough that
+ * one wave's `notif_id IN (…)` / `account_id IN (…)` / `device_id IN (…)` lists
+ * stay far under D1's bound-parameter ceiling (`db.ts IN_CHUNK` = 90), so a wave
+ * is always ONE statement and never needs chunking; and it is small enough that
+ * a wave of 10 s timeouts overshoots the deadline by one `PUSH_TIMEOUT_MS`
+ * rather than by a multiple of it.
+ *
+ * Concurrency here is over SENDS, not rows: a row with several devices
+ * contributes several sends and they are sliced into the same fixed-width waves,
+ * so the number of simultaneous provider calls is `DELIVER_CONCURRENCY` whatever
+ * the device distribution looks like.
+ */
+export const DELIVER_CONCURRENCY = 16;
+
+/** Binds `scheduleSet` spends ahead of the WHERE list (for `inChunks`). */
+const SCHEDULE_BINDINGS = 7;
+/** SET clause for one leg: rows in the JSON retry list back off (or settle at the
+ * ceiling); every other row in the WHERE list is settled as before. SQLite reads
+ * old column values on every right-hand side, so the three terms agree. */
+function scheduleSet(done: "delivered" | "emailed", leg: "push" | "email"): string {
+  const inRetry = "notif_id IN (SELECT value FROM json_each(?))";
+  return `${done} = CASE WHEN ${inRetry} AND ${leg}_attempts + 1 < ? THEN 0 ELSE 1 END,
+          ${leg}_next_at = CASE WHEN ${inRetry} THEN strftime('%Y-%m-%dT%H:%M:%fZ', ?, '+' || MIN(? << ${leg}_attempts, ?) || ' seconds') ELSE ${leg}_next_at END,
+          ${leg}_attempts = ${leg}_attempts + (${inRetry})`;
+}
+function scheduleBinds(retry: readonly number[], nowIso: string): unknown[] {
+  const j = JSON.stringify(retry);
+  return [j, DELIVERY_RETRY_MAX_ATTEMPTS, j, nowIso, DELIVERY_RETRY_BASE_S, DELIVERY_RETRY_CAP_S, j];
+}
+
+/**
+ * Devices ONE notification will be pushed to.
+ *
+ * `devices` has no per-account cap anywhere — `accounts.attachDevice` upserts on
+ * the push token and `registerDevice` bootstraps a new account, and neither
+ * counts. So "≤ DELIVER_BATCH × devices outbound pushes" was a worst case with
+ * an unbounded term in it: one account that had attached 5,000 devices could
+ * spend the whole invocation's subrequest budget on a single notification.
+ * `DELIVER_FETCH_BUDGET` is the hard stop, but a hard stop that one row can
+ * exhaust starves every other row in the page, so the per-row cost is bounded
+ * too. Newest devices first — a fan's current handset, not a registration they
+ * abandoned two phones ago.
+ *
+ * A TRUNCATED row is never settled by the all-devices-dead branch: it is left
+ * `delivered = 0` for the next pass, because "every device we looked at is dead"
+ * is not "every device is dead" when we did not look at all of them.
+ */
+export const MAX_DEVICES_PER_NOTIFICATION = 10;
+
+/** Undelivered rows one PUSH pass will attempt. Was `BATCH` (1000) — i.e. up to
+ * 2000 statements and 1000+ provider calls in a single invocation — then 100,
+ * which the serial wall clock made the real ceiling anyway. */
+export const DELIVER_BATCH = 150;
+/** Outbound pushes one PUSH pass may issue. THE SUBREQUEST BOUND: rows are not
+ * pushes (a row with three devices is three), so this is the number that has to
+ * be true for the arithmetic above, and it is enforced when the send list is
+ * built rather than hoped for. */
+export const DELIVER_FETCH_BUDGET = 200;
+/** …and the hard D1-statement ceiling for that pass, whichever binds first.
+ * `3 + 4⌈150/16⌉ = 43` at the numbers above — THREE page reads since slice 23's
+ * safety arm, and the worst case in which every wave spends all four of its
+ * reserved statements — so 60 is headroom. */
+export const DELIVER_STATEMENT_BUDGET = 60;
+
+/** Un-emailed rows one EMAIL pass will attempt. */
+export const EMAIL_BATCH = 150;
+/** Outbound mails one EMAIL pass may issue — one per row, so this is the row
+ * count, stated separately because it is the SUBREQUEST bound and the row count
+ * is the work bound, and they stop being the same number the moment anything
+ * sends twice. */
+export const EMAIL_FETCH_BUDGET = 150;
+/** `4 + 2⌈150/16⌉ = 24` at the numbers above: the dead-prefix settle, THREE page
+ * reads (slice 23's safety arm), and TWO statements per wave — the RFC 8058
+ * one-click mint and the settle UPDATE. (It read `3 + ⌈150/16⌉ = 13` and one
+ * statement per wave until slice 21 added the mint, and stated that stale sum
+ * for a whole slice afterwards; `slice23-safety-lane.test.ts` now derives every
+ * one of these four blocks so a fourth stale copy cannot ship.) */
+export const EMAIL_STATEMENT_BUDGET = 40;
+
+/**
+ * How many of the NEWEST undelivered rows each delivery leg looks at, on top of
+ * the oldest `batch` it is about to work — the PRIORITY window.
+ *
+ * WHY A SECOND WINDOW EXISTS AT ALL. Both legs page `ORDER BY notif_id ASC`,
+ * i.e. strict FIFO, and a payout-destination-change alert created just now sorts
+ * BEHIND every routine "a creator you saved posted an update" already waiting.
+ * With a backlog deeper than a pass, the one notification with a 24-hour deadline
+ * queues behind notifications that have none. Raising the ceiling shrinks that
+ * risk; it does not make ordering irrelevant.
+ *
+ * WHY IT IS A WINDOW AND NOT A `WHERE kind IN (…)`. Measured, on the repo's own
+ * double, at a 200,000-row undelivered backlog with no safety row in it:
+ * `WHERE delivered = 0 AND kind IN (…) ORDER BY notif_id ASC LIMIT 50` costs
+ * 57 ms because SQLite walks the ENTIRE `delivered = 0` set through
+ * `idx_notif_undelivered` before it can answer "none" — the same
+ * scan-the-dead-prefix defect `EMAIL_SETTLE_LIMIT` exists to fix, reintroduced
+ * on the other channel, and D1 is far slower than in-process SQLite. A LIMITed
+ * scan of the same index in DESCENDING order costs `O(limit)` and cannot
+ * degrade: 0.9 ms for both arms together at the same 200,000 rows, and it FOUND
+ * the fresh payout row buried behind all of them.
+ *
+ * So the page read is one compound statement — the oldest `batch` undelivered
+ * rows (fairness, drains the backlog) UNION ALL the newest `PRIORITY_SCAN`
+ * undelivered rows (rescues fresh safety alerts from behind it) — which is the
+ * head-plus-window shape `checkpoint.ts allAnchors` already uses for exactly the
+ * same reason. Statement count is unchanged: one page read, as before.
+ *
+ * THE GAP THIS USED TO CARRY IS CLOSED (slice 23), and widening the window was
+ * NOT the fix. The comment here used to read: "a safety alert that is neither in
+ * the oldest `batch` nor in the newest `PRIORITY_SCAN` … is reached in FIFO
+ * order like anything else. Widening this window is cheap … and is the knob to
+ * turn." Two things were wrong with that.
+ *
+ * First, the number that defeats a positional window is not the backlog depth,
+ * it is the CREATION RATE: `PRIORITY_SCAN` newer rows inside one 5-minute tick
+ * is 100 a minute, which one broadcast to a large audience produces. Any width
+ * has a burst that clears it.
+ *
+ * Second, a third arm keyed on KIND removes the window instead of enlarging it —
+ * and the reason that was rejected ("it walks the entire `delivered = 0` set")
+ * was true only without an index. Migration 0052 adds the partial index and the
+ * arm is measured FLAT where the walk was linear: 0.029 ms against 200,000
+ * undelivered rows, where the unindexed scan was 20.49 ms.
+ *
+ * SO WHY IS THIS CONSTANT STILL HERE. The safety arm makes the window
+ * unnecessary for SAFETY kinds, which is what it was for. The window stays
+ * because it is also the cheap generic answer for anything that later wants to
+ * jump the queue without being safety-critical, and removing it would spend a
+ * behaviour change on a leg that is already correct. It is now belt to the
+ * safety arm's braces, and its width no longer decides whether a payout warning
+ * arrives.
+ */
+export const PRIORITY_SCAN = 500;
+
+/**
+ * Rows the SAFETY arm may pull in one pass, before the oldest-`batch` and
+ * priority-window arms are merged in.
+ *
+ * Capped at the pass's own `batch` by the caller, so the fast lane can fill a
+ * pass but never exceed one — the trade `SAFETY_KINDS` already states ("if a
+ * pass has more safety rows than slots, the routine queue gets nothing that
+ * pass") is unchanged, not widened. It is self-limiting for the same reason:
+ * these kinds are produced by real payout changes, expiries and revocations
+ * rather than by volume.
+ */
+export const SAFETY_ARM = 300;
+
+/**
+ * The notification kinds that are delivered BEFORE the routine ones when a pass
+ * cannot carry everything.
+ *
+ * Every one of these is a "something changed that you must act on" line, and the
+ * whole point of each is to arrive inside a window:
+ *  - `payout_changed`   — the 24-hour cooling-off on a payout destination. Its
+ *                         own push copy is "open Dhwaja before you send
+ *                         anything"; delivered late it says it about money that
+ *                         has already moved.
+ *  - `verification_expiring` / `verification_expired` — the badge, the payout-tag
+ *                         presentation and minting all stop together, and the
+ *                         saver's view of where to send money goes with them.
+ *  - `account_revoked`  — an account has come off a creator's passport, either
+ *    because they signed it off or because an operator executed their "not
+ *    mine" correction. Anyone still
+ *                         treating it as theirs is talking to whoever holds it
+ *                         now.
+ *
+ * Deliberately NOT here: `creator_broadcast`, `account_added`,
+ * `claim_proven`, `correction`, `verification_granted`, `verification_renewed`.
+ * They are news. A promotional broadcast and a payout-address warning shared one
+ * queue and one ordering, and that is the thing being fixed; putting everything
+ * in the fast lane would recreate it under a new name.
+ *
+ * THE TRADE, stated: if a pass has more safety rows than slots, the routine
+ * queue gets nothing that pass. That is the intended answer — a payout warning
+ * outranks a promo — and it is self-limiting, because these kinds are produced
+ * by real payout changes, expiries and revocations rather than by volume. If it
+ * is ever observed starving the routine queue for long, the fix is more
+ * delivery ticks, not a smaller safety set.
+ *
+ * NO MIGRATION. Priority is a function of `kind`, a column that has been on
+ * `notifications` since 0004, and it is applied in memory over the page the
+ * statement above already read — so there is no new column, no new index, no
+ * backfill, and no second writer that could disagree about what is urgent.
+ */
+export const SAFETY_KINDS: ReadonlySet<string> = new Set(["payout_changed", "verification_expiring", "verification_expired", "account_revoked"]);
+
+/**
+ * The safety kinds as a SQL literal list, built from the set above so the two
+ * can never disagree — a hand-written second copy in a query string is the exact
+ * drift `accountableOperatorSql` was factored to prevent in slice 20.
+ *
+ * Inlined rather than bound: these are compile-time constants from a frozen set,
+ * not caller input, so there is nothing to inject and binding them would spend
+ * `SAFETY_KINDS.size` of D1's 100-parameter budget on every page read. The
+ * single-quote escape is belt-and-braces about a future editor adding a kind
+ * with an apostrophe in it.
+ *
+ * THE PUSH ARM CARRIES `INDEXED BY`, AND THE MEASUREMENT IS WHY. Without it
+ * SQLite does not choose `idx_notif_safety_push` AT ANY DEPTH on a database that
+ * has never been `ANALYZE`d — it stays on the single-column
+ * `idx_notif_undelivered (delivered)` and walks the backlog, which is the exact
+ * 22 ms-at-200,000-rows scan the index was added to remove:
+ *
+ *     depth      no ANALYZE                       after ANALYZE
+ *     200        0.049 ms  idx_notif_undelivered  0.034 ms  idx_notif_safety_push
+ *     5,000      0.537 ms  idx_notif_undelivered  0.031 ms  idx_notif_safety_push
+ *     200,000   22.127 ms  idx_notif_undelivered  0.034 ms  idx_notif_safety_push
+ *
+ * D1 databases are not `ANALYZE`d by anything in this repository, and a stats
+ * table would go stale as the backlog grows anyway. `INDEXED BY` takes the
+ * planner out of the decision, so the arm's cost is a property of the statement
+ * rather than of when someone last collected statistics. Without this hint the
+ * index would have shipped as dead weight and the arm as a walk.
+ */
+const SAFETY_KINDS_SQL = [...SAFETY_KINDS].map((k) => `'${k.replace(/'/g, "''")}'`).join(", ");
+
+/**
+ * TWO QUESTIONS, TWO SETS (W3-03 FIX2 item 1).
+ *
+ * `SAFETY_KINDS` above was being asked two different questions — "is this
+ * FAST-LANED?" (the priority tier at :1541, the `INDEXED BY` arms at :1680 and
+ * :1999) and "is this EXEMPT from the marketing opt-out and from CAN-SPAM?"
+ * (`WHERE_EMAILABLE`, the settle clause, `isCommercialClass`). They are not the
+ * same question and they diverge on the very first kind that is transactional
+ * without being urgent.
+ *
+ * `report_published` / `report_retracted` (`reports.ts:1879`) are the outcome of
+ * an abuse report the RECIPIENT THEMSELVES filed: a message about an action they
+ * took, which is the textbook transactional case. Under one set they were wrong
+ * in both directions at once — a default account (`email_alerts = 0` since
+ * W3-03-R1 flipped migration 0004's DEFAULT) got NO mail, and the same row was
+ * classed COMMERCIAL by `isCommercialClass`'s negation and refused outright
+ * while `SENDER_POSTAL_ADDRESS` is unset (D-0441 makes unset the shipped state).
+ *
+ * They do NOT belong in `SAFETY_KINDS`. That set's stated trade is "if a pass
+ * has more safety rows than slots, the routine queue gets nothing that pass",
+ * held self-limiting because those kinds are produced by real payout changes and
+ * expiries rather than by volume. A report outcome is produced by MODERATION
+ * THROUGHPUT and fans out one row per reporter of an item with an unbounded
+ * reporter list (`reports.ts:1876-1884` has no cap), so putting it in the fast
+ * lane would import exactly the volume the trade assumes away.
+ *
+ * So: `SAFETY_KINDS` keeps priority, this superset carries the exemption, and
+ * `SAFETY_KINDS ⊂ TRANSACTIONAL_KINDS` is a property a guard asserts rather than
+ * a convention — a kind can be transactional without being urgent, but nothing
+ * urgent may be commercial.
+ */
+export const TRANSACTIONAL_KINDS: ReadonlySet<string> = new Set([...SAFETY_KINDS, "report_published", "report_retracted", "account_closed"]);
+
+/**
+ * I3-0040 (D-1078(29)): THE CLOSURE NOTICE, written by closures.ts `suspendAccount` / `terminateAccount` in the flip's
+ * batch with event id `closure:<state>:<closure_id>`. Transactional (above), so `email_alerts = 0` does not stop it.
+ * It is the ONE kind the closed-account exclusion below does not drop — it exists to reach a closed account — and in its
+ * place it carries its own test: the notice settles unsent once the account's closure row (one per account, its PRIMARY
+ * KEY) describes a different episode or state — a suspension that was lifted, became a termination, or was replaced by
+ * a later episode. An account with no closure row does not supersede the notice (I32-FX3-GATE, D-1086(1)): the row is
+ * deleted only six years after its decision (money-retention.ts `pruneAccountClosures`), long after notifications are
+ * pruned (NOTIFICATION_RETENTION_DAYS), and erasure deletes the account's notifications with it (account_data.ts).
+ * The push leg is unchanged: a closed account's rows (this one included) settle there without a push.
+ */
+export const CLOSURE_NOTICE_KIND = "account_closed";
+const CLOSURE_NOTICE_CURRENT_SQL = `NOT EXISTS (SELECT 1 FROM account_closures c WHERE c.account_id = n.account_id AND n.event_id IS NOT 'closure:' || c.state || ':' || c.closure_id)`;
+const ACCOUNT_CLOSED_SQL = `EXISTS (SELECT 1 FROM account_closures c WHERE c.account_id = n.account_id AND c.state IN ${FROZEN_CLOSURE_STATES_SQL})`;
+/** True when the row may be mailed as far as account closure goes; its negation is the settle drain's clause. */
+const CLOSURE_GATE_SQL = `((n.kind = '${CLOSURE_NOTICE_KIND}' AND ${CLOSURE_NOTICE_CURRENT_SQL}) OR (n.kind <> '${CLOSURE_NOTICE_KIND}' AND NOT ${ACCOUNT_CLOSED_SQL}))`;
+
+/** The appeal window, in days (closures.ts re-exports it; declared here so this leg can start the clock without
+ * importing closures.ts, which reaches this module through recovery.ts). */
+export const APPEAL_WINDOW_DAYS = 30;
+const APPEAL_DAY_MS = 86_400_000;
+/** I3-0166 (I21-Q24, Jason: "clock starts on send"): the deadline sentence closures.ts `closureNoticeSummary` ends a
+ * suspension notice with, and nothing else (a termination notice names no deadline). */
+const SUSPENDED_NOTICE_DEADLINE_RE = / by \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC and quote your account id\.$/;
+
+/**
+ * I3-0166 (I21-Q24): a suspension notice as it is SENT at `sendAtMs` — its deadline re-stamped to `sendAtMs` +
+ * APPEAL_WINDOW_DAYS, and that deadline. `null` for any summary that is not a suspension notice: it is sent as stored
+ * and moves nothing.
+ */
+export function closureNoticeAtSend(summary: string, sendAtMs: number): { summary: string; deadline: string } | null {
+  if (!SUSPENDED_NOTICE_DEADLINE_RE.test(summary)) return null;
+  const deadline = new Date(sendAtMs + APPEAL_WINDOW_DAYS * APPEAL_DAY_MS).toISOString();
+  return { summary: summary.replace(SUSPENDED_NOTICE_DEADLINE_RE, ` by ${deadline.slice(0, 16).replace("T", " ")} UTC and quote your account id.`), deadline };
+}
+
+/**
+ * I3-0166 (I21-Q24): what a suspension notice that was handed over (accepted, or ambiguous: it may have arrived)
+ * commits, in this leg's settle batch. (1) The appeal deadline becomes the one the mail named — only on the closure
+ * EPISODE the notice names (its event id, `closure:suspended:<closure_id>`), only while it is still suspended, and only
+ * ever later: a lift, a new episode or a later stored deadline is left as it is. (2) The inbox row carries the text that
+ * was mailed.
+ */
+export function closureNoticeSentStmts(db: DbLike, notifId: number, sent: { summary: string; deadline: string }): DbStatement[] {
+  return [
+    db
+      .prepare(
+        "UPDATE account_closures SET appeal_deadline = ? WHERE state = 'suspended' AND 'closure:suspended:' || closure_id = (SELECT event_id FROM notifications WHERE notif_id = ?) AND appeal_deadline < ?",
+      )
+      .bind(sent.deadline, notifId, sent.deadline),
+    db.prepare("UPDATE notifications SET summary = ? WHERE notif_id = ?").bind(sent.summary, notifId),
+  ];
+}
+
+/** I3-0040: the closure notice's own message (subject approved, sheet-2 W56, D-1365). Not `alertEmail`: its frame says the
+ * person saved a creator and offers an alerts opt-out, neither of which is true of this mail. */
+export const CLOSURE_NOTICE_EMAIL_SUBJECT = "A notice about your Dhwaja account";
+export function closureNoticeEmail(to: string, summary: string): EmailMessage {
+  return { to, subject: CLOSURE_NOTICE_EMAIL_SUBJECT, text: `${summary}\n\n${NEVER_ASK_LINE}`, html: wrapHtml(textToHtml(summary), escapeHtml(NEVER_ASK_LINE)) };
+}
+
+const TRANSACTIONAL_KINDS_SQL = [...TRANSACTIONAL_KINDS].map((k) => `'${k.replace(/'/g, "''")}'`).join(", ");
+
+/** The email leg's eligibility predicate, shared by all three of its arms so the
+ * hinted one cannot drift from the two it merges with.
+ *
+ * S-026/C-596: a NOTABLE event bakes the creator's plaintext display name into
+ * `notifications.summary` at fan-out time (`processNewEvents`, `names.get`),
+ * before the row is ever emailed. `retract_passport` erases that name from
+ * `passports.display_name` (events.ts `UPDATE passports SET ... display_name =
+ * ''`) but never touches the already-written notification row, so a pending
+ * notification created before a retraction still carries the erased name.
+ * This predicate excluded only `request_suppressions` — a passport can be
+ * retracted (INV-004 erase direction) without ever being suppressed (they are
+ * deliberately independent controls, see passport-view.ts) — so a retracted
+ * subject's pre-retraction backlog was mailed forever. Same shape as the
+ * suppression clause beside it: a retraction reaches every reader of passport
+ * state, this predicate included. */
+// F-11: `email_alerts` is the ONE-CLICK unsubscribe's write target (unsubscribe.ts
+// `unsubscribeOneClick`), minted on any mail this leg sends — including a
+// promotional `creator_broadcast`. Before this clause, that column gated every
+// kind alike, so clicking unsubscribe on a broadcast permanently silenced
+// `payout_changed` too: the exact safety alert `sweepPayoutChangeFanout` exists
+// to make un-droppable, dropped by a marketing opt-out with no way back except
+// the fan finding Settings again — which they have no reason to do, since
+// nothing told them safety mail stopped. The push leg already drew this line
+// (`processNewEvents`'s `muteJoin` scopes `broadcasts_muted` to
+// `creator_broadcast` ONLY); email had no equivalent. `SAFETY_KINDS` is the
+// CAN-SPAM/GDPR "transactional" exemption in code: a marketing opt-out may
+// never silence a transactional or security notice. Same shape as the
+// suppression/retraction clauses beside it — a closed account (see below) is
+// excluded regardless of kind, because there is no lawful basis (nor a live
+// account) left to mail.
+/**
+ * THE ALERT ADDRESS (QUEUE #420, D-0693). A fan's VERIFIED `fan_email` — the
+ * address they added and proved by OTP (`fan-auth.ts` `redeemOtp`) — wins; the
+ * OAuth-provider `accounts.email` is the fallback only when no verified row
+ * exists. An unverified row and `pending_email` are never mailed. One JOIN constant and
+ * one expression, interpolated at every door of the email leg — the page reads
+ * and the safety arm (`WHERE_EMAILABLE`, `cols`) and the settle UPDATE in
+ * `deliverPendingEmail` — so eligibility, drain and recipient cannot disagree.
+ * `fan_email.account_id` is the PRIMARY KEY, so the LEFT JOIN adds at most one
+ * row per account and never multiplies a notification. It follows the
+ * `accounts a` join, after the safety arm's `INDEXED BY` on `notifications n`.
+ * A door that uses the expression without the join fails loudly (`no such
+ * column: fe.address`), never silently falls back.
+ */
+/**
+ * D-0817(2) (B27A-PRIMARY-BAR): the `accounts.email` fallback takes the
+ * verified bar of the backup address. oidc.ts writes `accounts.email` from the
+ * provider claim even when `email_verified=false`, always in the same batch as
+ * the identity row that carries the claim's `email_verified` (create: the
+ * `signInWithOidc` batch; refresh: the `resolveExisting` batch; the only DELETE
+ * is the erasure, account_data.ts `deleteAccount`). The
+ * second JOIN picks, by rowid, AT MOST ONE identity of this account attesting
+ * this exact address — a verified one when any exists — so it never multiplies
+ * a notification; an address attested ONLY as unverified is never mailed.
+ * RESIDUAL, stated: an address no identity attests at all is still mailed; no
+ * current writer produces one.
+ */
+const ALERT_ADDRESS_JOIN = `LEFT JOIN fan_email fe ON fe.account_id = a.account_id AND fe.verified_at IS NOT NULL LEFT JOIN oauth_identities ou ON ou.rowid = (SELECT o.rowid FROM oauth_identities o WHERE o.account_id = a.account_id AND o.email = a.email ORDER BY o.email_verified DESC LIMIT 1)`;
+const ALERT_ADDRESS_SQL = `COALESCE(fe.address, CASE WHEN ou.email_verified = 0 THEN NULL ELSE a.email END)`;
+
+/**
+ * I3-2152 (D-0829): MUTE IS RE-READ AT SEND TIME. `processNewEvents` drops a
+ * muted saver at COMPOSE (`muteJoin`, kept), but a row composed before the mute
+ * would still go out. Both delivery legs read the recipient's CURRENT
+ * `accounts.broadcasts_muted` for a `creator_broadcast` row and settle it
+ * without a send (skipped). One predicate, interpolated at every door (the email
+ * drain, `WHERE_EMAILABLE`, and the push leg's `muted` column below). `a` is
+ * `accounts` joined on the row's `account_id`.
+ */
+const BROADCAST_MUTED_SQL = "(n.kind = 'creator_broadcast' AND COALESCE(a.broadcasts_muted, 0) = 1)";
+
+const WHERE_EMAILABLE = `WHERE n.emailed = 0 AND ${ALERT_ADDRESS_SQL} IS NOT NULL
+          AND (a.email_alerts = 1 OR n.kind IN (${TRANSACTIONAL_KINDS_SQL}))
+          AND NOT EXISTS (SELECT 1 FROM request_suppressions r WHERE r.passport_id = n.passport_id)
+          AND NOT EXISTS (SELECT 1 FROM passports p WHERE p.passport_id = n.passport_id AND p.retracted = 1)
+          AND ${CLOSURE_GATE_SQL}
+          AND NOT ${BROADCAST_MUTED_SQL}`;
+
+/**
+ * MONEY FIRST, INSIDE THE FAST LANE.
+ *
+ * `SAFETY_KINDS` is not one deadline, it is four, and they are an order of
+ * magnitude apart. `payout_changed` is a 24-HOUR cooling-off window on a
+ * destination somebody may be about to send money to; `verification_expiring`
+ * warns 14 days out and `account_revoked` has no clock at all. Ordering the arm
+ * by `notif_id` alone made the fast lane FIFO within itself, so a payout warning
+ * queued behind a cohort of expiry notices — and expiry notices arrive in
+ * COHORTS, because `verification-sweep.ts` emits up to `SWEEP_APPEND_LIMIT`
+ * (200) of them in a single tick.
+ *
+ * Measured on the digest rail, where the same mistake was worse: 300 roundups
+ * plus ONE tick of proof-expiry notices put a fresh payout alert at sweep 9 =
+ * 54 hours, against its 24-hour window. The arm was buying two sweeps out of
+ * the twenty it needed.
+ *
+ * So the arm sorts money to the front of its own result, and `byPriority` gives
+ * it the same tier in memory. The set is small and already index-restricted, so
+ * the sort is over the matched rows rather than over the backlog.
+ */
+const MONEY_KIND = "payout_changed";
+const MONEY_FIRST = `(kind = '${MONEY_KIND}') DESC`;
+const MONEY_FIRST_EMAIL = `(n.kind = '${MONEY_KIND}') DESC`;
+
+/**
+ * Wall-clock ceiling on ONE delivery leg — the shape `reports.ts` already uses
+ * (`REPORT_NOTICE_BUDGET_MS`), for the same reason and against a worse clock.
+ *
+ * `cron-lease.ts` sets a 30-minute TTL on the STATED ASSUMPTION that it sits far
+ * above a real sweep, and nothing enforced that. At 3 s per provider request
+ * (the timeout in `push.ts` is 10 s) 1000 notifications is fifty minutes: the
+ * lease lapses at minute thirty, the next tick starts a second sweep, and both
+ * hand the SAME rows to APNs/FCM and the mailer. That is the duplicate push and
+ * duplicate mail the lease exists to prevent, produced by the lease's own TTL.
+ * Three bounds now stop it — this deadline, `scheduled()` re-asserting the lease
+ * between legs so an overrun run stops instead of racing its successor, and the
+ * wave structure that makes the overshoot past this deadline at most one
+ * `PUSH_TIMEOUT_MS` instead of the whole remaining batch.
+ */
+export const DELIVERY_BUDGET_MS = 20_000;
+
+/**
+ * Ceiling on ONE outbound alert mail, as the CALLER waits for it.
+ *
+ * Serially awaited inside a cron, one mail API that accepts a connection and
+ * never answers would hold the whole invocation open until the platform killed
+ * it, and `DELIVERY_BUDGET_MS` cannot help because it is only consulted BETWEEN
+ * rows. So `withSendTimeout` races the send against this timer and reads a
+ * timeout as `"ambiguous"` (739-F, D-0858(3)): the row was claimed before the
+ * send and is settled as sent, never re-sent by the next pass.
+ *
+ * Racing stops the WAIT; it does not abort the request. The abort is
+ * `email.ts`'s: `httpEmailFromEnv` wraps its provider fetch in an
+ * `AbortController` fired at `EMAIL_HTTP_TIMEOUT_MS`, which is set strictly
+ * BELOW this default so the request is already aborted when this race gives
+ * up — otherwise the next pass's retry could go out while the first request is
+ * still open and the provider could deliver both. This value is also the FLOOR:
+ * `emailRaceDeadlineMs` lets `DeliverOptions.sendTimeoutMs` RAISE the ceiling but
+ * never lower it below this, so no caller can end the race before the rail's
+ * abort (I3-2008; `test/i4-11-r8-send-race-clamp.test.ts`).
+ */
+export const EMAIL_SEND_TIMEOUT_MS = 10_000;
+
+/** I3-2008. The race deadline actually used: the caller's value, floored at
+ * `EMAIL_SEND_TIMEOUT_MS` (see there). A non-finite value, or one past the
+ * timer's 2^31-1 ms range (which `setTimeout` turns into ~1 ms), takes the
+ * default: both would otherwise end the race at once, before the rail's abort. */
+function emailRaceDeadlineMs(requested?: number): number {
+  const r = requested ?? EMAIL_SEND_TIMEOUT_MS;
+  return Number.isFinite(r) && r > EMAIL_SEND_TIMEOUT_MS && r <= 2_147_483_647 ? r : EMAIL_SEND_TIMEOUT_MS;
+}
+
+/**
+ * Rows the email leg SETTLES per pass — the fix for a set that only ever grew.
+ *
+ * `deliverPendingEmail` selects `emailed = 0` joined to an account with an
+ * address and `email_alerts = 1`. A row failing that predicate is never
+ * returned and nothing else has ever written `emailed = 1`, so it sat at the
+ * head of `notif_id ASC` forever while the scan walked past it every pass.
+ * Measured: a 200k dead prefix costs 107 ms per scan on in-process SQLite; D1 is
+ * far slower and hard-caps a single query at 30 s, so the email channel
+ * eventually dies SILENTLY — taking payout-change alerts with it, whose whole
+ * point is to be seen inside a 24-hour cooling-off window.
+ *
+ * One bounded UPDATE per pass drains them, exactly as the push leg already
+ * settles a device-less or suppressed row rather than leaving it to wedge the
+ * window. 2000 at four ticks a day drains 8000 rows daily; it is one statement
+ * whatever the number, so the only reason not to raise it is D1 query time.
+ */
+export const EMAIL_SETTLE_LIMIT = 2000;
+
+/**
+ * How long a notification row is kept. `notifications` had NO retention sweep at
+ * all — the one table in this file that grows on every ledger event times every
+ * saver. 180 days matches `pruneRedemptionAttempts` and is far past the 14-day
+ * verification-expiry window whose dedup gate reads this table (see
+ * `fanOutVerificationExpiring`), so pruning can never re-arm a notice.
+ */
+export const NOTIFICATION_RETENTION_DAYS = 180;
+/** I23-Q6 (D-1030: "2 years from the last bounce"): how long an address stays on the dead-email list (`email_suppressions`)
+ * after it was last refused, counted on `last_seen`. Its own period, no longer NOTIFICATION_RETENTION_DAYS. */
+export const EMAIL_SUPPRESSION_RETENTION_DAYS = 730;
+
+/** Options for the creation leg. Defaults are the production budgets; tests
+ * shrink them to prove the break is clean and the watermark survives it. */
+export interface ProcessOptions {
+  /** D1 statements the CREATION leg may spend. */
+  createBudget?: number;
+  /** Passed through to `deliverPending`. */
+  deliver?: DeliverOptions;
+  /** PS-089 correlation id for this tick's log lines. */
+  cid?: string;
+}
+
+export async function processNewEvents(
+  db: DbLike,
+  sender: PushSender = nullSender,
+  now: () => string = () => new Date().toISOString(),
+  opts: ProcessOptions = {},
+): Promise<ProcessResult> {
+  const createBudget = opts.createBudget ?? ALERT_CREATE_BUDGET;
+  const wm = await db.prepare("SELECT alerts_seq FROM processing_state WHERE id = 1").bind().first<{ alerts_seq: number }>();
+  const watermark = wm?.alerts_seq ?? 0;
+
+  // I3-0278: ONE PAGE IS NO LONGER ONE TICK. The page read and its three
+  // page-wide lookups are one unit, loaded again (up to ALERT_CREATE_PAGES)
+  // while each page comes back full and is consumed whole, so a backlog of
+  // non-notable events no longer caps creation at BATCH per tick.
+  const loadPage = async (after: number, room: number = Infinity) => {
+    const { results: events } = await db
+      .prepare("SELECT seq, event_id, event_type, subject, payload, created_at FROM trust_events WHERE seq > ? ORDER BY seq ASC LIMIT ?")
+      .bind(after, BATCH)
+      .all<EventRow>();
+
+    // ONE NAME LOOKUP FOR THE WHOLE PAGE, not one per event. The display name is
+    // the only thing an event needs from `passports`, the same creator usually
+    // produces several events in a page, and a per-event `SELECT display_name`
+    // put a third statement on the per-event cost for no information. Chunked
+    // through the shared `inChunks` so the IN list can never cross D1's
+    // bound-parameter ceiling (see db.ts).
+    const notable = events.filter((e) => e.subject.startsWith("psp_") && NOTABLE[e.event_type] !== undefined);
+    const nameChunks = inChunks(notable.map((e) => fanPassportOf(e) ?? e.subject));
+
+    // P1: A SHIELDED ACCOUNT DOES NOT GET ANNOUNCED TO EVERY FAN WHO SAVED THE
+    // CREATOR. Two of the NOTABLE templates are about one ACCOUNT and name it or
+    // its platform — `account_added` ("added a instagram account") and
+    // `account_revoked`. (`handle_changed`, which printed the handle outright, is
+    // retired: I3-0966, D-1078(25).)
+    // A notification carries `passport_id` and is readable by anyone who joined
+    // and tapped Save, so an un-filtered fan-out publishes "this passport has an
+    // account on <platform>, at time T" for a row that is on no roster, on no card, and 404s on /is/. That is most
+    // of what the shield exists to remove, on the cheapest surface in the product.
+    //
+    // ONE READ PER PAGE, chunked, like the display-name lookup above it — never
+    // one per event.
+    //
+    // WHAT THIS DOES NOT FIX, and it is written into the manifest: an
+    // `account_added` for an account shielded AFTERWARDS was already announced.
+    // Only a shield in the SAME signed batch as the add is covered (the drafts
+    // commit together, so the state this reads is the post-batch one). The console
+    // does not offer that yet.
+    const accountScoped = notable.filter((e) => ACCOUNT_SCOPED.has(e.event_type));
+    // I3-0911: a transfer is shield-checked against BOTH passports it touches.
+    const transfers = notable.filter((e) => e.event_type === "account_transferred");
+    const shieldSubjects = [...accountScoped.map((e) => e.subject), ...transfers.flatMap((e) => [e.subject, fanPassportOf(e) ?? e.subject])];
+    // Statements this page cost beyond its own read — upper bounds, from the
+    // same chunkers the lookups use (`inChunks`; 4 extra bindings in assertions.ts).
+    const lookups = nameChunks.length + inChunks(shieldSubjects).length + (accountScoped.length === 0 ? 0 : inChunks(accountScoped.map((e) => e.event_id), 4).length);
+    // I12-RG-PRIVACY-07: CHARGED BEFORE THEY RUN. The count above is known from
+    // the page read alone, so a page whose lookups plus one notable event do not
+    // fit the `room` its caller has left is refused here, before any lookup is
+    // issued (null: the caller stops and the watermark holds), instead of being
+    // run and charged after the fact.
+    if (lookups + PER_EVENT_STATEMENTS > room) return null;
+    const names = new Map<string, string>();
+    for (const chunk of nameChunks) {
+      const { results } = await db
+        .prepare(`SELECT passport_id, display_name FROM passports WHERE passport_id IN (${chunk.map(() => "?").join(",")})`)
+        .bind(...chunk)
+        .all<{ passport_id: string; display_name: string }>();
+      for (const r of results) names.set(r.passport_id, r.display_name);
+    }
+    const shields = shieldSubjects.length === 0 ? new Map<string, ReadonlySet<string>>() : await shieldedKeysForSubjects(db, shieldSubjects);
+    // X1: which of this page's account-scoped events name an account the passport
+    // ASSERTED and has not proved. One statement for the page, like the two above
+    // it — never one per event.
+    const unproven = accountScoped.length === 0 ? new Set<string>() : await unprovenAssertionEvents(db, accountScoped, Date.parse(now()));
+    return { events, names, shields, unproven, lookups };
+  };
+  // Page 1 is always loaded (unbounded `room`); its lookups are charged in full below.
+  let { events, names, shields, unproven, lookups: firstLookups } = (await loadPage(watermark))!;
+  let processed = events.length;
+
+  let created = 0;
+  /** The highest seq whose work is FINISHED. */
+  let maxSeq = watermark;
+  /** The highest seq actually written to `processing_state`. */
+  let committed = watermark;
+  // I12-RG-PRIVACY-07: page 1 is charged like every later page — its read AND
+  // its name, shield and unproven lookups, not the name reads alone.
+  let spent = 1 + firstLookups;
+  let truncated = false;
+  const commit = async (seq: number): Promise<void> => {
+    await db.prepare("UPDATE processing_state SET alerts_seq = ? WHERE id = 1").bind(seq).run();
+    committed = seq;
+  };
+
+  // SJ-17: replay durable dead letters BEFORE any new event can wedge the
+  // budget behind them. Bounded and cheap — a handful of rows, oldest first —
+  // so one poisoned event from a prior tick cannot starve this tick's new
+  // work either.
+  const fanOutSql = (kind: string): string => {
+    const muteJoin = kind === "creator_broadcast" ? "JOIN accounts a ON a.account_id = s.account_id AND a.broadcasts_muted = 0" : "";
+    return `INSERT INTO notifications (account_id, passport_id, event_id, kind, summary, created_at)
+            SELECT s.account_id, ?, ?, ?, ?, ?
+              FROM saves s ${muteJoin}
+             WHERE s.passport_id = ? AND s.created_at <= ?
+               AND NOT EXISTS (SELECT 1 FROM request_suppressions r WHERE r.passport_id = s.passport_id)
+          ON CONFLICT(account_id, event_id) DO NOTHING`;
+  };
+  // THE SAVE BOUND IS THE EVENT'S INSTANT (`event_at`, read from `trust_events`
+  // by `event_id`), exactly as the main loop binds `e.created_at`. The dead row's
+  // own `created_at` is the FIRST ATTEMPT's clock (`ts` at the dead-letter
+  // INSERT below), so bounding by it notified fans who saved between the event
+  // and that attempt — fans the main loop excludes (RG1-B9). `created_at` stays
+  // the notification's timestamp, as `ts` is on the main path. A NULL `event_at`
+  // (no ledger row: unreachable while `trust_events` is append-only) throws into
+  // the catch below — the row stays, `attempts` counts it — rather than
+  // fanning out against a NULL bound, which would select nobody and then
+  // delete the letter.
+  const { results: deadLetters } = await db
+    .prepare(
+      "SELECT d.event_id, d.passport_id, d.kind, d.summary, d.created_at, d.attempts, t.created_at AS event_at, t.event_type AS event_type, t.subject AS subject, t.payload AS payload FROM alert_fanout_dead_letters d LEFT JOIN trust_events t ON t.event_id = d.event_id WHERE d.attempts < ? ORDER BY d.created_at ASC LIMIT ?",
+    )
+    .bind(DEAD_LETTER_MAX_ATTEMPTS, DEAD_LETTER_RETRY_BUDGET)
+    .all<{
+      event_id: string;
+      passport_id: string;
+      kind: string;
+      summary: string;
+      created_at: string;
+      attempts: number;
+      event_at: string | null;
+      event_type: string | null;
+      subject: string | null;
+      payload: string | null;
+    }>();
+  spent += 1;
+  // I3-1286: a replayed letter passes the SAME shield (P1) and unproven (X1)
+  // predicate as the main loop below, read NOW — a shield set after the first
+  // attempt holds at replay. One read per replay page, only when a letter is
+  // account-scoped. A withheld letter is finished and announced to nobody.
+  const replayRows = deadLetters
+    .filter((d) => d.event_type !== null && d.subject !== null && (ACCOUNT_SCOPED.has(d.event_type) || d.event_type === "account_transferred"))
+    .map((d) => ({ event_id: d.event_id, event_type: d.event_type as string, subject: d.subject as string, payload: d.payload ?? "" }));
+  let replayShields = new Map<string, ReadonlySet<string>>();
+  let replayUnproven: ReadonlySet<string> = new Set<string>();
+  if (replayRows.length > 0) {
+    replayShields = await shieldedKeysForSubjects(db, replayRows.flatMap((r) => [r.subject, fanPassportOf(r) ?? r.subject]));
+    spent += 1;
+    const asserted = replayRows.filter((r) => ACCOUNT_SCOPED.has(r.event_type));
+    if (asserted.length > 0) {
+      replayUnproven = await unprovenAssertionEvents(db, asserted, Date.parse(now()));
+      spent += 1;
+    }
+  }
+  const replayById = new Map(replayRows.map((r) => [r.event_id, r] as const));
+  for (const dl of deadLetters) {
+    if (spent + PER_EVENT_STATEMENTS > createBudget) break;
+    try {
+      if (dl.event_at === null) throw new Error("dead letter has no ledger event");
+      const r = replayById.get(dl.event_id);
+      const withheld = r !== undefined && (r.event_type === "account_transferred" ? transferWithheld(replayShields, r) : isShielded(replayShields, r) || replayUnproven.has(r.event_id));
+      if (!withheld) await db.prepare(fanOutSql(dl.kind)).bind(dl.passport_id, dl.event_id, dl.kind, dl.summary, dl.created_at, dl.passport_id, dl.event_at).run();
+      await db.prepare("DELETE FROM alert_fanout_dead_letters WHERE event_id = ?").bind(dl.event_id).run();
+    } catch (err) {
+      await db.prepare("UPDATE alert_fanout_dead_letters SET attempts = attempts + 1 WHERE event_id = ?").bind(dl.event_id).run();
+      // I3-1602: the attempt that reaches the cap parks the letter; say so once.
+      if (dl.attempts + 1 >= DEAD_LETTER_MAX_ATTEMPTS) {
+        logError({ cid: opts.cid ?? "unknown", hop: "cron", msg: "alert_fan_out_dead_letter_parked", kind: dl.kind, count: dl.attempts + 1, err: err instanceof Error ? err.name : typeof err });
+      }
+    }
+    spent += 2;
+  }
+
+  for (let page = 1; ; page++) {
+    for (const e of events) {
+      // Not ours: costs nothing, so it needs no budget and no commit of its own —
+      // the trailing flush below carries it. `maxSeq` moves because the event IS
+      // finished; a later `break` therefore leaves the watermark past it.
+      if (!e.subject.startsWith("psp_") || NOTABLE[e.event_type] === undefined) {
+        maxSeq = e.seq;
+        continue;
+      }
+      // Shielded (P1), or an UNPROVEN ASSERTION (X1): finished, announced to
+      // nobody. Costs no budget and no statement, exactly like an event that is
+      // not ours.
+      //
+      // X1's half: `account_added` fans out "added a <platform> account" to every
+      // fan who tapped Save, and it did so for a claim nobody had proved. S101
+      // already refuses to SERVE an unproven assertion — it is dropped from
+      // /p/:id, from every card, and from the registry — so announcing it was the
+      // one surface that published what all the others withhold: a platform and a
+      // timestamp, for an account that may not even be the asserter's. The
+      // announcement belongs to the PROOF, not to the claim.
+      if (ACCOUNT_SCOPED.has(e.event_type) && (isShielded(shields, e) || unproven.has(e.event_id))) {
+        maxSeq = e.seq;
+        continue;
+      }
+      // I3-0911: same "finished, announced to nobody" for a shielded or source-less transfer.
+      if (e.event_type === "account_transferred" && transferWithheld(shields, e)) {
+        maxSeq = e.seq;
+        continue;
+      }
+      if (spent + PER_EVENT_STATEMENTS > createBudget) {
+        // BREAK CLEANLY, mid-page. The watermark stays at the last finished event,
+        // so the next tick resumes exactly here. This is the cursor pattern
+        // `ratings.ts` uses (RATINGS_BATCH + sweep_cursor) with the watermark
+        // playing the cursor's part.
+        truncated = true;
+        break;
+      }
+
+      const summarize = NOTABLE[e.event_type]!;
+      const fanPsp = fanPassportOf(e) ?? e.subject;
+      const name = names.get(fanPsp) ?? "A creator you follow";
+      let payload: Record<string, unknown> = {};
+      try {
+        payload = JSON.parse(e.payload) as Record<string, unknown>;
+      } catch {
+        // A payload that will not parse still gets its alert, with the generic
+        // half of the sentence. Throwing here would wedge the watermark on one
+        // bad row, which is the failure this whole rewrite exists to remove.
+        payload = {};
+      }
+      const summary = `${name} ${summarize(payload)}`;
+      const kind = NOTIFICATION_KIND[e.event_type] ?? e.event_type;
+      const ts = now();
+
+      // THE SAVE SET IS BOUNDED BY THE EVENT'S OWN INSTANT (`s.created_at <= ?`,
+      // bound to `e.created_at`). Without it the fan-out selects everyone who has
+      // saved BY THE TIME THE CRON RUNS, so an event that waited — a page that
+      // truncated on `createBudget`, a tick that had not fired yet, a dead letter
+      // replayed later — is announced as new activity to fans who saved AFTER it
+      // happened. The same predicate is interpolated at the dead-letter replay
+      // (`fanOutSql`), where it binds the same instant — the event's
+      // `trust_events.created_at`, joined by `event_id` — and not the dead row's
+      // `created_at`, which is the first ATTEMPT's clock.
+      //
+      // ONE STATEMENT PER EVENT, WHATEVER THE FOLLOWER COUNT. This used to be a
+      // `SELECT account_id FROM saves` followed by an INSERT per row, with no cap
+      // on rows — the unbounded term that wedged the cron.
+      //
+      // Broadcasts are promotional; a saver who muted them still gets safety
+      // alerts (payout change, impersonation) but not marketing. The mute filter
+      // applies to creator_broadcast ONLY — every other notable event ignores it.
+      //
+      // SUPPRESSION RIDES THE SAME STATEMENT, not a separate check. A creator who
+      // asked to be delisted keeps producing ledger events (a correction, a
+      // downgrade, an account revoke), and every one of them used to fan out a
+      // notification whose `summary` NAMES them, to everyone who had saved them
+      // before the request — the delisted person's name back on a fan surface, and
+      // a delisting oracle for anyone who had saved them. No savers selected ⇒ no
+      // notification created, on the same statement, so the cost does not
+      // distinguish either.
+      //
+      // ON CONFLICT keeps one notification per (account,event) — re-processing (or
+      // an overlapping run) never duplicates an alert. `changes` counts only REAL
+      // inserts, so a re-run reports zero rather than inflating the fan-out.
+      const muteJoin = kind === "creator_broadcast" ? "JOIN accounts a ON a.account_id = s.account_id AND a.broadcasts_muted = 0" : "";
+      const fanOut = `INSERT INTO notifications (account_id, passport_id, event_id, kind, summary, created_at)
+              SELECT s.account_id, ?, ?, ?, ?, ?
+                FROM saves s ${muteJoin}
+               WHERE s.passport_id = ? AND s.created_at <= ?
+                 AND NOT EXISTS (SELECT 1 FROM request_suppressions r WHERE r.passport_id = s.passport_id)
+            ON CONFLICT(account_id, event_id) DO NOTHING`;
+      try {
+        const res = await db.prepare(fanOut).bind(fanPsp, e.event_id, kind, summary, ts, fanPsp, e.created_at).run();
+        created += res.changes;
+      } catch (err) {
+        // ONE BAD EVENT MUST NOT BE PERMANENT, but it must not be LOST either
+        // (SJ-17). The watermark still advances past it below, so the next tick
+        // makes progress instead of throwing at the same index forever — but the
+        // exact statement this event needed is now durable in
+        // `alert_fanout_dead_letters`, and the retry pass at the top of this
+        // function replays it. `ON CONFLICT DO NOTHING` on both the original and
+        // the replay means a late-arriving success here and a later replay can
+        // never double the notifications.
+        logError({ cid: opts.cid ?? "unknown", hop: "cron", msg: "alert_fan_out_event_failed", event_type: e.event_type, err: err instanceof Error ? err.name : typeof err });
+        try {
+          await db
+            .prepare("INSERT INTO alert_fanout_dead_letters (event_id, passport_id, kind, summary, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(event_id) DO UPDATE SET attempts = attempts + 1")
+            .bind(e.event_id, fanPsp, kind, summary, ts)
+            .run();
+        } catch (dlErr) {
+          logError({ cid: opts.cid ?? "unknown", hop: "cron", msg: "alert_fan_out_dead_letter_write_failed", event_type: e.event_type, err: dlErr instanceof Error ? dlErr.name : typeof dlErr });
+          // I3-1348: neither the notifications nor their recovery witness exist.
+          // Stop BELOW this event — `maxSeq` and the watermark stay at the last
+          // finished one — so the next tick retries it rather than skipping it.
+          truncated = true;
+          break;
+        }
+      }
+      spent += 1;
+      maxSeq = e.seq;
+      await commit(maxSeq);
+      spent += 1;
+    }
+    // A short page is the end of the ledger; a truncated one stops the tick.
+    if (truncated || events.length < BATCH || page >= ALERT_CREATE_PAGES) break;
+    // The next page must leave room for its read, the commit before it, and
+    // one notable event; otherwise this tick is done and the watermark holds.
+    if (spent + 2 + PER_EVENT_STATEMENTS > createBudget) {
+      truncated = true;
+      break;
+    }
+    // Make the finished page durable before reading the next one.
+    if (maxSeq > committed) {
+      await commit(maxSeq);
+      spent += 1;
+    }
+    // The read is charged now; the lookups only if the page fits what is left.
+    spent += 1;
+    const next = await loadPage(maxSeq, createBudget - spent);
+    if (next === null) {
+      truncated = true;
+      break;
+    }
+    ({ events, names, shields, unproven } = next);
+    spent += next.lookups;
+    processed += events.length;
+    if (events.length === 0) break;
+  }
+
+  // Trailing flush: the run of skipped events after the last committed one.
+  if (maxSeq > committed) await commit(maxSeq);
+
+  const delivered = await deliverPending(db, sender, now, opts.deliver);
+  return { processed_events: processed, notifications_created: created, delivered, watermark: maxSeq, truncated };
+}
+
+/**
+ * Fan out a payout-tag CHANGE alert. This is the detection half of the
+ * payout-change safety (paired with the cooling-off): a silent address swap by a
+ * briefly-compromised account is visible to the creator's followers AND to the
+ * creator. Notifications dedup on a per-change synthetic event id so repeated
+ * calls don't spam.
+ *
+ * NOT ON ANY PRODUCTION PATH, deliberately, and kept as the reference
+ * execution of `buildPayoutChangeStatements` for a caller that has nothing to
+ * batch it with. Every real caller — `setPayoutTags` and, since the recovery
+ * work, `retractAllPayoutTags` — takes the STATEMENTS and commits them in the
+ * same atomic batch as the tag write, because a change that lands without its
+ * alert is precisely the silent swap the alert exists to make visible.
+ *
+ * It DRAINS the marker afterwards (the cron's job in production) so a caller
+ * with no cron behind it still ends up with the whole saver set notified.
+ */
+export async function fanOutPayoutChange(db: DbLike, passportId: string, changeId: string, now: () => string = () => new Date().toISOString()): Promise<number> {
+  const stmts = await buildPayoutChangeStatements(db, passportId, changeId, now);
+  if (stmts.length > 0) await db.batch(stmts);
+  const drained = await sweepPayoutChangeFanout(db, now, { budget: Number.MAX_SAFE_INTEGER });
+  return drained.notified;
+}
+
+/**
+ * How many savers ONE bounded `INSERT … SELECT` page covers. Rows, not
+ * statements: a page is a single D1 statement whatever its width, so the only
+ * thing this number trades against is that statement's execution time (D1 caps
+ * a query at 30 s). 5000 keeps a page comfortably inside that while making a
+ * 200,000-saver retraction a two-tick job rather than a five-day one.
+ */
+export const PAYOUT_FANOUT_PAGE = 5000;
+
+/** Statements the payout fan-out sweep may spend per invocation, across ALL
+ * open markers. Three per page (bound probe, insert, cursor write), so 60 is
+ * 20 pages — 100,000 savers a tick. */
+export const PAYOUT_FANOUT_BUDGET = 60;
+
+/**
+ * How many savers are notified INSIDE the atomic money batch, before the cron
+ * ever runs. See `buildPayoutChangeStatements` for why this is not zero.
+ */
+export const PAYOUT_FANOUT_INLINE = 500;
+
+/**
+ * Drain the `payout_change_fanout` markers: the saver half of a payout-change
+ * alert, moved OFF the money write and onto the cron.
+ *
+ * WHY THIS EXISTS AT ALL. `buildPayoutChangeStatements` used to map every row of
+ * `saves` to its own INSERT and `payout.ts` folded that unbounded array into the
+ * SAME `db.batch` as the signed `payout_tag_*` events and the tag rows. The
+ * atomicity argument was right — a payout change that lands without its alert is
+ * the silent swap the alert exists to expose — and that is exactly what made an
+ * oversized batch catastrophic: a compromised creator with 200,000 savers hits
+ * "retract all payout destinations", the batch exceeds D1's limits, the whole
+ * thing rolls back, the hijacker's destinations stay staged and the victim has
+ * no working lever. The emergency brake failed for precisely the accounts that
+ * needed it most, and it failed HARDER the more followers they had.
+ *
+ * The marker is what makes the alert un-droppable, not the 200,000 rows. One row
+ * rides the atomic batch; this sweep turns it into notifications in bounded
+ * pages. If the sweep never runs, the marker is still there and still says a
+ * payout changed — the fact is durable, only its distribution is deferred.
+ *
+ * PAGING. `saves` is keyed `(account_id, passport_id)`, so `account_id ASC` is a
+ * total order over one creator's savers. Each page reads the id that ENDS it
+ * (one statement, no rows transferred) and inserts the half-open range in one
+ * statement, so a page costs the same whether it carries five savers or five
+ * thousand. A short probe means this is the last page.
+ *
+ * THE BOUNDARY IS HELD IN MEMORY; WHAT IS PERSISTED IS A COUNT. Writing the
+ * boundary account_id into `payout_change_fanout` would put a fan identifier in
+ * a table that is otherwise entirely about a creator's money change, and would
+ * owe it an erasure/export disposition (`account-data.test.ts` derives that list
+ * from the schema by column name — a new fan identifier cannot arrive
+ * undecided). `covered` identifies nobody and needs no scrubbing. Resuming
+ * across invocations re-seeks with one `OFFSET covered - 1` probe; see
+ * migration 0029 for the exact drift that can introduce and why it does not
+ * matter (ON CONFLICT makes re-covered ground free, and the walk is exact
+ * within an invocation, which is the only case that is not hypothetical).
+ */
+export async function sweepPayoutChangeFanout(
+  db: DbLike,
+  now: () => string = () => new Date().toISOString(),
+  opts: { budget?: number; page?: number } = {},
+): Promise<{ markers: number; notified: number; statements: number }> {
+  const budget = opts.budget ?? PAYOUT_FANOUT_BUDGET;
+  const page = opts.page ?? PAYOUT_FANOUT_PAGE;
+  let statements = 1; // the marker read below
+  const { results: markers } = await db
+    .prepare("SELECT change_id, passport_id, summary, created_at, covered FROM payout_change_fanout WHERE done = 0 ORDER BY created_at ASC, change_id ASC LIMIT 50")
+    .bind()
+    .all<{ change_id: string; passport_id: string; summary: string; created_at: string; covered: number }>();
+
+  /** The account_id at 1-based position `n` in this creator's saver order, or
+   * null when there are fewer than `n`. The one shape both the resume seek and
+   * the page-end probe need. */
+  const nth = async (passportId: string, after: string, n: number): Promise<string | null> =>
+    (
+      await db
+        .prepare("SELECT account_id FROM saves WHERE passport_id = ? AND account_id > ? ORDER BY account_id ASC LIMIT 1 OFFSET ?")
+        .bind(passportId, after, n - 1)
+        .first<{ account_id: string }>()
+    )?.account_id ?? null;
+
+  let notified = 0;
+  let touched = 0;
+  for (const m of markers) {
+    touched += 1;
+    let covered = m.covered;
+    let cursor = "";
+    if (covered > 0) {
+      if (statements + 1 > budget) return { markers: touched, notified, statements };
+      // RESUME ON IDENTITY, NOT ON POSITION (S-070 SJ-16, migration 0094).
+      //
+      // This used to seek the `covered`-th saver in the CURRENT ordered set.
+      // 0029's own note acknowledges the drift and calls it free because
+      // "re-covering ground is free" under `ON CONFLICT DO NOTHING` — which is
+      // true of ADDITIONS below the boundary (they push the position BACKWARD)
+      // and false of REMOVALS, which push it FORWARD. An unsave or an erasure
+      // between invocations therefore started the next range AFTER savers who
+      // had never been notified, and the eventual `done = 1` made that
+      // permanent. The two directions are not one tradeoff.
+      //
+      // The greatest account_id this change has ALREADY NOTIFIED is an exact,
+      // identity-keyed boundary, and it costs 0029 nothing it was protecting:
+      // the fan identifier is read from `notifications`, which already holds it,
+      // already has an erasure and export disposition, and already carries the
+      // `payout:<change_id>` event id. `payout_change_fanout` stays free of fan
+      // identity — `covered` is still what is persisted there, and is still only
+      // a count.
+      //
+      // It is exact, not approximate: pages are contiguous ranges walked upward
+      // from "", and each page's INSERT covers EVERY saver in (cursor, upper],
+      // so every saver at or below the boundary was reached when it was reached.
+      const lastNotified =
+        (await db.prepare("SELECT MAX(account_id) AS a FROM notifications WHERE event_id = ?").bind(`payout:${m.change_id}`).first<{ a: string | null }>())?.a ?? null;
+      statements += 1;
+      if (lastNotified !== null) cursor = lastNotified;
+      else {
+        // Nothing for this change is in `notifications`: a suppressed creator
+        // (the fan-out's gate inserts zero rows), or retention took the lot.
+        // I3-0785: the positional seek is SJ-16's skip whenever savers left, so
+        // it is used ONLY for a creator suppressed NOW — whose gate selects
+        // nobody, so no owed fan can be skipped, and the walk stays finite.
+        // Otherwise restart from "" — re-covering ground, the free direction.
+        if (statements + 2 > budget) return { markers: touched, notified, statements };
+        const suppressedNow = (await db.prepare("SELECT 1 AS x FROM request_suppressions WHERE passport_id = ? LIMIT 1").bind(m.passport_id).first<{ x: number }>()) !== null;
+        statements += 1;
+        const seek = suppressedNow ? await nth(m.passport_id, "", covered) : "";
+        if (suppressedNow) statements += 1;
+        if (seek === null) {
+          // Fewer savers than we have already covered — nothing left to reach.
+          await db.prepare("UPDATE payout_change_fanout SET done = 1 WHERE change_id = ?").bind(m.change_id).run();
+          statements += 1;
+          continue;
+        }
+        cursor = seek;
+      }
+    }
+    for (;;) {
+      if (statements + 3 > budget) return { markers: touched, notified, statements };
+      // The id that ENDS this page, or nothing when fewer than `page` savers
+      // remain — which is also how "this is the final page" is decided.
+      const last = await nth(m.passport_id, cursor, page);
+      statements += 1;
+      const upper = last ?? "";
+      // D-0818 (B27A-PAYOUT-SAVEWINDOW), KEPT: no `saves.created_at` bound. The
+      // payout_changed notice is a 24-hour cooling-off SAFETY notice, so a fan
+      // who saved this creator mid-sweep receiving it is intended.
+      // Same suppression gate as every other fan-out here, on the same
+      // statement: a creator who asked to be delisted must not have their name
+      // put back on a fan surface by an automated alert. `'' ⇒ no upper bound`
+      // keeps one SQL shape for both the bounded and the final page.
+      const res = await db
+        .prepare(
+          `INSERT INTO notifications (account_id, passport_id, event_id, kind, summary, created_at)
+              SELECT s.account_id, ?, ?, 'payout_changed', ?, ?
+                FROM saves s
+               WHERE s.passport_id = ? AND s.account_id > ? AND (? = '' OR s.account_id <= ?)
+                 AND NOT EXISTS (SELECT 1 FROM request_suppressions r WHERE r.passport_id = s.passport_id)
+            ON CONFLICT(account_id, event_id) DO NOTHING`,
+        )
+        .bind(m.passport_id, `payout:${m.change_id}`, m.summary, now(), m.passport_id, cursor, upper, upper)
+        .run();
+      statements += 1;
+      notified += res.changes;
+      const done = last === null ? 1 : 0;
+      if (done === 0) {
+        // A full page by construction: the probe found a `page`-th row after the
+        // cursor, so the range (cursor, upper] holds exactly `page` savers.
+        covered += page;
+        cursor = upper;
+      }
+      await db.prepare("UPDATE payout_change_fanout SET covered = ?, done = ? WHERE change_id = ?").bind(covered, done, m.change_id).run();
+      statements += 1;
+      if (done === 1) break;
+    }
+  }
+  return { markers: touched, notified, statements };
+}
+
+/** I3-1944: rows per retention page, and pages per call — the bounded shape every
+ * other sweep here has. 20 x 5,000 = 100,000 rows a day, the same order as the
+ * delivery legs' ~87,000/day ceiling; a larger backlog drains over days. */
+export const NOTIFICATION_PRUNE_PAGE = 5000;
+export const NOTIFICATION_PRUNE_PAGES = 20;
+
+/**
+ * Retention for `notifications` — the table that had none.
+ *
+ * Every ledger event times every saver lands here, `delivered`/`emailed` only
+ * ever move a row from one state to another, and nothing ever removed one. The
+ * fan's own feed reads the newest rows (`accounts.ts` GET /account/notifications
+ * is `ORDER BY notif_id DESC LIMIT …`), so a row past this window is invisible
+ * to every reader; it was pure growth on the table both delivery legs scan.
+ *
+ * I3-1944: BOUNDED PAGES (`notif_id IN (SELECT … LIMIT ?)`), oldest first, at
+ * most `pages` of them; a short page ends the call. `idx_notif_created`
+ * (migration 0029) keeps each page an index walk.
+ *
+ * I3-1602 / I3-0464: `alert_fanout_dead_letters` shares this window — a letter
+ * older than the cutoff would replay a notification this same sweep deletes —
+ * and this daily call is where a PARKED letter (`DEAD_LETTER_MAX_ATTEMPTS`) is
+ * counted for the operator. Returns the NOTIFICATIONS removed.
+ */
+export async function pruneNotifications(db: DbLike, cutoffIso: string, opts: { page?: number; pages?: number; cid?: string; suppressionCutoffIso?: string } = {}): Promise<number> {
+  const page = opts.page ?? NOTIFICATION_PRUNE_PAGE;
+  const pages = opts.pages ?? NOTIFICATION_PRUNE_PAGES;
+  let removed = 0;
+  for (let i = 0; i < pages; i++) {
+    const res = await db
+      .prepare("DELETE FROM notifications WHERE notif_id IN (SELECT notif_id FROM notifications WHERE created_at < ? ORDER BY created_at ASC LIMIT ?)")
+      .bind(cutoffIso, page)
+      .run();
+    const n = res.changes ?? 0;
+    removed += n;
+    if (n < page) break;
+  }
+  const dl = await db
+    .prepare("DELETE FROM alert_fanout_dead_letters WHERE event_id IN (SELECT event_id FROM alert_fanout_dead_letters WHERE created_at < ? ORDER BY created_at ASC LIMIT ?)")
+    .bind(cutoffIso, page)
+    .run();
+  // I3-0014 e (D-0993(1)): an address not refused again within the list's period is forgotten, so a mailbox that came
+  // back to life is tried again. I23-Q6 (D-1030): that period is EMAIL_SUPPRESSION_RETENTION_DAYS on `last_seen`, not
+  // the notification cutoff. `cutoffIso` is the notification cutoff (now - NOTIFICATION_RETENTION_DAYS, index.ts), so
+  // the list's cutoff is derived from it unless the caller names one.
+  const suppressionCutoffIso =
+    opts.suppressionCutoffIso ?? new Date(Date.parse(cutoffIso) + (NOTIFICATION_RETENTION_DAYS - EMAIL_SUPPRESSION_RETENTION_DAYS) * 86_400_000).toISOString();
+  await db
+    .prepare("DELETE FROM email_suppressions WHERE address_hash IN (SELECT address_hash FROM email_suppressions WHERE last_seen < ? ORDER BY last_seen ASC LIMIT ?)")
+    .bind(suppressionCutoffIso, page)
+    .run();
+  const parked = (await db.prepare("SELECT COUNT(*) AS n FROM alert_fanout_dead_letters WHERE attempts >= ?").bind(DEAD_LETTER_MAX_ATTEMPTS).first<{ n: number }>())?.n ?? 0;
+  const log = parked > 0 ? logError : logInfo;
+  log({ cid: opts.cid ?? "unknown", hop: "cron", msg: "alert_fanout_dead_letters", pending: parked, count: dl.changes ?? 0 });
+  return removed;
+}
+
+/**
+ * What a payout change DID, in the only two facts the creator's notice needs:
+ * how many destinations they now have staged, and when those start rendering.
+ * Supplied by the caller from its own plan — never re-derived here (see
+ * `buildPayoutChangeStatements`). `effective_at: null` means "immediately",
+ * which is what a compromise-recovery retraction is.
+ */
+export interface PayoutChangeSummary {
+  destinations: number;
+  effective_at: string | null;
+}
+
+/**
+ * Build (but DON'T execute) the payout-change notification inserts — BOTH LEGS.
+ *
+ * Returning statements lets `setPayoutTags` and `retractAllPayoutTags` fold them
+ * into the SAME atomic batch as the tag staging (and, on the signed path, the
+ * ledger append) — so a payout change and the notices about it are
+ * all-or-nothing. Previously the alert fired after the staging batch committed
+ * and wasn't compensated on failure, so a partial failure could stage a swap
+ * while suppressing the very alert that makes silent swaps detectable. Dedup is
+ * on a per-change synthetic key so a re-run of the same change never spams.
+ *
+ * THE CREATOR LEG, AND WHY IT IS NOT THE SAVER QUERY (audit v11, D1).
+ *
+ * This function used to return the saver rows and nothing else, and its
+ * docstring claimed the creator was reached too, "via a self-follow". That was
+ * false from the moment part 4b (#24) eliminated the founder auto-follow/auto-
+ * save and dropped `founder_autofollow`: the only remaining writer of `saves` is
+ * `saveCreator`, a fan-scoped route requiring an `accounts` row a creator does
+ * not have. So a creator with zero savers produced ZERO statements — no push, no
+ * email, no in-app row, nothing on any channel — for the entire 24-hour
+ * cooling-off, which is precisely the window that exists so they can catch a
+ * hijacker's swap and pull it.
+ *
+ * Part 7 found this exact bug, wrote the diagnosis into the docblock sixty lines
+ * below, fixed `fanOutVerificationExpiring` by routing the creator through
+ * `digest.ts` — and left THIS function, the money one, on the byte-identical
+ * dead query.
+ *
+ * The creator now gets the same treatment the expiry warning got: a
+ * `creator_digests` row with `kind='alert'`, delivered by the ordinary digest
+ * pass over verified email and registered push, and served in-app by
+ * `GET /account/digests` whether or not either of those exists. It is the LAST
+ * statement in the list rather than the first only so the saver rows keep the
+ * order they had; both are in one batch, so order carries no meaning.
+ *
+ * TWO DIFFERENT SUPPRESSION ANSWERS, DELIBERATELY. The saver query keeps its
+ * gate — a delisted creator's NAME must not be re-published to a fan surface by
+ * an automated alert. The creator row has no gate: it goes to the subject's own
+ * console and their own verified address, names nobody, and "someone moved where
+ * your money goes" is the message a delisted creator most needs. Delisting is a
+ * fan-surface property, not a gag order on the subject.
+ *
+ * RETRACT2 (S-032, QUEUE #105) — NEITHER LEG GATES ON `retracted`, AND THAT IS
+ * THE ANSWER, NOT AN OMISSION. `retract_passport` (events.ts) never touches
+ * `payout_tags`, and the write gate a step above this one (`verifiedMintGate`,
+ * `CURRENTLY_VERIFIED`, payout.ts) only blocks ADDING a new destination —
+ * removal (`retractAllPayoutTags`, the compromise-recovery lever) has no
+ * standing check at all, by design (M35: turning payouts off must work even
+ * after standing is gone). So a payout change reaching this builder for a
+ * retracted passport is a real, currently-possible money event, not a stale
+ * echo — the exact opposite of the C-596/C-152 cases (S-026), where the STATE
+ * being served predated the retraction. The saver row keeps only the
+ * suppression gate it already had (display_name is already '' post-retraction,
+ * M30, so there is no name to re-publish either way); the creator row keeps no
+ * gate, same as before. See `services/trust-core/test/s032-retract2-readers.test.ts`
+ * for the pinned control (fan-out still happens for a retracted passport) and
+ * `fanOutVerificationExpiring` below for the reader that answers differently.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * THREE STATEMENTS, NOT N — AND WHY THE MIDDLE ONE IS THE IMPORTANT ONE.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * This function used to return one INSERT per row of `saves`, and `payout.ts`
+ * folded that unbounded array into the SAME atomic batch as the signed
+ * `payout_tag_*` events and the tag write. Correct about atomicity, and fatal
+ * because of it: a compromised creator with 200,000 savers hitting "retract all
+ * payout destinations" produced a batch D1 refuses, the whole write rolled back,
+ * and the hijacker's staged destinations survived the emergency brake. The
+ * bigger the audience, the more certainly the safety lever failed.
+ *
+ * What rides the money batch now is CONSTANT-WIDTH:
+ *
+ *   1. A bounded FIRST PAGE of saver notifications (PAYOUT_FANOUT_INLINE rows in
+ *      one `INSERT … SELECT … LIMIT`). Not required for durability — it is a
+ *      LATENCY decision. The alert exists to be seen inside a 24-hour
+ *      cooling-off window and the cron is 6-hourly, so waiting for the sweep
+ *      would spend a quarter of that window for the ordinary creator whose whole
+ *      audience fits in one page. One statement, fixed row count.
+ *   2. The `payout_change_fanout` MARKER — the durable fact. The tail is fanned
+ *      out by `sweepPayoutChangeFanout` in bounded pages. The marker is what
+ *      makes the alert un-droppable; the rows are just its distribution.
+ *   3. The creator-directed notice, which STILL RIDES THE ATOMIC BATCH. That is
+ *      the one that reaches the victim, and it is the reason the whole
+ *      all-or-nothing argument was made in the first place — it must not become
+ *      a thing a cron might get to later.
+ */
+export async function buildPayoutChangeStatements(
+  db: DbLike,
+  passportId: string,
+  changeId: string,
+  now: () => string = () => new Date().toISOString(),
+  change?: PayoutChangeSummary,
+): Promise<DbStatement[]> {
+  const disp = await db.prepare("SELECT display_name FROM passports WHERE passport_id = ?").bind(passportId).first<{ display_name: string }>();
+  const name = disp?.display_name ?? "A creator you follow";
+  const summary = `${name} changed their payout destination — verify it before you send anything`;
+  const ts = now();
+  return [
+    // D-0818 (B27A-PAYOUT-SAVEWINDOW), KEPT: no `saves.created_at` bound here
+    // either — a 24-hour cooling-off SAFETY notice reaching a fan who saved the
+    // creator mid-sweep is intended.
+    // The bounded first page. Same suppression gate as every other fan-out here,
+    // on the same statement: a suppressed creator fans out nothing, so the
+    // payout alert cannot re-publish their name to their savers.
+    db
+      .prepare(
+        `INSERT INTO notifications (account_id, passport_id, event_id, kind, summary, created_at)
+            SELECT s.account_id, ?, ?, 'payout_changed', ?, ?
+              FROM saves s
+             WHERE s.passport_id = ?
+               AND NOT EXISTS (SELECT 1 FROM request_suppressions r WHERE r.passport_id = s.passport_id)
+             ORDER BY s.account_id ASC
+             LIMIT ?
+          ON CONFLICT(account_id, event_id) DO NOTHING`,
+      )
+      .bind(passportId, `payout:${changeId}`, summary, ts, passportId, PAYOUT_FANOUT_INLINE),
+    // The marker. `covered = 0` deliberately restarts the sweep at the beginning
+    // of the saver set rather than after the inline page: re-covering it costs
+    // ONE ON CONFLICT no-op statement, and deriving the page boundary here would
+    // need a read this batch must not take. ON CONFLICT so a repeated change id
+    // (a re-resolved recovery case) re-uses the one marker instead of failing
+    // the money write.
+    db
+      .prepare("INSERT INTO payout_change_fanout (change_id, passport_id, summary, created_at, covered, done) VALUES (?, ?, ?, ?, 0, 0) ON CONFLICT(change_id) DO NOTHING")
+      .bind(changeId, passportId, summary, ts),
+    // NO EXTRA READ. `change` is handed down from the caller's own plan
+    // (`setPayoutTags` knows `plan.after.length` and `plan.effective_at`;
+    // `retractAllPayoutTags` knows the answer is "none, immediately"). Deriving
+    // it here with a SELECT would be both a second statement on the money write
+    // and WRONG: this builder runs BEFORE the batch, so it would see the
+    // pre-change staging and mail the creator the number they are being warned
+    // about replacing. Absent a plan the notice omits the detail rather than
+    // guessing — see digest.ts `payout_change`.
+    payoutChangeNoticeStatement(db, passportId, changeId, change?.destinations ?? null, change?.effective_at ?? null, () => ts),
+  ];
+}
+
+/**
+ * THE NOTICE THAT ARRIVES BEFORE THE EVENT — THE SAVER'S HALF OF IT.
+ *
+ * `verification_expired` tells everyone the badge is already gone. That is the
+ * wrong moment for the CREATOR to find out: an expiry costs them the badge, the
+ * payout-tag presentation and the ability to mint anything, all at once. It is
+ * also useful for a saver, whose view of that creator's payout destinations
+ * disappears on the same instant, so `verification-sweep.ts` sends it both ways
+ * while the grant is still good but inside `EXPIRY_WARNING_MS`.
+ *
+ * WHAT THIS FUNCTION NO LONGER CLAIMS. It used to say it reached the creator
+ * too, "by the SAME route `fanOutPayoutChange` already relies on — a
+ * self-save", and it was wrong by the time it was read: part 4b (#24)
+ * ELIMINATED the founder auto-follow/auto-save and dropped the marker table,
+ * leaving `saveCreator` — a fan-scoped route requiring an `accounts` row a
+ * creator does not have — as the only writer of `saves`. So the 14-day warning
+ * went to a creator's followers and never to the creator, which is precisely
+ * the outcome the sweep's own header calls unacceptable. This is now the FAN
+ * leg only, and it is named as such; the creator hears about it on the
+ * creator-directed channel (`digest.ts noticeVerificationExpiring`) and from an
+ * app-wide banner the console derives on every paint.
+ *
+ * DEDUP IS ON THE DEADLINE, not on a timestamp: the synthetic event id carries
+ * the `expires_at` itself, so the fourteen cron ticks before a lapse produce ONE
+ * notice, and a renewal (which moves the deadline) is what re-arms it. Returns
+ * the number of notices actually created, so a re-run reports zero rather than
+ * inflating the sweep's counters.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * `ON CONFLICT` MADE IT IDEMPOTENT, NOT FREE — and that was the bug.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * This ran one `INSERT … ON CONFLICT DO NOTHING` PER SAVER, and
+ * `verification-sweep.ts` calls it for every candidate inside the 14-day
+ * warning window on EVERY cron tick. The conflict clause meant the second tick
+ * wrote nothing — and still issued every statement. 20 creators × 5,000 savers
+ * is 100,000 D1 statements a tick, ~56 ticks across the window, for zero net
+ * effect after the first: a hundred thousand subrequests spent proving a row
+ * already existed.
+ *
+ * Two changes. The fan-out is ONE `INSERT … SELECT` (constant in followers), and
+ * a GATE in front of it makes ticks 2..56 cost a single indexed SELECT.
+ *
+ * THE GATE IS THE NOTIFICATIONS TABLE ITSELF, not a marker table — the rows
+ * already carry the per-(passport, deadline) key in `event_id`, so asking
+ * whether the fan-out happened is asking whether any row with that key exists.
+ * `idx_notif_event` (migration 0029) makes it a point lookup; without that index
+ * this would be a full scan and strictly worse than what it replaces.
+ *
+ * A creator with ZERO savers produces no rows, so the gate never trips for them
+ * and the (now 3-statement) fan-out is re-attempted each tick. That is correct
+ * rather than merely cheap: a fan who saves them mid-window still gets the
+ * notice.
+ */
+export async function fanOutVerificationExpiring(
+  db: DbLike,
+  passportId: string,
+  expiresAt: string,
+  now: () => string = () => new Date().toISOString(),
+): Promise<number> {
+  // I3-1069: the key carries the PASSPORT. `notifications` is UNIQUE(account_id,
+  // event_id), so a deadline-only key made a fan who saved two creators sharing
+  // one deadline lose the second notice to ON CONFLICT. The gate also reads the
+  // pre-fix key, so a deadline already announced under it is not re-announced.
+  const eventId = `vexpiring:${passportId}:${expiresAt}`;
+  const already = await db
+    .prepare("SELECT 1 AS x FROM notifications WHERE event_id IN (?, ?) AND passport_id = ? LIMIT 1")
+    .bind(eventId, `vexpiring:${expiresAt}`, passportId)
+    .first<{ x: number }>();
+  if (already) return 0;
+
+  // RETRACT2 (S-032, QUEUE #105): folded into the SAME statement that already
+  // reads `display_name`, so a retracted passport costs no extra read (the
+  // `db.shapes` sequence in alert-fanout-budget.test.ts stays
+  // ["SELECT notifications", "SELECT passports", "INSERT notifications"]).
+  // Unlike the payout-change alert (money already moved is real regardless of
+  // the passport's state — see `buildPayoutChangeStatements`), a renewal
+  // reminder for a takedown is pure noise: the badge, the payout presentation
+  // it gates, and the window to renew are all already gone (M30 also erased
+  // `display_name` to '', so the un-gated summary would read as
+  // "'s Dhwaja verification expires on..." with no name). No fan or the
+  // creator needs this notice once retraction has happened, so it is
+  // suppressed at the source instead of mailing a name-shaped blank.
+  const disp = await db.prepare("SELECT display_name, retracted FROM passports WHERE passport_id = ?").bind(passportId).first<{ display_name: string; retracted: number }>();
+  if (disp?.retracted === 1) return 0;
+  const name = disp?.display_name ?? "A creator you follow";
+  const summary = `${name}'s Dhwaja verification expires on ${expiresAt.slice(0, 10)} — it has to be renewed to keep the badge`;
+  // Same suppression gate, on the same statement, as every other fan-out here: a
+  // creator who asked to be delisted must not have their name put back on a fan
+  // surface by an automated reminder.
+  const res = await db
+    .prepare(
+      `INSERT INTO notifications (account_id, passport_id, event_id, kind, summary, created_at)
+          SELECT s.account_id, ?, ?, 'verification_expiring', ?, ?
+            FROM saves s
+           WHERE s.passport_id = ?
+             AND NOT EXISTS (SELECT 1 FROM request_suppressions r WHERE r.passport_id = s.passport_id)
+        ON CONFLICT(account_id, event_id) DO NOTHING`,
+    )
+    .bind(passportId, eventId, summary, now(), passportId)
+    .run();
+  return res.changes;
+}
+
+/** Knobs both delivery legs share. Production defaults are the constants above;
+ * tests shrink them to prove the break is clean and leaves nothing wedged. */
+export interface DeliverOptions {
+  /** PS-089 correlation id for this pass's log lines. */
+  cid?: string;
+  /** Rows to attempt this pass. */
+  batch?: number;
+  /** Hard D1-statement ceiling for this pass. */
+  budget?: number;
+  /** Hard OUTBOUND-PROVIDER-CALL ceiling for this pass. Rows are not sends — a
+   * push row with three devices is three sends — so this is the bound that has
+   * to hold for the subrequest arithmetic, and it is separate from `batch`. */
+  fetchBudget?: number;
+  /** Provider calls in flight at once, and the width of one statement wave. */
+  concurrency?: number;
+  /** How many of the NEWEST undelivered rows are scanned for safety-critical
+   * kinds on top of the oldest `batch`. 0 disables the priority window. */
+  priorityScan?: number;
+  /** Wall-clock ceiling, in ms, for this pass. */
+  budgetMs?: number;
+  /** Injectable clock for the deadline (tests). */
+  nowMs?: () => number;
+  /** Ceiling on ONE provider call, where this module can impose one (email —
+   * see EMAIL_SEND_TIMEOUT_MS). May only RAISE it: `emailRaceDeadlineMs` floors
+   * it at EMAIL_SEND_TIMEOUT_MS (I3-2008). Push has its own in `push.ts`. */
+  sendTimeoutMs?: number;
+  /**
+   * Rows the slice-23 SAFETY arm may pull, before the two positional arms are
+   * merged in. Clamped to `batch` by both legs. 0 disables the arm, which is how
+   * the tests measure what the positional window alone was worth.
+   */
+  safetyArm?: number;
+  /**
+   * EMAIL LEG ONLY — this Worker's own public origin (`PUBLIC_BASE_URL`), which
+   * is what an RFC 8058 one-click URL has to be built on. Absent ⇒ no one-click
+   * token is minted and no `List-Unsubscribe-Post` is sent: the mail still
+   * carries the RFC 2369 app link and the body footer, so the channel is never
+   * blocked on this. It is NOT `appOrigin` — that is a Pages asset origin, and
+   * a POST to it is a 405 the provider would read as a broken sender.
+   */
+  oneClickBase?: string | null;
+  /**
+   * EMAIL LEG ONLY — the sender's own physical postal address, required in
+   * every COMMERCIAL message by CAN-SPAM 7704(a)(5)(A)(i). Absent, or present
+   * but not reaching the rendered body, means every COMMERCIAL-class row on
+   * this pass is REFUSED and left `emailed = 0`; the gate is at
+   * the `isCommercialClass(n.kind)` postal check in `deliverPendingEmail`'s send loop. It is never defaulted and never synthesised — D-0441
+   * reserves the VALUE, so an unwired deploy blocks commercial mail rather
+   * than mailing a placeholder.
+   */
+  postalAddress?: string | null;
+}
+
+/**
+ * Statements ONE wave may spend, and therefore what a wave must RESERVE before
+ * it starts: the device read (one — the account list is at most `width` wide and
+ * `width` is clamped to `IN_CHUNK`), the settle UPDATE (one, same argument), and
+ * the dead-token DELETE, whose id list is `width × MAX_DEVICES_PER_NOTIFICATION`
+ * and therefore the only one that can need chunking — 16 × 10 = 160 ids against
+ * D1's 90-parameter ceiling is 2 statements.
+ *
+ * COMPUTED FROM `width`, not a literal, because `DeliverOptions.concurrency` is
+ * a caller's knob: a wider wave has a proportionally longer dead-token list, and
+ * a reservation that ignored that would be a budget the wave discovers it has
+ * already broken. Reserved up front, so stopping is always a decision and never
+ * a discovery.
+ */
+function waveStatements(width: number): number {
+  return 2 + Math.ceil((width * MAX_DEVICES_PER_NOTIFICATION) / IN_CHUNK);
+}
+
+/** The reservation at the production `DELIVER_CONCURRENCY` — the 4 that THE
+ * BUDGETS arithmetic above is written against. */
+export const WAVE_STATEMENTS = waveStatements(DELIVER_CONCURRENCY);
+
+/** One row of the pending page, either leg. `kind` is here for the priority
+ * ordering; `notif_id` is the identity the dedup and the settle use. */
+interface PendingRow {
+  notif_id: number;
+  kind: string;
+}
+
+/**
+ * Safety-critical first, then FIFO — over the page that was already read.
+ *
+ * Dedups by `notif_id` (the head and priority arms overlap whenever the backlog
+ * is shallower than both windows) and is a pure, total function of `kind` and
+ * `notif_id`, so two passes over the same rows agree and a row can never
+ * ping-pong between positions. `Array.prototype.sort` is stable in every engine
+ * this runs on, but the comparator is total anyway rather than relying on it.
+ */
+function byPriority<T extends PendingRow>(rows: readonly T[]): T[] {
+  const seen = new Set<number>();
+  const uniq: T[] = [];
+  for (const r of rows) {
+    if (seen.has(r.notif_id)) continue;
+    seen.add(r.notif_id);
+    uniq.push(r);
+  }
+  // THREE TIERS, NOT TWO. Money, then the rest of the fast lane, then the queue.
+  //
+  // Two tiers had a failure the safety arm alone does not fix: when the BACKLOG
+  // IS SAFETY-KIND, every candidate ties and the merged page collapses to the
+  // `batch` lowest ids — so a fresh `payout_changed`, which has the HIGHEST id,
+  // is dropped by the caller's `.slice(0, batch)`. Measured: 5,000
+  // `verification_expiring` rows (one creator's saver fan-out, and that kind is
+  // in SAFETY_KINDS) plus one payout alert put the payout alert at pass 34 =
+  // 170 minutes, with or without the arm. At 200,000 it is ~4.6 days — the same
+  // failure mode this slice exists to close, inside the lane meant to close it.
+  //
+  // `SAFETY_KINDS` is four kinds and four different clocks: 24 hours for a
+  // payout destination, 14 days for a verification warning, none at all for a
+  // revocation. Tiering by the clock is what makes the lane mean something.
+  const tier = (kind: string): number => (kind === MONEY_KIND ? 0 : SAFETY_KINDS.has(kind) ? 1 : 2);
+  return uniq.sort((a, b) => {
+    const pa = tier(a.kind);
+    const pb = tier(b.kind);
+    return pa !== pb ? pa - pb : a.notif_id - b.notif_id;
+  });
+}
+
+/** Clamp a wave to something that is always ONE `IN (…)` statement. A caller
+ * that asks for a wider wave than D1 can bind would silently need chunking, and
+ * a wave that needs chunking is no longer the fixed cost the budget assumes. */
+function waveWidth(requested: number | undefined): number {
+  return Math.max(1, Math.min(Math.floor(requested ?? DELIVER_CONCURRENCY), IN_CHUNK));
+}
+
+/**
+ * Deliver undelivered notifications to each account's devices. Best-effort: a
+ * failure leaves the row undelivered for the next pass.
+ *
+ * FOUR BOUNDS, and each one closes a different way of overrunning. `batch` caps
+ * the ROWS; `fetchBudget` caps the OUTBOUND PROVIDER CALLS, which is the one
+ * that actually maps to the platform's subrequest ceiling (a row with ten
+ * devices is ten calls, and nothing caps devices per account); `budget` caps the
+ * D1 STATEMENTS; `budgetMs` caps the WALL CLOCK, because the thing that killed
+ * this leg in the first place was not statements but a slow provider. Whichever
+ * binds first stops the pass, and the unfinished rows are still `delivered = 0`
+ * for the next one.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * WHY THE SENDS ARE IN WAVES AND THE STATEMENTS ARE SET-BASED.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * This loop used to be `for (row) { SELECT devices; for (device) await send; }` —
+ * two statements per row and one SERIAL await per device against a 10 s
+ * timeout. Both halves scaled with the batch, so raising the batch raised the
+ * wall clock in lockstep and bought nothing: `DELIVERY_BUDGET_MS` was already
+ * the binding limit at a batch of 100. Now a WAVE of `concurrency` sends is in
+ * flight at once and costs a FIXED number of statements — one device read for
+ * the whole wave, one settle UPDATE for the whole wave, one dead-token DELETE
+ * for the whole wave — so the pass is `2 + WAVE_STATEMENTS × ⌈rows/W⌉`
+ * statements and `rows/W × latency` of wall clock. See THE BUDGETS above for the
+ * arithmetic this makes true.
+ *
+ * THE DEADLINE IS CHECKED BEFORE EACH WAVE, never mid-wave, and that is what
+ * bounds the overshoot: a wave cannot outlive one `PUSH_TIMEOUT_MS` (every
+ * adapter call is deadlined and aborted), so the worst overrun past `budgetMs`
+ * is 10 s — where the serial version's worst overrun was `remaining rows × 10 s`,
+ * i.e. past the cron lease and into a double-sending successor.
+ *
+ * WHAT SETTLES AND WHAT IS LEFT ALONE, because the difference is a lost alert:
+ * a row settles when a provider ACCEPTED it, when the account has no device at
+ * all, when the subject is suppressed, or when every device it has was rejected
+ * as permanently dead AND we looked at every device it has. A row that was only
+ * partly attempted — the wave was cut short, or the device list was truncated at
+ * `MAX_DEVICES_PER_NOTIFICATION` — is left `delivered = 0` and retried, because
+ * "everything we tried failed" is not "there is nobody to deliver to".
+ *
+ * PUSH IS AT-LEAST-ONCE, BY DECISION (#791b, D-0920 option A). A wave SENDS first
+ * and SETTLES after (the `scheduleSet("delivered", "push")` UPDATE that follows the
+ * whole wave), and nothing is claimed in between — there is no push counterpart of
+ * the mail wave's `email_claimed_at` (migration 0148), and none is to be added. So a
+ * pass that dies after a provider accepted a notification and before the settle
+ * commits leaves the row `delivered = 0`, and the next pass sends it again: a phone
+ * may show the same alert twice. Duplicates are the accepted cost; a lost alert is
+ * not. Alert MAIL is the opposite trade (at-most-once, `deliverPendingEmail`).
+ * Pinned by test/i16-w06a-push-at-least-once.test.ts.
+ */
+export async function deliverPending(
+  db: DbLike,
+  sender: PushSender,
+  now: () => string = () => new Date().toISOString(),
+  opts: DeliverOptions = {},
+): Promise<number> {
+  void now;
+  const batch = opts.batch ?? DELIVER_BATCH;
+  const budget = opts.budget ?? DELIVER_STATEMENT_BUDGET;
+  const fetchBudget = opts.fetchBudget ?? DELIVER_FETCH_BUDGET;
+  const width = waveWidth(opts.concurrency);
+  const clock = opts.nowMs ?? (() => Date.now());
+  // I3-1223 (I4-01-R3 patch 5): a dead-token delete removes only bindings not
+  // refreshed since this pass began (attachDevice stamps created_at on every
+  // refresh). Read from the SAME clock() call the deadline is, not a second one.
+  const passStartMs = clock();
+  const passStartIso = new Date(passStartMs).toISOString();
+  const deadline = passStartMs + (opts.budgetMs ?? DELIVERY_BUDGET_MS);
+
+  interface Row extends PendingRow {
+    account_id: string;
+    passport_id: string;
+    suppressed: number;
+    /** C-49: the account has an active (suspended/terminated) closure. Treated
+     * exactly like `suppressed` below — settled without a send — because a
+     * closed account cannot open the app (`explainNullEpoch` answers its own
+     * session resolution with `AccountClosedError`, fan-auth.ts) and so can
+     * never reach `/account/notifications` to turn this off itself. Without
+     * this, closure freezes everything EXCEPT the one channel that keeps
+     * reaching the person regardless. */
+    closed: number;
+    /** I3-2152: a `creator_broadcast` whose recipient has muted broadcasts since
+     * compose — settled without a send, like `suppressed`. */
+    muted: number;
+    /** I3-1287/I3-1288: retries spent so far (0128). */
+    push_attempts: number;
+  }
+  // The three arms share one projection so they cannot drift in what they select
+  // — `byPriority` merges their rows into one array and a column present in only
+  // two of them would be `undefined` for the third.
+  // The three arms share one projection (`cols`) so they cannot drift in what
+  // they select — `byPriority` merges their rows into one array and a column
+  // present in only two of them would be `undefined` for the third. The safety
+  // arm builds its own FROM clause rather than appending to `base`, because
+  // `INDEXED BY` belongs immediately after the table name and before the WHERE:
+  // appending it after one produces invalid SQL, which that arm's own catch
+  // would then swallow into a silently-disabled feature. It did, once.
+  const cols = `SELECT notif_id, account_id, passport_id, kind, push_attempts,
+              EXISTS(SELECT 1 FROM request_suppressions r WHERE r.passport_id = notifications.passport_id) AS suppressed,
+              EXISTS(SELECT 1 FROM account_closures c WHERE c.account_id = notifications.account_id AND c.state IN ${FROZEN_CLOSURE_STATES_SQL}) AS closed,
+              EXISTS(SELECT 1 FROM accounts a JOIN notifications n ON n.notif_id = notifications.notif_id WHERE a.account_id = notifications.account_id AND ${BROADCAST_MUTED_SQL}) AS muted`;
+  // I3-1287/I3-1288: every arm skips a row whose retry is not yet due.
+  const due = "(push_next_at IS NULL OR push_next_at <= ?)";
+  const base = `${cols} FROM notifications WHERE delivered = 0 AND ${due}`;
+  const page = `${base} ORDER BY notif_id`;
+
+  let statements = 1; // the head page read below (the priority and safety arms add their own)
+  const { results: head } = await db.prepare(`${page} ASC LIMIT ?`).bind(passStartIso, batch).all<Row>();
+  const candidates: Row[] = [...head];
+
+  // THE PRIORITY WINDOW. The newest `priorityScan` undelivered rows, of which
+  // ONLY the safety-critical kinds are merged in. Filtering HERE rather than in
+  // the SQL is what keeps the scan `O(limit)` instead of a walk of the whole
+  // `delivered = 0` set — see PRIORITY_SCAN for the measurement. The `kind` test
+  // is belt-and-braces about ORDER rather than load-bearing: `byPriority` breaks
+  // ties by ascending `notif_id` and the head arm already holds the oldest
+  // `batch` rows, so a routine row from the NEWEST end could never win a slot
+  // anyway. It is here so that a future change to that tiebreak cannot silently
+  // start promoting routine alerts over the queue, and so the merged array stays
+  // `batch + (safety rows)` wide instead of `batch + priorityScan`.
+  const priorityScan = batch > 0 ? (opts.priorityScan ?? PRIORITY_SCAN) : 0;
+  if (priorityScan > 0) {
+    const { results: newest } = await db.prepare(`${page} DESC LIMIT ?`).bind(passStartIso, priorityScan).all<Row>();
+    statements += 1;
+    for (const r of newest) if (SAFETY_KINDS.has(r.kind)) candidates.push(r);
+  }
+  // THE SAFETY ARM (slice 23) — selected by WHAT IT IS, not by WHERE IT SITS.
+  //
+  // The two arms above are both POSITIONAL: the oldest `batch` and the newest
+  // `priorityScan`. A safety alert with a full batch of older rows in front and
+  // more than `priorityScan` newer ones behind is in neither, and was reached in
+  // FIFO order — measured at pass 2 for a 751-row backlog, i.e. ⌈older/batch⌉
+  // passes, which is bounded but is a function of the backlog rather than of the
+  // alert's urgency.
+  //
+  // This arm has no such dependence: it asks for undelivered safety rows —
+  // money first, then oldest — and gets them at any depth. The money tier is
+  // part of the claim, not a refinement: without it a fresh payout alert ties
+  // with every other safety row and loses on ascending id (see `byPriority`). Migration 0052's partial index is
+  // what makes that affordable — 0.029 ms at 200,000 undelivered rows, against
+  // 20.49 ms for the same query unindexed, which is the walk this design
+  // previously (and correctly) refused to do.
+  if (batch > 0 && (opts.safetyArm ?? SAFETY_ARM) > 0) {
+    const safetyArm = Math.min(opts.safetyArm ?? SAFETY_ARM, batch);
+    try {
+      const { results: safety } = await db
+        .prepare(`${cols} FROM notifications INDEXED BY idx_notif_safety_push WHERE delivered = 0 AND ${due} AND kind IN (${SAFETY_KINDS_SQL}) ORDER BY ${MONEY_FIRST}, notif_id ASC LIMIT ?`)
+        .bind(passStartIso, safetyArm)
+        .all<Row>();
+      statements += 1;
+      candidates.push(...safety);
+    } catch (e) {
+      // A HALF-MIGRATED DEPLOY DEGRADES, IT DOES NOT STOP. `INDEXED BY` errors
+      // if 0052 has not been applied; this leg then behaves exactly as it did
+      // before slice 23 — the two positional arms are untouched and still carry
+      // the pass — rather than throwing delivery away. The statement is NOT
+      // counted, because it did not run.
+      logError({ cid: opts.cid ?? "unknown", hop: "cron", msg: "delivery_safety_arm_unavailable", err: e instanceof Error ? e.name : typeof e });
+    }
+  }
+  // `byPriority` dedups by `notif_id` — the three arms overlap whenever the
+  // backlog is shallower than all of them — and breaks ties by ascending id, so
+  // a row appearing in two arms is carried once and in its FIFO position.
+  const pending = byPriority(candidates).slice(0, Math.max(0, batch));
+
+  let delivered = 0;
+  let fetches = 0;
+  let exhausted = 0;
+  for (let i = 0; i < pending.length; i += width) {
+    // BREAK CLEANLY. Every row settled so far is settled durably; every row not
+    // reached is untouched and still `delivered = 0`, so the next pass picks up
+    // exactly here. Stopping is never worse than being killed by the platform
+    // mid-row, which is what happened before any of these bounds existed.
+    if (statements + waveStatements(width) > budget || clock() >= deadline || fetches >= fetchBudget) break;
+    const wave = pending.slice(i, i + width);
+
+    /** notif_ids whose push question is CLOSED by this wave. */
+    const settle: number[] = [];
+    const needDevices: Row[] = [];
+    for (const n of wave) {
+      // A notification created BEFORE the removal request is retired, not sent:
+      // the fan-out gate stops new ones, this stops the backlog. Marked
+      // delivered rather than skipped so a suppressed subject's rows cannot
+      // accumulate at the head of the queue and starve everyone else's alerts.
+      // The row survives (lifting the suppression restores it to
+      // `GET /account/notifications`); it just never becomes a push.
+      if (n.suppressed || n.closed || n.muted) settle.push(n.notif_id);
+      else needDevices.push(n);
+    }
+
+    // ONE DEVICE READ FOR THE WHOLE WAVE. The id list is at most `width` wide
+    // and `width` is clamped to IN_CHUNK, so this is always a single statement.
+    // Newest-first so a truncation at MAX_DEVICES_PER_NOTIFICATION drops the
+    // stalest registrations rather than an arbitrary ten.
+    const byAccount = new Map<string, DeviceTarget[]>();
+    const overflowed = new Set<string>();
+    // `inChunks` for the house rule, ONE ITERATION for the budget: it dedups the
+    // ids and splits at `IN_CHUNK`, and `width` is clamped to `IN_CHUNK`, so a
+    // wave's account list can never be more than one chunk. The loop is what
+    // makes that true structurally rather than by argument.
+    for (const chunk of inChunks(needDevices.map((n) => n.account_id))) {
+      const { results: devices } = await db
+        .prepare(
+          `SELECT device_id, account_id, platform, push_token FROM devices
+            WHERE account_id IN (${chunk.map(() => "?").join(",")})
+            ORDER BY account_id ASC, created_at DESC, device_id ASC`,
+        )
+        .bind(...chunk)
+        .all<DeviceTarget & { account_id: string }>();
+      statements += 1;
+      for (const d of devices) {
+        const list = byAccount.get(d.account_id);
+        if (list === undefined) byAccount.set(d.account_id, [{ device_id: d.device_id, platform: d.platform, push_token: d.push_token }]);
+        else if (list.length < MAX_DEVICES_PER_NOTIFICATION) list.push({ device_id: d.device_id, platform: d.platform, push_token: d.push_token });
+        else overflowed.add(d.account_id);
+      }
+    }
+
+    /** Per-row tally of what the wave's sends did. */
+    const state = new Map<number, { total: number; attempted: number; ok: boolean; dead: number; truncated: boolean }>();
+    const sends: { row: Row; device: DeviceTarget }[] = [];
+    let fetchRoomGone = false;
+    for (const n of needDevices) {
+      const list = byAccount.get(n.account_id) ?? [];
+      if (list.length === 0) {
+        // No device to deliver to — settle so it doesn't retry forever.
+        settle.push(n.notif_id);
+        continue;
+      }
+      // ALL OF A ROW'S DEVICES OR NONE OF THEM. Half-attempting a row would
+      // spend provider calls on an outcome the row cannot be settled on, and the
+      // next pass would repeat the ones already sent. The row is simply left for
+      // the next pass instead.
+      if (fetches + sends.length + list.length > fetchBudget) {
+        fetchRoomGone = true;
+        break;
+      }
+      state.set(n.notif_id, { total: list.length, attempted: 0, ok: false, dead: 0, truncated: overflowed.has(n.account_id) });
+      for (const device of list) sends.push({ row: n, device });
+    }
+
+    const dead: string[] = [];
+    let outOfTime = false;
+    for (let j = 0; j < sends.length; j += width) {
+      // Between SEND sub-waves as well as between ROW waves — a wave of rows
+      // with several devices each is several sub-waves, and a pass that only
+      // checked the outer loop would run all of them however long it had
+      // already been going. Never INSIDE a sub-wave, which is what keeps the
+      // overshoot at one provider timeout. See the docblock.
+      if (clock() >= deadline) {
+        outOfTime = true;
+        break;
+      }
+      const slice = sends.slice(j, j + width);
+      const outcomes = await Promise.all(
+        slice.map(async ({ row, device }): Promise<PushOutcome> => {
+          try {
+            // The stored `summary` (which names the creator) is NOT handed to
+            // the adapter — see PushPayload. The provider gets the kind and a
+            // fixed line.
+            const out = await sender(device, { account_id: row.account_id, kind: row.kind, notice: pushNotice(row.kind) });
+            return out === true ? "ok" : out === false ? "retry" : out;
+          } catch {
+            /* provider hiccup — leave undelivered; retried when due (I3-1287 schedule) */
+            return "retry";
+          }
+        }),
+      );
+      fetches += slice.length;
+      for (let k = 0; k < slice.length; k++) {
+        const { row, device } = slice[k]!;
+        const st = state.get(row.notif_id)!;
+        st.attempted += 1;
+        if (outcomes[k] === "ok") st.ok = true;
+        else if (outcomes[k] === "dead") {
+          // H6: a permanently-rejected token (APNs 410 / FCM UNREGISTERED) is
+          // INVALIDATED so it can never wedge delivery again. Deleting it also
+          // means a future notification for this account skips it entirely.
+          st.dead += 1;
+          dead.push(device.device_id);
+        }
+      }
+    }
+
+    /** I3-1287/I3-1288: rows every device of which was tried and none took. */
+    const retry: number[] = [];
+    const attemptsOf = new Map(wave.map((n) => [n.notif_id, n.push_attempts ?? 0]));
+    for (const [notifId, st] of state) {
+      if (st.ok) {
+        settle.push(notifId);
+        delivered += 1;
+      } else if (st.attempted === st.total && st.dead === st.total && !st.truncated) {
+        // Every device was dead (and is now removed): there is nobody to deliver
+        // to, so settle rather than let it wedge the window forever. NOT taken
+        // when the device list was truncated — an unlooked-at device is not a
+        // dead one.
+        settle.push(notifId);
+      } else if (st.attempted === st.total) {
+        retry.push(notifId);
+        if ((attemptsOf.get(notifId) ?? 0) + 1 >= DELIVERY_RETRY_MAX_ATTEMPTS) exhausted += 1;
+      }
+    }
+
+    // Same shape, same reason: one chunk per wave, and the loop is the proof.
+    // The retry schedule rides in this same statement (`scheduleSet`).
+    const schedule = scheduleBinds(retry, passStartIso);
+    for (const chunk of inChunks([...settle, ...retry], SCHEDULE_BINDINGS)) {
+      await db
+        .prepare(`UPDATE notifications SET ${scheduleSet("delivered", "push")} WHERE notif_id IN (${chunk.map(() => "?").join(",")})`)
+        .bind(...schedule, ...chunk)
+        .run();
+      statements += 1;
+    }
+    for (const chunk of inChunks(dead, 1)) {
+      await db
+        .prepare(`DELETE FROM devices WHERE device_id IN (${chunk.map(() => "?").join(",")}) AND created_at <= ?`)
+        .bind(...chunk, passStartIso)
+        .run();
+      statements += 1;
+    }
+    if (outOfTime || fetchRoomGone) break;
+  }
+  if (exhausted > 0) logError({ cid: opts.cid ?? "unknown", hop: "cron", msg: "delivery_push_retry_exhausted", failed: exhausted });
+  return delivered;
+}
+
+/**
+ * Email un-emailed notifications to accounts that have an alert address
+ * (`ALERT_ADDRESS_SQL`: the fan's verified `fan_email`, else the provider's
+ * `accounts.email`) and haven't opted out (`accounts.email_alerts = 1`). A SECOND channel
+ * alongside push, tracked by `notifications.emailed` so the two never retry
+ * each other. Best-effort: a send failure leaves `emailed = 0` for the next
+ * pass. Same four bounds, same wave structure and the same priority window as
+ * `deliverPending` — see that docblock for why each exists.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * "THEIR ROWS STAY UN-EMAILED FOREVER, WHICH IS CORRECT" — IT WAS NOT.
+ * ─────────────────────────────────────────────────────────────────────────────
+ * That is what this docstring used to say about a row whose account has no
+ * address or has opted out, and it is true about the EMAIL and false about the
+ * TABLE. `emailed = 0` is the working set of this query. Nothing else in the
+ * codebase ever wrote `emailed = 1`, `notifications` had no retention sweep, and
+ * ineligible rows sort by `notif_id ASC` — i.e. to the FRONT — so the dead
+ * prefix grew without bound and every pass paid to walk past all of it.
+ * Measured: 200k dead rows ⇒ 107 ms per scan on in-process SQLite, and D1 is far
+ * slower and hard-caps one query at 30 s. The end state is an email channel that
+ * dies silently, taking the payout-change alert with it.
+ *
+ * So the ineligible rows are SETTLED, in one bounded UPDATE, exactly as the push
+ * leg already settles a device-less or suppressed row rather than letting it
+ * wedge the window. Marking them `emailed = 1` says "this row's email question
+ * is closed", which is the truth: nobody was ever going to be mailed. The row
+ * itself survives for `GET /account/notifications`. That drain is also what
+ * keeps the DESCENDING priority arm affordable: it walks `emailed = 0` rows from
+ * the newest end, so what it costs is the size of a working set the settle keeps
+ * from becoming a graveyard.
+ *
+ * SUPPRESSED SUBJECTS ARE SETTLED TOO, matching `deliverPending` exactly. A
+ * delisted creator's backlog must not sit at the head of the queue starving
+ * everyone else's alerts, and a lifted suppression restores the row to the fan's
+ * in-app list either way.
+ */
+/**
+ * CAN-SPAM 7704(a)(5)(A)(i) — "a valid physical postal address of the sender"
+ * in every COMMERCIAL message. The MECHANISM is this module's; the VALUE is
+ * not (D-0441, #355) and is deliberately absent from the tree: a placeholder
+ * here is worse than the missing address, because the next guard pins it as
+ * correct and the violation ships looking compliant.
+ *
+ * ONE PLACE TO SET IT: this env var, read by `senderPostalAddressFromEnv`
+ * below and handed to `deliverPendingEmail` as `DeliverOptions.postalAddress`.
+ * Nothing else in this module may carry an address, and nothing defaults it.
+ */
+
+/**
+ * Read the one configured value, or null. Same fail-closed stance as
+ * `email.ts`'s `placeholder`: empty or TODO-shaped is ABSENT, not a value,
+ * so a half-filled deploy blocks commercial mail instead of mailing the word
+ * TODO to fans. A postal address is at minimum a street and a locality, so a
+ * single-token value is refused on the same grounds.
+ */
+export function senderPostalAddressFromEnv(env: Record<string, unknown>): string | null {
+  // DOT access, never a bracket read (W3-01 gate0, orchestrator). INV paywall — "protection is
+  // never paywalled" — refuses ANY bracket access on this binding in the verdict closure, not
+  // just a variable-keyed one, because a static reader cannot rule out an entitlement binding
+  // behind a bracket. The guard was green at HEAD and red on this candidate, naming this line;
+  // a literal string key inside brackets does not satisfy it either, and neither does a comment
+  // quoting the bracket form, since the guard scans raw text.
+  const v = env.SENDER_POSTAL_ADDRESS;
+  if (typeof v !== "string") return null;
+  const s = v.trim();
+  if (s.length < 12 || !/\s/.test(s)) return null;
+  if (/TODO|FIXME|PLACEHOLDER|XXX|CHANGEME/i.test(s)) return null;
+  return s;
+}
+
+/**
+ * COMMERCIAL vs TRANSACTIONAL, read off the set this module ALREADY splits on
+ * rather than a second hand-written list: `TRANSACTIONAL_KINDS` — the superset
+ * of `SAFETY_KINDS` plus `report_published` / `report_retracted` (see "TWO
+ * QUESTIONS, TWO SETS" above it). That superset, not `SAFETY_KINDS`, is what
+ * the settle clause in `deliverPendingEmail` and `WHERE_EMAILABLE` call the
+ * transactional exemption, and it is why those rows are mailed to a fan who
+ * has opted OUT. `SAFETY_KINDS` only decides priority (the fast lane). Every
+ * other kind on this rail is creator content a fan is sent — commercial, and
+ * it owes the postal address.
+ */
+export function isCommercialClass(kind: string): boolean {
+  return !TRANSACTIONAL_KINDS.has(kind);
+}
+
+/** I3-0618 (D-0829): the broadcast mail's fixed subject. No creator-controlled text. */
+export const BROADCAST_EMAIL_SUBJECT = "A creator you saved posted an update — their words, not Dhwaja's";
+/** I3-0618: the line under the creator's quoted words. */
+export const BROADCAST_EMAIL_DISCLAIMER = "Dhwaja passes this on without checking it. Links in it go where the creator chose.";
+
+const escHtml = (s: string): string =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+
+/**
+ * I3-0618: a `creator_broadcast` mail never arrives in Dhwaja's own voice. The
+ * subject is the fixed `BROADCAST_EMAIL_SUBJECT`, and the creator's words (the
+ * stored summary) sit in a quoted block headed "They wrote:" with the
+ * disclaimer under it. Everything after the summary — the "why you got this"
+ * footer and the postal address the CAN-SPAM limb of `deliverPendingEmail`
+ * checks `msg.text` for — is carried over unchanged from `alertEmail`.
+ */
+export function broadcastEmail(msg: EmailMessage, summary: string): EmailMessage {
+  const quoted = summary.split("\n").map((l) => `> ${l}`).join("\n");
+  const textTail = msg.text.startsWith(summary) ? msg.text.slice(summary.length) : `\n\n${msg.text}`;
+  const htmlHead = `<p>${escHtml(summary)}</p>`;
+  const html = msg.html ?? "";
+  const quotedHtml = `<p>They wrote:</p><blockquote style="border-left:3px solid #ccc;margin:0 0 1em;padding-left:1em">${escHtml(summary)}</blockquote><p>${escHtml(BROADCAST_EMAIL_DISCLAIMER)}</p>`;
+  // I3-0543: `alertEmail`'s html is the shared frame (email.ts wrapHtml) with the summary paragraph inside it, so the
+  // quoted block REPLACES that paragraph in place and the frame and footer are kept. A function replacer, so a `$`
+  // in the creator's words is never read as a replacement pattern.
+  const at = html.indexOf(htmlHead);
+  return {
+    ...msg,
+    subject: BROADCAST_EMAIL_SUBJECT,
+    text: `They wrote:\n\n${quoted}\n\n${BROADCAST_EMAIL_DISCLAIMER}${textTail}`,
+    html: at >= 0 ? html.slice(0, at) + quotedHtml + html.slice(at + htmlHead.length) : wrapHtml(quotedHtml, ""),
+  };
+}
+
+export async function deliverPendingEmail(db: DbLike, sender: EmailSender, appOrigin?: string, opts: DeliverOptions = {}): Promise<number> {
+  const batch = opts.batch ?? EMAIL_BATCH;
+  const budget = opts.budget ?? EMAIL_STATEMENT_BUDGET;
+  const fetchBudget = opts.fetchBudget ?? EMAIL_FETCH_BUDGET;
+  const width = waveWidth(opts.concurrency);
+  const clock = opts.nowMs ?? (() => Date.now());
+  const deadline = clock() + (opts.budgetMs ?? DELIVERY_BUDGET_MS);
+
+  // Drain the dead prefix first, so the page reads below are not walking past
+  // it. One statement whatever the row count.
+  //
+  // S-026/C-596: a retracted subject settles here too, same as a suppressed
+  // one — the row's email question is closed either way, and neither reopens
+  // it (a lifted suppression can restore delivery; a retraction is INV-004
+  // one-directional and never un-retracts).
+  // F-11/C-49: mirrors WHERE_EMAILABLE's two additions — a SAFETY_KINDS row
+  // does not drain on `email_alerts = 0` alone (the transactional exemption,
+  // same reasoning as that clause), and a closed account's rows drain like a
+  // suppressed subject's, so a suspended/terminated fan's backlog cannot sit at
+  // the head of the queue either.
+  await db
+    .prepare(
+      `UPDATE notifications SET emailed = 1
+        WHERE emailed = 0 AND notif_id IN (
+          SELECT n.notif_id FROM notifications n
+            LEFT JOIN accounts a ON a.account_id = n.account_id
+            ${ALERT_ADDRESS_JOIN}
+           WHERE n.emailed = 0
+             AND (a.account_id IS NULL OR ${ALERT_ADDRESS_SQL} IS NULL
+                  OR (a.email_alerts = 0 AND n.kind NOT IN (${TRANSACTIONAL_KINDS_SQL}))
+                  OR EXISTS (SELECT 1 FROM request_suppressions r WHERE r.passport_id = n.passport_id)
+                  OR EXISTS (SELECT 1 FROM passports p WHERE p.passport_id = n.passport_id AND p.retracted = 1)
+                  OR NOT ${CLOSURE_GATE_SQL}
+                  OR ${BROADCAST_MUTED_SQL})
+           ORDER BY n.notif_id ASC LIMIT ?)`,
+    )
+    .bind(EMAIL_SETTLE_LIMIT)
+    .run();
+  let statements = 2; // the settle above, and the head page read below
+
+  interface Row extends PendingRow {
+    summary: string;
+    email: string;
+    /** The one-click token's subject. Selected only for that: the address is
+     * what the mail goes to, and `unsubscribe_tokens` deliberately stores no
+     * address in any form (migration 0049's rule, for its reason). */
+    account_id: string;
+    /** I3-1287/I3-1288: retries spent so far (0128). */
+    email_attempts: number;
+  }
+  // Split so the safety arm can put `INDEXED BY` where SQLite requires it —
+  // immediately after the driving table, before the JOIN and the WHERE.
+  const cols = `SELECT n.notif_id AS notif_id, n.kind AS kind, n.summary AS summary, ${ALERT_ADDRESS_SQL} AS email, a.account_id AS account_id, n.email_attempts AS email_attempts`;
+  // I3-1287/I3-1288: every arm skips a row whose retry is not yet due.
+  const nowIso = new Date(clock()).toISOString();
+  const due = "AND (n.email_next_at IS NULL OR n.email_next_at <= ?)";
+  const base = `${cols} FROM notifications n JOIN accounts a ON a.account_id = n.account_id ${ALERT_ADDRESS_JOIN} ${WHERE_EMAILABLE} ${due}`;
+  const page = `${base} ORDER BY n.notif_id`;
+  const { results: head } = await db.prepare(`${page} ASC LIMIT ?`).bind(nowIso, batch).all<Row>();
+  const candidates: Row[] = [...head];
+  const priorityScan = batch > 0 ? (opts.priorityScan ?? PRIORITY_SCAN) : 0;
+  if (priorityScan > 0) {
+    const { results: newest } = await db.prepare(`${page} DESC LIMIT ?`).bind(nowIso, priorityScan).all<Row>();
+    statements += 1;
+    for (const r of newest) if (SAFETY_KINDS.has(r.kind)) candidates.push(r);
+  }
+  // THE SAFETY ARM (slice 23) — the same third arm the push leg gained, for the
+  // same reason and with its own partial index (`idx_notif_safety_email`, keyed
+  // on `emailed = 0` because the two channels settle independently).
+  if (batch > 0 && (opts.safetyArm ?? SAFETY_ARM) > 0) {
+    const safetyArm = Math.min(opts.safetyArm ?? SAFETY_ARM, batch);
+    try {
+      const { results: safety } = await db
+        .prepare(`${cols} FROM notifications n INDEXED BY idx_notif_safety_email JOIN accounts a ON a.account_id = n.account_id ${ALERT_ADDRESS_JOIN} ${WHERE_EMAILABLE} ${due} AND n.kind IN (${SAFETY_KINDS_SQL}) ORDER BY ${MONEY_FIRST_EMAIL}, n.notif_id ASC LIMIT ?`)
+        .bind(nowIso, safetyArm)
+        .all<Row>();
+      statements += 1;
+      candidates.push(...safety);
+    } catch (e) {
+      // Same degrade-don't-stop stance as the push leg, and the same hint. An
+      // earlier draft of this arm carried NO `INDEXED BY`, with a comment
+      // claiming the hint "would have to name an index on the driving table,
+      // which the planner chooses". That was a rationalisation of an untested
+      // omission: `n` IS the driving table in the planner's own choice, hinting
+      // it is one identifier, and without it this arm was a FULL WALK of the
+      // `emailed = 0` working set on every pass — 288 times a day, 28.5 ms at
+      // 200,000 rows, and unavoidably to the END of the set in the common case
+      // where no safety row is pending, because `LIMIT` cannot stop early when
+      // nothing matches. It also made `idx_notif_safety_email` write
+      // amplification on the hottest table in the service and nothing else.
+      logError({ cid: opts.cid ?? "unknown", hop: "cron", msg: "email_delivery_safety_arm_unavailable", err: e instanceof Error ? e.name : typeof e });
+    }
+  }
+  const pending = byPriority(candidates).slice(0, Math.max(0, batch));
+
+  let sent = 0;
+  let fetches = 0;
+  const postal = opts.postalAddress ?? null;
+  /** Rows this pass refused for want of a rendered postal address. Counted, not
+   * logged per row: INV-061 keeps per-entity values out of every field. */
+  let refusedCommercial = 0;
+  /** Rows this pass settled because the provider refused the ADDRESS, not the
+   * moment. Counted, not logged per row: INV-061 keeps per-entity values out of
+   * every field, and the recipient is exactly such a value. */
+  let permanentlyRejected = 0;
+  /** I3-1018: sends that came back "transient" (a thrown or timed-out send included). */
+  let transient = 0;
+  /** I3-1287/I3-1288: rows that reached the retry ceiling this pass. */
+  let exhausted = 0;
+  /** 739-F: sends WE stopped (our abort / our race) — settled as sent, counted. */
+  let ambiguous = 0;
+  const raceMs = emailRaceDeadlineMs(opts.sendTimeoutMs);
+  /** 739-F: a claim older than this is a crashed pass's and may be re-taken. Two
+   * race deadlines: a live wave settles within one. */
+  const leaseMs = 2 * raceMs;
+  // RFC 8058 one-click tokens, minted ONE STATEMENT PER WAVE rather than one per
+  // message: `budget` is a hard D1-statement ceiling that exists to keep this
+  // cron inside D1's limits, and spending it on a per-mail INSERT would trade
+  // delivered alerts for unsubscribe headers. `mintUnsubscribeTokens` dedupes by
+  // account, which is also correct on its own terms — two alerts for the same
+  // fan in one wave offer the same act, and spending it once is the intent.
+  //
+  // A wave reserves its mint alongside its settle, so a wave that cannot afford
+  // both stops rather than half-running.
+  const oneClickBase = opts.oneClickBase;
+  // I3-0014 a/e: the suppression list (email.ts). With a key, every wave reads the list once before its claim and
+  // writes it once after its sends, so the wave's reserve below grows by those two statements.
+  const suppressionKey = suppressionKeyOf(sender);
+  /** I3-0014 e: rows settled unsent because their address is on the list. A count, never the address (INV-061). */
+  let suppressedRows = 0;
+  for (let i = 0; i < pending.length; i += width) {
+    // Same clean break as the push leg: an un-reached row is untouched and still
+    // `emailed = 0`, so the next pass resumes exactly here. Two statements per
+    // wave (the claim and the settle), plus the mint when one-click is on.
+    if (statements + (oneClickBase ? 3 : 2) + (suppressionKey ? 2 : 0) > budget || clock() >= deadline || fetches >= fetchBudget) break;
+    const wave = pending.slice(i, i + width).slice(0, Math.max(0, fetchBudget - fetches));
+    if (wave.length === 0) break;
+    // Best effort, and deliberately so: a mint that throws (a table that is not
+    // there yet on a half-migrated deploy, a D1 hiccup) must not cost the fan
+    // their alert. An empty map means every mail in this wave falls back to the
+    // RFC 2369 header it already had.
+    let tokens = new Map<string, string>();
+    if (oneClickBase) {
+      try {
+        tokens = await mintUnsubscribeTokens(db, "fan_alerts", wave.map((n) => n.account_id), new Date(clock()).toISOString());
+        statements += 1;
+      } catch (e) {
+        logError({ cid: opts.cid ?? "unknown", hop: "cron", msg: "email_alerts_one_click_mint", err: e instanceof Error ? e.name : typeof e });
+      }
+    }
+    // I3-0166 (I21-Q24): a suspension notice is sent naming the deadline that starts at THIS wave's hand-over.
+    const sendAtMs = clock();
+    const atSend = new Map<number, { summary: string; deadline: string }>();
+    // Render and gate first, so only mail that WILL be handed over is claimed.
+    const prepared = wave.map((n): EmailMessage | "transient" | "deferred" | "suppressed" => {
+        try {
+          const tok = tokens.get(n.account_id);
+          const oneClick = tok ? unsubscribeUrl(oneClickBase, tok) : null;
+          const rendered = alertEmail(n.email, n.summary, appOrigin, oneClick, n.kind, postal);
+          const sentNotice = n.kind === CLOSURE_NOTICE_KIND ? closureNoticeAtSend(n.summary, sendAtMs) : null;
+          if (sentNotice !== null) atSend.set(n.notif_id, sentNotice);
+          const msg = n.kind === CLOSURE_NOTICE_KIND ? closureNoticeEmail(n.email, sentNotice?.summary ?? n.summary) : n.kind === "creator_broadcast" ? broadcastEmail(rendered, n.summary) : rendered;
+          // THE CAN-SPAM GATE (I3-0013). Two limbs, both fail-closed, because
+          // the two failures are the same violation: the address must be
+          // CONFIGURED (`postal`), and it must actually REACH the message the
+          // provider is handed (`msg.text`). The second limb is what makes the
+          // RENDER half non-optional from here — that half lives in
+          // `email.ts`'s `alertEmail` (its postal footer), which this module
+          // does not own, so a
+          // configured value with no footer to land in must not ship either.
+          // A refused row is left `emailed = 0` (this return is `false`, and
+          // the dead-prefix settle at the head of this pass does not drain it), so mail
+          // is DEFERRED until the value exists, never silently sent without
+          // it. Safety mail is exempt and still drains through the safety arm
+          // of this pass's page read (slice 23), so a commercial backlog cannot starve it.
+          if (isCommercialClass(n.kind) && !(postal !== null && msg.text.includes(postal))) {
+            refusedCommercial += 1;
+            // DEFERRED, NOT REJECTED — this row is mailable the moment the
+            // address is configured, so it must stay in the working set. Its
+            // own outcome, so the I3-1287 retry ceiling never settles it.
+            return "deferred";
+          }
+          return msg;
+        } catch {
+          /* render fault — leave un-emailed; retried when due (I3-1287 schedule) */
+          return "transient";
+        }
+      });
+    // I3-0014 e: an address on the suppression list is not handed to the provider; its row settles like a permanent
+    // rejection (the email question is closed). Hashed in the wave, read in ONE statement.
+    const hashes = new Map<number, string>();
+    if (suppressionKey) {
+      for (const [k, n] of wave.entries()) if (typeof prepared[k] === "object") hashes.set(k, await emailAddressHash(suppressionKey, n.email));
+      const listed = await suppressedAddressHashes(db, [...hashes.values()], retiredSuppressionLookup(sender, [...hashes.keys()].map((k) => wave[k]!.email)));
+      statements += 1;
+      for (const [k, h] of hashes) if (listed.has(h)) prepared[k] = "suppressed";
+    }
+    // 739-F (D-0837(1), D-0858(3)): THE WAVE CLAIM, immediately before the provider
+    // calls. One statement stamps `email_claimed_at` (0148) on exactly the rows it
+    // re-finds unsent and uncancelled (`WHERE_EMAILABLE`: suppression, retraction,
+    // closure, opt-out, mute) and unclaimed or past the lease, and only the ids it
+    // RETURNS are sent. A row another pass holds, or one cancelled since the page
+    // read, is left untouched ("held"); the dead-prefix drain settles the latter.
+    const claimAt = new Date(clock()).toISOString();
+    const sendable = wave.filter((_, k) => typeof prepared[k] === "object").map((n) => n.notif_id);
+    let claimed = new Set<number>();
+    if (sendable.length > 0) {
+      const { results: got } = await db
+        .prepare(
+          `UPDATE notifications SET email_claimed_at = ? WHERE notif_id IN (SELECT n.notif_id FROM notifications n JOIN accounts a ON a.account_id = n.account_id ${ALERT_ADDRESS_JOIN} ${WHERE_EMAILABLE}
+             AND n.notif_id IN (SELECT value FROM json_each(?)) AND (n.email_claimed_at IS NULL OR n.email_claimed_at < ?)) RETURNING notif_id`,
+        )
+        .bind(claimAt, JSON.stringify(sendable), new Date(clock() - leaseMs).toISOString())
+        .all<{ notif_id: number }>();
+      statements += 1;
+      claimed = new Set(got.map((r) => r.notif_id));
+    }
+    const results = await Promise.all(
+      wave.map(async (n, k): Promise<EmailOutcome | "deferred" | "held" | "suppressed"> => {
+        const msg = prepared[k]!;
+        if (typeof msg !== "object") return msg;
+        if (!claimed.has(n.notif_id)) return "held";
+        try {
+          return await withSendTimeout(sendOnce(sender, msg), raceMs);
+        } catch {
+          /* a sender that threw — leave un-emailed; retried when due (I3-1287 schedule) */
+          return "transient";
+        }
+      }),
+    );
+    fetches += wave.length;
+    suppressedRows += results.filter((r) => r === "suppressed").length;
+    // I3-0014 e: every address the provider refused permanently in this wave goes on the list (one statement).
+    const dead = [...hashes].filter(([k]) => results[k] === "permanent").map(([, h]) => h);
+    if (dead.length > 0) {
+      await recordEmailSuppressions(db, dead, new Date(clock()).toISOString());
+      statements += 1;
+    }
+    // I3-0014. A PERMANENT rejection settles the row exactly as an accepted one
+    // does, and for the same reason the dead-prefix settle at the head of this pass drains a
+    // suppressed or retracted subject: the row's EMAIL QUESTION IS CLOSED. Leaving
+    // it `emailed = 0` is what made a dead address a standing 288-passes-a-day
+    // charge against this service's sender reputation. Only `transient` is
+    // retried — which is the whole of what a boolean could ever have meant.
+    // 739-F: `ambiguous` (we stopped a send that may have been accepted) settles too —
+    // at most once, since mail cannot be recalled. `held` is another pass's row.
+    const settle = wave.filter((_, k) => results[k] !== "transient" && results[k] !== "deferred" && results[k] !== "held").map((n) => n.notif_id);
+    // I3-1287/I3-1288: a real transient backs off (0128); a postal-deferred row does not.
+    const retryRows = wave.filter((_, k) => results[k] === "transient");
+    const retry = retryRows.map((n) => n.notif_id);
+    exhausted += retryRows.filter((n) => (n.email_attempts ?? 0) + 1 >= DELIVERY_RETRY_MAX_ATTEMPTS).length;
+    permanentlyRejected += wave.filter((_, k) => results[k] === "permanent").length;
+    ambiguous += results.filter((r) => r === "ambiguous").length;
+    transient += results.filter((r) => r === "transient" || r === "deferred").length;
+    const accepted = results.filter((r) => r === "accepted").length;
+    const schedule = scheduleBinds(retry, nowIso);
+    // 739-F / INV-058: the settle is bound to THIS wave's claim (or to no claim, a
+    // row that never reached the claim), and releases it; a row another pass has
+    // re-claimed since is not this wave's to settle.
+    // I3-0166: a suspension notice handed over (accepted, or ambiguous: it may have arrived naming that deadline) moves
+    // the episode's deadline in the SAME batch as the settle of its own row; one that was not keeps the act's.
+    const sentNotices = new Map<number, DbStatement[]>();
+    for (const [k, n] of wave.entries()) {
+      const s = atSend.get(n.notif_id);
+      if (s !== undefined && (results[k] === "accepted" || results[k] === "ambiguous")) sentNotices.set(n.notif_id, closureNoticeSentStmts(db, n.notif_id, s));
+    }
+    for (const chunk of inChunks([...settle, ...retry], SCHEDULE_BINDINGS + 1)) {
+      const settleStmt = db
+        .prepare(
+          `UPDATE notifications SET ${scheduleSet("emailed", "email")}, email_claimed_at = NULL WHERE notif_id IN (${chunk.map(() => "?").join(",")}) AND (email_claimed_at IS NULL OR email_claimed_at = ?)`,
+        )
+        .bind(...schedule, ...chunk, claimAt);
+      const notices = chunk.flatMap((id) => sentNotices.get(id) ?? []);
+      if (notices.length > 0) await db.batch([...notices, settleStmt]);
+      else await settleStmt.run();
+      statements += 1 + notices.length;
+    }
+    sent += accepted;
+  }
+  // THE ALARM (I3-0013). Once per pass, not per row, and a count rather than a
+  // recipient — INV-061. This line is the LOUD part of the absence: every
+  // 5-minute tick that has commercial mail pending re-emits it until the
+  // address is configured AND rendered, so an unwired deploy is noisy, not
+  // quietly non-compliant. `refused` and `kind` are both on `log.ts`'s
+  // ALLOWED_KEYS, so neither is dropped by `redact`.
+  if (refusedCommercial > 0) {
+    logError({
+      cid: opts.cid ?? "unknown",
+      hop: "cron",
+      msg: "email_commercial_no_postal_address",
+      refused: refusedCommercial,
+      kind: "commercial",
+    });
+  }
+  // I3-0014's LOUD HALF. Settling a permanently-rejected row stops the charge;
+  // it must not also make the dead address invisible. One line per pass, a COUNT
+  // and a closed enum only (`failed` and `kind` are both on `log.ts`'s
+  // ALLOWED_KEYS, :64-100) — never the recipient, which is INV-061's whole point.
+  if (exhausted > 0) logError({ cid: opts.cid ?? "unknown", hop: "cron", msg: "email_delivery_retry_exhausted", failed: exhausted });
+  // 739-F: a send we stopped was settled as sent; one count line per pass, so a
+  // hanging provider is loud rather than a quiet stream of maybe-delivered mail.
+  if (ambiguous > 0) logError({ cid: opts.cid ?? "unknown", hop: "cron", msg: "email_delivery_ambiguous_settled", count: ambiguous });
+  if (suppressedRows > 0) logInfo({ cid: opts.cid ?? "unknown", hop: "cron", msg: "email_suppressed_settled", count: suppressedRows, kind: "permanent" });
+  if (permanentlyRejected > 0) {
+    logError({
+      cid: opts.cid ?? "unknown",
+      hop: "cron",
+      msg: "email_permanent_rejection",
+      failed: permanentlyRejected,
+      kind: "permanent",
+    });
+  }
+  // I3-1018: EVERY tick says what it did, so an idle rail (count 0) and a rail
+  // failing every send (count > 0, notified 0) are no longer the same silence.
+  logInfo({ cid: opts.cid ?? "unknown", hop: "cron", msg: "email_delivery_tick", count: fetches, notified: sent, failed: transient });
+  if (fetches > 0 && sent === 0 && transient > refusedCommercial) {
+    logError({ cid: opts.cid ?? "unknown", hop: "cron", msg: "email_delivery_all_transient", count: fetches, failed: transient - refusedCommercial });
+  }
+  return sent;
+}
+
+/**
+ * Race one mail send against a deadline. See `EMAIL_SEND_TIMEOUT_MS` for how
+ * this caller-side bound relates to `email.ts`'s own abort, and for what racing
+ * does and does not guarantee. A timeout reports `"ambiguous"` (739-F, D-0858(3):
+ * we stopped waiting on a request that may still be accepted), so the row is
+ * settled as sent and the next pass does NOT re-send it; there is no retry inside
+ * one call, for the same reason `mailer.ts` gives — retrying mail is
+ * amplification.
+ */
+async function withSendTimeout(p: Promise<EmailOutcome>, ms: number): Promise<EmailOutcome> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<EmailOutcome>((resolve) => {
+        timer = setTimeout(() => resolve("ambiguous"), ms);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * I3-0014. One send, reported as an outcome rather than a boolean.
+ *
+ * A sender that can classify (`email.ts`'s `httpEmailFromEnv`, which is what
+ * `index.ts:4271` and the delivery tick at `index.ts:3498` both hand us) answers
+ * `permanent` for a recipient the provider will never accept. A sender that
+ * cannot — a test double, `nullEmailSender`, any `EmailSender` written before this
+ * seam existed — keeps its old meaning exactly: false is a hiccup, and a hiccup is
+ * retried. NOTHING IS INFERRED FROM A BARE `false`; the retry-forever behaviour is
+ * still correct for it, because a caller that cannot tell has not told us anything.
+ */
+// W309A-FR1-04 (orchestrator, 2026-09-20): this file used to keep a PRIVATE
+// copy of `sendOnce`, byte-identical to `email.ts`'s. Two copies of a control
+// is FAMILY-004's trap waiting to happen — whoever changes the classification
+// rule changes one of them, and the other keeps the old meaning silently.
+// There is now one primitive, imported above, and this comment is what is left
+// of the second copy.
+
+/**
+ * ───────────────────────────────────────────────────────────────────────────
+ * THE DELIVERY-ONLY TICK.
+ * ───────────────────────────────────────────────────────────────────────────
+ *
+ * The 6-hourly cadence in `wrangler.jsonc` is set by the checkpoint export, the
+ * anchor read and the registry rebuild — work that is expensive, is bounded by
+ * how often the published artifacts need to move, and has no opinion at all
+ * about notifications. Delivery was tied to it only because it happened to live
+ * in the same handler, and that gave the whole deployment FOUR delivery passes a
+ * day.
+ *
+ * Cloudflare lets one Worker declare several cron expressions and tells
+ * `scheduled()` which one fired (`event.cron`), so delivery gets its own,
+ * frequent trigger and its own invocation — which means its own ~1000-subrequest
+ * budget, with none of it spent on artifacts. Everything else in the 6-hourly
+ * sweep is untouched, and the 6-hourly sweep still runs the delivery legs as a
+ * BACKSTOP: if this trigger is never wired up, or is removed from one
+ * environment during a hand-edit of `wrangler.jsonc`, delivery degrades to
+ * exactly what it does today instead of stopping.
+ *
+ * THE LEASE IS THE SAME LEASE, deliberately. `cron-lease.ts` exists because two
+ * overlapping runs both select the same `delivered = 0` rows and both hand them
+ * to APNs/FCM — and a delivery tick landing inside a 6-hourly sweep is precisely
+ * that race, just from a different trigger. Sharing the `scheduled` lease name
+ * makes them mutually exclusive; a tick that finds the lease held does nothing
+ * and returns, because the run holding it is already delivering.
+ *
+ * WITH A SHORTER TTL. 30 minutes is chosen for the artifact sweep against a
+ * 6-hour period ("far above a real sweep, far below the cron period"). Against a
+ * 5-minute period it is the opposite of that: a tick evicted mid-run — the one
+ * case a `finally` cannot cover — would block six later ticks. `DELIVERY_LEASE_TTL_MS`
+ * keeps the same ratio at the new cadence: comfortably above one pass's
+ * wall-clock budget, comfortably below the gap to the next tick.
+ */
+export const DELIVERY_CRON = "*/5 * * * *";
+
+/** Lease TTL for a delivery-only tick. Above `SOLO_DELIVERY_BUDGET_MS` × 2
+ * (a run that hits both legs' wall clocks) and below the `DELIVERY_CRON`
+ * period, so a run evicted without its `finally` costs at most one skipped
+ * tick. */
+export const DELIVERY_LEASE_TTL_MS = 2 * 60 * 1000;
+
+/**
+ * The bounds for a DELIVERY-ONLY invocation, where the ~1000 subrequests are not
+ * shared with the chain verify, the checkpoint export, the registry rebuild,
+ * fourteen retention prunes and the digests. See THE BUDGETS for the full
+ * arithmetic; the short version is
+ *
+ *     push   3 + 4⌈300/16⌉ = 79 statements + ≤340 pushes = 419
+ *     email  4 + 2⌈300/16⌉ = 42 statements + ≤300 mails  = 342
+ *     lease acquire + re-assert + release                =   3
+ *                                                          ───
+ *                                                          764   (of ~1000)
+ *
+ * and 300 rows per channel per tick at 288 ticks a day is ~86,400 of each.
+ *
+ * THE EMAIL LINE DOUBLED IN SLICE 21 and the budget had to move with it. Each
+ * wave now spends TWO statements — the RFC 8058 one-click mint and the settle —
+ * so 19 waves cost 41 against the old ceiling of 40, and the pass stopped at 18
+ * waves (288 of the 300 selected rows, the remainder re-selected next tick).
+ * That is a silent throughput cut disguised as a feature flag, which is why the
+ * ceiling below is stated as the arithmetic plus headroom rather than as a round
+ * number somebody once picked.
+ */
+export const SOLO_DELIVER_BATCH = 300;
+export const SOLO_DELIVER_FETCH_BUDGET = 340;
+export const SOLO_DELIVER_STATEMENT_BUDGET = 90;
+export const SOLO_EMAIL_BATCH = 300;
+export const SOLO_EMAIL_FETCH_BUDGET = 300;
+/** `4 + 2⌈300/16⌉ = 42`, plus headroom for the settle chunking. */
+export const SOLO_EMAIL_STATEMENT_BUDGET = 48;
+/** Wall clock per leg in a delivery-only tick. Larger than `DELIVERY_BUDGET_MS`
+ * because nothing else is waiting on this invocation, and still an order of
+ * magnitude below both the lease TTL and the tick period. */
+export const SOLO_DELIVERY_BUDGET_MS = 45_000;
+/**
+ * I3-0462: the CREATION legs ride the five-minute tick too, ahead of delivery, so
+ * a notable event or a payout-change marker is turned into rows within one tick
+ * instead of waiting for the six-hourly delivery tail (index.ts
+ * `deliveryTailCreationOnly`, under DELIVERY_CREATE_LEASE and the tails' chain
+ * gate). Small on purpose — the tail is still the bulk creator:
+ *
+ *     creation  ≤ SOLO_CREATE_BUDGET (60) + 1 watermark read            61
+ *     fan-out   ≤ SOLO_FANOUT_BUDGET (30) statements                    30
+ *     chain gate (verdict read + integrity head) + lease acquire/release 4
+ *                                                                       ──
+ *                                                                       95   -> 764 + 95 = 859 (of ~1000)
+ *
+ * ~30 notable events and 10 payout fan-out pages (50,000 savers) per tick, 288
+ * ticks a day. The tick's other legs (registry advance, hygiene, purge retries)
+ * were never in the 764 and are not here either.
+ */
+export const SOLO_CREATE_BUDGET = 60;
+export const SOLO_FANOUT_BUDGET = 30;
+
+export interface DeliverySweepResult {
+  /** Another run held the lease; this tick did nothing. Not an error. */
+  skipped: boolean;
+  /** Stopped between the legs because the lease had lapsed to a successor. */
+  stopped_early: boolean;
+  delivered: number;
+  emailed: number;
+}
+
+/**
+ * Run BOTH delivery legs and nothing else, under the cron lease — the whole body
+ * of a `DELIVERY_CRON` tick.
+ *
+ * It lives here rather than in `index.ts` so the thing that owns the budgets
+ * owns the sequence that has to respect them, and so the lease handling, the
+ * mid-sweep re-assert and the per-leg isolation are testable without a Worker.
+ * `index.ts` only has to route the trigger to it.
+ *
+ * THE RE-ASSERT BETWEEN THE LEGS is the same fencing check `scheduled()` makes
+ * for the same reason: the push leg above may have spent its whole wall-clock
+ * budget talking to APNs/FCM, and a run that has lost its lease has no business
+ * mailing rows a successor is already mailing. It fails SAFE — an unreadable
+ * answer stops this run rather than letting two run.
+ *
+ * EACH LEG IS ISOLATED. A throw in the push leg must not cost the email leg, for
+ * the same reason `scheduled()` learned to wrap `processNewEvents`: these are
+ * independent channels and one provider being down is not a reason to skip the
+ * other.
+ */
+export async function runDeliverySweep(
+  db: DbLike,
+  sender: PushSender,
+  emailSender: EmailSender,
+  appOrigin?: string,
+  opts: { leaseName?: string; nowMs?: number; ttlMs?: number; push?: DeliverOptions; email?: DeliverOptions } = {},
+): Promise<DeliverySweepResult> {
+  const name = opts.leaseName ?? "scheduled";
+  const lease = await acquireCronLease(db, name, opts.nowMs ?? Date.now(), opts.ttlMs ?? DELIVERY_LEASE_TTL_MS);
+  if (!lease) {
+    logError({ cid: crypto.randomUUID(), hop: "cron", msg: "delivery_tick_skipped_lease_held" });
+    return { skipped: true, stopped_early: false, delivered: 0, emailed: 0 };
+  }
+  const stillLeased = async (): Promise<boolean> => {
+    try {
+      const row = await db.prepare("SELECT holder, expires_at FROM cron_leases WHERE name = ?").bind(lease.name).first<{ holder: string; expires_at: string }>();
+      return row !== null && row.holder === lease.holder && row.expires_at > new Date().toISOString();
+    } catch {
+      return false;
+    }
+  };
+  let delivered = 0;
+  let emailed = 0;
+  try {
+    try {
+      delivered = await deliverPending(db, sender, undefined, {
+        batch: SOLO_DELIVER_BATCH,
+        budget: SOLO_DELIVER_STATEMENT_BUDGET,
+        fetchBudget: SOLO_DELIVER_FETCH_BUDGET,
+        budgetMs: SOLO_DELIVERY_BUDGET_MS,
+        cid: lease.holder,
+        ...opts.push,
+      });
+    } catch (e) {
+      logError({ cid: lease.holder, hop: "cron", msg: "delivery_tick_push", err: e instanceof Error ? e.name : typeof e });
+    }
+    if (!(await stillLeased())) {
+      logError({ cid: lease.holder, hop: "cron", msg: "delivery_tick_stopping_before_email" });
+      return { skipped: false, stopped_early: true, delivered, emailed };
+    }
+    try {
+      emailed = await deliverPendingEmail(db, emailSender, appOrigin, {
+        batch: SOLO_EMAIL_BATCH,
+        budget: SOLO_EMAIL_STATEMENT_BUDGET,
+        fetchBudget: SOLO_EMAIL_FETCH_BUDGET,
+        budgetMs: SOLO_DELIVERY_BUDGET_MS,
+        cid: lease.holder,
+        ...opts.email,
+      });
+    } catch (e) {
+      logError({ cid: lease.holder, hop: "cron", msg: "delivery_tick_email", err: e instanceof Error ? e.name : typeof e });
+    }
+    return { skipped: false, stopped_early: false, delivered, emailed };
+  } finally {
+    // The ordinary path (including a thrown leg) gives the lease back at once. A
+    // Worker evicted mid-tick runs no `finally` — that case is what the TTL is
+    // for, and why it must be bounded.
+    // Holder-scoped DELETE: a run that has already lost its lease to expiry
+    // cannot delete the one its successor now holds, so this is safe even on the
+    // early-return path above.
+    await releaseCronLease(db, lease);
+  }
+}
+
+/**
+ * I13-CRON (QUEUE #885): THE PER-TRIGGER WORST CASES, as sums of the caps the
+ * legs charge before they run. Defined at the end of the module, after every cap they add, and
+ * asserted against the caps and against a saturated run by
+ * `test/i13-cron-budget.test.ts`. See THE BUDGETS above for the derivation.
+ */
+/** The per-invocation subrequest ceiling every budget in this module is written
+ * against (~1000 on the paid plan — THE BUDGETS; an assumption about the
+ * platform, not a number read from it). */
+export const INVOCATION_SUBREQUEST_CEILING = 1000;
+/** What one tail invocation spends around its legs (index.ts `scheduled()`):
+ * lease acquire + release, the chain-verdict read, the group's hold read (+ its
+ * write when a leg is held), two in-flight writes per leg, the lease fences, a
+ * renewal tick — measured on an idle store (legs' idle reads included). */
+export const TAIL_OVERHEAD_SUBREQUESTS = 40;
+/** The delivery tail (index.ts TAIL_DELIVERY_CRON): creation (+ its watermark
+ * read), push statements + pushes, payout fan-out, email statements + mails. */
+export const TAIL_DELIVERY_SUBREQUESTS =
+  ALERT_CREATE_BUDGET + 1 + DELIVER_STATEMENT_BUDGET + DELIVER_FETCH_BUDGET + PAYOUT_FANOUT_BUDGET + EMAIL_STATEMENT_BUDGET + EMAIL_FETCH_BUDGET + TAIL_OVERHEAD_SUBREQUESTS;
+/** The payouts tail (index.ts TAIL_MONEY_CRON): creator-payout.ts THE BOUNDS, now 951 + TAIL_OVERHEAD_SUBREQUESTS (40) = 991
+ * (the last line below). The history, oldest first — the I15 all-new tick:
+ * 5 + PAYOUT_TRANSFER_BUDGET (50) x (5 statements + PAYOUT_DISPATCH_SUBREQUESTS (then 3)) = 405.
+ * I15 (H-W1-CAP): 305 -> 355 when a dispatch became 3 Stripe calls (group GET, account GET,
+ * POST — creator-payout.ts PAYOUT_DISPATCH_SUBREQUESTS, I15-PAYOUT).
+ * I19 (#936(c), I19-W1E H1): 355 -> 405 when each paid transfer's settle batch gained its `payout:paid` audit row.
+ * I19-FXA (RG-MONEY-01, D-0956(1)): 405 -> 420. 405 was the ALL-NEW tick; the worst case is the MIXED tick:
+ * 5 + PAYOUT_RETRY_BUDGET (15) x (6 + 3) + (PAYOUT_TRANSFER_BUDGET - PAYOUT_RETRY_BUDGET) (35) x (5 + 3) = 420,
+ * a paid retry carrying its send claim and release (6 statements) where a new payout carries its reservation (5).
+ * It holds only because STEP 1 now counts every reservation INSERT that sent nothing against the transfer budget;
+ * the 200-row page would otherwise add up to 165 uncounted INSERTs on top of it — creator-payout.ts PAYOUT_TRANSFER_BUDGET.
+ * A literal because this module cannot import creator-payout.ts's constants at
+ * load time; the test re-derives it from them.
+ * I22 (I3-0028, D-0976(1)): 420 -> 620 when a dispatch became up to 7 Stripe calls, one account listing per
+ * destination the creator has had — creator-payout.ts PAYOUT_DISPATCH_SUBREQUESTS = 2 + MAX_RECONCILE_DESTINATIONS:
+ * 5 + 15 x (6 + 7) + 35 x (5 + 7) = 620, + 40 scaffolding = 660 <= INVOCATION_SUBREQUEST_CEILING (1,000).
+ * I22-FX-MONEY (I3-0028 c, D-0976(1)): 620 -> 870 — PAYOUT_DISPATCH_SUBREQUESTS = 2 + MAX_RECONCILE_DESTINATIONS + RECONCILE_LOOKBACK_WEEKS = 12: 5 + 15 x (6 + 12) + 35 x (5 + 12) = 870, + 40 = 910 <= 1,000.
+ * I29-PAYOUT (D-1030 I22-Q1 + I21-Q52): 870 -> 944 — D = 12 + RECONCILE_RELEASE_KEYS (3) + the Connect account read (1) = 16,
+ * and PAYOUT_TRANSFER_BUDGET 50 -> 44 so the tick fits: 5 + 15 x (6 + 16) + 29 x (5 + 16) = 944, + 40 = 984 <= 1,000.
+ * I56-MONEY (D-1437): 944 -> 951 — each new reservation's batch gains its `payout:reserved` audit row (6 + 16 per new
+ * payout) and PAYOUT_TRANSFER_BUDGET 44 -> 43: 5 + 15 x 22 + 28 x 22 = 951, + 40 = 991 <= 1,000. */
+export const TAIL_MONEY_SUBREQUESTS = 951 + TAIL_OVERHEAD_SUBREQUESTS;
+
+/**
+ * I3-0598 (D-0920 option B) — THE EXPLAINER'S REFUSAL RATE, WATCHED. `creator-ai.ts` refuses a reply whose numbers the
+ * packet did not serve and logs `AI_REPLY_REJECTED`; nothing read that line, so a vendor-side change to the unpinned
+ * `AI_MODEL` that made the model invent figures would show up only as creators' 502s. Two PLATFORM-WIDE counters per UTC
+ * day — served and refused, keyed by outcome and day and NEVER by creator (INV-005: "is the model inventing numbers" is
+ * one number for the platform) — live in `rate_limits` (reuse before write: one row per key, swept after
+ * 2 x RL_LONGEST_WINDOW_MS by `pruneRateLimits`, no migration). Wired (I16-L03): the explain route records each outcome
+ * (`recordExplainOutcome`, intelligence-routes.ts) and the digests tail leg (index.ts) calls `alertExplainRefusals` for the previous UTC day,
+ * which mails every operator ONCE when refusals are over 25% of a day with at least 20 replies. The marker stays.
+ */
+export const EXPLAIN_OUTCOME_PREFIX = "explain-outcome:";
+export const EXPLAIN_REFUSAL_ALERT_SHARE = 0.25;
+export const EXPLAIN_REFUSAL_ALERT_MIN_REPLIES = 20;
+export const EXPLAIN_REFUSAL_ALERT_MARKER = "AI_REFUSAL_RATE_HIGH";
+/** Q974-B16 / AIT-03: `cut` counts a SERVED reply that had a clause cut (also counted `served`); `template` counts the
+ * money-withheld day's fixed template, which is no inference and is never `served`. The alert reads served + refused only. */
+export type ExplainOutcome = "served" | "refused" | "cut" | "template";
+export const explainOutcomeKey = (outcome: ExplainOutcome | "alerted", day: string): string => `${EXPLAIN_OUTCOME_PREFIX}${outcome}:${day}`;
+const dayStart = (day: string): string => `${day}T00:00:00.000Z`;
+
+/** Count one served or refused explainer reply against its UTC day. One statement, no creator id. */
+export async function recordExplainOutcome(db: DbLike, outcome: ExplainOutcome, nowMs: number): Promise<void> {
+  const day = new Date(nowMs).toISOString().slice(0, 10);
+  await db
+    .prepare("INSERT INTO rate_limits (rl_key, window_start, count) VALUES (?, ?, 1) ON CONFLICT(rl_key) DO UPDATE SET count = rate_limits.count + 1")
+    .bind(explainOutcomeKey(outcome, day), dayStart(day))
+    .run();
+}
+
+/** D-0920: refusals over 25% of the day's replies, on a day with at least 20 replies. */
+export function explainRefusalsExceed(served: number, refused: number): boolean {
+  const total = served + refused;
+  return total >= EXPLAIN_REFUSAL_ALERT_MIN_REPLIES && refused > total * EXPLAIN_REFUSAL_ALERT_SHARE;
+}
+
+/**
+ * Read `day`'s two counters and, over the threshold, mail each operator once. The alert is CLAIMED before the mail (an
+ * `explain-outcome:alerted:<day>` row, so a later tick of the same day sends nothing) and the claim is RELEASED when no
+ * operator's mail was accepted, so the next tick retries instead of the day going silent; the marker line is written
+ * before any send either way, so a reader can find the breach in the log even when every mail fails.
+ */
+export async function alertExplainRefusals(
+  db: DbLike,
+  send: EmailSender,
+  operatorEmails: readonly string[],
+  day: string,
+): Promise<{ served: number; refused: number; alerted: boolean }> {
+  const read = async (o: ExplainOutcome): Promise<number> =>
+    (await db.prepare("SELECT count FROM rate_limits WHERE rl_key = ?").bind(explainOutcomeKey(o, day)).first<{ count: number }>())?.count ?? 0;
+  const served = await read("served");
+  const refused = await read("refused");
+  if (!explainRefusalsExceed(served, refused)) return { served, refused, alerted: false };
+  const claim = explainOutcomeKey("alerted", day);
+  const won = await db.prepare("INSERT INTO rate_limits (rl_key, window_start, count) VALUES (?, ?, 1) ON CONFLICT(rl_key) DO NOTHING").bind(claim, dayStart(day)).run();
+  if ((won.changes ?? 0) === 0) return { served, refused, alerted: false };
+  const total = served + refused;
+  logError({ cid: `explain-refusals:${day}`, hop: "cron", msg: EXPLAIN_REFUSAL_ALERT_MARKER, marker: EXPLAIN_REFUSAL_ALERT_MARKER, day, count: total, refused });
+  const pct = Math.round((refused / total) * 100);
+  const opsText = `On ${day} (UTC) the creator AI explainer refused ${refused} of ${total} model replies (${pct}%) because they stated numbers the packet did not serve. The alert threshold is ${EXPLAIN_REFUSAL_ALERT_SHARE * 100}% of a day with at least ${EXPLAIN_REFUSAL_ALERT_MIN_REPLIES} replies. A jump like this usually means the inference provider changed the model behind the configured id; check recent AI_REPLY_REJECTED log lines.`;
+  const msg = (to: string): EmailMessage => ({
+    to,
+    subject: `AI explainer: ${pct}% of replies refused on ${day}`,
+    text: opsText,
+    // I3-0543: operator mail wears the same frame as the fan and creator mail; the text part is the message of record.
+    html: wrapHtml(textToHtml(opsText), ""),
+  });
+  let accepted = 0;
+  for (const to of operatorEmails) if (await send(msg(to)).catch(() => false)) accepted++;
+  if (accepted === 0) {
+    await db.prepare("DELETE FROM rate_limits WHERE rl_key = ?").bind(claim).run();
+    return { served, refused, alerted: false };
+  }
+  return { served, refused, alerted: true };
+}
+
+/**
+ * I3-0567 a (I22-FX-HUB; D-0522 "not just the action, the CLOCK"): THE DATA-SUBJECT-REQUEST DEADLINE ALERT. Migration
+ * 0210 derives each request's statutory `deadline`; until now only an operator's GET /ops/dsr read it, so a request
+ * could pass its deadline with nobody told. Run on the digests tail (index.ts TAIL_DIGESTS_CRON, every 3 h, 8 a day): every OPEN request
+ * (`received`/`in_progress`) whose deadline is within DSR_DUE_SOON_MS is mailed to every operator ONCE as "due soon",
+ * and once per UTC day as "overdue" after the deadline passes. The alertExplainRefusals pattern: each request's alert
+ * is CLAIMED in `rate_limits` before the mail (pruned after 14 days, longer than the 7-day window), the marker line is
+ * written before any send, and every claim is RELEASED when no operator's mail was accepted, so the next run retries.
+ * The mail names request ids, types and deadlines, never the subject. Reads at most DSR_ALERT_SCAN requests, earliest
+ * deadline first; when the read is full the mail says there may be more (the rest are due no earlier than the last named).
+ */
+export const DSR_DUE_SOON_MS = 7 * 24 * 60 * 60 * 1000;
+export const DSR_ALERT_SCAN = 50;
+export const DSR_ALERT_PREFIX = "dsr-deadline:";
+export const DSR_ALERT_MARKER = "DSR_DEADLINE";
+/** I34-FX2-ALARM: the row that says a request's due-soon mail was accepted (the key the claim itself used before). */
+export const dsrSoonSentKey = (dsrId: string): string => `${DSR_ALERT_PREFIX}soon:${dsrId}`;
+export async function alertDsrDeadlines(
+  db: DbLike,
+  send: EmailSender,
+  operatorEmails: readonly string[],
+  nowMs: number,
+): Promise<{ due_soon: number; overdue: number; alerted: boolean }> {
+  const now = new Date(nowMs).toISOString();
+  const day = now.slice(0, 10);
+  const { results } = await db
+    .prepare(
+      "SELECT dsr_id, request_type, deadline FROM data_subject_requests WHERE state IN ('received', 'in_progress') AND deadline <= ? ORDER BY deadline ASC, dsr_id ASC LIMIT ?",
+    )
+    .bind(new Date(nowMs + DSR_DUE_SOON_MS).toISOString(), DSR_ALERT_SCAN)
+    .all<{ dsr_id: string; request_type: string; deadline: string }>();
+  const rows = results ?? [];
+  const claimed: { dsr_id: string; request_type: string; deadline: string; overdue: boolean; key: string }[] = [];
+  for (const r of rows) {
+    const overdue = r.deadline < now;
+    // I34-FX2-ALARM: the due-soon CLAIM carries the day, so a claim a failed release (or an evicted run) leaves behind
+    // holds that day only; "once" is the sent row (dsrSoonSentKey), written after an accepted mail and read here.
+    if (!overdue && (await db.prepare("SELECT 1 AS x FROM rate_limits WHERE rl_key = ?").bind(dsrSoonSentKey(r.dsr_id)).first<{ x: number }>()) !== null) continue;
+    const key = overdue ? `${DSR_ALERT_PREFIX}overdue:${day}:${r.dsr_id}` : `${DSR_ALERT_PREFIX}soon:${day}:${r.dsr_id}`;
+    const won = await db.prepare("INSERT INTO rate_limits (rl_key, window_start, count) VALUES (?, ?, 1) ON CONFLICT(rl_key) DO NOTHING").bind(key, now).run();
+    if ((won.changes ?? 0) > 0) claimed.push({ ...r, overdue, key });
+  }
+  const overdue = claimed.filter((r) => r.overdue).length;
+  const dueSoon = claimed.length - overdue;
+  if (claimed.length === 0) return { due_soon: 0, overdue: 0, alerted: false };
+  logError({ cid: `dsr-deadline:${day}`, hop: "cron", msg: DSR_ALERT_MARKER, marker: DSR_ALERT_MARKER, day, count: claimed.length, detail: `overdue=${overdue} due_soon=${dueSoon}` });
+  const line = (r: (typeof claimed)[number]) => `- ${r.dsr_id} (${r.request_type}): ${r.overdue ? "OVERDUE, deadline was" : "due by"} ${r.deadline}`;
+  const opsText = [
+    `${overdue} data-subject request(s) are past their statutory deadline and ${dueSoon} are due within 7 days. Open them in the operator console (GET /ops/dsr?open=1), and record the outcome or the one extension.`,
+    "",
+    ...claimed.map(line),
+    ...(rows.length === DSR_ALERT_SCAN ? ["", `This run read the ${DSR_ALERT_SCAN} earliest deadlines; there may be more open requests, none due earlier than the last listed.`] : []),
+  ].join("\n");
+  const msg = (to: string): EmailMessage => ({
+    to,
+    subject: overdue > 0 ? `Privacy requests: ${overdue} overdue, ${dueSoon} due within 7 days` : `Privacy requests: ${dueSoon} due within 7 days`,
+    text: opsText,
+    html: wrapHtml(textToHtml(opsText), ""),
+  });
+  let accepted = 0;
+  for (const to of operatorEmails) if (await send(msg(to)).catch(() => false)) accepted++;
+  if (accepted === 0) {
+    for (const r of claimed) await db.prepare("DELETE FROM rate_limits WHERE rl_key = ?").bind(r.key).run();
+    return { due_soon: dueSoon, overdue, alerted: false };
+  }
+  for (const r of claimed) {
+    if (!r.overdue) await db.prepare("INSERT INTO rate_limits (rl_key, window_start, count) VALUES (?, ?, 1) ON CONFLICT(rl_key) DO NOTHING").bind(dsrSoonSentKey(r.dsr_id), now).run();
+  }
+  return { due_soon: dueSoon, overdue, alerted: true };
+}
+===== END FILE: services/trust-core/src/alerts.ts =====
+
+===== END OF CHUNK 36 OF 75 =====

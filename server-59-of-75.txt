@@ -1,0 +1,3287 @@
+DHWAJA CODE REVIEW — server — CHUNK 59 OF 75
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (intelligence*), services/trust-core/src (internal*), services/trust-core/src (jwks*), services/trust-core/src (leaderboard*), services/trust-core/src (legal*), services/trust-core/src (likeness*), services/trust-core/src (log*), services/trust-core/src (mailer*), services/trust-core/src (manual*)
+Files in this chunk (11):
+  - services/trust-core/src/intelligence-routes.ts
+  - services/trust-core/src/intelligence.ts
+  - services/trust-core/src/internal-face-hold.ts
+  - services/trust-core/src/jwks-caches.ts
+  - services/trust-core/src/leaderboard.ts
+  - services/trust-core/src/legal-hold-sql.ts
+  - services/trust-core/src/legal-holds.ts
+  - services/trust-core/src/likeness.ts
+  - services/trust-core/src/log.ts
+  - services/trust-core/src/mailer.ts
+  - services/trust-core/src/manual-claims.ts
+
+
+===== BEGIN FILE: services/trust-core/src/intelligence-routes.ts =====
+import { type Context, Hono } from "hono";
+import { recordExplainOutcome } from "./alerts.js";
+import { backCatalog } from "./back-catalog.js";
+import { d1 } from "./db.js";
+import { dailyIntelligence, IntelError, isVerifiedPassport } from "./intelligence.js";
+import { nicheRank } from "./rankings.js";
+import { audienceRegions } from "./regions.js";
+import { AI_NO_ANSWER_MARKER, AI_REPLY_REJECTED_MARKER, CreatorAiError, explainIntelligence, regionsFromSummary, type Explanation, type InferenceBinding, type SummaryInput } from "./creator-ai.js";
+import { dailyRoi, FrozenNotReady, frozenRead, type CreatorRoi } from "./roi.js";
+import { capRefusal, creatorAdmission, creatorId, r2Store, errorBody } from "./route-helpers.js";
+import { sessionIssuedAt } from "./sessions.js";
+import { consumeRateLimit, refundRateLimit } from "./ratelimit.js";
+import { dayBuilder, generatedAtFor, readDayKind, type DayBuildContext, type DaySummary } from "./analytics-read.js";
+import type { ConditionalObjectStore } from "@dhwaja/schema";
+import type { Env } from "./env.js";
+
+/**
+ * CREATOR INTELLIGENCE — aggregates a verified creator may read over their OWN
+ * audience, and nothing that identifies a fan.
+ *
+ * BOUNDARY. `/account/intelligence`, `/account/roi`, `/account/attribution`,
+ * `/account/back-catalog` and `/account/campaigns`. The AGENCY mirror of the
+ * same four dashboards is a different authorization question (a scoped grant on
+ * someone else's passport) and lives in `agency-analytics-routes.ts` behind the
+ * shared `resolveAgencyGrantedRead` gate.
+ *
+ * FOUR OF THE FIVE ARE DAY-FROZEN, and that is a privacy control rather than a
+ * cache: a dashboard that reports a fan population and recomputes on demand lets
+ * its own owner time two reads around one known event and attribute the delta to
+ * one person. `roi.ts frozenRead` states the mechanism and the measurement in
+ * full.
+ *
+ * `/account/back-catalog` is the exception on purpose, but NOT for the reason
+ * this comment used to give. It said the wizard reports the creator's own
+ * releases and anniversaries, "not a per-fan population". It also reports S23
+ * ARCHIVE DEMAND, and `archive_requests` is `PRIMARY KEY (account_id,
+ * passport_id)` — one row per fan — so that half of it is exactly a per-fan
+ * population, and while that sentence stood the count was served live and
+ * unfloored here and on `/account/archive-demand`.
+ *
+ * It is now day-lagged and k-floored AT THE SOURCE (`requests.ts
+ * archiveDemand`), which is the `regions.ts` treatment rather than the freeze:
+ * the answer for a given creator and UTC day is the same at every hour by
+ * construction, so a live read has no pair of instants to difference and needs
+ * no snapshot, no sweep and no 503. roi.ts:241-247 (the `FrozenAnalytics`
+ * docblock) argues that trade in full.
+ */
+/** Paid inferences a creator may run per `EXPLAIN_WINDOW_MS` window: 24 hours from the window's first debit
+ * (ratelimit.ts `consumeRateLimit`: a call after the window has run out opens the next one), NOT a UTC day, as the
+ * 429 says ("per 24 hours", I3-1632). Low on purpose: the brief is deterministic, so a second call the same day is
+ * asking the same question of the same numbers, and the answer a creator actually wanted is the first one. */
+export const MAX_EXPLAIN_PER_DAY = 10;
+/** The window that ceiling is per, written once: it is now read by the debit,
+ * by the refusal's own bucket and by the refund, and three spellings of one
+ * window is how a refund ends up reaching a bucket the debit never touched. */
+const EXPLAIN_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** Refused replies whose debit is given back per window (D-0832, I3-1632): its
+ * own ceiling, so a refusal loop buys at most this many extra paid inferences. */
+export const MAX_EXPLAIN_REFUNDS_PER_DAY = 3;
+/** Q974-B1 (FINDING-0015 E-doors-4): a refund is credited to the TOKEN whose request was charged, in its own row
+ * `explain-credit:<passport>:<ep>.<iat>` — a creator token's claims are {k, id, iat, exp, ep}, so for one passport
+ * (ep, iat) names one token, and nothing secret is stored. A token's unspent credits hold that many slots of the
+ * per-passport ceiling back from every OTHER token; its own next charge spends one. */
+const explainCreditKey = (id: string, slot: string): string => `explain-credit:${id}:${slot}`;
+function explainTokenSlot(auth: string, ep: number): string {
+  return `${ep}.${sessionIssuedAt(/^Bearer\s+(.+)$/.exec(auth)?.[1] ?? "") ?? "?"}`;
+}
+async function explainCreditsHeld(db: ReturnType<typeof d1>, id: string, slot: string, nowMs: number): Promise<{ own: number; others: number }> {
+  const { results } = await db
+    .prepare("SELECT rl_key, count FROM rate_limits WHERE rl_key >= ? AND rl_key < ? AND window_start >= ?")
+    .bind(`explain-credit:${id}:`, `explain-credit:${id};`, new Date(nowMs - EXPLAIN_WINDOW_MS).toISOString())
+    .all<{ rl_key: string; count: number }>();
+  const own = results.filter((r) => r.rl_key === explainCreditKey(id, slot)).reduce((n, r) => n + r.count, 0);
+  return { own, others: results.reduce((n, r) => n + r.count, 0) - own };
+}
+/** AIT-03: a binding that is never asked — `explainIntelligence` returns the money-day template without calling `run`,
+ * and throws on every other day, so a probe with it answers "is this a template day" by the one implementation. */
+const UNASKED: InferenceBinding = {
+  run: async () => {
+    throw new Error("not asked");
+  },
+};
+
+/**
+ * THE RESPONSE CACHE (ADR-0006 section 7, INV-052), keyed
+ * `(passport_id, day, normalized question)`.
+ *
+ * THE PASSPORT IS IN THE KEY, not merely in the value. Two creators asking the
+ * same question of the same day are two entries, and a key that hashed only the
+ * question would serve one creator's numbers to the other - the one failure a
+ * response cache in front of a creator-private surface can have. The day is in
+ * it because a day object is immutable, so a hit is always the answer to the
+ * same bytes.
+ *
+ * THE QUESTION IS NORMALIZED, NOT HASHED. It was hashed, and the digest bought
+ * nothing: this key is a process-local Map key, never stored, never logged and
+ * never published, and INV-052 asks for the PASSPORT in the key, not for the
+ * question to be unreadable. What the digest did buy was a second SHA-256 call
+ * site outside `@dhwaja/canonical` (the single-hasher invariant), so it is
+ * gone. The question is still NEVER PROMPTED — it is creator-authored text and
+ * INV-052 keeps creator text out of a model prompt; this route asks no question
+ * today, so the key carries the normalized empty string.
+ *
+ * THE STORE is the artifact bucket (`explainStoreKey` below): this service has
+ * no KV and no cache binding (`index.ts Env`, `wrangler.jsonc`), and a
+ * per-isolate Map diverged across isolates (I3-1634). What the invariant needs
+ * is the KEY, and the key does not change when the store behind it does.
+ */
+export function normalizeQuestion(question: string): string {
+  return question.normalize("NFKC").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+export function explainCacheKey(passportId: string, day: string, question: string): string {
+  return `${passportId}|${day}|${normalizeQuestion(question)}`;
+}
+
+/**
+ * THE STORE BEHIND THE KEY (I3-1634, I3-2184). The cache was a per-isolate Map,
+ * so one creator's same-day answer depended on which isolate served it, and it
+ * had no expiry and no erasure path. It now lives in the artifact store beside
+ * the day object it explains, `frozen/day/<psp>/explain/<day>.json`: one answer
+ * per (creator, day) for every isolate (`putIfAbsent`, first writer wins), cut
+ * at `SNAPSHOT_RETENTION_DAYS` by `sweepFrozenSnapshots` (its `/<day>.json`
+ * match) and removed with the creator by `purgeFrozenAnalytics` (its
+ * `frozen/day/<psp>/` prefix). The value carries `explainCacheKey`, so a stored
+ * answer serves only the exact (passport, day, question) it was written for.
+ */
+let explainTestEpoch = 0;
+export function explainStoreKey(passportId: string, day: string): string {
+  return `frozen/day/${passportId}/explain${explainTestEpoch === 0 ? "" : `-t${explainTestEpoch}`}/${day}.json`;
+}
+/** TESTS ONLY: moves later reads to a fresh key, so a suite that reuses one
+ * store, passport and day reads a miss. Production never calls it (epoch 0). */
+export function _resetExplainCacheForTests(): void {
+  explainTestEpoch++;
+}
+interface StoredExplanation {
+  key: string;
+  answer: Explanation;
+}
+async function cachedExplanation(store: ConditionalObjectStore, passportId: string, day: string, key: string): Promise<Explanation | undefined> {
+  const raw = await store.get(explainStoreKey(passportId, day));
+  if (raw === null) return undefined;
+  const v = JSON.parse(raw) as StoredExplanation;
+  return v.key === key ? v.answer : undefined;
+}
+/** The answer every isolate serves for this key: ours if we wrote first, else the winner's. */
+async function cacheExplanation(store: ConditionalObjectStore, passportId: string, day: string, key: string, answer: Explanation): Promise<Explanation> {
+  const value: StoredExplanation = { key, answer };
+  if (await store.putIfAbsent(explainStoreKey(passportId, day), JSON.stringify(value))) return answer;
+  return (await cachedExplanation(store, passportId, day, key)) ?? answer;
+}
+
+/**
+ * THE ONE FAILURE MAP for these routes (I3-0971, I3-1722). A known refusal keeps
+ * its status; ANY OTHER exception is re-thrown to the service `app.onError`
+ * (`index.ts`), which logs it and answers 500 `{"error":"internal"}` — a D1 or
+ * R2 fault is the server's, and the old `400 {"error":"error"}` told the caller
+ * it was theirs.
+ */
+function analyticsFailure(c: Context, e: unknown): Response {
+  if (e instanceof CreatorAiError) return c.json(errorBody(e), e.status);
+  if (e instanceof FrozenNotReady) return c.json({ error: e.message, retry: "daily" }, 503);
+  if (e instanceof IntelError) return c.json(errorBody(e), e.status);
+  throw e;
+}
+
+export function makeIntelligenceRoutes(): Hono<{ Bindings: Env }> {
+  const app = new Hono<{ Bindings: Env }>();
+
+  /**
+   * The snapshot store, or null when the artifact bucket is unbound. FAIL CLOSED
+   * (invariant 6): with nowhere to freeze the day's numbers the only remaining
+   * behaviour is live recomputation, which is precisely the differencing
+   * primitive the freeze exists to remove — so the dashboard goes dark instead
+   * of quietly going back to being live.
+   */
+  const frozenStore = (env: Env): ConditionalObjectStore | null => (env.REGISTRY_BUCKETS ? r2Store(env.REGISTRY_BUCKETS) : null);
+  const UNAVAILABLE = { error: "analytics_unavailable", detail: "the analytics snapshot store is not configured" };
+
+  /**
+   * THE CREATOR'S OWN READ MAY BUILD (ADR-0006 section 1, O-18). Their session
+   * is the authorization, the build grace is when, and `putIfAbsent` is how
+   * often - one day object per (creator, UTC day), O(1) per request. The hook
+   * returns without touching a store before `T 00:30 UTC`, and the two-day
+   * lookback then serves `T - 1`.
+   *
+   * `null` when the second database is unbound: the read degrades to
+   * serve-or-refuse rather than to a live compute, which is the direction this
+   * whole slice exists to hold.
+   */
+  const buildCtx = (env: Env, store: ConditionalObjectStore): DayBuildContext | null =>
+    env.ANALYTICS_DB ? { analytics: d1(env.ANALYTICS_DB), prod: d1(env.TRUST_DB), store } : null;
+  const builder = (env: Env, store: ConditionalObjectStore) => {
+    const ctx = buildCtx(env, store);
+    return ctx === null ? (false as const) : dayBuilder(ctx);
+  };
+
+
+  // --- S25 creator intelligence (aggregates over the creator's OWN audience) ---
+  // Gated: verified creators only (Creator Pro billing slots in here when it
+  // lands). Agencies reach the same view for passports they hold an ACTIVE
+  // grant on. Aggregates only — no fan identity ever crosses this boundary.
+
+  // F10 / #52 — where this creator's audience acted from, per UTC month.
+  // Day-frozen with the other four for the reason `roi.ts FrozenAnalytics`
+  // gives: a live region read is a differencing primitive that reconstructs the
+  // per-account row the schema refuses to store.
+  app.get("/account/regions", async (c) => {
+    const id = await creatorId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      if (!(await isVerifiedPassport(db, id))) return c.json({ error: "intelligence unlocks at verified status" }, 403);
+      const store = frozenStore(c.env);
+      if (!store) return c.json(UNAVAILABLE, 503);
+      // NOT day-frozen, and it does not need to be: `audienceRegions` reports
+      // only COMPLETED UTC days, so the answer for a given creator and month is
+      // the same at every hour. The freeze would have added a snapshot whose
+      // instant the reader picks — which is the differencing primitive it was
+      // supposed to remove.
+      return c.json(await audienceRegions(db, id));
+    } catch (e) {
+      // FrozenNotReady is "not yet" (503 retry daily), never a live compute.
+      return analyticsFailure(c, e);
+    }
+  });
+
+  // F10 / #53 — a plain-language reading of the two aggregate views above.
+  // The seam receives the FROZEN objects and never a database handle; the
+  // response carries the exact brief that was sent, so "aggregates only" is
+  // something a creator can check rather than something they are told.
+  app.post("/account/intelligence/explain", async (c) => {
+    const who = await creatorAdmission(c);
+    if (!who) return c.json({ error: "unauthorized" }, 401);
+    const id = who.id;
+    const slot = explainTokenSlot(c.req.header("Authorization") ?? "", who.ep);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      // THE BINDING IS CHECKED FIRST, before any work. It used to be checked
+      // inside `explainIntelligence`, after two frozen computes — so on a
+      // deployment with no inference configured every call still burned the
+      // creator's daily compute budget and wrote snapshots, to answer 503.
+      // VERIFIED FIRST (I3-1633): an unverified creator reads the same 403 on every
+      // deployment, so the binding's presence is not disclosed to them.
+      if (!(await isVerifiedPassport(db, id))) return c.json({ error: "intelligence unlocks at verified status" }, 403);
+      const ai = c.env.CREATOR_AI as InferenceBinding | undefined;
+      if (!ai) return c.json({ error: "this deployment has no inference binding configured" }, 503);
+      // This creator reads dashboards, so the cron keeps building theirs. A
+      // passport id and a timestamp; the marker is what bounds a per-creator
+      // precompute to creators who actually use it.
+      // ITS OWN DAILY CEILING, and it needs one that the dashboards do not.
+      // The frozen reads cost nothing per call once built, so the ceiling here
+      // hit — correct for a read that costs nothing on the second call, and
+      // wrong here, where every call is a paid inference however cheap the two
+      // reads behind it became. Without this a single session could loop the
+      // button and bill the operator without limit.
+      // THE BUCKET IS PER-CREATOR, not a global or per-response counter: the
+      // `rate_limits` row is keyed `explain:<creatorId>` (and, on a refused
+      // reply, a sibling row `explain-refused:<creatorId>`), and each row
+      // keeps one count and the window's start instant, live for
+      // `EXPLAIN_WINDOW_MS`. A refund (below, on `AI_REPLY_REJECTED_MARKER`)
+      // moves that count back by one on the `explain:` row — it changes the
+      // budget, never the response: the refused call still returns the same
+      // 502 as an unrefunded one, byte-identical in status, body and headers.
+      // THE REFUND BELONGS TO THE TOKEN THAT WAS CHARGED (Q974-B1, FINDING-0015
+      // E-doors-4). Both buckets above stay per passport (the ceiling and the
+      // bound on refunds); the refunded slot is credited to the charged token's
+      // own `explain-credit:` row (`explainCreditsHeld`), so a second token for
+      // the passport cannot spend it, one step later or ever. It stays invisible to a
+      // guesser with no session (`creatorId` refuses before any store is
+      // touched, at the top of this handler) and to every other reader of this route.
+      const store = frozenStore(c.env);
+      if (!store) return c.json(UNAVAILABLE, 503);
+      // THE READS COME BEFORE THE QUOTA. Debiting first meant a creator with no
+      // snapshot yet spent all ten of their daily explanations collecting 503s
+      // — a refusal is not a service rendered.
+      // `explain` NEVER BUILDS (ADR-0006 section 1, C6). An inference route is
+      // not the creator asking for their day; it is the creator asking a model
+      // about a day that already exists. Written out rather than left implicit.
+      // ONE INSTANT FOR THE WHOLE BRIEF. The two frozen reads used to mint a
+      // wall-clock instant each, and the geo block carried a third clock of its
+      // own (`regions.ts:214-216`), so one brief could name three days.
+      const nowMs = Date.now();
+      const intel = await dailyIntelligence(store, id, nowMs, { build: false });
+      // `null` is the context that CANNOT build (ADR-0006 section 1, C6).
+      const summary = await readDayKind<DaySummary>(store, null, id, "summary", nowMs);
+      // BOTH KINDS OR NEITHER. One clock does not make one WALK: these are two
+      // passes of the lookback (`roi.ts readFrozenBundle`) over a store another
+      // request may write between them, so a build landing here would serve
+      // D's intelligence beside T's cells under a key naming T. The pair is
+      // checked rather than assumed, and a straddle is the same refusal a
+      // creator with no object yet already receives (FINDING-0020).
+      if (summary.served_day !== intel.generated_at.slice(0, 10)) throw new FrozenNotReady();
+      // THE KEY CARRIES THE PASSPORT AND THE DAY (INV-052). The binding was
+      // checked at the top of the handler, so a hit can never answer for a
+      // feature the operator has turned off.
+      const key = explainCacheKey(id, summary.served_day, "");
+      const hit = await cachedExplanation(store, id, summary.served_day, key);
+      // A CACHE HIT SPENDS NO QUOTA (S-19). The lookup sits ABOVE the debit
+      // because `MAX_EXPLAIN_PER_DAY` bounds PAID INFERENCES, and a hit is not
+      // one: the day object is immutable and the question is the same, so the
+      // second call returns the first call's bytes without reaching the model.
+      // Debiting for it charged a creator for re-reading an answer they had
+      // already been given, which is the same "a refusal is not a service
+      // rendered" argument that put the reads above the quota. The button is
+      // still not free to loop: every MISS is debited before the inference, so
+      // the number of model calls in a window is unchanged.
+      if (hit !== undefined) return c.json(hit);
+      // THE GEO BLOCK IS THE OBJECT'S OWN (`creator-ai.ts regionsFromSummary`),
+      // not a live `audienceRegions(db, id)` on the wall clock.
+      const regions = regionsFromSummary(summary as SummaryInput);
+      const opts = { summary: summary as SummaryInput };
+      // AIT-03 (D-1051(3)): THE TEMPLATE IS NOT A PAID INFERENCE. A money-withheld day's answer is the service's fixed
+      // template (`creator-ai.ts moneyDayTemplate`), so it is found BEFORE the charge, spends no slot and is recorded as
+      // `template`, never `served`. A binding with no `run` is not probed: it keeps its 503 (and debit + refund) below.
+      const asks = typeof ai.run === "function";
+      const template = asks ? await explainIntelligence(UNASKED, intel, regions, opts).catch(() => null) : null;
+      if (template !== null) {
+        await recordExplainOutcome(db, "template", nowMs).catch(() => undefined);
+        return c.json(await cacheExplanation(store, id, summary.served_day, key, template));
+      }
+      // Q974-B1: the ceiling stays per passport; this token's own unspent refunds are its to spend, every other
+      // token's are held back from it.
+      const held = await explainCreditsHeld(db, id, slot, nowMs);
+      if (!(await consumeRateLimit(db, `explain:${id}`, nowMs, MAX_EXPLAIN_PER_DAY - held.others, EXPLAIN_WINDOW_MS))) {
+        return c.json(capRefusal(`explanation limit reached (${MAX_EXPLAIN_PER_DAY} per 24 hours)`), 429);
+      }
+      if (held.own > 0) await refundRateLimit(db, explainCreditKey(id, slot), nowMs, EXPLAIN_WINDOW_MS);
+      // Q974-B16: the model's own reply, kept to tell a served CUT reply from a whole one.
+      let said: unknown;
+      const heard: InferenceBinding = asks ? { run: async (m, i) => (said = await ai.run(m, i)) } : ai;
+      const answer = await explainIntelligence(heard, intel, regions, opts).catch(
+        async (e: unknown): Promise<never> => {
+          // A REFUSED REPLY IS NOT A SERVICE RENDERED EITHER — the rule this
+          // handler already states twice above, applied to the one outcome that
+          // was still charged for. The OUTPUT HALF (`creator-ai.ts:617`)
+          // refuses a reply the model DID give, the throw skips
+          // `cacheExplanation` below, so the next press is another miss and
+          // another debit: ten refusals took the feature away for the window
+          // on prose the platform's own SYSTEM prompt invites.
+          //
+          // THE REFUND IS BOUNDED BY A RECORD OF THE REFUSAL, in its own bucket
+          // at the same ceiling. Refunding unconditionally would give back
+          // exactly what the ceiling's own comment above says it is for — a session that
+          // loops the button and bills the operator without limit — because
+          // every refused call is still a paid inference. So a refusal returns
+          // the creator's slot only while `explain-refused:` has room, which
+          // caps a window's paid inferences at MAX_EXPLAIN_PER_DAY plus
+          // MAX_EXPLAIN_REFUNDS_PER_DAY (D-0832): a refund stops being a
+          // doubling of the ceiling and stays a retry for an honest refusal.
+          // I3-0597 (I15-W2J): a provider failure, an empty reply or an overlong one bought nothing
+          // either (`AI_NO_ANSWER_MARKER`) — refunded the same way, through the same bounded bucket.
+          // I3-0598 (D-0920 B, D-0922(6)): one platform-wide refused count (no creator id); a counter fault never changes the answer.
+          if (e instanceof CreatorAiError && e.code === AI_REPLY_REJECTED_MARKER) await recordExplainOutcome(db, "refused", nowMs).catch(() => undefined);
+          if (e instanceof CreatorAiError && (e.code === AI_REPLY_REJECTED_MARKER || e.code === AI_NO_ANSWER_MARKER))
+            if (await consumeRateLimit(db, `explain-refused:${id}`, nowMs, MAX_EXPLAIN_REFUNDS_PER_DAY, EXPLAIN_WINDOW_MS)) {
+              await refundRateLimit(db, `explain:${id}`, nowMs, EXPLAIN_WINDOW_MS);
+              // Q974-B1: the slot goes back to THIS token, not to the passport's shared count.
+              await consumeRateLimit(db, explainCreditKey(id, slot), nowMs, MAX_EXPLAIN_REFUNDS_PER_DAY, EXPLAIN_WINDOW_MS);
+            }
+          throw e;
+        },
+      );
+      await recordExplainOutcome(db, "served", nowMs).catch(() => undefined);
+      // Q974-B16: served, but not the model's whole reply (`creator-ai.ts` cut its ungrounded clauses).
+      // A whole reply is served as itself, then (on a withheld day) "\n\n" and the service's notes.
+      const raw = String(typeof said === "string" ? said : ((said as { response?: unknown } | undefined)?.response ?? ""));
+      if (!`${answer.explanation}\n\n`.startsWith(`${raw.trim()}\n\n`)) await recordExplainOutcome(db, "cut", nowMs).catch(() => undefined);
+      return c.json(await cacheExplanation(store, id, summary.served_day, key, answer));
+    } catch (e) {
+      return analyticsFailure(c, e);
+    }
+  });
+
+  app.get("/account/intelligence", async (c) => {
+    const id = await creatorId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      if (!(await isVerifiedPassport(db, id))) return c.json({ error: "intelligence unlocks at verified status" }, 403);
+      const store = frozenStore(c.env);
+      if (!store) return c.json(UNAVAILABLE, 503);
+      // Daily-frozen snapshot (privacy: no single-event differencing).
+      return c.json(await dailyIntelligence(store, id, Date.now(), { build: builder(c.env, store) }));
+    } catch (e) {
+      // FrozenNotReady is "not yet" (503 retry daily), never a live compute.
+      return analyticsFailure(c, e);
+    }
+  });
+
+  /**
+   * S-002 S-4 / ADR-0006 section 7 - the SNAPSHOT. The Phase-1 metrics of one
+   * (creator, UTC day), floored by `serveDay` before they were ever written to
+   * the day object, and NO INFERENCE: this route is what `explain` explains.
+   *
+   * A CREATOR READ, SO IT MAY BUILD (ADR-0006 section 1, O-18) - `buildCtx` is
+   * the same context the four dashboards pass, so the grace, the lookback and
+   * `putIfAbsent` are one behaviour across all five kinds rather than five.
+   * Served-or-refused with them: a miss inside the lookback is 503
+   * `retry: "daily"`, never a live compute.
+   *
+   * NO CEILING OF ITS OWN, and that is deliberate. `MAX_EXPLAIN_PER_DAY` exists
+   * because every explain call is a paid inference; this one costs a `get` and,
+   * at most once per (creator, day), a build - exactly what the four sibling
+   * reads cost, and they carry no per-route limiter either.
+   *
+   * `version` IS THE DAY (ADR-0006 section 7). The object is a function of
+   * (creator, UTC day) and carries no version of its own, so the day IS the
+   * version; `generated_at` is derived from that same day and never from a
+   * clock. `day` stays what the summary itself calls `day` - D, the sealed day
+   * the cells describe - and `served_day` is the object's own day T.
+   */
+  app.get("/account/intelligence/summary", async (c) => {
+    const id = await creatorId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      if (!(await isVerifiedPassport(db, id))) return c.json({ error: "intelligence unlocks at verified status" }, 403);
+      const store = frozenStore(c.env);
+      if (!store) return c.json(UNAVAILABLE, 503);
+      const summary = await readDayKind<DaySummary>(store, buildCtx(c.env, store), id, "summary", Date.now());
+      return c.json({ ...summary, generated_at: generatedAtFor(summary.served_day), version: summary.served_day });
+    } catch (e) {
+      return analyticsFailure(c, e);
+    }
+  });
+
+  // S86 — the creator ROI dashboard (protection + discovery + conversion). Not a
+  // payout figure — the ROI board is a scoreboard, not earnings (those live on
+  // GET /account/creator-earnings since the store). Creator-private (own session), verified
+  // gated like intelligence; fan-population counts k-floored inside the module and
+  // the whole view DAY-FROZEN + throttled, exactly like /account/intelligence: it
+  // reports the same three fan populations that view does, and reporting them live
+  // is what let a caller difference one named fan out of them (roi.ts `frozenRead`).
+  app.get("/account/roi", async (c) => {
+    const id = await creatorId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      if (!(await isVerifiedPassport(db, id))) return c.json({ error: "the ROI dashboard unlocks at verified status" }, 403);
+      // THIS CREATOR READS DASHBOARDS, so the cron keeps building theirs.
+      // Every frozen dashboard registers it, not just Intelligence: a creator
+      // who only ever opens the ROI tab would otherwise never be built, and
+      // would read 503 forever.
+      const store = frozenStore(c.env);
+      if (!store) return c.json(UNAVAILABLE, 503);
+      const roi: CreatorRoi & { niche?: unknown } = await dailyRoi(store, id, Date.now(), { build: builder(c.env, store) });
+      // "You rank #N in <niche>" — creator-private, read off the precomputed S81
+      // by-category board (null when they have no category / aren't in the top board).
+      // NOT frozen with the rest: it carries no fan population at all, it is read
+      // off an artifact a cron already froze, and it is the creator's own rank.
+      // I3-1125 (I4-05-R8 F12): a niche line the day object carries is served as
+      // frozen; the live read stays only until the ROI builder (roi.ts) seals it.
+      const niche = roi.niche !== undefined ? roi.niche : await nicheRank(store, db, id);
+      return c.json({ ...roi, niche });
+    } catch (e) {
+      // FrozenNotReady is "not yet" (503 retry daily), never a live compute.
+      return analyticsFailure(c, e);
+    }
+  });
+
+  // S87 — the conversion-attribution funnel (eligible → claimed → redeemed) per
+  // reverse-code pool. Creator-private, verified-gated; eligible k-floored; no
+  // invented "views" and no external revenue (uploaded pools are labelled
+  // redemption_observable=false). Day-frozen for the same reason as ROI: a funnel
+  // that moves the instant one identified fan claims a code is a per-fan report
+  // wearing an aggregate's clothes.
+  app.get("/account/attribution", async (c) => {
+    const id = await creatorId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      if (!(await isVerifiedPassport(db, id))) return c.json({ error: "attribution unlocks at verified status" }, 403);
+      // THIS CREATOR READS DASHBOARDS, so the cron keeps building theirs.
+      // Every frozen dashboard registers it, not just Intelligence: a creator
+      // who only ever opens the ROI tab would otherwise never be built, and
+      // would read 503 forever.
+      const store = frozenStore(c.env);
+      if (!store) return c.json(UNAVAILABLE, 503);
+      return c.json(await frozenRead(store, "attribution", id, Date.now(), { build: builder(c.env, store) }));
+    } catch (e) {
+      // FrozenNotReady is "not yet" (503 retry daily), never a live compute.
+      return analyticsFailure(c, e);
+    }
+  });
+
+  // S88 — the Back Catalog Wizard read: archive demand + the creator's releases +
+  // upcoming anniversaries (throwback candidates). Creator-private, verified-gated.
+  // Mints nothing itself — the actual re-drop is the existing signed drop flow.
+  app.get("/account/back-catalog", async (c) => {
+    const id = await creatorId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      if (!(await isVerifiedPassport(db, id))) return c.json({ error: "the back-catalog wizard unlocks at verified status" }, 403);
+      return c.json(await backCatalog(db, id, Date.now()));
+    } catch (e) {
+      return analyticsFailure(c, e);
+    }
+  });
+
+  // S89 — campaign templates: ready-to-run recipes (reward supporters, anniversary
+  // re-drop, revive a set, recognize fans) computed from the creator's own state,
+  // each linking into the existing hardened flow (drop / reverse-code pool). Mints
+  // nothing; verified-gated; the save audience is k-floored inside the module and
+  // day-frozen here — it is the same `saves` population ROI and intelligence
+  // report, so leaving one of the three live leaves the differencing attack open.
+  app.get("/account/campaigns", async (c) => {
+    const id = await creatorId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    try {
+      const db = d1(c.env.TRUST_DB);
+      if (!(await isVerifiedPassport(db, id))) return c.json({ error: "campaign templates unlock at verified status" }, 403);
+      // THIS CREATOR READS DASHBOARDS, so the cron keeps building theirs.
+      // Every frozen dashboard registers it, not just Intelligence: a creator
+      // who only ever opens the ROI tab would otherwise never be built, and
+      // would read 503 forever.
+      const store = frozenStore(c.env);
+      if (!store) return c.json(UNAVAILABLE, 503);
+      return c.json(await frozenRead(store, "campaigns", id, Date.now(), { build: builder(c.env, store) }));
+    } catch (e) {
+      // FrozenNotReady is "not yet" (503 retry daily), never a live compute.
+      return analyticsFailure(c, e);
+    }
+  });
+
+  return app;
+}
+===== END FILE: services/trust-core/src/intelligence-routes.ts =====
+
+===== BEGIN FILE: services/trust-core/src/intelligence.ts =====
+import type { DbLike } from "./db.js";
+import { DAY_CELL, IntelError, readFrozenBundle, type DayCells, type LegacyFacts, type ReadOptions, type SnapshotStore } from "./roi.js";
+import { isCurrentlyVerified, passportStanding } from "./standing.js";
+
+/**
+ * S25 — creator intelligence. Analytics over the acquisition + social graph,
+ * for the creator's OWN audience only.
+ *
+ * The privacy boundary, enforced by construction:
+ *  - Every query is filtered to the calling creator's own passport/releases —
+ *    creator A can never see creator B's relationship data.
+ *  - AGGREGATES ONLY: no fan account ids, handles, or per-fan rows ever leave
+ *    this module. A fan's relationship with a creator (what they bought, when
+ *    they went quiet) is surfaced only as counts and distributions.
+ *  - Cross-creator behavior stays out entirely (nothing here joins another
+ *    creator's data); anything user-public lives on public surfaces instead.
+ *
+ * Gating: VERIFIED creators (+ agencies holding an active grant on a verified
+ * passport). When Creator Pro billing lands, that check slots in at the HTTP
+ * layer next to the verified check — the module itself stays gating-agnostic.
+ */
+
+/**
+ * IntelError — the error type the intelligence routes map to a status — is DECLARED in roi.ts and
+ * re-exported here unchanged (one class object, so every `instanceof` is the same check). roi.ts
+ * used to import it from this module while this module imports roi.ts for its cells: that pair was
+ * an import cycle (I13-ARCH, QUEUE #902). Importers keep `import { IntelError } from "./intelligence.js"`.
+ * This block keeps the class's nine lines on purpose: org/skills anchors `intelligence.ts:N` lines
+ * below it (the I13-TOOLS skill-anchor test), so the move shifts no line number.
+ */
+export { IntelError };
+
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+export const DORMANT_AFTER_DAYS = 90;
+export const ARCHIVE_AGE_DAYS = 90; // an acquisition of a release older than this is an "archive" acquisition
+export const MAX_INTEL_CALLS_PER_DAY = 100;
+/**
+ * k-anonymity floor: behavioral breakdowns (repeat/dormant/depth/completion)
+ * are SUPPRESSED below this audience size. With collectors_total = 1, every
+ * "aggregate" describes one identifiable person — and the creator knows who
+ * they handed each credential to, so tiny-audience analytics would bind real
+ * identities to behavior without consent (review finding).
+ */
+export const K_ANONYMITY_FLOOR = 5;
+
+export interface CreatorIntelligence {
+  passport_id: string;
+  generated_at: string;
+  /** True when the audience is under K_ANONYMITY_FLOOR: behavioral breakdowns
+   * are withheld (null) so tiny-audience "aggregates" can't describe an
+   * identifiable individual. */
+  audience_suppressed: boolean;
+  audience: {
+    collectors_total: number | null; // distinct accounts holding >=1 of this creator's releases (null = WITHHELD, I3-1243)
+    repeat_collectors: number | null; // >=2 acquisitions (null when suppressed)
+    one_time_collectors: number | null;
+    new_collectors_90d: number | null; // first acquisition within the window
+    dormant_collectors: number | null; // last acquisition older than DORMANT_AFTER_DAYS
+    saved_by: number | null; // fans with this creator saved (null when a small non-zero population is k-suppressed)
+    card_collectors: number | null; // fans holding this creator's card (null when k-suppressed)
+  };
+  catalog: {
+    releases_published: number;
+    acquisitions_total: number | null; // null = WITHHELD cell (I3-1243)
+    acquisitions_90d: number | null;
+    archive_acquisitions: number | null; // always null: no archive/new-release cell exists (I3-1982)
+    new_release_acquisitions: number | null;
+  };
+  completion: {
+    eligible: boolean; // >=3 published releases
+    completed_collectors: number | null; // own every published release (null when suppressed)
+    near_completion_collectors: number | null; // own all but one
+  };
+  depth_distribution: Array<{ bucket: string; collectors: number }> | null; // null when suppressed
+  demand: {
+    /** S23 back-catalog demand (counts only; notes live on
+     * /account/archive-demand). A DISTINCT-FAN population: day-lagged and
+     * k-floored at source, so `null` means WITHHELD, never "nobody asked". */
+    archive_requests: number | null;
+    archive_requests_withheld: boolean;
+  };
+  /** INV-004's spatial limb over the DEAD-ATTEMPT population. Every field here
+   * derived from `redemption_attempts.account_id` is withheld together, gated on
+   * whether ANY per-release row cleared K_ANONYMITY_FLOOR on its own population
+   * (:318), with ZERO INCLUDED, so a population of nobody and a population of
+   * four produce the same bytes. The three totals are computed over the SERVED
+   * rows only, so subtracting the rows from a total leaves nothing.
+   * `dead_attempts` travels with them because it BOUNDS the population from
+   * above (one attempt is one account). `active_credentials` /
+   * `redeemed_credentials` are the creator's own inventory, but the split is not
+   * day-pure (B7 OQ 2), so both are null (WITHHELD) in both arms (I3-1149).
+   * `distinct_dead_accounts` is served only when it is ONE release's distinct
+   * count: a sum over releases counts an account on two of them twice (I3-1244). */
+  integrity: {
+    active_credentials: number | null;
+    redeemed_credentials: number | null;
+    dead_attempts: number | null;
+    distinct_dead_accounts: number | null;
+    reused_credentials: number | null;
+    per_release: IntegrityReleaseRow[];
+    integrity_withheld: boolean;
+  };
+}
+
+/** One release's dead-attempt row. A row EXISTS only when that release's own
+ * account population clears the floor (:275) — a sub-floor release is not
+ * emitted at all, because the row's presence, `release_id` and `title` alone
+ * prove an account attempted that named release, and because the creator-wide
+ * totals are summed over these rows (:284) so any row left out of them is
+ * recoverable by subtraction. The counts are therefore always served; the
+ * nullable type is what the console DTO tolerates on a pre-fix body. */
+export interface IntegrityReleaseRow {
+  release_id: string;
+  title: string;
+  dead_attempts: number | null;
+  distinct_accounts: number | null;
+  reused_credentials: number | null; // null = WITHHELD (no cell; sibling of I3-1149)
+}
+
+/**
+ * The intelligence view, re-expressed over the analytics store (S-002 S-1).
+ *
+ * IT NO LONGER TOUCHES A DATABASE, and that is the point. Every field below was
+ * a live `COUNT(*)` or an N+1 over the creator's releases; each is now a served
+ * cell, a day-pure production read, or WITHHELD. The per-collector rollup, the
+ * depth distribution, the archive/new split and the completion counts have no
+ * cell in the Phase-1 store — they need per-fan acquisition depth, which is
+ * exactly the shape the second store refuses to carry — so they are withheld
+ * through the `audience_suppressed` / `null` conventions this type already has.
+ *
+ * THE THROTTLE IS GONE WITH THE COMPUTE. `MAX_INTEL_CALLS_PER_DAY` stood in
+ * front of a live build a caller could trigger at an instant they picked; there
+ * is no such build any more (the read serves a frozen object and, for the
+ * creator's own read, may build ONE day object per creator per UTC day). The
+ * constant stays exported because the ceiling on the INFERENCE route is a
+ * different decision and a different number.
+ *
+ * WHAT `integrity` MEANS NOW (S-1). The store's per-release cell counts
+ * DISTINCT dead-attempt accounts (membership scope `release_attempt`), so a row
+ * exists only when `serveDay` served that release's cell — the same gate the
+ * live version applied with its own floor, now applied by the one served-set
+ * function. `dead_attempts` (raw attempts) and `reused_credentials` have no
+ * cell and are withheld; the totals are summed over the SERVED rows only, so
+ * subtracting the rows from a total still leaves nothing.
+ */
+/**
+ * FINDING-0025 / INV-004 SPATIAL CLAUSE 2 (docket #13, accepted 2026-09-06):
+ * "a count is floored against the population it summarises — and any
+ * population derivable from it — never against a larger neighbouring one (a
+ * cell of 1 inside an audience of 50 is a single-person signal)."
+ *
+ * The pre-Phase-1 builder (`git show 0606463:services/trust-core/src/
+ * intelligence.ts`, its three collector-cell gates) gated `repeat_collectors`/`one_time_collectors`,
+ * `completed_collectors`/`near_completion_collectors` and `depth_distribution`
+ * on `suppressed` (the AUDIENCE floor, `collectors_total < K_ANONYMITY_FLOOR`)
+ * alone — the wrong denominator this org has stepped in twice before (RUN-0012
+ * B-1; S-017/S-020 property work). A body built that way is still readable for
+ * `FROZEN_LOOKBACK_DAYS` (roi.ts:452) days after any deploy, and
+ * `dailyIntelligence`'s fast path served it with NO re-check at all — this
+ * function is the ONE place both that fast path and a fresh build now run
+ * through, so a wrong-denominator body from any source is corrected here
+ * (FAMILY-004 P1: the control lives in the primitive, not at one caller).
+ *
+ * OWN POPULATIONS, PER MEASURE (why a shared audience-level gate is not enough):
+ *  - `repeat_collectors` / `one_time_collectors` — SAME population as the
+ *    audience gate, `collectors_total`, but a FINER, EXHAUSTIVE 2-cell
+ *    partition of it (repeat + one_time === collectors_total, always, because
+ *    every collector is one or the other). `collectors_total` is served EXACT
+ *    once `audience_suppressed` is false, so if `collectors_total` clears
+ *    K_ANONYMITY_FLOOR while `repeat_collectors` itself does not (e.g. 1 repeat
+ *    collector inside an audience of 50 — the row's own example), showing
+ *    `one_time_collectors` alone hands `repeat_collectors` back by subtraction
+ *    (`one_time = collectors_total - repeat`). COMPLEMENTARY CASE: both floor
+ *    and withhold TOGETHER, never one alone.
+ *  - `completed_collectors` / `near_completion_collectors` — the SAME
+ *    population again (`collectors_total`), but each is a SEPARATE,
+ *    NON-EXHAUSTIVE subset of it (owns everything / owns all-but-one; a
+ *    collector who owns neither is never counted anywhere), so there is no
+ *    served quantity that sums the two of them back to a served total.
+ *    COMPLEMENTARY CASE closed by construction: each floors INDEPENDENTLY on
+ *    its own count, and nulling one never exposes the other.
+ *  - `depth_distribution` — `collectors_total` a third time, this time
+ *    partitioned EXHAUSTIVELY across N buckets (every collector is in exactly
+ *    one). The same subtraction attack as repeat/one-time applies to ANY
+ *    single bucket: dropping just the sub-floor bucket while the rest and the
+ *    exact `collectors_total` stay served hands it back arithmetically.
+ *    COMPLEMENTARY CASE: one sub-floor bucket withholds the WHOLE array, not
+ *    just that entry — there is no per-bucket victim-selection primitive in
+ *    this file to pick a second bucket to hide instead (that machinery is
+ *    `analytics-cells.ts`'s, out of this room's ownership), and withholding
+ *    everything is trivially safe: nothing served, nothing to difference.
+ *  - `redeemed_credentials` is NOT covered by this function — see the
+ *    docblock on `dailyIntelligence` and this room's report OPEN QUESTIONS.
+ *    Three independent places in this codebase (this file's own prior
+ *    docblock, `run0006-frozen-integrity.test.ts`'s positive control at "B7 OQ
+ *    2", and `run0006-builder-integrity-view.test.ts`) have ALREADY ruled
+ *    `active_credentials`/`redeemed_credentials` are not a fan population and
+ *    are withheld UNCONDITIONALLY (null since I3-1149; it was a literal 0
+ *    because the type had no null) for a DAY-PURITY reason unrelated to
+ *    population size. Applying a K-anonymity floor here would fight that ruling and a
+ *    pinned test (`run0006-frozen-integrity.test.ts` "positive control": both
+ *    fields must read `0` in both arms). This is flagged, not chosen, in the
+ *    report.
+ */
+function floorOwnPopulation(n: number | null): number | null {
+  return n === null ? null : n < K_ANONYMITY_FLOOR ? null : n;
+}
+
+/** `repeat_collectors`/`one_time_collectors`: an exhaustive 2-cell partition of
+ * the SERVED, exact `collectors_total`. Either side missing or sub-floor takes
+ * both down together — see the docblock above this section. */
+function floorExhaustivePair(a: number | null, b: number | null): [number | null, number | null] {
+  if (a === null || b === null) return [null, null];
+  if (a < K_ANONYMITY_FLOOR || b < K_ANONYMITY_FLOOR) return [null, null];
+  return [a, b];
+}
+
+/** `depth_distribution`: buckets partition `collectors_total` exhaustively, so
+ * one sub-floor bucket takes the WHOLE array — see the docblock above. */
+function floorDepthDistribution(depth: Array<{ bucket: string; collectors: number }> | null): Array<{ bucket: string; collectors: number }> | null {
+  if (depth === null) return null;
+  return depth.some((d) => d.collectors < K_ANONYMITY_FLOOR) ? null : depth;
+}
+
+/**
+ * Apply INV-004 spatial clause 2 to the three measures above, over ANY
+ * `CreatorIntelligence` object — freshly built or read back out of a frozen
+ * bundle up to `FROZEN_LOOKBACK_DAYS` old. Called from both `creatorIntelligence`
+ * and `dailyIntelligence` (FAMILY-004 P1): a future cell wired into EITHER path
+ * is floored by construction rather than by a builder repeating this reasoning.
+ * A no-op on today's live builder, whose three fields are already `null`
+ * (no cell) — the fix is for the frozen-read side, where an older body's own,
+ * wrong-denominator floor logic must not be trusted.
+ */
+export function floorAudiencePartitions(intel: CreatorIntelligence): CreatorIntelligence {
+  const [repeat, oneTime] = floorExhaustivePair(intel.audience.repeat_collectors, intel.audience.one_time_collectors);
+  return {
+    ...intel,
+    audience: { ...intel.audience, repeat_collectors: repeat, one_time_collectors: oneTime },
+    completion: {
+      ...intel.completion,
+      completed_collectors: floorOwnPopulation(intel.completion.completed_collectors),
+      near_completion_collectors: floorOwnPopulation(intel.completion.near_completion_collectors),
+    },
+    depth_distribution: floorDepthDistribution(intel.depth_distribution),
+  };
+}
+
+export function creatorIntelligence(cells: DayCells, facts: LegacyFacts, passportId: string, generatedAt: string): CreatorIntelligence {
+  if (!PSP_RE.test(passportId)) throw new IntelError("bad passport id");
+
+  const collectors = cells.get(DAY_CELL.collectors);
+  // A withheld audience is what `audience_suppressed` has always announced.
+  const suppressed = collectors === null;
+  const demand = facts.back_catalog.demand;
+
+  const perRelease: IntegrityReleaseRow[] = [];
+  let distinctDead = 0;
+  for (const r of facts.back_catalog.releases) {
+    const served = cells.get(DAY_CELL.releaseDeadAccounts(r.release_id));
+    if (served === null) continue; // a sub-floor release is not emitted AT ALL
+    perRelease.push({
+      release_id: r.release_id,
+      title: r.title,
+      dead_attempts: null, // WITHHELD: the store counts accounts, not attempts
+      distinct_accounts: served,
+      reused_credentials: null, // WITHHELD (no cell) — null, never a printed 0 (sibling of I3-1149)
+    });
+    distinctDead += served;
+  }
+  const integrityWithheld = perRelease.length === 0;
+  // I3-1244: the store has a DISTINCT-accounts cell per release only, so a sum
+  // over two or more served rows counts an account on two releases twice. It is
+  // exact only for one served row over a whole (untruncated, I3-2009) page.
+  // RG-AN-04 / D-0844(4): this total is defined ACROSS THE RELEASES SHOWN
+  // (the served, un-withheld ones) — not a creator-wide total, and not a
+  // defect: a withheld sibling release is excluded from both the numerator
+  // and the population it is a total of, by the perRelease.length === 1
+  // guard below. Ruled, not built — do not change the number this returns.
+  const distinctTotal = perRelease.length === 1 && facts.back_catalog.releases_truncated !== true ? distinctDead : null;
+
+  // floorAudiencePartitions is a no-op here today (the three fields it touches
+  // are already null, "no cell" — see their comments below) but this function
+  // is the one place BOTH this live build and dailyIntelligence's frozen-read
+  // path run their result through, so a cell added to either one later is
+  // floored against its OWN population by construction (FAMILY-004 P1).
+  return floorAudiencePartitions({
+    passport_id: passportId,
+    generated_at: generatedAt,
+    audience_suppressed: suppressed,
+    audience: {
+      // I3-1243: WITHHELD is null, never the 0 an empty audience would read.
+      collectors_total: collectors,
+      repeat_collectors: null, // WITHHELD (no cell)
+      one_time_collectors: null, // WITHHELD (no cell)
+      new_collectors_90d: null, // WITHHELD (no cell)
+      dormant_collectors: null, // WITHHELD (no cell)
+      saved_by: cells.get(DAY_CELL.supporters),
+      card_collectors: cells.get(DAY_CELL.cardCollectors),
+    },
+    catalog: {
+      releases_published: facts.releases_published,
+      acquisitions_total: cells.get(DAY_CELL.acquisitions),
+      acquisitions_90d: cells.get(DAY_CELL.acquisitions90),
+      archive_acquisitions: null, // WITHHELD (no cell)
+      new_release_acquisitions: null, // WITHHELD (no cell)
+    },
+    completion: {
+      eligible: facts.releases_published >= 3,
+      completed_collectors: null, // WITHHELD (no cell)
+      near_completion_collectors: null, // WITHHELD (no cell)
+    },
+    depth_distribution: null, // WITHHELD (no cell)
+    demand: { archive_requests: demand.request_count, archive_requests_withheld: demand.withheld },
+    integrity: {
+      // NOT floored by floorAudiencePartitions — see that function's docblock:
+      // the active/redeemed split is withheld unconditionally for a day-purity
+      // reason (B7 OQ 2), not a population-size one.
+      active_credentials: null, // WITHHELD: the active/redeemed split is not day-pure (I3-1149)
+      redeemed_credentials: null, // WITHHELD
+      dead_attempts: null, // WITHHELD: no attempt-count cell
+      distinct_dead_accounts: integrityWithheld ? null : distinctTotal,
+      reused_credentials: null, // WITHHELD (no cell)
+      per_release: perRelease,
+      integrity_withheld: integrityWithheld,
+    },
+  });
+}
+
+/** I3-1149 / I3-1243 / I3-1244 on the FROZEN read (`dailyIntelligence`): a
+ * bundle sealed before this fix (readable for FROZEN_LOOKBACK_DAYS) carries the
+ * old literal zeros and the old per-release sum. A suppressed audience's
+ * `collectors_total`, the active/redeemed split, and a dead-account total over
+ * more than one release are served as null. (An old body's withheld
+ * acquisition 0 cannot be told from a real 0 and ages out with the lookback.) */
+function projectWithheld(intel: CreatorIntelligence): CreatorIntelligence {
+  const integ = intel.integrity;
+  return {
+    ...intel,
+    audience: { ...intel.audience, collectors_total: intel.audience_suppressed ? null : intel.audience.collectors_total },
+    integrity: {
+      ...integ,
+      active_credentials: null,
+      redeemed_credentials: null,
+      distinct_dead_accounts: Array.isArray(integ.per_release) && integ.per_release.length === 1 ? integ.distinct_dead_accounts : null,
+    },
+  };
+}
+
+/** Is this passport verified AND still listed (the S25 access gate)?
+ *
+ * D6 fix: a delisted (`request_suppressions`) creator is no longer verified for
+ * ANY access purpose — their private audience intelligence, ROI, attribution,
+ * back-catalog and recognition grants must stop being served (to them AND to
+ * their agency) the moment they opt out. The suppression term rides the SAME
+ * single statement so the suppression-oracle statement-sequence guard is
+ * unaffected; this is the same `NOT EXISTS (… request_suppressions …)` clause
+ * `VERIFIED_NOW_SUBQUERY` / `livePassport` / the fold use, kept in lockstep. */
+export async function isVerifiedPassport(db: DbLike, passportId: string, nowMs: number = Date.now()): Promise<boolean> {
+  if (!PSP_RE.test(passportId)) return false;
+  // D-60 fix: was its own `claim_state='verified' AND retracted=0 AND NOT
+  // suppressed` read with no expiry check, so a lapsed (`reverification_required`)
+  // grant still passed here while credentials.ts/payout.ts's identical-intent
+  // gate (passportStanding + isCurrentlyVerified) correctly closed. Now the
+  // same single derivation every other door already asks (standing.ts: "new
+  // code must not add a sixth reader").
+  return isCurrentlyVerified(await passportStanding(db, passportId, nowMs));
+}
+
+/**
+ * Daily-frozen intelligence: READS THE SNAPSHOT, and never computes.
+ *
+ * It used to compute on the first read of a UTC day, which handed the snapshot's
+ * instant to whoever read it — see `roi.ts frozenRead` for the measurement and
+ * the twenty-second attack it allowed. `analytics-build.ts` writes it on the
+ * cron now, at an instant the schedule chooses.
+ *
+ * ONE READER, not a second copy of the lookback loop. `intel` is a kind inside
+ * the (creator, day) bundle `roi.ts bundleKey` names, so this and `frozenRead`
+ * cannot drift over which day they are serving — which is what let `roi` and
+ * `intel` be served from two different days for one request pair
+ * (FINDING-0020). `intel/<psp>/<day>.json` is no longer written.
+ */
+export async function dailyIntelligence(store: SnapshotStore, passportId: string, nowMs: number = Date.now(), opts?: ReadOptions): Promise<CreatorIntelligence> {
+  if (!PSP_RE.test(passportId)) throw new IntelError("bad passport id");
+  const body = await readFrozenBundle<CreatorIntelligence>(store, "intel", passportId, nowMs, opts);
+  // ABSENT FLAG = WITHHELD, the same default the console applies to a missing
+  // block. A bundle written before this floor existed carries raw sub-floor
+  // counts and no `integrity_withheld`, and stays readable for
+  // FROZEN_LOOKBACK_DAYS after deploy (roi.ts:378) — served unprojected it
+  // would hand back exactly the numbers the floor now refuses. The flag is the
+  // only thing that says the body was built under the floor.
+  const integ = body.integrity as Partial<CreatorIntelligence["integrity"]> | undefined;
+  const merged: CreatorIntelligence =
+    typeof integ?.integrity_withheld === "boolean"
+      ? body
+      : {
+          ...body,
+          integrity: {
+            active_credentials: null,
+            redeemed_credentials: null,
+            dead_attempts: null,
+            distinct_dead_accounts: null,
+            reused_credentials: null,
+            per_release: [],
+            integrity_withheld: true,
+          },
+        };
+  // FINDING-0025 (INV-004 spatial clause 2): the `return body` arm above is
+  // exactly the unchecked pass-through that let a pre-Phase-1 body (gated on
+  // the AUDIENCE floor alone — `git show 0606463:...intelligence.ts:335,356,
+  // 359`) serve `repeat_collectors`/`completed_collectors`/`depth_distribution`
+  // straight through for as long as `FROZEN_LOOKBACK_DAYS` keeps it readable.
+  // That old body carries `integrity_withheld` as a boolean too (it always
+  // computed one), so it takes the FIRST arm above, not the legacy-repair one —
+  // the floor below has to run on BOTH arms to close it.
+  return projectWithheld(floorAudiencePartitions(merged));
+}
+===== END FILE: services/trust-core/src/intelligence.ts =====
+
+===== BEGIN FILE: services/trust-core/src/internal-face-hold.ts =====
+import type { DbLike } from "./db.js";
+import { faceDataHoldSql } from "./legal-hold-sql.js";
+import { constantTimeEqual, FACE_ERASE_AUDIENCE, FACE_HOLD_ASK_AUDIENCE, internalServiceCredential } from "./sessions.js";
+
+/**
+ * I65-IMAGE (Jason D-1569 "Yes, ask trust-core first (Recommended)", "Either kind keeps it (Recommended)"; W0-10, W0-11).
+ *
+ * POST /internal/face-hold — the image service asks, before it erases a creator's face data (enrolment rows, their
+ * vectors), whether an open legal hold names the passport OR the account that owns it (`founder.account_id`, the only
+ * passport-to-account ownership column, I65-SCOUT-22A). Gated like /internal/likeness-revoke: `X-Internal-Auth` must
+ * equal internalServiceCredential(SESSION_SECRET, FACE_HOLD_ASK_AUDIENCE) (constant-time); no usable secret -> 503;
+ * body `{passport_id}` read only after the gate.
+ *
+ * Held: `image:face_erase_owed` (item_id = the passport) is written in the same batch that answers. A plain ask writes none
+ * while a plain one has no later `image:face_erase_done` (I65-HOLD's DONE literal), so a retried plain ask owes once; a reviews
+ * ask always writes its own (I66-FX-SWEEP, D-1591 C4), so a later held DELETE /enrollments moves the review cut to its instant.
+ * Both statements run in one batch, so a held answer is given only with an open marker in place.
+ * Unheld: nothing is written.
+ */
+
+/** The hold the face-data doors keep: the passport, or its founder account. Binds the passport id TWICE. I65-FX-FACE R6:
+ * the one predicate every face-data door reads (legal-hold-sql.ts faceDataHoldSql), never a private copy. */
+export const FACE_ERASE_HOLD_SQL = faceDataHoldSql("?");
+
+/** An `image:face_erase_owed` for the passport WITH THIS DETAIL and no later `image:face_erase_done`. Binds the passport id
+ * then the detail. I65-FX-FACE (D-1576): keyed by detail. I66-FX-SWEEP (D-1591 C4): read for a plain ask only. */
+const OPEN_FACE_ERASE_OWED_SQL =
+  "EXISTS (SELECT 1 FROM audit_log o WHERE o.item_id = ? AND o.action = 'image:face_erase_owed' AND o.detail = ? AND NOT EXISTS (SELECT 1 FROM audit_log d WHERE d.item_id = o.item_id AND d.action = 'image:face_erase_done' AND d.audit_id > o.audit_id))";
+
+/** I65-FX-FACE (D-1576, I65-Q3): the two OWED details. The reviews one is written only for an ask from a door that deletes the
+ * exact-photo review rows (image DELETE /enrollments); requests.ts sweepImageFaceEraseOwed then asks the image service to delete them. */
+export const FACE_ERASE_OWED_DETAIL = "image face-data erasure kept under an open legal hold; owed on release";
+export const FACE_ERASE_OWED_REVIEWS_DETAIL = "image face-data erasure and its review rows kept under an open legal hold; owed on release";
+
+const PASSPORT_RE = /^psp_[0-9a-f]{16}$/;
+
+/** Ask and, when held, owe. One batch, so the marker and the answer read the same state. */
+export async function faceEraseHoldAnswer(db: DbLike, passportId: string, ts: string, reviews = false): Promise<{ held: boolean }> {
+  const detail = reviews ? FACE_ERASE_OWED_REVIEWS_DETAIL : FACE_ERASE_OWED_DETAIL;
+  const res = await db.batch([
+    db
+      .prepare(
+        `INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT 'system:image-face-hold', 'image:face_erase_owed', ?, ?, ?, 'system' WHERE ${FACE_ERASE_HOLD_SQL}${reviews ? "" : ` AND NOT ${OPEN_FACE_ERASE_OWED_SQL}`}`, // I66-FX-SWEEP (D-1591 C4): a reviews ask is never deduplicated
+      )
+      .bind(detail, ts, passportId, passportId, passportId, ...(reviews ? [] : [passportId, detail])),
+    db.prepare(`SELECT ${FACE_ERASE_HOLD_SQL} AS held`).bind(passportId, passportId), // held => the INSERT above left an open owed marker
+  ]);
+  const row = (res[1] as { results?: { held?: number }[] } | undefined)?.results?.[0];
+  return { held: row?.held === 1 };
+}
+
+/** The gate and the answer of POST /internal/face-hold (registered in index.ts). The body is read only after the gate. */
+export async function faceHoldAskAnswer(
+  secret: string | undefined,
+  given: string,
+  readBody: () => Promise<string>,
+  db: () => DbLike,
+): Promise<{ status: 200 | 400 | 401 | 503; body: Record<string, unknown> }> {
+  const expected = await internalServiceCredential(secret, FACE_HOLD_ASK_AUDIENCE);
+  if (!expected) return { status: 503, body: { error: "not_configured" } };
+  if (!constantTimeEqual(given, expected)) return { status: 401, body: { error: "unauthorized" } };
+  const raw = await readBody();
+  const bad = { status: 400 as const, body: { error: "passport_id required" } };
+  if (raw.length > 1024) return bad;
+  let b: { passport_id?: unknown; reviews?: unknown } | null = null;
+  try {
+    b = JSON.parse(raw) as { passport_id?: unknown; reviews?: unknown } | null;
+  } catch {
+    b = null;
+  }
+  // I65-FX-FACE (D-1576): `reviews: true` is the one optional key (the asking door also deletes review rows).
+  if (!b || typeof b !== "object" || Object.keys(b).some((k) => k !== "passport_id" && k !== "reviews") || (b.reviews !== undefined && b.reviews !== true) || typeof b.passport_id !== "string" || !PASSPORT_RE.test(b.passport_id)) return bad;
+  return { status: 200, body: { ok: true, ...(await faceEraseHoldAnswer(db(), b.passport_id, new Date().toISOString(), b.reviews === true)) } };
+}
+
+/** The image service's owed face-data erasure for one passport (image POST /internal/face-erase). RESOLVES on a 2xx;
+ * REJECTS otherwise. For the I65-HOLD sweep arm that answers `image:face_erase_owed`. `owedAt` (I66-SWEEP, W0-13) is the review-row
+ * cut, sent as `owed_at` beside `reviews: true` only; the image service deploys its reading of it first (W0-12). */
+export type ImageFaceErasePeer = (passportId: string, opts?: { reviews?: boolean; owedAt?: string }) => Promise<void>;
+
+/** Same transport as likeness.ts imageConsentPeerFromEnv: the IMAGE_SERVICE binding; null when it is not bound. */
+export function imageFaceErasePeerFromEnv(env: Record<string, unknown>): ImageFaceErasePeer | null {
+  const svc = env.IMAGE_SERVICE as { fetch: (url: string, init?: RequestInit) => Promise<Response> } | undefined;
+  if (!svc || typeof svc.fetch !== "function") return null;
+  const secret = typeof env.SESSION_SECRET === "string" ? env.SESSION_SECRET : undefined;
+  return async (passportId: string, opts?: { reviews?: boolean; owedAt?: string }): Promise<void> => {
+    const credential = await internalServiceCredential(secret, FACE_ERASE_AUDIENCE);
+    if (!credential) throw new Error("image face erase: session secret not configured");
+    const res = await svc.fetch("https://image.internal/internal/face-erase", {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-Internal-Auth": credential },
+      body: JSON.stringify(opts?.reviews === true ? { passport_id: passportId, reviews: true, ...(typeof opts.owedAt === "string" ? { owed_at: opts.owedAt } : {}) } : { passport_id: passportId }), // I65-FX-FACE (D-1576); I66-SWEEP (W0-13): `owed_at` rides only with `reviews: true`
+      signal: AbortSignal.timeout(5_000),
+      redirect: "manual", // D-0930(3): a 3xx is a non-2xx, never followed with X-Internal-Auth attached
+    });
+    if (res.status < 200 || res.status > 299) throw new Error(`image face erase: image answered ${res.status}`);
+  };
+}
+===== END FILE: services/trust-core/src/internal-face-hold.ts =====
+
+===== BEGIN FILE: services/trust-core/src/jwks-caches.ts =====
+import type { JwksCache } from "./auth.js";
+
+/**
+ * Module-scoped JWKS caches, factored into their own dependency-free module.
+ *
+ * In production these are correct and load-bearing: keys are cached across
+ * requests so a certs-endpoint blip can't take the console down on every call.
+ * They live here (rather than inline in `index.ts`) for ONE reason — the vitest
+ * global setup needs to clear them between tests, and importing them from a tiny
+ * type-only module keeps that reset free instead of pulling the whole Hono app
+ * into every test file's setup.
+ *
+ * - `accessJwksCaches`: one cache per Cloudflare-Access team domain.
+ * - `oidcJwksCaches`: one cache per OIDC provider certs URL (Google / Apple).
+ *
+ * The `import type` above is erased at runtime, so this module has no runtime
+ * dependencies.
+ */
+export const accessJwksCaches = new Map<string, JwksCache>();
+export const oidcJwksCaches = new Map<string, JwksCache>();
+
+/**
+ * TEST-ONLY. Drop the cached JWKS instances so the next lookup re-fetches. Under
+ * a shared (non-isolated) test module registry this stops one test file's cached
+ * certs from verifying another file's differently signed tokens. Production never
+ * calls it; clearing the maps only forces a lazy repopulate, so behavior is
+ * unchanged.
+ */
+export function __resetJwksCachesForTest(): void {
+  accessJwksCaches.clear();
+  oidcJwksCaches.clear();
+}
+===== END FILE: services/trust-core/src/jwks-caches.ts =====
+
+===== BEGIN FILE: services/trust-core/src/leaderboard.ts =====
+import type { DbLike } from "./db.js";
+import { qualifiedFanJoin } from "./fan-quality.js";
+
+/**
+ * #19 — the per-creator TOP-FAN leaderboard. A fan's standing with one creator is
+ * ranked by how much of that creator's catalogue they hold: the count of DISTINCT
+ * published releases they've acquired from that creator (the same superfan signal
+ * that drives #17 milestones), tie-broken by who got there FIRST (earliest
+ * acquisition = a founding-ish signal). Derived from the log; nothing new to store.
+ *
+ * Two surfaces, two privacy postures — never a raw roster either way:
+ *  - PUBLIC (`publicTopFans`): only fans whose profile is PUBLIC appear — their
+ *    opt-in handle is their public identity, exactly like Fan-of-the-Week. A fan
+ *    with no public profile is simply absent; the raw account_id is NEVER exposed.
+ *    A RETRACTED creator serves nothing (the kill-switch for every share surface).
+ *  - CREATOR-PRIVATE (`creatorTopFans`): the OWNING creator, behind their verified
+ *    session, sees their top fans by OPAQUE account_id + count — the same exposure
+ *    the recognition queue already gives them, so they can decide who to recognize.
+ *    No handles, no emails.
+ *
+ * THE QUALIFIED-FAN GATE (D-0922(8), I16-L03; D-0920 I3-0920). Both boards join
+ * `qualified_fan_accounts` (`qualifiedFanJoin`) like every other acquisition reader.
+ * AUDIT #17 argued the join was redundant — holding an acquisition is one of the
+ * signals the view accepts, and the acquisition trigger qualifies the redeemer — and
+ * that is still true of every row production writes; the gate makes the board's
+ * population the view's by construction instead of by that argument, so a row the
+ * trigger never qualified (or a later change to the view) cannot rank.
+ *
+ * THE FOUNDER IS OFF BOTH BOARDS. Identity is read through the `rankable_*`
+ * views (`0011_founder.sql`) — the base tables minus the configured founder — so a
+ * new board written here is covered by construction; `test/founder.test.ts`
+ * fails any aggregate in this module that reads a base identity table instead.
+ * See founder.ts for the whole exemption list.
+ */
+
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+
+export interface PublicTopFan {
+  handle: string; // the fan's opt-in PUBLIC handle
+  display_name: string;
+  collected: number; // distinct published releases held from this creator
+}
+
+/**
+ * The public top-fan board for a creator's passport page. Opt-in public profiles
+ * only; retracted creator → []. Bounded. Ranked by holdings desc, then earliest
+ * first-acquisition (a stable, founding-flavored tiebreak).
+ *
+ * AND ONLY FANS WHO AGREED TO BE LISTED ON SOMEBODY ELSE'S PAGE (item #12,
+ * migration 0017). `u.visibility = 'public'` was carrying two different consents
+ * at once: "people may see my profile" and "creators may name me on their
+ * pages". A fan who wanted off this board had to take down their own page,
+ * their collection display, their achievements and their discovery presence to
+ * do it — five things to escape one. `affiliation_visibility` is the separable
+ * lever, and Top Fans is the surface that NEEDS it: unlike a recognition there
+ * is no per-row entity here for a fan to accept or decline, so the per-fan
+ * switch is the only consent this board can have.
+ *
+ * One more predicate on the `rankable_profiles` join this statement already
+ * makes — no extra round trip, no second read, and it stays inside the view, so
+ * `test/founder.test.ts`'s structural guard (every ranked aggregate reads
+ * identity through a `rankable_*` view) still holds. The column lives on
+ * `user_profiles` and the view is `SELECT *`, which SQLite expands at query
+ * time, so the view inherited it with no edit.
+ *
+ * A withheld fan is simply ABSENT — the board never says a name was withheld,
+ * for the same reason the suppression gates don't: an opt-out that announces
+ * itself is not an opt-out.
+ */
+export async function publicTopFans(db: DbLike, passportId: string, limit = 10): Promise<PublicTopFan[]> {
+  return (await publicTopFansKeyed(db, passportId, limit)).map((r) => ({ handle: r.handle, display_name: r.display_name, collected: r.collected }));
+}
+
+/** A board row plus the account it was RANKED as — internal to the board build. */
+export interface PublicTopFanKeyed extends PublicTopFan {
+  account_id: string; // opaque; never served (serveTopFans strips it)
+}
+
+/**
+ * INTERNAL (`rankings.ts buildRankings`): the same board as `publicTopFans`, each
+ * row keyed to the account the ranking statement grouped on — the GROUP BY key
+ * `COALESCE(a.redeemed_by, a.account_id)` is returned by the SAME statement that
+ * ranks it (D-0844(1), D-0850(1), QUEUE #748). A second handle -> account lookup
+ * would let an erased fan's freed handle, re-claimed in between, key the row to a
+ * stranger. Never served as-is.
+ */
+export async function publicTopFansKeyed(db: DbLike, passportId: string, limit = 10): Promise<PublicTopFanKeyed[]> {
+  if (!PSP_RE.test(passportId)) return [];
+  const capped = Math.max(1, Math.min(50, limit));
+  // I3-0902: rank and tie-break on the REDEEMER (0061_acquisition_redeemer.sql
+  // — "an acquisition is PROPERTY; the redemption is EVIDENCE"), never the
+  // current holder. `account_id` moves on a gift; `redeemed_by` never does.
+  // Ranking on `account_id` let two cooperating accounts transfer a public
+  // "Top Fan" standing by gifting, and the recipient inherited a
+  // first-acquisition date that predates their own account. `COALESCE` keeps
+  // a legacy/never-migrated row (no redeemer recorded) reading as its own
+  // holder's acquisition, matching every other evidence consumer
+  // (social.ts awardAchievements, eligibility.ts, reverse-codes.ts).
+  const { results } = await db
+    .prepare(
+      `SELECT u.handle AS handle, u.display_name AS display_name, u.account_id AS account_id,
+              COUNT(DISTINCT a.release_id) AS collected, MIN(a.acquired_at) AS first_at
+         FROM acquisitions a
+         JOIN releases r ON r.release_id = a.release_id AND r.passport_id = ? AND r.status = 'published'
+         JOIN rankable_profiles u ON u.account_id = COALESCE(a.redeemed_by, a.account_id) AND u.visibility = 'public' AND u.affiliation_visibility = 'public'
+         ${qualifiedFanJoin("u.account_id")}
+         JOIN rankable_passports p ON p.passport_id = r.passport_id AND p.retracted = 0
+        GROUP BY COALESCE(a.redeemed_by, a.account_id)
+        ORDER BY collected DESC, first_at ASC, COALESCE(a.redeemed_by, a.account_id) ASC
+        LIMIT ?`,
+    )
+    .bind(passportId, capped)
+    .all<{ handle: string; display_name: string | null; account_id: string; collected: number; first_at: string }>();
+  return results.map((r) => ({ handle: r.handle, display_name: r.display_name ?? "", collected: r.collected ?? 0, account_id: r.account_id }));
+}
+
+export interface CreatorTopFan {
+  account_id: string; // opaque — surfaced ONLY to this fan's own creator
+  collected: number;
+  first_at: string;
+}
+
+/**
+ * The creator-PRIVATE top-fan board — for the owning creator's own session. Ranks
+ * ALL of their fans (not just public-profile ones) by holdings, returning opaque
+ * account_ids (never handles/emails), so the creator can pick who to recognize.
+ * Verified-gated at the route. Bounded.
+ */
+export async function creatorTopFans(db: DbLike, passportId: string, limit = 25): Promise<CreatorTopFan[]> {
+  if (!PSP_RE.test(passportId)) return [];
+  const capped = Math.max(1, Math.min(100, limit));
+  // I3-0902: same redeemer-not-holder basis as publicTopFans — see its comment.
+  const { results } = await db
+    .prepare(
+      `SELECT COALESCE(a.redeemed_by, a.account_id) AS account_id,
+              COUNT(DISTINCT a.release_id) AS collected, MIN(a.acquired_at) AS first_at
+         FROM acquisitions a
+         JOIN releases r ON r.release_id = a.release_id AND r.passport_id = ? AND r.status = 'published'
+         JOIN rankable_fan_accounts fa ON fa.account_id = COALESCE(a.redeemed_by, a.account_id)
+         ${qualifiedFanJoin("fa.account_id")}
+        GROUP BY COALESCE(a.redeemed_by, a.account_id)
+        ORDER BY collected DESC, first_at ASC, account_id ASC
+        LIMIT ?`,
+    )
+    .bind(passportId, capped)
+    .all<{ account_id: string; collected: number; first_at: string }>();
+  return results.map((r) => ({ account_id: r.account_id, collected: r.collected ?? 0, first_at: r.first_at }));
+}
+===== END FILE: services/trust-core/src/leaderboard.ts =====
+
+===== BEGIN FILE: services/trust-core/src/legal-hold-sql.ts =====
+/**
+ * I29-GATEFIX3 (D-1048(1)): the string-only legal-hold predicates, a leaf with NO imports. legal-holds.ts re-exports
+ * every name here, so its importers are unchanged; brand-index.ts imports this leaf directly, because legal-holds.ts
+ * imports review.ts and brand-index -> legal-holds -> review -> events -> brand-index is a cycle (lint:arch,
+ * tests/invariants/i13-arch-cycles.test.ts). Table `legal_holds` (0227); the doors that read these are classified in
+ * test/i34-fx2alarm-hold-census.test.ts.
+ */
+export const LEGAL_HOLD_SUBJECT_KINDS = ["account", "passport", "report_item"] as const;
+export type LegalHoldSubjectKind = (typeof LEGAL_HOLD_SUBJECT_KINDS)[number];
+
+/** An open hold on (`kind`, the SQL expression `idExpr`). `kind` is one of three literals, never caller text. */
+export function legalHoldOpenSql(kind: LegalHoldSubjectKind, idExpr: string): string {
+  if (!LEGAL_HOLD_SUBJECT_KINDS.includes(kind)) throw new Error(`legal hold: unknown subject kind ${String(kind)}`);
+  return `EXISTS (SELECT 1 FROM legal_holds lh WHERE lh.released_at IS NULL AND lh.subject_kind = '${kind}' AND lh.subject_id = ${idExpr})`;
+}
+
+/** The bound form: binds (subject_kind, subject_id). No door in src reads it today (dismissReport asks itemPurgeHeldSql). */
+export const LEGAL_HOLD_OPEN_SQL = "EXISTS (SELECT 1 FROM legal_holds lh WHERE lh.released_at IS NULL AND lh.subject_kind = ? AND lh.subject_id = ?)";
+
+/**
+ * THE ERASURE PREDICATE — one const for the friendly read and the in-batch validator. Binds the account id FOUR times.
+ * True when an open hold names the account itself, or names a report item whose rows this erasure would delete or
+ * alter for this fan: their evidence (`report_evidence`, deleted or re-keyed), their scan matches
+ * (`evidence_scan_events`, re-keyed) or their reporter row (`fan_report_reporters`, re-keyed and note dropped).
+ */
+export const ERASURE_LEGAL_HOLD_SQL = `(${legalHoldOpenSql("account", "?")} OR EXISTS (SELECT 1 FROM legal_holds lh WHERE lh.released_at IS NULL AND lh.subject_kind = 'report_item' AND lh.subject_id IN (SELECT item_id FROM report_evidence WHERE account_id = ? UNION SELECT item_id FROM evidence_scan_events WHERE account_id = ? UNION SELECT item_id FROM fan_report_reporters WHERE reporter_kind = 'fan' AND reporter_id = ?)))`;
+
+/** D-1037(8): an open hold on creator passport `?` — the one predicate every creator deletion door asks. */
+export const PASSPORT_LEGAL_HOLD_SQL = legalHoldOpenSql("passport", "?");
+
+/**
+ * D-1046(2): an open hold on the reporter a reporter-shaped row (`t` has reporter_kind, reporter_id — fan_report_reporters,
+ * fan_report_reporter_closures) names: a fan reporter's account, or a creator reporter's passport (0010: reporter_id is an
+ * account_id for a fan, a passport_id for a creator).
+ */
+export const reporterLegalHoldSql = (t: string): string =>
+  `((${t}.reporter_kind = 'fan' AND ${legalHoldOpenSql("account", `${t}.reporter_id`)}) OR (${t}.reporter_kind = 'creator' AND ${legalHoldOpenSql("passport", `${t}.reporter_id`)}))`;
+
+/**
+ * I65-HOLD F1 (D-1566 "Yes, every door"; D-1569 "Either kind keeps it"; W0 am.2-3): an open hold on creator passport
+ * `idExpr` OR on the account that owns it. The owning account is `founder.account_id` where `founder.passport_id` is the
+ * passport (migrations/0011_founder.sql:17-22: a singleton row whose account_id may be NULL; the only passport-to-account
+ * ownership column, I65-SCOUT-22A 22A-16), so an account hold whose subject_id merely equals the passport id never holds.
+ * Read only by the face-data doors and the face-data sweep arms; the names, analytics and brand-index doors keep
+ * PASSPORT_LEGAL_HOLD_SQL.
+ */
+export function faceDataHoldSql(idExpr: string): string {
+  return `(${legalHoldOpenSql("passport", idExpr)} OR EXISTS (SELECT 1 FROM founder fh WHERE fh.passport_id = ${idExpr} AND ${legalHoldOpenSql("account", "fh.account_id")}))`;
+}
+
+/** The bound form of faceDataHoldSql: binds the passport id TWICE. */
+export const FACE_DATA_HOLD_SQL = faceDataHoldSql("?");
+===== END FILE: services/trust-core/src/legal-hold-sql.ts =====
+
+===== BEGIN FILE: services/trust-core/src/legal-holds.ts =====
+/**
+ * I21-Q29 (I3-0123, I3-0376, I3-1401; D-1030, Jason: "2 but build the operator hold flag mechanism now") — LEGAL HOLDS.
+ * An operator's hold on a subject (a fan account, a creator passport or a report item), table `legal_holds` (0227).
+ * While a hold is OPEN (`released_at IS NULL`):
+ *   - the fan erasure batch refuses: `legalHoldErasureValidator` is a statement of `deleteAccount`'s batch
+ *     (account_data.ts), and `legalHoldBlockingErasure` is its friendly pre-read — the same predicate, one const;
+ *   - the published-evidence expiry sweep skips the subject (evidence.ts purgeExpiredPublishedEvidence);
+ *   - D-1037(8): a hold on a creator PASSPORT stops every creator deletion door — the wipe batch shared by
+ *     eraseCreator, wipeCreatorPersonalData and sweepCreatorWipes (creator-erasure.ts runWipe:
+ *     `passportLegalHoldValidator`, friendly read `passportUnderLegalHold`) and the profile-history prune
+ *     (creator-profile.ts pruneCreatorProfileHistory: `legalHoldOpenSql("passport", <col>)` in its one statement).
+ *     A creator holds no fan account, so the passport is the creator's only subject kind.
+ * I34-FX2-ALARM (widened by I34-W3-REVIEW to upserts): every DELETE, UPDATE ... SET, REPLACE and INSERT ... ON CONFLICT
+ * DO UPDATE statement in services/trust-core/src/*.ts on a hold-covered table (the census's HOLD_TABLES) is
+ * classified (held, gated, not a hold door, or open) in test/i34-fx2alarm-hold-census.test.ts, and DEPLOY.md's legal-hold
+ * launch step 1 names each held door; this list is the history, the census is the list.
+ */
+import type { DbLike, DbStatement } from "./db.js";
+import { mintId } from "./ids.js";
+import {
+  ERASURE_LEGAL_HOLD_SQL,
+  LEGAL_HOLD_SUBJECT_KINDS,
+  PASSPORT_LEGAL_HOLD_SQL,
+} from "./legal-hold-sql.js";
+import { auditStmt, auditStmtAfterWrite } from "./review.js";
+
+export {
+  ERASURE_LEGAL_HOLD_SQL,
+  LEGAL_HOLD_OPEN_SQL,
+  LEGAL_HOLD_SUBJECT_KINDS,
+  legalHoldOpenSql,
+  PASSPORT_LEGAL_HOLD_SQL,
+  reporterLegalHoldSql,
+} from "./legal-hold-sql.js";
+export type { LegalHoldSubjectKind } from "./legal-hold-sql.js";
+
+/** In-batch gate: inserts a NULL `hold_id` (NOT NULL) exactly when the predicate holds, aborting the batch. */
+export function legalHoldErasureValidator(db: DbLike, accountId: string): DbStatement {
+  return db
+    .prepare(`INSERT INTO legal_holds (hold_id, subject_kind, subject_id, reason, opened_by, opened_at) SELECT NULL, 'account', '', '', '', '' WHERE ${ERASURE_LEGAL_HOLD_SQL}`)
+    .bind(accountId, accountId, accountId, accountId);
+}
+
+/** In-batch gate for a creator deletion batch: aborts it (NULL `hold_id`) exactly when PASSPORT_LEGAL_HOLD_SQL holds. */
+export function passportLegalHoldValidator(db: DbLike, passportId: string): DbStatement {
+  return db.prepare(`INSERT INTO legal_holds (hold_id, subject_kind, subject_id, reason, opened_by, opened_at) SELECT NULL, 'passport', '', '', '', '' WHERE ${PASSPORT_LEGAL_HOLD_SQL}`).bind(passportId);
+}
+
+/** Friendly pre-read of PASSPORT_LEGAL_HOLD_SQL. */
+export async function passportUnderLegalHold(db: DbLike, passportId: string): Promise<boolean> {
+  const row = await db.prepare(`SELECT ${PASSPORT_LEGAL_HOLD_SQL} AS held`).bind(passportId).first<{ held: number }>();
+  return row?.held === 1;
+}
+
+/** The error text the validator's abort carries (better-sqlite3 and D1 both name the column). */
+export const LEGAL_HOLD_ABORT_RE = /legal_holds\.hold_id/;
+
+/** Friendly pre-read: the same predicate. */
+export async function legalHoldBlockingErasure(db: DbLike, accountId: string): Promise<boolean> {
+  const row = await db.prepare(`SELECT ${ERASURE_LEGAL_HOLD_SQL} AS held`).bind(accountId, accountId, accountId, accountId).first<{ held: number }>();
+  return row?.held === 1;
+}
+
+export class LegalHoldError extends Error {
+  override name = "LegalHoldError";
+  constructor(
+    message: string,
+    public readonly status: 400 | 404 | 409 = 400,
+  ) {
+    super(message);
+  }
+}
+
+/** Open a hold (+ one `legal_hold:open` audit row, one batch). Returns the hold id. */
+export async function openLegalHold(
+  db: DbLike,
+  input: { subjectKind: unknown; subjectId: unknown; reason: unknown; operator: string },
+  now: () => string = () => new Date().toISOString(),
+): Promise<string> {
+  const kind = input.subjectKind;
+  if (typeof kind !== "string" || !(LEGAL_HOLD_SUBJECT_KINDS as readonly string[]).includes(kind)) throw new LegalHoldError("subject_kind must be account, passport or report_item");
+  const subject = typeof input.subjectId === "string" ? input.subjectId.trim() : "";
+  if (!subject || subject.length > 200) throw new LegalHoldError("subject_id is required (1 to 200 characters)");
+  const reason = typeof input.reason === "string" ? input.reason.trim() : "";
+  if (!reason || reason.length > 500) throw new LegalHoldError("a reason of 1 to 500 characters is required");
+  const ts = now();
+  const holdId = mintId("lgh");
+  await db.batch([
+    db
+      .prepare("INSERT INTO legal_holds (hold_id, subject_kind, subject_id, reason, opened_by, opened_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .bind(holdId, kind, subject, reason, input.operator, ts),
+    auditStmt(db, input.operator, "legal_hold:open", null, `${holdId} ${kind}`, ts),
+  ]);
+  return holdId;
+}
+
+/** Release an open hold (+ one `legal_hold:release` audit row, one batch). 404 unknown, 409 already released. */
+export async function releaseLegalHold(db: DbLike, holdId: string, operator: string, now: () => string = () => new Date().toISOString()): Promise<void> {
+  const row = await db.prepare("SELECT 1 AS x FROM legal_holds WHERE hold_id = ?").bind(holdId).first<{ x: number }>();
+  if (!row) throw new LegalHoldError("no such legal hold", 404);
+  const ts = now();
+  // The audit row is written only when the guarded UPDATE changed the row (auditStmtAfterWrite), so a release that
+  // lost a race writes nothing; the re-read then names the outcome.
+  await db.batch([
+    db.prepare("UPDATE legal_holds SET released_at = ?, released_by = ? WHERE hold_id = ? AND released_at IS NULL").bind(ts, operator, holdId),
+    auditStmtAfterWrite(db, { actor: operator, action: "legal_hold:release", detail: holdId, at: ts, itemId: null }),
+  ]);
+  const after = await db.prepare("SELECT released_at, released_by FROM legal_holds WHERE hold_id = ?").bind(holdId).first<{ released_at: string | null; released_by: string | null }>();
+  if (after?.released_at !== ts || after.released_by !== operator) throw new LegalHoldError("this legal hold is already released", 409);
+}
+===== END FILE: services/trust-core/src/legal-holds.ts =====
+
+===== BEGIN FILE: services/trust-core/src/likeness.ts =====
+import type { DraftEvent } from "@dhwaja/schema";
+import type { DbLike, DbStatement } from "./db.js";
+import { appendEvents } from "./events.js";
+import { legalHoldOpenSql } from "./legal-holds.js";
+import { FACE_DATA_HOLD_SQL, faceDataHoldSql } from "./legal-hold-sql.js";
+import { logError } from "./log.js";
+import { numericSetting } from "./money-record-period.js";
+import { internalServiceCredential, LIKENESS_REVOKE_AUDIENCE, LIKENESS_REVOKED_AUDIENCE } from "./sessions.js";
+
+/**
+ * Likeness-AI studio — SFW AI art of a VERIFIED creator, made only with that
+ * creator's own standing consent.
+ *
+ * Consent-first + revocable + provenance:
+ *  - Consent is a creator-passkey-signed `likeness_consent_granted` event
+ *    (revoked by `likeness_consent_revoked`), derived from the log. No consent,
+ *    no job — checked at job time, so a revocation takes effect immediately for
+ *    all future jobs.
+ *  - Only a VERIFIED creator may run the studio (identity confirmed).
+ *  - Every job is SFW-gated twice: a cheap prompt pre-filter here AND the
+ *    generator's own moderation verdict (`safe`), which is authoritative ONCE A
+ *    GENERATOR IS WIRED — at HEAD `releases-routes.ts likenessGeneratorFromEnv`
+ *    is a fail-closed stub (`ok:false`), so no job produces output at all. A
+ *    `safe:false` verdict is audited (`likeness:generator_rejected`). A job
+ *    is stored with a provenance stamp (authorized_by = the consenting passport)
+ *    so an image can always be traced to the consent it ran under.
+ *  - The actual model is a PLUGGABLE seam (LikenessGenerator) — no bytes or
+ *    provider calls live here; tests inject a stub. This keeps the sensitive
+ *    generation behind an interface the trust core never itself implements.
+ */
+
+export class LikenessError extends Error {
+  override name = "LikenessError";
+  constructor(message: string, public readonly status: 400 | 403 | 404 | 503 = 400) {
+    super(message);
+  }
+}
+
+export interface LikenessGenerator {
+  // I3-0283: this used to be `{ passportId: string; prompt: string }`. passportId
+  // is the creator's permanent, KYC-linked identifier (claim_state === 'verified'
+  // is required to even reach this seam) — sending it to an external generation
+  // provider unminimized meant every provider request doubled as an identity
+  // disclosure the provider never needed to do its job. The provider needs
+  // something to key its own logs/callbacks on, not who the creator really is;
+  // the job id is already the thing `createLikenessJob` uses for that internally
+  // (provenance stays on `authorized_by` in `likeness_jobs`, never sent out).
+  (req: { jobId: string; prompt: string }): Promise<{ ok: boolean; safe: boolean; outputRef?: string; reason?: string }>;
+}
+
+// A deliberately conservative pre-filter. NOT the safety mechanism — the
+// generator's moderation is authoritative — just a cheap first gate so obviously
+// disallowed prompts never reach the model. Split so a minor-related hit can be
+// distinguished from a generic SFW hit (F-35): the matched GROUP is recorded as
+// a fixed enum label, never the prompt text.
+// I3-1859: the plurals were missed — `\bchild\b` does not match inside
+// "children" and `\bminor\b` does not match "minors" (no boundary before the
+// suffix), so the minor-related audit trail never fired for them.
+// D-0845(5): also teen/teenager/kid(s)/schoolgirl/schoolboy and an explicit
+// age under 18 ("16 years old", "16-year-old", "15yo", "15 y/o", "age 15",
+// "aged 15"). "young" alone is deliberately NOT a term (false positives).
+const MINOR_BLOCKED =
+  /\b(?:underage|minors?|child(?:ren|s)?|teens?|teenage[rd]?s?|kids?|school(?:girl|boy)s?)\b|\b(?:[1-9]|1[0-7])\s?(?:yo|y\/o|(?:-|\s)?(?:years?|yrs?)(?:-|\s)?old)\b|\baged?\s?(?:[1-9]|1[0-7])\b/i;
+const SFW_BLOCKED = /\b(nude|nudes|naked|nsfw|explicit|sexual|porn)\b/i;
+
+export async function consentActive(db: DbLike, passportId: string): Promise<boolean> {
+  const { results } = await db
+    .prepare("SELECT event_type FROM trust_events WHERE subject = ? AND event_type IN ('likeness_consent_granted','likeness_consent_revoked') ORDER BY seq ASC")
+    .bind(passportId)
+    .all<{ event_type: string }>();
+  let active = false;
+  for (const r of results) active = r.event_type === "likeness_consent_granted";
+  return active;
+}
+
+/** The only `output_ref` a job may store: a Dhwaja content hash (D-0858(13), I4-DR3). */
+export const LIKENESS_OUTPUT_REF = /^sha256:[0-9a-f]{64}$/;
+
+export interface LikenessJob {
+  job_id: string;
+  status: "queued" | "generating" | "done" | "rejected" | "failed";
+  reason: string | null;
+  output_ref: string | null;
+}
+
+/**
+ * Create + run a likeness job. Verified-creator + active-consent gated; SFW
+ * pre-filtered; then run through the injected generator. Returns the final job.
+ */
+export async function createLikenessJob(
+  db: DbLike,
+  passportId: string,
+  prompt: string,
+  generate: LikenessGenerator | null,
+  nowMs: number,
+  mintJobId: () => string,
+  now: () => string = () => new Date().toISOString(),
+): Promise<LikenessJob> {
+  if (!/^psp_[0-9a-f]{16}$/.test(passportId)) throw new LikenessError("bad passport id");
+  const p = await db
+    .prepare(
+      `SELECT claim_state, retracted,
+         EXISTS(SELECT 1 FROM request_suppressions s WHERE s.passport_id = passports.passport_id) AS suppressed
+       FROM passports WHERE passport_id = ?`,
+    )
+    .bind(passportId)
+    .first<{ claim_state: string; retracted: number; suppressed: number }>();
+  // I3-1062: retracted and suppressed both refuse the same way a nonexistent
+  // passport does — this gate re-spelled the standing check used elsewhere in
+  // the app (claim_state + retracted) without the suppression clause, so a
+  // creator who asked to be delisted could keep minting new likeness jobs.
+  if (!p || p.retracted === 1 || p.suppressed === 1) throw new LikenessError("no such passport", 404);
+  if (p.claim_state !== "verified") throw new LikenessError("the likeness studio requires a verified creator", 403);
+  if (!(await consentActive(db, passportId))) throw new LikenessError("no active likeness consent", 403);
+
+  const clean = prompt.trim();
+  if (!clean || clean.length > 1000) throw new LikenessError("prompt out of range");
+  // I6-Q6 (I3-1726, Jason: "the studio stays off until then"): no generator configured (releases-routes.ts
+  // likenessGeneratorFromEnv -> null) refuses here, after the standing and consent checks and BEFORE the INSERT, so
+  // no likeness_jobs row (and no prompt) is stored while no vendor exists.
+  if (generate === null) throw new LikenessError("likeness_unavailable", 503);
+
+  const jobId = mintJobId();
+  const ts = now();
+  await db.prepare("INSERT INTO likeness_jobs (job_id, passport_id, prompt, status, authorized_by, created_at, updated_at) VALUES (?, ?, ?, 'queued', ?, ?, ?)").bind(jobId, passportId, clean, passportId, ts, ts).run();
+
+  // Pre-filter: obviously disallowed prompt → rejected, never sent to the model.
+  // Minor-related hits get their own audit trail (F-35) — a system-actor
+  // audit_log line naming the passport and the fixed label, never the prompt.
+  if (MINOR_BLOCKED.test(clean)) {
+    await db
+      .prepare("INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) VALUES ('system', 'likeness:prefilter_minor_related', ?, ?, ?, 'system')")
+      .bind(passportId, now(), jobId)
+      .run();
+    return finish(db, jobId, "rejected", "prompt failed the SFW pre-filter (minor-related)", null, now);
+  }
+  if (SFW_BLOCKED.test(clean)) {
+    return finish(db, jobId, "rejected", "prompt failed the SFW pre-filter", null, now);
+  }
+
+  await db.prepare("UPDATE likeness_jobs SET status = 'generating', updated_at = ? WHERE job_id = ?").bind(now(), jobId).run();
+  let res: Awaited<ReturnType<LikenessGenerator>>;
+  try {
+    res = await generate({ jobId, prompt: clean });
+  } catch {
+    return finish(db, jobId, "failed", "generator error", null, now);
+  }
+  if (!res.safe) {
+    // I3-1859: the authoritative layer's refusal leaves the same kind of record the
+    // pre-filter's minor hit does — the passport and a fixed label, never the prompt.
+    await db
+      .prepare("INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) VALUES ('system', 'likeness:generator_rejected', ?, ?, ?, 'system')")
+      .bind(passportId, now(), jobId)
+      .run();
+    return finish(db, jobId, "rejected", res.reason ?? "generator flagged the result as unsafe", null, now);
+  }
+  if (!res.ok || !res.outputRef) return finish(db, jobId, "failed", res.reason ?? "generation failed", null, now);
+  // I3-0851: output_ref is a Dhwaja content hash or nothing — a vendor URL or any other string is never stored.
+  if (typeof res.outputRef !== "string" || !LIKENESS_OUTPUT_REF.test(res.outputRef)) return finish(db, jobId, "failed", "generator output is not a Dhwaja content hash", null, now);
+  return finishDone(db, jobId, res.outputRef, now);
+}
+
+/** D-1111(3) (I34-FX1-CORE, I34-TERMS-01/02): the reason a job admitted before a likeness consent revoke ends with
+ * (DRAFT wording, REPORT ## JASON). */
+export const LIKENESS_CONSENT_WITHDRAWN_REASON = "likeness consent was withdrawn before the picture was finished";
+/** `consentActive`'s rule (the latest likeness consent event is a grant) over the job's own passport, as a SQL term. */
+const JOB_CONSENT_LIVE_SQL =
+  "(SELECT c.event_type FROM trust_events c WHERE c.subject = likeness_jobs.passport_id AND c.event_type IN ('likeness_consent_granted', 'likeness_consent_revoked') ORDER BY c.seq DESC LIMIT 1) = 'likeness_consent_granted'";
+
+/**
+ * D-1111(3) (I34-FX1-CORE, I34-TERMS-01/02): a generated picture is stored only if the creator's likeness consent is
+ * still live when the job is finished. Consent is checked at admission (createLikenessJob) and the generator is
+ * awaited after it, so a revoke can land in between; the statement that would write `done` re-asks consent itself, and
+ * a revoked job ends `failed` with `LIKENESS_CONSENT_WITHDRAWN_REASON` and no output_ref (one statement, so no revoke can
+ * land between the check and the write).
+ */
+async function finishDone(db: DbLike, jobId: string, outputRef: string, now: () => string): Promise<LikenessJob> {
+  const row = await db
+    .prepare(
+      `UPDATE likeness_jobs SET status = CASE WHEN ${JOB_CONSENT_LIVE_SQL} THEN 'done' ELSE 'failed' END,
+              reason = CASE WHEN ${JOB_CONSENT_LIVE_SQL} THEN NULL ELSE ? END,
+              output_ref = CASE WHEN ${JOB_CONSENT_LIVE_SQL} THEN ? ELSE NULL END,
+              updated_at = ?
+        WHERE job_id = ? RETURNING status, reason, output_ref`,
+    )
+    .bind(LIKENESS_CONSENT_WITHDRAWN_REASON, outputRef, now(), jobId)
+    .first<{ status: LikenessJob["status"]; reason: string | null; output_ref: string | null }>();
+  // No row: the job was removed while it generated, so no picture was stored and none is reported.
+  if (!row) return { job_id: jobId, status: "failed", reason: null, output_ref: null };
+  return { job_id: jobId, status: row.status, reason: row.reason, output_ref: row.output_ref };
+}
+
+/** I22-Q6 (I3-0859): accepted (`done`) prompts, and since D-1074(5) those of a job stuck `queued` or `generating`, are
+ * kept this many days (ops_settings; default 365 - default_pending_jason). */
+export const LIKENESS_PROMPT_RETENTION_DAYS_KEY = "likeness_prompt_retention_days";
+export const LIKENESS_PROMPT_RETENTION_DAYS_DEFAULT = 365;
+/** I22-Q6 (Jason: "rejected prompts 30 days"): fixed, not a setting. Since I29-Q4 (2026-10-21 answer: "treat failed
+ * like rejected: 30 days.") a `failed` job's prompt is kept this long too. */
+export const LIKENESS_REJECTED_PROMPT_RETENTION_DAYS = 30;
+/** I6-Q6: finished job rows are kept this many days once a vendor is configured (ops_settings; default 365 -
+ * default_pending_jason, set with the vendor choice I6-Q7). */
+export const LIKENESS_JOB_RETENTION_DAYS_KEY = "likeness_job_retention_days";
+export const LIKENESS_JOB_RETENTION_DAYS_DEFAULT = 365;
+/** D-1433(2) (I56, INV-089): a job still `generating` this many hours after its last update raises LIKENESS_JOB_STALE_MARKER
+ * (ops_settings; default 24 - DRAFT, an operational default, D-1434 Q6). An alarm, not a sweep: no row is moved. */
+export const LIKENESS_JOB_STALE_HOURS_KEY = "likeness_job_stale_hours";
+export const LIKENESS_JOB_STALE_HOURS_DEFAULT = 24;
+export const LIKENESS_JOB_STALE_MARKER = "LIKENESS_JOB_STALE";
+/** D-1037(8) / D-1046(1): a job whose passport an open legal hold names keeps its prompt and its row (both statements). */
+const PROMPT_HELD = legalHoldOpenSql("passport", "likeness_jobs.passport_id");
+/** Rows each statement of one `pruneLikenessPrompts` call touches at most. */
+export const LIKENESS_PRUNE_LIMIT = 500;
+
+/**
+ * I22-Q6 / I6-Q6: a `scheduled()` step (wired by I29-INT, INV-049). Blanks `prompt` ('' — the column is NOT NULL)
+ * on `done` jobs last updated before the prompt setting, on `queued` and `generating` jobs last updated before the same
+ * setting (D-1074(5): a job is generated inside the one call that queued it, so one still in either state that long was
+ * interrupted and its prompt goes too) and on `rejected` and `failed` jobs last updated more than 30 days ago (I29-Q4:
+ * a failed job's prompt goes like a rejected one's);
+ * the row, its status and its consent provenance (`authorized_by`) are kept. With `vendorConfigured` (scheduled()
+ * passes releases-routes.ts likenessVendorConfigured(env)) it also DELETES finished (`done`/`rejected`/`failed`) job
+ * rows last updated before the job setting; while no vendor exists no job row is deleted by age. Each statement is
+ * bounded (`job_id IN (SELECT ... LIMIT ?)`) on migration 0241's (status, updated_at) index.
+ * D-1433(2): it first counts `generating` jobs last updated before LIKENESS_JOB_STALE_HOURS_KEY and logs LIKENESS_JOB_STALE_MARKER
+ * when there are any (an alarm; the rows are left as they are).
+ */
+export async function pruneLikenessPrompts(db: DbLike, nowMs: number, vendorConfigured = false, limit: number = LIKENESS_PRUNE_LIMIT): Promise<{ blanked: number; deleted: number }> {
+  const ago = (days: number): string => new Date(nowMs - days * 86_400_000).toISOString();
+  const doneCut = ago(await numericSetting(db, LIKENESS_PROMPT_RETENTION_DAYS_KEY, LIKENESS_PROMPT_RETENTION_DAYS_DEFAULT, 1, 3650));
+  const rejectedCut = ago(LIKENESS_REJECTED_PROMPT_RETENTION_DAYS);
+  const blank = async (status: LikenessJob["status"], cut: string): Promise<number> =>
+    (
+      await db
+        .prepare(
+          `UPDATE likeness_jobs SET prompt = '' WHERE job_id IN (SELECT job_id FROM likeness_jobs WHERE status = ? AND updated_at < ? AND prompt <> '' AND NOT ${PROMPT_HELD} LIMIT ?)`,
+        )
+        .bind(status, cut, limit)
+        .run()
+    ).changes ?? 0;
+  // D-1433(2): the staleness alarm, before the prompt blanking (which does not touch updated_at) and the vendor gate.
+  const staleCut = new Date(nowMs - (await numericSetting(db, LIKENESS_JOB_STALE_HOURS_KEY, LIKENESS_JOB_STALE_HOURS_DEFAULT, 1, 8760)) * 3_600_000).toISOString();
+  const stale = (await db.prepare("SELECT COUNT(*) AS n FROM likeness_jobs WHERE status = 'generating' AND updated_at < ?").bind(staleCut).first<{ n: number }>())?.n ?? 0;
+  if (stale > 0) logError({ cid: "likeness-prune", hop: "cron", msg: "likeness_job_stale", marker: LIKENESS_JOB_STALE_MARKER, count: stale });
+  const blanked =
+    (await blank("done", doneCut)) + (await blank("failed", rejectedCut)) + (await blank("queued", doneCut)) + (await blank("generating", doneCut)) + (await blank("rejected", rejectedCut));
+  if (!vendorConfigured) return { blanked, deleted: 0 };
+  const jobCut = ago(await numericSetting(db, LIKENESS_JOB_RETENTION_DAYS_KEY, LIKENESS_JOB_RETENTION_DAYS_DEFAULT, 1, 3650));
+  const deleted =
+    (
+      await db
+        .prepare(
+          `DELETE FROM likeness_jobs WHERE job_id IN (SELECT job_id FROM likeness_jobs WHERE status IN ('done', 'rejected', 'failed') AND updated_at < ? AND NOT ${PROMPT_HELD} LIMIT ?)`,
+        )
+        .bind(jobCut, limit)
+        .run()
+    ).changes ?? 0;
+  return { blanked, deleted };
+}
+
+async function finish(db: DbLike, jobId: string, status: LikenessJob["status"], reason: string | null, outputRef: string | null, now: () => string): Promise<LikenessJob> {
+  await db.prepare("UPDATE likeness_jobs SET status = ?, reason = ?, output_ref = ?, updated_at = ? WHERE job_id = ?").bind(status, reason, outputRef, now(), jobId).run();
+  return { job_id: jobId, status, reason, output_ref: outputRef };
+}
+
+export async function listLikenessJobs(db: DbLike, passportId: string, limit = 50): Promise<LikenessJob[]> {
+  const capped = Math.max(1, Math.min(100, limit));
+  const { results } = await db
+    .prepare("SELECT job_id, status, reason, output_ref FROM likeness_jobs WHERE passport_id = ? ORDER BY created_at DESC LIMIT ?")
+    .bind(passportId, capped)
+    .all<LikenessJob>();
+  return results;
+}
+
+// ---------------------------------------------------------------------------
+// I3-0603 (D-0829 / D-0838(1)) — THE LIKENESS <-> IMAGE CONSENT MIRROR, this
+// service's half. Withdrawing likeness consent here withdraws the image
+// service's biometric consent, and the reverse. Each side keeps its own owed
+// row (`image_consent_revoke_outbox`, migration 0136 — the image side's is
+// `likeness_revoke_outbox`) written in the SAME batch as its local revoke,
+// clears it only on peer success bound to `gen` (INV-058), and drains it on a
+// sweep. A revoke that ARRIVES from the peer is recorded with NO owed row, so
+// the two never echo each other.
+// ---------------------------------------------------------------------------
+
+/** One audience PER DIRECTION, owned by @dhwaja/session (imported by both services). */
+export { LIKENESS_REVOKE_AUDIENCE, LIKENESS_REVOKED_AUDIENCE };
+
+/** The only originating service D-0838(1) admits for a `system` revoke. */
+export const LIKENESS_MIRROR_ACTOR_ID = "svc:image";
+
+/**
+ * The target of the image service's peer (`POST /internal/likeness-revoke`).
+ * Records `likeness_consent_revoked` as actor `system`, actor_id
+ * `svc:image`, payload `{origin: "image"}` (the originating service —
+ * packages/schema LIKENESS_REVOKE_ORIGINS), when consent is active; a passport
+ * with no active consent is a no-op success, so the image outbox's retry is
+ * idempotent. NEVER writes `image_consent_revoke_outbox`: this revoke came FROM
+ * the image service, and queuing the reverse call would echo it back.
+ * REVOKE ONLY — there is no system-actor grant (D-0838(1)).
+ */
+export async function revokeLikenessConsentAsSystem(
+  db: DbLike,
+  passportId: string,
+  now: () => string = () => new Date().toISOString(),
+): Promise<{ revoked: boolean }> {
+  if (!/^psp_[0-9a-f]{16}$/.test(passportId)) throw new LikenessError("bad passport id");
+  if (!(await consentActive(db, passportId))) return { revoked: false };
+  const draft: DraftEvent = { event_type: "likeness_consent_revoked", subject: passportId, actor_kind: "system", actor_id: LIKENESS_MIRROR_ACTOR_ID, payload: { origin: "image" } };
+  // Governed: `likeness_consent_revoked` is not on the general append path;
+  // this door is the one that proved the originating service (the internal
+  // credential is checked by its route).
+  await appendEvents(db, [draft], now, ["likeness_consent_revoked"], [], ["system"]);
+  return { revoked: true };
+}
+
+/**
+ * The owed rows for a creator-signed batch: one upsert per
+ * `likeness_consent_revoked` draft, for the signed-append call site to pass in
+ * `extraStatements` so the debt commits with the revoke or not at all. A
+ * repeat while one is owed bumps `gen`, so an in-flight success cannot clear
+ * the newer debt. Empty for a batch with no revoke.
+ */
+export function imageConsentOwedStatements(db: DbLike, drafts: readonly Pick<DraftEvent, "event_type" | "subject">[], ts: string): DbStatement[] {
+  const subjects = new Set(drafts.filter((d) => d.event_type === "likeness_consent_revoked").map((d) => d.subject));
+  return [...subjects].map((pid) =>
+    db
+      .prepare(`INSERT INTO image_consent_revoke_outbox (passport_id, queued_at) SELECT ?, ? WHERE NOT ${FACE_DATA_HOLD_SQL} ON CONFLICT(passport_id) DO UPDATE SET gen = gen + 1, queued_at = MAX(queued_at, excluded.queued_at)`) // I65-HOLD F1: not under a hold of either kind (faceRevokeOwedForDrafts owes it); I65-FX-FACE R4: queued_at is the newest owed instant
+      .bind(pid, ts, pid, pid),
+  );
+}
+
+/**
+ * The owed row for a GRANTED REMOVAL (I3-0212 / I16 #609i): one guarded upsert
+ * for a door that suppresses a passport on the subject's own request, so the
+ * image service's biometric revoke (`/internal/likeness-revoked` ->
+ * `revokeConsents`, which also erases the enrolments and their vectors) is owed
+ * in the SAME batch as the removal and drained by
+ * `drainImageConsentRevokeOutbox`. `guard` is an SQL boolean expression the
+ * caller binds (e.g. "this request is the one that flipped"), so a lost race
+ * owes nothing. Upsert bumps `gen` like the creator-signed door above.
+ */
+export function imageConsentOwedOnRemovalStatement(db: DbLike, passportId: string, ts: string, guard: string, guardBinds: readonly unknown[]): DbStatement {
+  return db
+    .prepare(`INSERT INTO image_consent_revoke_outbox (passport_id, queued_at) SELECT ?, ? WHERE (${guard}) AND NOT ${FACE_DATA_HOLD_SQL} ON CONFLICT(passport_id) DO UPDATE SET gen = gen + 1, queued_at = MAX(queued_at, excluded.queued_at)`) // I65-HOLD F1; I65-FX-FACE R4: queued_at is the newest owed instant
+    .bind(passportId, ts, ...guardBinds, passportId, passportId);
+}
+
+/** The image service's biometric-consent revoke for one passport. RESOLVES
+ * when the image service recorded it (or had nothing live); REJECTS otherwise. */
+export type ImageConsentRevokePeer = (passportId: string, owedAt?: string) => Promise<void>; // I65-FX-FACE R4: owedAt = the outbox row's queued_at
+
+/** Call the peer for one owed passport; delete the owed row only on success,
+ * bound to the `gen` read BEFORE the call (INV-058). Never throws. */
+export async function propagateImageConsentRevoke(
+  db: DbLike,
+  peer: ImageConsentRevokePeer,
+  passportId: string,
+  now: () => string = () => new Date().toISOString(),
+): Promise<boolean> {
+  let gen: number | undefined;
+  let owedAt: string | undefined; // I65-FX-FACE R4 (D-1575 (4a)): the instant the revoke was owed; the image side erases only data made at or before it
+  try {
+    const row = await db.prepare("SELECT gen, queued_at FROM image_consent_revoke_outbox WHERE passport_id = ?").bind(passportId).first<{ gen: number; queued_at: string | null }>();
+    gen = row?.gen;
+    owedAt = typeof row?.queued_at === "string" ? row.queued_at : undefined;
+  } catch {
+    gen = undefined;
+  }
+  let ok = false;
+  try {
+    await peer(passportId, owedAt);
+    ok = true;
+  } catch {
+    ok = false;
+  }
+  try {
+    if (ok && gen !== undefined) await db.prepare("DELETE FROM image_consent_revoke_outbox WHERE passport_id = ? AND gen = ?").bind(passportId, gen).run();
+    else if (!ok) await db.prepare("UPDATE image_consent_revoke_outbox SET attempts = attempts + 1, last_attempt_at = ? WHERE passport_id = ?").bind(now(), passportId).run();
+  } catch {
+    // Row left as it was: a re-sent success is idempotent, an uncounted failure is still retried.
+  }
+  return ok;
+}
+
+/** The sweep: least recently attempted first, at most `limit` (1..500) per
+ * run; `more` says rows remain for the next run. */
+export async function drainImageConsentRevokeOutbox(
+  db: DbLike,
+  peer: ImageConsentRevokePeer,
+  now: () => string = () => new Date().toISOString(),
+  limit = 50,
+): Promise<{ attempted: number; synced: number; more: boolean }> {
+  const cap = Math.max(1, Math.min(500, Math.floor(limit)));
+  const rows = (
+    await db
+      .prepare(`SELECT passport_id FROM image_consent_revoke_outbox WHERE NOT ${faceDataHoldSql("image_consent_revoke_outbox.passport_id")} ORDER BY COALESCE(last_attempt_at, '') ASC, passport_id ASC LIMIT ?`) // I65-HOLD (W0-24): a held row stays queued, unattempted
+      .bind(cap + 1)
+      .all<{ passport_id: string }>()
+  ).results;
+  const batch = rows.slice(0, cap);
+  let synced = 0;
+  for (const r of batch) if (await propagateImageConsentRevoke(db, peer, r.passport_id, now)) synced++;
+  return { attempted: batch.length, synced, more: rows.length > cap };
+}
+
+interface Fetcher {
+  fetch(input: string, init?: RequestInit): Promise<Response>;
+}
+
+/** The image service as an `ImageConsentRevokePeer`, over the `IMAGE_SERVICE`
+ * service binding face triage already uses (index.ts `Env`); null when it is
+ * not bound (no owed row should be written then). Resolves only on a 2xx from
+ * `POST /internal/likeness-revoked`. */
+export function imageConsentPeerFromEnv(env: Record<string, unknown>): ImageConsentRevokePeer | null {
+  const svc = env.IMAGE_SERVICE as Fetcher | undefined;
+  if (!svc || typeof svc.fetch !== "function") return null;
+  const secret = typeof env.SESSION_SECRET === "string" ? env.SESSION_SECRET : undefined;
+  return async (passportId: string, owedAt?: string): Promise<void> => {
+    const credential = await internalServiceCredential(secret, LIKENESS_REVOKED_AUDIENCE);
+    if (!credential) throw new Error("image consent revoke: session secret not configured");
+    const res = await svc.fetch("https://image.internal/internal/likeness-revoked", {
+      method: "POST",
+      headers: { "content-type": "application/json", "X-Internal-Auth": credential },
+      body: JSON.stringify(owedAt === undefined ? { passport_id: passportId } : { passport_id: passportId, owed_at: owedAt }), // I65-FX-FACE R4
+      signal: AbortSignal.timeout(5_000),
+      // D-0930(3) (I16-L14:10, landed by I16-L15): never follow a 3xx with X-Internal-Auth attached; a redirect is a non-2xx.
+      redirect: "manual",
+    });
+    if (res.status < 200 || res.status > 299) throw new Error(`image consent revoke: image answered ${res.status}`);
+  };
+}
+
+/**
+ * I65-HOLD F1 (D-1566, D-1569; D-1568 (4) "act recorded at once, face-data revoke owed and queued exactly once after
+ * release, check in trust-core"): the OWED marker a face-data door writes INSTEAD of its outbox row while
+ * FACE_DATA_HOLD_SQL holds (a hold on the passport or on its founder account), under the door's own `guard`, so exactly
+ * one of the outbox row (imageConsentOwedOnRemovalStatement, which asks NOT FACE_DATA_HOLD_SQL) and this marker lands.
+ * requests.ts sweepFaceRevokeOwed queues the revoke once no hold of either kind names the passport, then writes
+ * `face:revoke_done`. `door` names the door in the detail.
+ */
+export function faceRevokeOwedStatement(db: DbLike, passportId: string, ts: string, door: string, guard: string, guardBinds: readonly unknown[]): DbStatement {
+  return db
+    .prepare(`INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT 'system:face-hold', 'face:revoke_owed', ?, ?, ?, 'system' WHERE (${guard}) AND ${FACE_DATA_HOLD_SQL}`)
+    .bind(`${door}: face-data revoke kept under an open legal hold; owed on release`, ts, passportId, ...guardBinds, passportId, passportId);
+}
+
+/** I65-HOLD F1 (W0-5): the creator-signed consent withdrawal's OWED markers, one per `likeness_consent_revoked` draft,
+ * the twin of imageConsentOwedStatements (which writes no outbox row under a hold). */
+export function faceRevokeOwedForDrafts(db: DbLike, drafts: readonly Pick<DraftEvent, "event_type" | "subject">[], ts: string): DbStatement[] {
+  const subjects = new Set(drafts.filter((d) => d.event_type === "likeness_consent_revoked").map((d) => d.subject));
+  return [...subjects].map((pid) => faceRevokeOwedStatement(db, pid, ts, "consent withdrawal", "1 = 1", []));
+}
+
+/** I65-HOLD F1 (W0-5): true while a hold of either kind names the passport; the consent door's inline send asks it. */
+export async function faceDataHeld(db: DbLike, passportId: string): Promise<boolean> {
+  const r = await db.prepare(`SELECT 1 AS held WHERE ${FACE_DATA_HOLD_SQL}`).bind(passportId, passportId).first<{ held: number }>();
+  return r?.held === 1;
+}
+===== END FILE: services/trust-core/src/likeness.ts =====
+
+===== BEGIN FILE: services/trust-core/src/log.ts =====
+/**
+ * services/trust-core/src/log.ts
+ *
+ * PS-089, increment #1 (org/07-findings/S-034-batch/OBS/PLAN.md,
+ * "Increment #1, to build level"). The only file in this service that is
+ * allowed to call `console.error`/`console.log` directly — every other call
+ * site in `src/` goes through `logError`/`logInfo` here instead
+ * (enforced by test/log-no-raw-console.test.ts).
+ *
+ * WHY ALLOWLIST, NOT DENYLIST (SCOPE item #2 / INV-004):
+ * A denylist ("strip these known-bad fields") only stops the leaks someone
+ * thought of. An allowlist ("only these named fields ever leave this
+ * function") means a caller cannot widen what's loggable without editing
+ * THIS file — which is one small, reviewable surface per PR, rather than
+ * trusting every call site across the codebase to remember the denylist.
+ * There is no opt-out flag and no "trusted caller" bypass: every field not
+ * named below is dropped, unconditionally, before the line is written.
+ *
+ * WHAT THIS CANNOT FIX (documented, not solved — see PLAN.md lines 98-99):
+ * redact() filters structured field NAMES, never free text inside a value. A
+ * thrown `Error.message` can carry an interpolated passport id, account id or
+ * code (`` `no grant for ${passportId}` ``), so callers pass the error's CLASS
+ * as `err` — `e instanceof Error ? e.name : typeof e` — and never its message
+ * (#848/#857; scanned per file by test/i9-848-log-error-no-raw-message.test.ts).
+ * That rule is held at the call sites, not here: this logger cannot tell a
+ * class name from a message after the fact.
+ * This migration removed every raw identifier it found being passed as a
+ * *field* (see REPORT.md's flagged live leaks); it did not and cannot audit
+ * every `throw new Error(...)` in the tree for interpolated ids.
+ */
+
+import { noteOperatorAlarm } from "./operator-alarm.js";
+
+export type Hop = "http" | "queue" | "cron";
+
+export interface LogFields {
+  /** Correlation id — the one value that must be identical across all log
+   * lines for one HTTP request, one queue message, or one cron tick. */
+  cid: string;
+  hop: Hop;
+  /** Path TEMPLATE only, e.g. "/p/:id/requests" — NEVER the resolved path
+   * with a real id substituted in (that is the exact INV-004 oracle this
+   * logger exists to not reintroduce). */
+  route?: string;
+  /** A short, static, human-readable label for what happened — written by
+   * the developer at the call site, never built from user input or from a
+   * resolved identifier. */
+  msg: string;
+  /** The error's class name (`e instanceof Error ? e.name : typeof e`), never
+   * `Error.message` or a raw Error/object — a message may carry PII from a
+   * layer this file cannot see (see file header; #848/#857). */
+  err?: string;
+  status?: number;
+  duration_ms?: number;
+  [extra: string]: string | number | boolean | undefined;
+}
+
+/**
+ * THE ALLOWLIST. Every name here was reviewed while migrating the 87 call
+ * sites in the five PS-089 files and is a bounded, non-identifying value:
+ * a count, a duration, a status code, or a closed enum of a handful of known
+ * string values (e.g. `rail` is one of "stripe"/"crypto"/"apple"/"google").
+ * Nothing here identifies a PERSON (no account or passport id, no handle, no
+ * email, no IP, no free-text user content). Two INTERNAL ids are allowed by
+ * Jason's ruling (I7-Q7, D-1030): `spend_item_id` (the manual-claim ref a spend
+ * consumed) and `policy_id` (a reward policy) — an operator searches the log by
+ * them, and neither names a fan or a creator. Adding a field means adding it
+ * here, in a reviewed PR — that is the whole enforcement mechanism.
+ */
+export const ALLOWED_KEYS: ReadonlySet<string> = new Set([
+  "cid",
+  "hop",
+  "route",
+  "msg",
+  "err",
+  "status",
+  "duration_ms",
+  // bounded counters emitted by the sweep legs this increment migrates
+  "count",
+  "pending",
+  "scanned",
+  "failed",
+  "notified",
+  "markers",
+  "generated",
+  "notable",
+  "proof_warnings",
+  "transfers",
+  "stopped",
+  "spilled",
+  "quota",
+  "undeletable",
+  "opted_in",
+  "window_offset",
+  "unreadable_expiry",
+  "no_grant",
+  // I3-0257-b (I16-W07A): the other two VERIFICATION EXPIRY counters DEPLOY.md
+  // names (`verification-sweep.ts` VerificationSweepResult) — integers.
+  "expired",
+  "warned",
+  "seq",
+  "day",
+  "queue",
+  "marker",
+  "reason",
+  "churn",
+  // closed, small-cardinality enums — never a free-text or per-entity value
+  "rail",
+  "event_type",
+  "kind",
+  "arm",
+  // aggregate money amounts (not identifiers) — see REPORT.md's flagged
+  // leak: the identifiers that used to travel alongside these (accountId,
+  // externalTxnId) are deliberately NOT on this list and are dropped.
+  "grossCents",
+  "credits",
+  // bounded, truncated (MAX_STRING_LEN) diagnostic dump for ledger/checkpoint
+  // integrity events (seq numbers, hashes, structural reasons) — never a
+  // per-entity identifier; these events are about the LEDGER, not a person.
+  "detail",
+  // more bounded sweep counters (character-lapse, pack-odds, payout-run legs)
+  "opened",
+  "recovered",
+  "voided",
+  "in_grace",
+  "deferred",
+  "lapsed",
+  "refused",
+  "cap",
+  "subjects",
+  "paid",
+  "held",
+  "retry_truncated",
+  "deadline_abandoned",
+  "skipped_below_min",
+  "examined",
+  "wrapped",
+  "revoked_before_reserve",
+  // I15-W3L (H-W1-LOG, I15-W2E hand-off): the payout summary's two remaining
+  // COUNTS (`index.ts` `payoutSummaryFields`) — integers, never an identifier;
+  // redact() dropped both silently. test/i15-w3l-log-reconcile-holds.test.ts.
+  "stalled",
+  "reconcile_holds",
+  // I29-INT H1 (I29-PAYOUT H2c): the payout summary's connect_unfinished COUNT (an integer; index.ts payoutSummaryFields).
+  "connect_unfinished",
+  // I3-2066: `app.onError`'s stack FRAMES only (`at …` lines; the message line
+  // is dropped at the call site), truncated to MAX_STRING_LEN like any string.
+  // Frames name source locations, never a per-entity identifier.
+  "stack",
+  // I12-FX4 (f): the config-warning fields `logWarn` carries (cors.ts, oauth.ts,
+  // env-config.ts). `env_key` and `platform` and `stage` are closed enums named by
+  // the call site; `entry` / `configured` are an OPERATOR-SET env value (an origin
+  // or a resolver URL, truncated to MAX_STRING_LEN like any string), never a value
+  // taken from a request, a fan or a creator.
+  "env_key",
+  "platform",
+  "stage",
+  "event",
+  "entry",
+  "configured",
+  "using",
+  // I16-W02G (#812a, D-0920 option A): the analytics tick's marker lines
+  // (analytics-outbox.ts) moved here from raw console. `leg` is a closed enum
+  // (outbox|publish|erasure|request), `watermark` an outbox seq (a counter,
+  // never an identifier), `lagging`/`backlog_capped` booleans; the rest are
+  // per-tick row counts and one age in seconds.
+  "leg",
+  "watermark",
+  "lagging",
+  "sent",
+  "owed",
+  "dead",
+  "pruned",
+  "dead_pruned",
+  "drained",
+  "batches",
+  "backlog",
+  "backlog_capped",
+  "oldest_owed_age_s",
+  // I3-0465b (I19-L02 H-B, the I19-L01 hand-off): the analytics pre-build sweep's report
+  // (analytics-build.ts BuildSweepReport) logged as named fields — per-tick creator COUNTS,
+  // never an identifier. test/i19-l02-build-sweep-log-fields.test.ts.
+  "granted",
+  "written",
+  "dropped",
+  "unreached",
+  // I19-FXB (JN-B03 L02:4): the same report's two remaining per-tick creator COUNTS (BuildSweepReport `over_budget`:
+  // builds the cap refused and rotated behind; `resumed`: builds that landed part of their state and resume next tick).
+  "over_budget",
+  "resumed",
+  // I3-1516 b (I22): two operator-read fields the census (test/i22-platform-log-census.test.ts) found dropped at
+  // live call sites — `oldest` (rankings.ts topfans_erasure_backlog: the dirty-since instant of the oldest
+  // backlogged creator, an ISO time, no identity) and `spent` (index.ts tail_budget_carried: a subrequest count).
+  "oldest",
+  "spent",
+  // I7-Q7 (D-1030, I30-TOOLS): the two internal ids above — the manual-claim spend's ref and the reward policy.
+  "spend_item_id",
+  "policy_id",
+  // I30-INT hand-off: Q102 `held_window` (index.ts payoutSummaryFields: a closed enum, cursor_to_table_end |
+  // cursor_to_page_end) and Q974-B15 `face_erasure_more` (the creator face-erasure backlog flag, a boolean).
+  "held_window",
+  "face_erasure_more",
+  // Written by `redact` itself, never by a caller: how many fields it dropped (below).
+  "redacted_fields",
+]);
+
+/** Strings longer than this are truncated — a bound against an oversized
+ * `err` or `msg` turning one log line into an unbounded write. */
+const MAX_STRING_LEN = 200;
+
+/**
+ * Strip every field not on ALLOWED_KEYS. This is the ONLY function in the
+ * service allowed to decide what is loggable, and it is a pure allowlist
+ * filter: no caller-supplied bypass, no per-field opt-out, no "trusted"
+ * flag. A field a caller wants logged that is not here is silently dropped,
+ * never passed through.
+ */
+export function redact(f: LogFields): Record<string, string | number | boolean> {
+  const out: Record<string, string | number | boolean> = {};
+  // I3-1516 b (I22): THE DROP IS COUNTED ON THE LINE. Dropping stays unconditional (the allowlist is the
+  // control), but a field lost at a call site used to leave no trace; `redacted_fields` says how many were, so an
+  // operator reading the line knows it is incomplete. The count only — never a dropped NAME or value.
+  let dropped = 0;
+  for (const key of Object.keys(f)) {
+    if (key === "redacted_fields") continue;
+    if (!ALLOWED_KEYS.has(key)) {
+      dropped++;
+      continue;
+    }
+    const v = (f as Record<string, unknown>)[key];
+    if (v === undefined || v === null) continue;
+    if (typeof v === "string") {
+      out[key] = v.length > MAX_STRING_LEN ? v.slice(0, MAX_STRING_LEN) : v;
+    } else if (typeof v === "number" || typeof v === "boolean") {
+      out[key] = v;
+    }
+    // any other typeof (object, function, symbol) is silently dropped —
+    // the allowlist governs shape as well as name.
+  }
+  if (dropped > 0) out.redacted_fields = dropped;
+  if (typeof out.cid !== "string" || out.cid.length === 0) out.cid = "unknown";
+  if (typeof out.hop !== "string") out.hop = "http";
+  if (typeof out.msg !== "string") out.msg = "";
+  return out;
+}
+
+/** Structured, privacy-floored replacement for `console.error`. I21-Q27: a line carrying an alarm marker is also
+ * handed to the operator alarm (operator-alarm.ts), which buffers it and never throws into this caller. */
+export function logError(f: LogFields): void {
+  console.error(JSON.stringify(redact(f)));
+  noteOperatorAlarm(f);
+}
+
+/** Structured, privacy-floored replacement for `console.warn`. */
+export function logWarn(f: LogFields): void {
+  console.warn(JSON.stringify(redact(f)));
+}
+
+/** Structured, privacy-floored replacement for `console.log`. */
+export function logInfo(f: LogFields): void {
+  console.log(JSON.stringify(redact(f)));
+}
+===== END FILE: services/trust-core/src/log.ts =====
+
+===== BEGIN FILE: services/trust-core/src/mailer.ts =====
+/**
+ * Templated-mail seam for fan auth (M2) + the REAL Postmark adapter (M7).
+ * Distinct from email.ts (the Save-Creator alerts channel): this seam carries
+ * auth-critical mail (verify codes, sign-in OTPs, was-this-you notices) and
+ * outcome notices, keyed by an internal template name so call sites never
+ * learn a provider template id.
+ *
+ * FAIL CLOSED (invariant #6): absent/placeholder POSTMARK_TOKEN — or a token
+ * with no verified sender — leaves the mailer DISABLED. `send` returns false
+ * and the routes that depend on outbound mail 503; they never pretend-succeed.
+ * A security notice that cannot send is escalated to an operator audit line by
+ * the caller (fan-auth.ts), never silently dropped.
+ *
+ * Callers must NEVER log the address or the vars (codes are secrets). This
+ * module never logs the token, the recipient, or the template model either —
+ * a failed send logs the provider's HTTP status and nothing else.
+ *
+ * OFF THE RESPONSE PATH: M2's review found that a real provider makes send
+ * latency an account-existence oracle on the no-oracle OTP path. The fix — the
+ * `defer` parameter that rides `executionCtx.waitUntil` in index.ts, plus the
+ * equalized DB work in fan-auth.ts — is what makes wiring THIS adapter safe.
+ * Do not call `send` inline on a path that must not leak whether an address
+ * maps to an account.
+ */
+
+import { appOriginFromEnv, settingValue } from "./env-config.js";
+import { classifyPostmarkStatus, MAILER_CONFIG_ALERT_MARKER, postmarkConfigError, type EmailOutcome } from "./email.js";
+import { previousSessionSecrets } from "./sessions.js";
+import { logError } from "./log.js";
+import { stripUnsafeDisplayText } from "@dhwaja/schema";
+
+/** D-1004(2): the operator alert a Postmark CONFIGURATION refusal raises (email.ts postmarkConfigError); declared in email.ts, which the http rail shares. */
+export { MAILER_CONFIG_ALERT_MARKER };
+
+export interface Mailer {
+  /** Returns true when the provider accepted the message. `replyTo`, when
+   * given, sets the message's Reply-To (I3-0728); templates that promise a
+   * reply gate that promise on it being present. */
+  send(template: string, to: string, vars: Record<string, string>, replyTo?: string, opts?: MailOptions): Promise<boolean>;
+  /** JA-11: the same send, classified (email.ts EmailOutcome) — `permanent` only on Postmark ErrorCode 406 (D-1004(2), D-1005(a)). */
+  sendClassified?(template: string, to: string, vars: Record<string, string>, replyTo?: string, opts?: MailOptions): Promise<EmailOutcome>;
+}
+/** D-0996(3): per-message options. `listUnsubscribe` is an RFC 8058 one-click URL (unsubscribe.ts unsubscribeUrl); the
+ * Postmark adapter sends it as `List-Unsubscribe` + `List-Unsubscribe-Post` only when it is that exact shape. */
+export interface MailOptions {
+  listUnsubscribe?: string;
+}
+/** An https `/unsubscribe/uns_<32 hex>` URL and nothing else: the only value this rail puts in a header. */
+const ONE_CLICK_URL_RE = /^https:\/\/[a-z0-9.-]+(?::\d+)?(?:\/[A-Za-z0-9._~-]+)*\/unsubscribe\/uns_[0-9a-f]{32}$/i;
+
+/** Disabled mailer (no secret / dev default): every send reports failure so
+ * callers fail closed — a security notice that cannot send is escalated to an
+ * operator audit line by the caller, never silently dropped. */
+export const noopMailer: Mailer = {
+  send: async () => false,
+};
+
+const placeholder = (v: string | undefined): boolean => !v || String(v).trim() === "" || /TODO/i.test(v);
+
+/** F-45's POSTMARK half. The control is `mailerConfigured` (:333) — an unaligned sender
+ * yields the disabled mailer and the routes 503, exactly as a missing token does.
+ * `email.ts:174` states this half is this module's to add; `email.ts:137` is the twin
+ * predicate and is NOT exported, so this is a second copy by necessity. The guard that
+ * keeps the two from drifting is `postmark.test.ts`'s cross-door case table. */
+const SENDER_SHAPE_RE = /^[^\s@]+@([^\s@]+)$/;
+
+function senderAlignsWithOrigin(from: string, appOrigin: string | null): boolean {
+  const m = SENDER_SHAPE_RE.exec(from);
+  if (!m) return false;
+  if (!appOrigin) return true; // nothing to check the domain against
+  let host: string;
+  try {
+    host = new URL(appOrigin).host;
+  } catch {
+    return true; // unreachable given appOriginFromEnv's own shape check
+  }
+  const dom = (m[1] ?? "").toLowerCase();
+  const h = host.toLowerCase();
+  return dom === h || dom.endsWith(`.${h}`);
+}
+
+/**
+ * Internal template name → Postmark template ALIAS.
+ *
+ * WHERE THE TEMPLATES LIVE: the HTML bodies are kept in `ops/email/templates/`
+ * as the reviewable source of truth (mock 43; no images, no trackers, table
+ * layout), but Postmark renders from templates stored in the Postmark
+ * dashboard — the operator uploads each file under the alias below (alias =
+ * filename stem). The repo therefore ships the HTML *and* this alias map; the
+ * adapter sends `TemplateAlias` + `TemplateModel`, never raw HTML, so template
+ * copy can be corrected without a deploy.
+ *
+ * UNMAPPED NAMES DO NOT SEND. An unknown template name returns false (and the
+ * caller's audit path fires) rather than reaching the provider with a guessed
+ * alias.
+ */
+export const TEMPLATE_ALIASES: Readonly<Record<string, string>> = Object.freeze(Object.assign(Object.create(null) as Record<string, string>, {
+  // M2 fan auth — both code mails share the one `{{code}}` body (mock 43's
+  // fallback-code, including the load-bearing anti-phishing line).
+  "fan-otp-signin": "fallback-code",
+  "fan-email-verify": "fallback-code",
+  // I3-0215 (D-0920 A; I16-W09B H1, landed by I16-L10): the code mailed to the CURRENT verified address
+  // before a change of it starts (fan-auth.ts PURPOSE_SWAP).
+  "fan-email-swap": "fallback-code",
+  "fan-was-this-you": "was-this-you",
+  // D-0706 (QUEUE #180) — oidc.ts notifyProviderLinked: a second sign-in provider was
+  // auto-linked to the account; its owner is told at the addresses it held before.
+  "fan-provider-linked": "provider-linked",
+  // I3-1113 (I4-06-R5) — fan-auth.ts verifyFanEmail: a confirmed email change is told to the
+  // address it displaced (the one inbox that can say "that wasn't me").
+  "fan-email-replaced": "email-replaced",
+  // #934 (I16-W09B H2, landed by I16-L10) — fan-auth.ts removeFanEmail: the removed address is told it was removed.
+  "fan-email-removed": "email-removed",
+  // THE CREATOR'S WAY BACK IN (0043). Same `fallback-code` body as the two fan
+  // code mails — a six-digit code and the anti-phishing line — because it is the
+  // same act: prove you hold this inbox. It is mapped to an EXISTING, reviewed
+  // template rather than a new one precisely so this cannot ship as an alias
+  // with no body behind it, the way `report-outcome` did.
+  //
+  // Note what this code does NOT do, and why sharing the body is honest: it
+  // mints no session and grants nothing. It lets a locked-out creator FILE a
+  // recovery request with their identity attached, into the operator queue. A
+  // separate body would be worth authoring the day it does more than that.
+  "creator-recovery": "fallback-code",
+  // I3-0034 (I34-W3-PASSKEY H1, D-1110(8), D-1115(1)) — the code mailed to a creator's VERIFIED contact address before
+  // their FIRST passkey is added (passkeys.ts FIRST_PASSKEY_CODE_TEMPLATE, startPasskeyRegistration). Its OWN body
+  // (D-1122(1), the D-1063 precedent): fallback-code names four other acts and a fixed 10 minutes, and this code adds a
+  // passkey and lives PASSKEY_FIRST_CODE_MINUTES. Vars `{{code}}` and `{{lifetime}}` (creator-passkey-routes.ts
+  // firstPasskeyCodeDeps adds `lifetime` to the send); text DRAFT pending Jason; no link.
+  "creator-first-passkey": "creator-first-passkey",
+  // M27 — THE DEAD END, and the only mail on this path with its own body.
+  //
+  // `fileCreatorRecovery` sends it when a proven inbox matched no live passport.
+  // It gets a body rather than sharing `fallback-code` because it is the one
+  // place in this whole channel where the product is ALLOWED to say "nothing was
+  // filed": the public `POST /recovery/status` must answer `with_an_operator`
+  // for a dead end exactly as it does for an open case, or the ticket becomes
+  // the creator-contact oracle `startCreatorRecovery` spends its body refusing
+  // to be. A mail to an address whose code was just redeemed reaches only
+  // someone already holding that inbox, so the same sentence costs nothing
+  // there. It carries the tracking id and, deliberately, no link.
+  "creator-recovery-no-match": "recovery-no-match",
+  // S-013 (AS-001) — THE LAST THING A DELETED ACCOUNT SAYS.
+  //
+  // A store-rail subscription (App Store / Google Play) cannot be cancelled
+  // server-side, and after erasure the fan has no surface of ours left that
+  // names it — so the one remaining duty is to tell them where the switch is.
+  // It gets its OWN reviewed body (`ops/email/templates/account-delete-store-notice.html`)
+  // rather than sharing one: no existing body says this, and an alias with no
+  // body behind it is the `report-outcome` failure. The model is ONE variable,
+  // `{{store}}`, holding a store NAME ("the App Store", "Google Play", or "an
+  // app store" for the unknown rail) — no account id, no subscription id, no
+  // amount, no period end. The account it is about no longer exists.
+  "account_delete_store_notice": "account-delete-store-notice",
+  // I3-1927 (I4-13-R11) — THE LAST THING SAID, when there IS no store-rail
+  // notice: one mail after the erasure batch commits, to the address the
+  // account held. Model is EMPTY — the account it is about no longer exists.
+  "account_deleted": "account-deleted",
+  // I3-0858 (I16-W08A H4 / I16-L09 H2, landed by I16-L10) — admin.ts peerAuditDigest: another operator's
+  // audited actions, mailed to each operator (model vars `count`, `lines`).
+  "ops-peer-audit-digest": "ops-peer-audit-digest",
+  // I21-Q27 (I34-W3-PASSKEY, the I34-W2-ALARM hand-off) — operator-alarm.ts OPERATOR_ALARM_TEMPLATE, the Postmark
+  // fallback when the direct operator mail is not accepted. Its own body (operatorAlarmText's sentences, DRAFT for
+  // Jason): vars `marker`, `since_utc`, `count`; no link.
+  "ops-alarm": "ops-alarm",
+  // M3 report outcome (D-0960(7)). Body: ops/email/templates/report-outcome.html
+  // and .txt, the copy Jason approved as drafted (subject "An update on your
+  // report"). It renders {{platform}}, {{handle}} and, only when reports.ts minted
+  // a one-click token, {{unsubscribe_url}} (I23-Q10, D-1030 (a)): one plain link,
+  // the body's last line, to stop these emails. It states no outcome and names no
+  // one. See ops/email/README.md.
+  "report-outcome": "report-outcome",
+  // S7-4 — brand self-enrolment decision notices (slice 35's console routes).
+  // Sent only when the enroller gave a contact address (optional; DNS is the
+  // authorization, never the address) — see console.ts's approve/decline
+  // routes. `brand-enrol-approved` carries the claim-door sentence; the
+  // Postmark templates ship alongside the others in ops/email/templates/.
+  "brand-enrol-approved": "brand-enrol-approved",
+  // J-02 / D-0595. The INCUMBENT's notice when someone contests a brand they
+  // hold. Its own body, not an alias of the decline mail: nothing has been
+  // decided and nothing of theirs has changed, and a decline body would say the
+  // opposite of both. One variable, the incumbent's own host — INV-025's wording
+  // rule, as console.ts:236-249 and :115-121 state it: point only at the real
+  // account, never name the party contesting.
+  "brand_contest_opened": "brand-contest-opened",
+  "brand-enrol-declined": "brand-enrol-declined",
+  // S-022 (docket #36j) — THE INCUMBENT IS TOLD, in INV-025's wording: point
+  // only to the REAL account (theirs, the one that moved) and never name the
+  // fake. The model carries ONE var, `{{platform}}` — a bare platform word
+  // (e.g. "x"), never a handle, an id, or either passport. INV-003's no-oracle
+  // shape is why: naming the challenger here would turn a routine transfer
+  // into an intelligence channel about who now holds the account.
+  "account-transfer-notice": "account-transfer-notice",
+  // I39-OPS (D-1158 answer 4) — the incumbent's WARNING that a one-signature transfer is scheduled (console.ts
+  // scheduleSoloTransfer, sent through notifyIncumbentAccountTransferred). Vars `{{platform}}` and `{{due_utc}}`, the
+  // same no-oracle rule as the notice above: nothing about the destination or the challenger.
+  "account-transfer-scheduled": "account-transfer-scheduled",
+  // I39-OPS (D-1158 answer 6a) — every remaining operator is told the owner revoked an operator alone (console.ts
+  // notifyOperatorsOfBreakGlass). Vars `{{revoked}}` (the op id) and `{{when_utc}}`; no link.
+  "operator-break-glass-revoke": "operator-break-glass-revoke",
+  // I40-OPS (D-1154(2) I38-FX1-OPS, W0-DIG-01) — the owner of an address an operator LINKED to another as one person is
+  // told once (console.ts notifyLinkedOperatorAddress). Var `{{when_utc}}`; no link; nothing about the other address.
+  "operator-address-linked": "operator-address-linked",
+  // I41-NEWSLETTER (QUEUE #237, D-0384 double opt-in) — the signed-in fan's confirmation link for one creator's newsletter
+  // (newsletter.ts requestNewsletterSubscription). Vars `{{creator}}`, `{{confirm_url}}` and `{{unsubscribe_url}}`.
+  "newsletter-confirm": "newsletter-confirm",
+  // QUEUE #146 / D-0793 (B27-TAKEOVER hand-off H1) — the fan-account OWNER's
+  // notice that someone filed a takeover claim on their account
+  // (recovery.ts `notifyFanTakeoverClaim`). ONE var, `{{filed_utc}}`; nothing
+  // about the filer — no address, name, IP or device — because the owner of a
+  // contested account and the filer may be adversaries (INV-003's no-oracle shape).
+  "fan-takeover-claim": "fan-takeover-claim",
+  // I26-Q7 (Jason: "both a and b", D-1030) — the creator's no-link security notice on every push-device change
+  // (digest.ts notifyCreatorDeviceChanged): added, a removal requested and held for the owner, a removal completed.
+  // One var `{{when_utc}}` plus the section naming which; nothing about the device or the requester.
+  "creator-device-changed": "creator-device-changed",
+  // I26-Q7 (b) — the one-time code a creator with NO passkey types to confirm a held push-device removal
+  // (digest.ts holdCreatorPushRemoval). Its OWN body (D-1063): it lives CREATOR_PUSH_REMOVAL_HOLD_MS, not the
+  // shared code body's 10 minutes, and confirms one act the shared body never names. One var `{{code}}`;
+  // test/i30-fx5.test.ts holds the stated expiry to the hold's real lifetime.
+  "creator-device-code": "creator-device-code",
+  // WHAT USED TO BE HERE, and why it is not [D8]. Three more aliases —
+  // `notify-when-claimed`, `claim-welcome`, `weekly-digest` — were mapped here
+  // and shipped as reviewed HTML bodies, and NOTHING ever sent any of them; the
+  // repo's own docs recorded them as shipped. They were removed rather than
+  // wired, because each one's obstacle is upstream of the alias:
+  //   - `weekly-digest` duplicated a mail that ALREADY SHIPS. The S68 creator
+  //     roundup is delivered by `digest.ts` on the other rail entirely
+  //     (`EMAIL_API_*`, plain text, its own subject), so this was a second body
+  //     for a live feature, reachable by nothing.
+  //   - `claim-welcome` had no recipient. At the moment a claim completes,
+  //     Dhwaja holds no PROVEN address for that creator — `creator_contacts`
+  //     is filled by a separate, later opt-in ceremony — so the mail was not
+  //     unwired, it was unsendable.
+  //   - `notify-when-claimed` is the one with a real path (requesters are fans,
+  //     and a fan address in `fan_email` is verified), but it is an unsolicited
+  //     fan-mail surface: it needs a consent rule, an unsubscribe, and a cron
+  //     leg to drive it. That is a slice, not a wiring. It is written down in
+  //     ops/email/README.md as backlog instead of pre-shipped as an alias.
+  // The invariant that replaced them is in postmark.test.ts: the alias map and
+  // the template directory now have to CLOSE — every alias has a caller, and
+  // every body on disk has an alias.
+}));
+
+/** Postmark's templated-send endpoint. */
+const POSTMARK_URL = "https://api.postmarkapp.com/email/withTemplate";
+
+/** Hard ceiling on ONE provider call. A hung provider must never hold a
+ * response path (or a waitUntil task) open until the platform's subrequest
+ * budget fires — same convention as verify-fetch.ts / domain-claims.ts.
+ * There are deliberately NO retries anywhere: a timeout is a failure, and the
+ * caller's audit path owns it (retrying auth mail is an amplification vector). */
+export const MAIL_TIMEOUT_MS = 10_000;
+
+/** Longest value we will hand a template. Long enough for a URL, short enough
+ * that no var can inflate a message. */
+const VAR_MAX_LEN = 512;
+/** A var whose NAME ends in `url` is a link target, not display text. */
+const URL_VAR_RE = /(^|_)url$/;
+/** Link schemes a template may receive. `javascript:`/`data:` survive HTML
+ * escaping, so a link is guarded by ALLOWLIST, never by escaping. */
+const ALLOWED_LINK_SCHEMES = ["https:"];
+
+/**
+ * Server-side sanitation of one template value — the control `ops/email/README.md`
+ * documents. Two rules, chosen by var name:
+ *
+ *  - LINK vars (`*_url`): parsed and allowlisted to https, no embedded
+ *    credentials. Anything else → null (dropped). Escaping is NOT a defense
+ *    here: `javascript:alert(1)` contains no markup characters.
+ *  - every other var: markup-relevant characters are STRIPPED (the same rule
+ *    reports.ts already applies to operator-visible notes) rather than entity-
+ *    escaped, so the value is safe even in a raw `{{{var}}}` interpolation and
+ *    is never double-escaped inside a normal `{{var}}` one. Control characters
+ *    go too, and the value is clamped.
+ *
+ * Returns null when the value cannot be made safe; the caller DROPS the key, so
+ * the template renders it empty (fail closed) rather than rendering an attack.
+ */
+export function sanitizeTemplateVar(key: string, value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const clamped = value.slice(0, VAR_MAX_LEN);
+  if (URL_VAR_RE.test(key)) {
+    let u: URL;
+    try {
+      u = new URL(clamped);
+    } catch {
+      return null;
+    }
+    if (!ALLOWED_LINK_SCHEMES.includes(u.protocol)) return null;
+    if (u.username || u.password) return null;
+    return u.toString();
+  }
+  // #523a (I16): the control class is the shared display rule's (\p{Cc}\p{Cf}\p{Zl}\p{Zp},
+  // ZWJ/ZWNJ kept), DROPPED rather than refused — a hand-written C0 range let U+0085,
+  // U+2028/9 and the bidi overrides (U+202E) into a mail. Census: i7-523-control-class-census.
+  return stripUnsafeDisplayText(clamped.replace(/[<>&"'`\\]/g, ""), "");
+}
+
+/** Sanitize a whole TemplateModel. Unsafe values are dropped, not passed. */
+export function sanitizeTemplateModel(vars: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const key of Object.keys(vars ?? {})) {
+    const safe = sanitizeTemplateVar(key, (vars as Record<string, unknown>)[key]);
+    if (safe !== null) out[key] = safe;
+  }
+  return out;
+}
+
+export interface PostmarkOptions {
+  token: string;
+  from: string;
+  /** Postmark message stream; security mail must not ride a broadcast stream. */
+  stream?: string;
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * The real Postmark adapter. One POST per message, no retries here (callers
+ * are deferred + audited), open/link tracking OFF (a security mail must not
+ * carry a tracking pixel or a rewritten link).
+ */
+export function postmarkMailer(opts: PostmarkOptions): Mailer {
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  const stream = opts.stream && !placeholder(opts.stream) ? opts.stream : "outbound";
+  // JA-11 (I24-INT, MONEY H-1): ONE attempt, classified (email.ts EmailOutcome); `send` keeps its boolean meaning.
+  const attempt = async (template: string, to: string, vars: Record<string, string>, replyTo?: string, mailOpts?: MailOptions): Promise<EmailOutcome> => {
+      // hasOwnProperty + typeof: a template name like "constructor" must not
+      // resolve to something off Object.prototype and reach the provider.
+      const alias = Object.prototype.hasOwnProperty.call(TEMPLATE_ALIASES, template) ? TEMPLATE_ALIASES[template] : undefined;
+      if (typeof alias !== "string" || alias.length === 0) {
+        logError({ cid: "unknown", hop: "http", msg: "mailer_unmapped_template", kind: template }); // name only — never the address
+        return "transient";
+      }
+      if (typeof to !== "string" || to.length === 0 || to.length > 254 || !/^[^\s@,;]+@[^\s@,;]+$/.test(to)) return "transient";
+      // I3-0728: Reply-To is set only from a value the caller already resolved
+      // (e.g. supportEmailFromEnv); an absent/invalid one is simply omitted.
+      const safeReplyTo = typeof replyTo === "string" && /^[^\s@,;]+@[^\s@,;]+$/.test(replyTo) ? replyTo : undefined;
+      // Every value is sanitized HERE, at the one choke point, so no call site
+      // can forget (ops/email/README.md documents this as the control).
+      const model = sanitizeTemplateModel(vars);
+      // I3-0616 c (I22): A DROPPED VAR REFUSES THE SEND, AND SAYS SO. The drop is
+      // the right call for the value, but sending anyway delivered a mail with a
+      // blank where the code or link belonged and told nobody. The key COUNT and
+      // the alias are logged, never a value or a key name the caller chose.
+      const dropped = Object.keys(vars ?? {}).length - Object.keys(model).length;
+      if (dropped > 0) {
+        logError({ cid: "unknown", hop: "http", msg: "mailer_var_dropped", kind: alias, count: dropped });
+        return "transient";
+      }
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), MAIL_TIMEOUT_MS);
+      try {
+        const res = await fetchImpl(POSTMARK_URL, {
+          method: "POST",
+          headers: {
+            "X-Postmark-Server-Token": opts.token,
+            "content-type": "application/json",
+            accept: "application/json",
+          },
+          body: JSON.stringify({
+            From: opts.from,
+            To: to,
+            ...(safeReplyTo ? { ReplyTo: safeReplyTo } : {}),
+            TemplateAlias: alias,
+            TemplateModel: model,
+            // D-0996(3): RFC 8058 one-click, only for a well-formed one-click URL (a malformed one sends no header).
+            ...(typeof mailOpts?.listUnsubscribe === "string" && ONE_CLICK_URL_RE.test(mailOpts.listUnsubscribe)
+              ? { Headers: [{ Name: "List-Unsubscribe", Value: `<${mailOpts.listUnsubscribe}>` }, { Name: "List-Unsubscribe-Post", Value: "List-Unsubscribe=One-Click" }] }
+              : {}),
+            MessageStream: stream,
+            TrackOpens: false,
+            TrackLinks: "None",
+          }),
+          redirect: "manual", // never chase a redirect with the server token attached
+          signal: ctl.signal,
+        });
+        if (res.status >= 300 && res.status < 400) {
+          // manual mode surfaces a 3xx as a response instead of throwing; it
+          // must be checked BEFORE !res.ok and treated as the same failure
+          // the transport-error catch below already reaches.
+          logError({ cid: "unknown", hop: "http", msg: "mailer_postmark_unreachable", kind: alias });
+          return "transient";
+        }
+        if (!res.ok) {
+          // Status ONLY. The response body can echo the recipient and the
+          // token rides in the request headers; neither is ever logged.
+          // D-1004(2): Postmark's ErrorCode (a number) decides; the rest of the body is never read into a log.
+          const parsed = (await res.json().catch(() => null)) as { ErrorCode?: unknown } | null;
+          const code = typeof parsed?.ErrorCode === "number" ? parsed.ErrorCode : undefined;
+          logError({ cid: "unknown", hop: "http", msg: "mailer_postmark_rejected", kind: alias, status: res.status, ...(code === undefined ? {} : { code }) });
+          // A configuration fault (bad token, unconfirmed sender) is the operator's, and the operator alert is the marker
+          // line (DEPLOY.md "MAILER_CONFIG_ERROR"); it never touches the recipient's address.
+          if (postmarkConfigError(res.status, code)) logError({ cid: "unknown", hop: "http", msg: MAILER_CONFIG_ALERT_MARKER, marker: MAILER_CONFIG_ALERT_MARKER, kind: alias, status: res.status, ...(code === undefined ? {} : { code }) });
+          return classifyPostmarkStatus(res.status, code);
+        }
+        return "accepted";
+      } catch {
+        // Undelivered either way; nothing about the recipient is logged. OUR abort fired after the request was handed
+        // over -> "ambiguous" (never permanent); any other throw -> "transient" (email.ts httpEmailFromEnv, same rule).
+        logError({ cid: "unknown", hop: "http", msg: "mailer_postmark_unreachable", kind: alias });
+        return ctl.signal.aborted ? "ambiguous" : "transient";
+      } finally {
+        clearTimeout(timer);
+      }
+  };
+  return {
+    send: async (template: string, to: string, vars: Record<string, string>, replyTo?: string, mailOpts?: MailOptions): Promise<boolean> =>
+      (await attempt(template, to, vars, replyTo, mailOpts)) === "accepted",
+    sendClassified: attempt,
+  };
+}
+
+/**
+ * Build the mailer from env. POSTMARK_TOKEN or POSTMARK_FROM
+ * absent/placeholder → the noop (disabled) mailer; both present → the real
+ * Postmark adapter. The sender is required because Postmark rejects an
+ * unverified From: a token without one is a half-configured mail path, and
+ * that fails closed HERE (routes 503) rather than at send time. `fetchImpl` (absent: the global fetch) is the
+ * adapter's transport.
+ */
+export function mailerFromEnv(env: Record<string, unknown>, fetchImpl?: typeof fetch): Mailer {
+  if (!mailerConfigured(env)) return noopMailer;
+  // I63 C2 (I62-CC-13): each setting through settingValue (padding trimmed); mailerConfigured has refused an unset token or sender.
+  const stream = settingValue(env.POSTMARK_STREAM);
+  const m: Mailer & { suppressionKey?: string; previousSuppressionKeys?: readonly string[] } = postmarkMailer({
+    token: settingValue(env.POSTMARK_TOKEN) as string,
+    from: settingValue(env.POSTMARK_FROM) as string,
+    ...(stream !== null ? { stream } : {}),
+    ...(fetchImpl ? { fetchImpl } : {}), // D-1122(3): the scheduled tick hands its outFetch
+  });
+  // JA-11 (MONEY H-1): the deployment's suppression key rides the mailer, the same rule as email.ts httpEmailFromEnv.
+  const secret = env.SESSION_SECRET;
+  if (typeof secret === "string" && secret.length > 0) {
+    m.suppressionKey = secret;
+    // D-1003(3): retired keys are consulted on lookup only (email.ts suppressedAddressHashes).
+    m.previousSuppressionKeys = previousSessionSecrets(env);
+  }
+  return m;
+}
+
+/** True when outbound auth mail is configured at all — the routes' 503 gate.
+ * (Send-level failures are still possible and handled per-call.) */
+export function mailerConfigured(env: Record<string, unknown>): boolean {
+  if (settingValue(env.POSTMARK_TOKEN) === null) return false;
+  const from = settingValue(env.POSTMARK_FROM);
+  if (from === null) return false;
+  return senderAlignsWithOrigin(from, appOriginFromEnv(env));
+}
+===== END FILE: services/trust-core/src/mailer.ts =====
+
+===== BEGIN FILE: services/trust-core/src/manual-claims.ts =====
+import { sha256Hex } from "@dhwaja/canonical";
+import { accountIsShielded, creatorMinAge, newCode, passportPublicState, resolveClaimAccountKey } from "./claims.js";
+import type { DbLike } from "./db.js";
+import { currentCreatorEpoch } from "./creator-session.js";
+import { mintId } from "./ids.js";
+import { verificationTarget } from "./verify-fetch.js";
+
+/**
+ * MANUAL CLAIM (H9) — the claim path for platforms with no fetchable public
+ * profile and no OAuth: Instagram, TikTok, OnlyFans (and X, as a fallback beside
+ * its OAuth). Bio-code claiming needs a public profile to fetch; these are
+ * login-walled or fenced, so `verifyClaim` could only ever answer `manual` and
+ * the console copy pointed at an intake that did not exist. The wedge platforms
+ * — exactly the ones impersonation targets most — had no working claim path at
+ * all.
+ *
+ * THE DESIGN, and what makes it safe. The creator still posts a Dhwaja bio code
+ * on the account they claim; the difference is only WHO reads it. Instead of an
+ * outbound fetch, this enqueues an ordinary `claim` review item carrying the
+ * code and the profile URL, and an OPERATOR opens the profile, confirms the code
+ * is present, and approves — at which point the existing `review.ts approveItem`
+ * writes `claim_proven` (method `manual_review`), exactly as it does for any
+ * operator-adjudicated claim. The trust model is unchanged from the bio-code
+ * path: only someone who controls the account can place the code where the
+ * operator will find it, so a stranger's request for a victim's real handle is
+ * rejected at review (the victim never posted the code).
+ *
+ * Because approval is asynchronous, the creator keeps a `claim_ref` bearer token
+ * and later polls `POST /claim/manual/status` with it; once the passport is
+ * claimed, that endpoint mints the creator session the bio-code path mints
+ * inline. Only a SHA-256 of the ref is stored (in the review payload), so a D1
+ * read never yields a session-minting token.
+ *
+ * SCOPE. This is the initial claim (unclaimed → claimed). A manual account proof
+ * ON AN ALREADY-CLAIMED passport (the S101 case for a no-fetch platform) is a
+ * separate, smaller follow-on and is not built here.
+ *
+ * IT NOW SERVES GENERIC (Tier-2) LINKS TOO. `LINK_BIO_VERIFIABLE_HOSTS` gates
+ * bio-code proof on a `link` to hosts a human has reviewed as owner-authored,
+ * and that list ships EMPTY — because a substring match on an uncurated page is
+ * not a proof of control, it is a proof that SOMEBODY typed ten characters
+ * there. Without this door that gate would leave a link with no claim path at
+ * all, which is a worse product outcome than the bug: a listed creator who
+ * cannot claim their own listing. The operator opens the page and looks, exactly
+ * as they do for Instagram — which is strictly more trustworthy than the fetch
+ * ever was, since a person can tell a bio from a comment thread.
+ */
+
+/** THE ONE PLACE A `claim_ref` IS HASHED. `manual-claims.ts` is the allowed
+ * `sha256Hex` importer for the claim-ref lookup key (tests/invariants/single-hasher);
+ * every other door that mints a claim_ref of this shape (domain review, S-007)
+ * derives the stored hash through here, so the key can never diverge. */
+export async function claimRefHashOf(claimRef: string): Promise<string> {
+  return sha256Hex(claimRef);
+}
+
+export class ManualClaimError extends Error {
+  override name = "ManualClaimError";
+  constructor(
+    message: string,
+    public readonly status: 400 | 404 | 409 | 429 = 400,
+  ) {
+    super(message);
+  }
+}
+
+interface AccountRow {
+  account_key: string;
+  passport_id: string;
+  platform: string;
+  id_kind: string;
+  id: string;
+  status: string;
+  claim_state: string;
+  retracted: number;
+}
+
+/** How many open manual-claim requests one passport may have at once — a
+ * backstop against a stranger flooding the review queue with requests against a
+ * victim's passport. Low: a legitimate creator needs one at a time. */
+export const MAX_OPEN_MANUAL_CLAIMS_PER_PASSPORT = 3;
+/** Total manual-claim attempts (open OR closed) one passport may accrue in a
+ * rolling window. The open cap alone bounds only instantaneous queue DEPTH — a
+ * rejected item stops counting, so without this an attacker could file, get
+ * rejected, and refile forever, spending an operator's time on each. This bounds
+ * sustained operator cost per passport (adversarial review, MODERATE). */
+export const MAX_MANUAL_CLAIMS_PER_PASSPORT_WINDOW = 10;
+export const MANUAL_CLAIM_WINDOW_MS = 24 * 60 * 60 * 1000;
+/** I-06 (adversarial review, MEDIUM): both caps above are per-PASSPORT, and the
+ * door is anonymous (no session, both inputs anonymously discoverable), so a
+ * single caller alone can spend the WHOLE shared budget — 3 opens shut the
+ * queue for everyone, 10 in a day locks the passport for 24h regardless of who
+ * else shows up. Every sibling anonymous-door cap in this codebase (see
+ * brand-enrolment.ts's callerPrefix comment, claim-routes.ts startDomainClaim)
+ * keys its throttle on (subject, caller) for exactly this reason; this door
+ * didn't. These sub-caps bound any ONE caller's share of the shared passport
+ * budget without lowering it. A caller with no resolvable prefix is REFUSED
+ * (I38-MANCLAIM, `requestManualClaim`'s first statement): pooled on the plain
+ * per-passport caps, one such caller filled them alone. Sub-caps bound one
+ * caller's share only; the after-rejection hold is per caller too (see the
+ * guarded INSERT). */
+export const MAX_OPEN_MANUAL_CLAIMS_PER_PASSPORT_PER_CALLER = 1;
+export const MAX_MANUAL_CLAIMS_PER_PASSPORT_WINDOW_PER_CALLER = 4;
+
+/** I38-MANCLAIM: the refusal a caller with no resolvable prefix gets (DRAFT copy, REPORT.md ## JASON). */
+export const MANUAL_CLAIM_NO_CALLER = "a manual claim cannot be started from this connection";
+/** I38-MANCLAIM: the audit action every refused manual claim writes (item_id = passport, detail = {reason, caller}). */
+export const MANUAL_CLAIM_REFUSED_ACTION = "claim:manual_refused";
+export type ManualClaimRefusal = "no_caller_prefix" | "shared_open" | "caller_open" | "caller_rejected_hold" | "shared_window" | "caller_window";
+
+async function recordManualClaimRefusal(db: DbLike, passportId: string, reason: ManualClaimRefusal, caller: string | null | undefined, ts: string): Promise<void> {
+  const audit = db
+    .prepare("INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) VALUES ('system', ?, ?, ?, ?, 'system')")
+    .bind(MANUAL_CLAIM_REFUSED_ACTION, JSON.stringify({ reason, caller: caller ?? null }), ts, passportId);
+  if (reason !== "shared_open" && reason !== "shared_window") {
+    await db.batch([audit]);
+    return;
+  }
+  // The shared per-passport cap refused: flag the passport's open manual-claim items (the item view renders the payload).
+  await db.batch([
+    audit,
+    db
+      .prepare(
+        "UPDATE review_queue SET payload = json_set(payload, '$.cap_full_at', ?, '$.cap_full_reason', ?) WHERE subject = ? AND item_type = 'claim' AND state = 'open' AND json_extract(payload, '$.source') = 'manual_claim'",
+      )
+      .bind(ts, reason, passportId),
+  ]);
+}
+
+/**
+ * THE PHANTOM'S ACCOUNT ROW, DERIVED FROM THE CALLER'S OWN BYTES AND NOTHING
+ * ELSE — the local twin of `claims.ts:515` (not imported: that one is private to
+ * `claims.ts`, and this room's ownership list is this file alone). Every field
+ * comes from the `(passport_id, account_key)` this request carried, so the row —
+ * and the `handle`/`platform` the answer and the review payload compose from it
+ * — cannot carry back one bit that did not go out. Key grammar is
+ * `v1|platform|id_kind|id`.
+ */
+function phantomAccountFor(passportId: string, accountKey: string): AccountRow {
+  const parts = accountKey.split("|");
+  return {
+    account_key: accountKey,
+    passport_id: passportId,
+    platform: parts[1] ?? "",
+    id_kind: parts[2] ?? "handle",
+    id: parts[3] ?? "",
+    status: "active",
+    claim_state: "unclaimed",
+    retracted: 0,
+  };
+}
+
+export interface ManualClaimStartResult {
+  review_item_id: string;
+  /** The code the creator must place in the account's public bio/profile. */
+  code: string;
+  /** The profile the operator (and the creator) should see the code on. */
+  handle: string;
+  platform: string;
+  /** Bearer token the creator keeps to poll for the session after approval. */
+  claim_ref: string;
+}
+
+/**
+ * Begin a manual claim. Anonymous + proof-authorized like the bio-code start
+ * (an unclaimed creator has no session), rate-limited per IP at the route.
+ * Requires: the account is on the passport, active, the passport is unclaimed,
+ * and the platform has no bio-code auto-verify (else the working automatic path
+ * should be used instead of loading the operator queue).
+ */
+export async function requestManualClaim(
+  db: DbLike,
+  passportId: string,
+  rawAccountKey: string,
+  now: () => string = () => new Date().toISOString(),
+  nowMs: number = Date.now(),
+  // I-06: the route's callerPrefix(c). I38-MANCLAIM: null (unresolvable) is refused below; undefined (no HTTP caller —
+  // an in-process call; claim-routes.ts always passes one) keeps the plain per-passport caps.
+  callerPrefix?: string | null,
+): Promise<ManualClaimStartResult> {
+  if (callerPrefix === null) {
+    await recordManualClaimRefusal(db, passportId, "no_caller_prefix", null, now());
+    throw new ManualClaimError(MANUAL_CLAIM_NO_CALLER, 429);
+  }
+  // M39: the console feeds a HAND-TYPED account key here (same free-text field as
+  // the bio-code path), so fold it to canonical before lookup. M-03: that same
+  // field now also accepts a profile URL — resolveClaimAccountKey resolves it
+  // through the one canonicalizer, or throws AccountKeyFormatError, which the
+  // route (claim-routes.ts) maps to a 400 naming the accepted shapes.
+  const accountKey = resolveClaimAccountKey(rawAccountKey);
+  const acct = await db
+    .prepare(
+      `SELECT a.account_key, a.passport_id, a.platform, a.id_kind, a.id, a.status, p.claim_state, p.retracted
+       FROM passport_accounts a JOIN passports p ON p.passport_id = a.passport_id
+       WHERE a.account_key = ? AND a.passport_id = ?`,
+    )
+    .bind(accountKey, passportId)
+    .first<AccountRow>();
+  // INV-003 SHADOW BRANCH — the same shape `claims.ts startClaim` (:449) landed
+  // for the bio-code door, applied to this one. For the population the public
+  // surface does not acknowledge at all — passport absent, `retracted != 0`, or
+  // suppressed — this door must answer exactly as it answers for a passport
+  // that was never written, and the only answer a nonexistent passport can give
+  // without admitting anything is the one an admissible account gets. So no
+  // distinguishing `ManualClaimError` is thrown here: every key is enqueued.
+  // REAL where the account is genuinely on the roster, unshielded, active,
+  // unclaimed, of an admissible `id_kind` and has NO `verificationTarget`;
+  // PHANTOM otherwise, bound to the CALLER-SUPPLIED (passport_id, account_key).
+  //
+  // THE PHANTOM IS A REAL `review_queue` ROW, never a decoy id. It falls through
+  // to the same guarded INSERT below, so the `claim_ref` it hands back answers
+  // `pending` at `POST /claim/manual/status` exactly as a genuine one does. A
+  // decoy ref would answer `404 no such claim` there — the same oracle moved one
+  // door downstream.
+  //
+  // BOTH READS RUN UNCONDITIONALLY. The line this replaced was
+  // `if (!acct || await accountIsShielded(...))`, which SHORT-CIRCUITS: the
+  // shield read (`SELECT trust_events`) ran when the account existed and not
+  // when it did not, so the two worlds differed in D1 statement SEQUENCE even
+  // where every status matched.
+  const pub = await passportPublicState(db, passportId);
+  let row = acct;
+  if (!pub.acknowledged) {
+    const shielded = await accountIsShielded(db, passportId, accountKey);
+    const admissible =
+      !!acct &&
+      !shielded &&
+      acct.retracted === 0 &&
+      acct.status === "active" &&
+      acct.claim_state === "unclaimed" &&
+      (acct.id_kind === "handle" || acct.id_kind === "pid" || acct.id_kind === "url") &&
+      verificationTarget(acct.platform, acct.id_kind as "handle" | "pid" | "url", acct.id) === null;
+    row = admissible ? (acct as AccountRow) : phantomAccountFor(passportId, accountKey);
+  } else {
+    if (pub.claimed) throw new ManualClaimError("passport already claimed", 409);
+    if (!acct || (await accountIsShielded(db, passportId, accountKey))) throw new ManualClaimError("no such account on that passport", 404);
+    if (acct.retracted === 1) throw new ManualClaimError("passport retracted", 409);
+    if (acct.status !== "active") throw new ManualClaimError("account not active", 409);
+    if (acct.claim_state !== "unclaimed") throw new ManualClaimError("passport already claimed", 409);
+  // `url` is the generic M3 `link` account. It belongs here for the reason in
+  // the module header: with `LINK_BIO_VERIFIABLE_HOSTS` empty, a link has no
+  // automatic path, and refusing it here would leave it with no path at all.
+  // `domain` is still excluded — it proves control through DNS
+  // (`/claim/domain/*`), which is an automatic path that works.
+    if (acct.id_kind !== "handle" && acct.id_kind !== "pid" && acct.id_kind !== "url") {
+      throw new ManualClaimError("manual claim is for a handle, pid or link account", 409);
+    }
+    // Only for accounts that CAN'T be auto-verified — a fetchable profile (a
+    // Tier-1 `publicProfile`, or a link on a reviewed host) has the automatic
+    // bio-code path and must not be routed through a human.
+    if (verificationTarget(acct.platform, acct.id_kind as "handle" | "pid" | "url", acct.id) !== null) {
+      throw new ManualClaimError("this account can be claimed automatically with a bio code — no manual review needed", 409);
+    }
+    row = acct;
+  }
+
+  const code = newCode();
+  const claimRef = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
+  const claimRefHash = await claimRefHashOf(claimRef);
+  const payloadJson = JSON.stringify({
+    source: "manual_claim",
+    method: "manual_review",
+    platform: row.platform,
+    // For a `link` this is the case-preserved URL norm rather than an @handle;
+    // the operator opens `https://<handle>` and looks for the code there.
+    handle: row.id,
+    account_key: row.account_key,
+    // The operator confirms THIS code is live on the profile before approving.
+    code,
+    // Only the hash is stored; the plaintext ref is returned once, to the caller.
+    claim_ref_hash: claimRefHash,
+    // PS-014: carried into the review payload (it was already loaded off
+    // `acct` above, just not recorded) so the operator reviewing this item can
+    // see whether the claim is against a persistent platform pid or a
+    // human-recyclable handle.
+    id_kind: row.id_kind,
+    // I-06: the masked caller this admission came from, for the per-(passport,
+    // caller) sub-caps below. Never a real IP — callerPrefix() truncates it.
+    caller: callerPrefix,
+  });
+
+  // -------------------------------------------------------------------------
+  // BOTH CAPS LIVE INSIDE THE INSERT. THIS ROUTE IS ANONYMOUS.
+  // -------------------------------------------------------------------------
+  // They were `SELECT COUNT(*)` → compare → an unconditional `enqueue`, and
+  // `review_queue` carries no uniqueness that would serialise them. `POST
+  // /claim/manual/start` needs no session (an unclaimed creator has none) and
+  // both its inputs are anonymously discoverable, so K concurrent requests
+  // NAMING ONE VICTIM all read the same zero and all enqueue: the ceiling was
+  // the width of the burst, not the constant. What that buys an attacker is an
+  // operator's attention — the scarcest per-victim resource this product has —
+  // and a queue full of noise around the one real claim.
+  //
+  // The fix is `recovery.ts`'s idiom, for the same reason it was adopted there:
+  // the guard is the statement. Both counts are re-evaluated INSIDE the INSERT,
+  // the audit line is guarded so it cannot outlive the item it describes, and
+  // the two land in one atomic batch. Admission is then read back by primary key
+  // rather than from a rowcount, because a D1 batch result carries no portable
+  // `changes`.
+  //
+  // This is also why the enqueue is written out here instead of calling
+  // `review.ts enqueue`: that helper's INSERT is unconditional by design (every
+  // other caller is operator- or session-gated and wants it that way), and a
+  // guard bolted on outside it is exactly the check-then-act being removed.
+  const reviewId = mintId("itm");
+  const ts = now();
+  const windowStart = new Date(nowMs - MANUAL_CLAIM_WINDOW_MS).toISOString();
+  const manualClaims = "FROM review_queue r WHERE r.subject = ? AND r.item_type = 'claim' AND json_extract(r.payload, '$.source') = 'manual_claim'";
+  // Backstop 1 bounds instantaneous queue DEPTH; backstop 2 bounds sustained
+  // operator cost, so a reject-then-refile loop cannot spend a person's time
+  // without bound. Both are per-PASSPORT (the victim), which is the whole point.
+  // I-06: when the caller is resolvable, two more sub-caps bound THAT caller's
+  // own share of the same passport's budget, so no single caller can spend the
+  // whole thing alone. `1=1` only for an in-process call with no caller
+  // (undefined); an unresolvable (null) caller never reaches this statement.
+  const callerClaims = `${manualClaims} AND json_extract(r.payload, '$.caller') = ?`;
+  // I38-MANCLAIM: the after-rejection hold is the REJECTED CALLER's: a caller with a manual claim on this passport
+  // rejected in the last 24h (by rejection time, `updated_at`) is held. I40-CLAIMS (D-1154(2) I38-FX1-CLAIMS): the
+  // shared 24h window counts every manual claim filed on the passport, rejected or not, for every caller, so a
+  // file-rejected-refile loop across rotating callers still stops at MAX_MANUAL_CLAIMS_PER_PASSPORT_WINDOW.
+  const callerUnderCaps =
+    callerPrefix === undefined
+      ? "1 = 1"
+      : `(SELECT COUNT(*) ${callerClaims} AND r.state = 'open') < ? AND (SELECT COUNT(*) ${callerClaims} AND r.created_at >= ?) < ? AND NOT EXISTS (SELECT 1 ${callerClaims} AND r.state = 'rejected' AND r.updated_at >= ?)`;
+  const sharedWindowCap = `(SELECT COUNT(*) ${manualClaims} AND r.created_at >= ?) < ?`;
+  const underCaps = `(SELECT COUNT(*) ${manualClaims} AND r.state = 'open') < ? AND ${sharedWindowCap} AND ${callerUnderCaps}`;
+  const capBindings = [
+    passportId,
+    MAX_OPEN_MANUAL_CLAIMS_PER_PASSPORT,
+    passportId,
+    windowStart,
+    MAX_MANUAL_CLAIMS_PER_PASSPORT_WINDOW,
+    ...(callerPrefix === undefined
+      ? []
+      : [passportId, callerPrefix, MAX_OPEN_MANUAL_CLAIMS_PER_PASSPORT_PER_CALLER, passportId, callerPrefix, windowStart, MAX_MANUAL_CLAIMS_PER_PASSPORT_WINDOW_PER_CALLER, passportId, callerPrefix, windowStart]),
+  ];
+  await db.batch([
+    db
+      .prepare(
+        `INSERT INTO review_queue (item_id, item_type, state, subject, payload, created_at, updated_at, import_batch_id)
+         SELECT ?, 'claim', 'open', ?, ?, ?, ?, NULL WHERE ${underCaps}`,
+      )
+      .bind(reviewId, passportId, payloadJson, ts, ts, ...capBindings),
+    // The shape `review.ts auditStmt` writes, guarded so a refused claim leaves
+    // no audit line saying it was queued.
+    //
+    // The guard is THE ITEM'S OWN EXISTENCE, not a second copy of `underCaps`.
+    // Statements inside a batch run in order within the one transaction, so by
+    // the time this executes the insert above has already moved the counts — the
+    // claim that takes the LAST slot would find `open < cap` false and write no
+    // audit line at all. Keying off the row makes the two exactly consistent
+    // whichever way the counts land.
+    db
+      .prepare(
+        `INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind)
+         SELECT 'system', 'enqueue:claim', ?, ?, ?, 'system' WHERE EXISTS (SELECT 1 FROM review_queue q WHERE q.item_id = ?)`,
+      )
+      .bind(reviewId, ts, reviewId, reviewId), // I34-W3-SEAM-P (D-1119(8), D-1120(6)): the review-queue audit copy keeps only the item id
+  ]);
+
+  const mine = await db.prepare("SELECT 1 AS x FROM review_queue WHERE item_id = ?").bind(reviewId).first();
+  if (!mine) {
+    // Refused by one of the two caps. WHICH one is read back only now, so the
+    // creator still gets the message that tells them what to do — wait for the
+    // operator, or come back tomorrow — without either count having been
+    // trusted to make the decision. Both were already distinguishable to this
+    // caller before the fix, so nothing new is disclosed; the caller has already
+    // proved the passport exists and is unclaimed to get this far.
+    // I38-MANCLAIM: every refusal is recorded (audit row; a shared-cap refusal also flags the open items).
+    const awaiting = "there is already a manual claim awaiting review for this passport";
+    const open = await db.prepare(`SELECT COUNT(*) AS n ${manualClaims} AND r.state = 'open'`).bind(passportId).first<{ n: number }>();
+    if ((open?.n ?? 0) >= MAX_OPEN_MANUAL_CLAIMS_PER_PASSPORT) {
+      await recordManualClaimRefusal(db, passportId, "shared_open", callerPrefix, ts);
+      throw new ManualClaimError(awaiting, 429);
+    }
+    if (callerPrefix !== undefined) {
+      const callerOpen = await db.prepare(`SELECT COUNT(*) AS n ${callerClaims} AND r.state = 'open'`).bind(passportId, callerPrefix).first<{ n: number }>();
+      if ((callerOpen?.n ?? 0) >= MAX_OPEN_MANUAL_CLAIMS_PER_PASSPORT_PER_CALLER) {
+        await recordManualClaimRefusal(db, passportId, "caller_open", callerPrefix, ts);
+        throw new ManualClaimError(awaiting, 429);
+      }
+      const held = await db.prepare(`SELECT 1 AS x ${callerClaims} AND r.state = 'rejected' AND r.updated_at >= ? LIMIT 1`).bind(passportId, callerPrefix, windowStart).first();
+      if (held) {
+        await recordManualClaimRefusal(db, passportId, "caller_rejected_hold", callerPrefix, ts);
+        throw new ManualClaimError("too many manual claim attempts for this passport today", 429);
+      }
+    }
+    const shared = await db.prepare(`SELECT COUNT(*) AS n ${manualClaims} AND r.created_at >= ?`).bind(passportId, windowStart).first<{ n: number }>();
+    await recordManualClaimRefusal(db, passportId, (shared?.n ?? 0) >= MAX_MANUAL_CLAIMS_PER_PASSPORT_WINDOW ? "shared_window" : "caller_window", callerPrefix, ts);
+    throw new ManualClaimError("too many manual claim attempts for this passport today", 429);
+  }
+
+  return { review_item_id: reviewId, code, handle: row.id, platform: row.platform, claim_ref: claimRef };
+}
+
+export interface ManualClaimStatus {
+  /** "pending" while the review item is still open; "approved" once an operator
+   * has approved THIS item; "declined" if this item was closed any other way. */
+  state: "pending" | "approved" | "declined";
+  passport_id?: string;
+}
+
+/**
+ * Poll a manual claim by its `claim_ref`. The ref is matched by SHA-256 against
+ * the stored hash — a bad or unknown ref is a uniform 404, never a pending-item
+ * oracle for a third party.
+ *
+ * APPROVAL IS THIS ITEM'S OWN TERMINAL STATE, never the passport's global
+ * claim_state (adversarial review, CRITICAL). A passport has one claim_state but
+ * can accumulate many claim attempts; keying approval off the passport meant an
+ * attacker who filed a bogus request, placed NO code, and was explicitly
+ * REJECTED still read "approved" the moment the passport was claimed by anyone —
+ * and the route minted them a full session. `review.ts approveItem` sets
+ * state='approved' (and writes claim_proven) ONLY for the item it approved; a
+ * rejected/expired item is never 'approved'. So the item state is the only
+ * honest approval signal, and we additionally require the passport to actually
+ * be claimed before handing back an id the route will mint a session for.
+ */
+export async function manualClaimStatus(db: DbLike, claimRef: string): Promise<ManualClaimStatus> {
+  const hash = await claimRefHashOf(claimRef);
+  const row = await db
+    .prepare("SELECT subject, state FROM review_queue WHERE item_type = 'claim' AND json_extract(payload, '$.claim_ref_hash') = ? LIMIT 1")
+    .bind(hash)
+    .first<{ subject: string; state: string }>();
+  if (!row) throw new ManualClaimError("no such claim", 404);
+  if (row.state === "open") return { state: "pending" };
+  // Closed. It is an approval ONLY if THIS item was approved — not because the
+  // passport is claimed (that could be someone else's proof entirely).
+  if (row.state !== "approved") return { state: "declined" };
+  // Defence in depth: an approved claim item wrote claim_proven, so the passport
+  // must be claimed. If it somehow is not, do not hand back a session-mintable id.
+  const psp = await db.prepare("SELECT claim_state FROM passports WHERE passport_id = ?").bind(row.subject).first<{ claim_state: string }>();
+  if (!psp || psp.claim_state === "unclaimed") return { state: "declined" };
+  return { state: "approved", passport_id: row.subject };
+}
+
+/**
+ * POLL A MANUAL CLAIM BY THE CODE THE CREATOR POSTED — STATE ONLY, NEVER A
+ * SESSION, AND THE "NEVER" IS THE WHOLE POINT.
+ *
+ * THE TRAP THIS EXISTS FOR. The `claim_ref` is minted once, returned once, and
+ * stored only as a SHA-256. The console rendered it into a button's `data-ref`
+ * attribute and nowhere else, under a sentence that said "you don't have to stay
+ * on this page". Manual review is the only claim path for Instagram, TikTok and
+ * OnlyFans — and, since `LINK_BIO_VERIFIABLE_HOSTS` ships empty, for every
+ * Tier-2 link as well. So the ordinary sequence was: post the code, read that
+ * sentence, close the tab. The operator approves. The passport is now claimed IN
+ * HER NAME, `requestManualClaim` answers 409 "passport already claimed" to every
+ * fresh attempt, and `/account/creator-signin/start` answers 403 because she
+ * never held a session and so never enrolled a passkey. Claimed, never signed
+ * in, no door.
+ *
+ * WHY THIS ONE DOES NOT MINT A SESSION, however much it would help. The code is
+ * PUBLISHED BY DESIGN — the creator is instructed to put it in a public bio, and
+ * the operator's whole job is to read it there. A `(passport_id, code)` pair is
+ * therefore a public value plus a public value, and minting a creator session
+ * from it would hand a full takeover of a freshly-claimed passport to anyone who
+ * looked at the victim's profile during the review window, permanently (nothing
+ * ever invalidates the pair). That is strictly worse than the lockout: it would
+ * turn the wedge platforms' only claim path into their only takeover path. The
+ * bio-code path has the same public code and is safe precisely because holding
+ * the code grants nothing — `/claim/verify` spends a secret `challenge_id` and
+ * re-reads the profile itself.
+ *
+ * WHAT IT IS FOR, then. Telling the creator the truth. Without it, a lost ref
+ * makes even "is my claim still being reviewed?" unanswerable, and the only
+ * signal the product gives back is a 409 reading "passport already claimed" —
+ * which to the person who just claimed it reads as someone else having taken it.
+ * With it, the console can say which of the three things actually happened and
+ * route to the door that fits: keep waiting, start again, or account recovery.
+ *
+ * NO ORACLE ABOVE WHAT THE CALLER ALREADY HAS: an unknown pair is the same
+ * uniform 404 the ref path gives, the code is 50 bits from `newCode`, and the
+ * route's per-IP verify ceiling bounds guessing at the same rate it bounds every
+ * other claim door.
+ */
+export async function manualClaimStatusByCode(db: DbLike, passportId: string, code: string): Promise<{ state: ManualClaimStatus["state"] }> {
+  const row = await db
+    .prepare(
+      "SELECT state FROM review_queue WHERE item_type = 'claim' AND subject = ? AND json_extract(payload, '$.source') = 'manual_claim' AND json_extract(payload, '$.code') = ? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(passportId, code)
+    .first<{ state: string }>();
+  if (!row) throw new ManualClaimError("no such claim", 404);
+  if (row.state === "open") return { state: "pending" };
+  if (row.state !== "approved") return { state: "declined" };
+  // Same defence in depth as the ref path: an approved claim item wrote
+  // `claim_proven`, so the passport must be claimed. Report `declined` rather
+  // than an approval we cannot stand behind.
+  const psp = await db.prepare("SELECT claim_state FROM passports WHERE passport_id = ?").bind(passportId).first<{ claim_state: string }>();
+  if (!psp || psp.claim_state === "unclaimed") return { state: "declined" };
+  return { state: "approved" };
+}
+
+// -----------------------------------------------------------------------------
+// CL:I-01 — THE `claim_ref` IS SPENT ONCE, AND ONLY AT THE EPOCH IT WAS APPROVED AT.
+// -----------------------------------------------------------------------------
+// What it was. `manualClaimStatus` above answers "approved" for as long as the
+// item stays approved, and the route (`claim-routes.ts`) read the epoch FRESH at
+// poll time. So the bearer token was neither one-shot nor bound to anything: one
+// operator approval minted unlimited creator sessions, forever, to whoever held
+// the ref — the creator, anyone who read it off a shared screen, anyone who
+// recovered it from a browser she later sold. Worse (INV-020/021), an epoch bump
+// is this product's "log out everywhere" and the LAST act of a hijack recovery:
+// it kills every session already minted, and then this route handed the bearer a
+// brand-new one carrying the NEW epoch. Recovery did not close the door it was
+// run to close.
+//
+// What it is now. A mint requires all three: the item is approved, the ref has
+// not been consumed, and the epoch is the one that was current WHEN THE OPERATOR
+// APPROVED. The consumption is the single guarded statement below, enumerated by
+// RETURNING rather than counted (`db.ts`: a rowcount on a trigger-bearing table
+// is not "rows my statement wrote"), so two concurrent polls cannot both mint.
+//
+// WHERE `epoch_at_approval` COMES FROM, since review.ts is not edited here. It is
+// captured LAZILY, at the first poll that could mint, and DERIVED rather than
+// read-as-of-now — a naive "current epoch at first poll" would rebind the ref to
+// the attacker's post-recovery epoch and leave a never-polled ref mintable after
+// a bump, which is the precise case INV-020 is about. The derivation: the item's
+// `updated_at` IS the approval timestamp (`review.ts` sets it in the same
+// statement that sets state='approved'), and `creator_sessions
+// .last_involuntary_bump_at` is the time of the last OPERATOR-OR-RECOVERY bump
+// (migration 0082). No row => never bumped => epoch 0. An involuntary bump
+// stamped at or after the approval => the ref is inert, permanently, and nothing
+// is written, so every later poll re-derives the same verdict. Otherwise the
+// current epoch IS the epoch at approval and is frozen into the payload by the
+// consumption write.
+//
+// THIS NOTE USED TO SAY `creator_sessions.updated_at`, and the sentence it
+// carried — "the recovery that bumped it was run to end exactly this kind of
+// outstanding authority" — was FALSE for the creator's own logout-all, which
+// stamps the same column. That is FINDING-0014-C-1; the watermark column is the
+// correction, and the false premise is quoted here once so a reader who
+// remembers it knows it was withdrawn rather than mislaid.
+//
+// NO NEW ORACLE. This function reports only "minted or not" to its caller; a
+// consumed ref, an epoch-stale ref and a live one all leave the route answering
+// the same `{state:"approved", passport_id}` body, and an unknown ref stays the
+// uniform 404 `manualClaimStatus` already throws (INV-003 shape).
+
+export interface ManualClaimConsumption {
+  /** True only when THIS call took the ref: approved, unconsumed, epoch matches. */
+  minted: boolean;
+  /** The epoch to bind the session to — the one current at approval, never a fresh read. */
+  epoch?: number;
+  /** The review item, so a caller that loses the minted session can name the row. */
+  item_id?: string;
+}
+
+interface ConsumableRow {
+  item_id: string;
+  subject: string;
+  updated_at: string;
+  epoch_at_approval: number | null;
+}
+
+export async function consumeManualClaimRef(
+  db: DbLike,
+  claimRef: string,
+  now: () => string = () => new Date().toISOString(),
+  /** D-1060(3): the minimum age the creator confirmed at the door (claim-routes.ts, `ageAckMatches`); absent reads the
+   * `creator_min_age` setting that door checked. Stored in the write that spends the ref. */
+  minAge?: number,
+): Promise<ManualClaimConsumption> {
+  const hash = await claimRefHashOf(claimRef);
+  const row = await db
+    .prepare(
+      `SELECT item_id, subject, updated_at, json_extract(payload, '$.epoch_at_approval') AS epoch_at_approval
+       FROM review_queue
+       WHERE item_type = 'claim' AND state = 'approved' AND json_extract(payload, '$.claim_ref_hash') = ? LIMIT 1`,
+    )
+    .bind(hash)
+    .first<ConsumableRow>();
+  if (!row) return { minted: false };
+
+  let epochAtApproval = row.epoch_at_approval;
+  if (epochAtApproval === null || epochAtApproval === undefined) {
+    const sess = await db
+      .prepare("SELECT session_epoch, updated_at, last_involuntary_bump_at FROM creator_sessions WHERE passport_id = ?")
+      .bind(row.subject)
+      .first<{ session_epoch: number; updated_at: string; last_involuntary_bump_at: string | null }>();
+    if (!sess) epochAtApproval = 0;
+    // An INVOLUNTARY bump stamped at or after the instant this item was
+    // approved: the operator force-logout or the hijack recovery that bumped it
+    // was run to end exactly this kind of outstanding authority. Inert,
+    // fail-closed.
+    //
+    // WHICH BUMP, AND WHY THE COLUMN EXISTS (FINDING-0014-C-1, migration 0082).
+    // This was asked of `sess.updated_at`, which EVERY bump stamps — including
+    // the creator's own "log out everywhere". A creator who tapped it between
+    // the approval and her first poll burned her own approved claim, forever,
+    // and the only remedy was a support ticket. `last_involuntary_bump_at` is a
+    // MONOTONIC WATERMARK written only at the operator/recovery doors
+    // (`creator-session.ts bumpCreatorEpoch(..., involuntary)`), so the question
+    // asked here is the one the rule is actually about. It is a watermark and
+    // not a reason because `creator_sessions` is one row per passport: a reason
+    // would record only the LAST bump, and a recovery followed later by a
+    // self-service logout would read self-service and re-arm a ref the recovery
+    // killed.
+    //
+    // NOTHING IS RE-ISSUED. A ref that is no longer inert is the SAME ref: the
+    // single-consumption guard below (one statement, enumerated by `RETURNING`)
+    // still spends it exactly once, so this is not a second door into the
+    // account, it is the first door no longer refusing its own holder.
+    //
+    // `COALESCE(...,'')` is "no involuntary bump on record": the empty string
+    // sorts below every ISO stamp, so a NULL watermark never satisfies the
+    // comparison. Existing rows are NOT null — 0082 backfills them to
+    // `updated_at`, so no ref burned before that migration changes verdict.
+    //
+    // The comparison is `>=`, not `>` (FINDING-0014-C-3). Both stamps are
+    // millisecond ISO strings from the same clock, so a bump in the SAME
+    // millisecond as the approval is ORDER-UNKNOWN between them — and an
+    // unknown order at a claim door has exactly one safe reading. Under `>` the
+    // tie read as "before the approval", and the ref then bound and minted at
+    // the POST-bump epoch: the recovery did not close the door it was run to
+    // close (INV-020/021).
+    else if ((sess.last_involuntary_bump_at ?? "") >= row.updated_at) {
+      // FINDING-0014-C-2: the burn is RECORDED. It previously wrote no payload
+      // marker, no audit row and no state change, so a creator whose approved
+      // claim died to her own logout left nothing any reader — operator,
+      // support, or a later forensic pass — could find.
+      //
+      // The row goes to `audit_log`, never to the response: `manualClaimStatus`
+      // keeps answering the uniform `{state:"approved"}` body for a consumed, an
+      // epoch-stale and a live ref alike, because a distinguishable answer here
+      // is the INV-003 oracle this door's whole shape exists to deny.
+      //
+      // Guarded on its own absence so a poller that presses the button a
+      // thousand times leaves ONE line per burned ref, not a thousand: the
+      // record is of the burn, not of the polling.
+      // BEST-EFFORT, the `console.ts:161-164` idiom verbatim (RUN-0015 E-2).
+      // Bare, this INSERT was the one arm of the door that could fail: the
+      // throw left `consumeManualClaimRef` uncaught, `claim-routes.ts:189`
+      // mapped it to 400, and an unavailable `audit_log` then answered the
+      // INERT population differently from every other one — the record of the
+      // burn became the oracle the uniform body denies (INV-006). The burn is
+      // the epoch comparison above and has already happened; what a failure
+      // here loses is the LINE, not the decision, and the loss is platform-wide
+      // (audit_log unavailable), never a per-creator state. Next actor on a
+      // missing line: none — the ref is inert either way and the caller keeps
+      // the uniform `{state:"approved"}`.
+      try {
+        await db
+          .prepare(
+            `INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind)
+             SELECT 'system', 'claim:ref_inert', ?, ?, ?, 'system'
+             WHERE NOT EXISTS (SELECT 1 FROM audit_log a WHERE a.item_id = ? AND a.action = 'claim:ref_inert')`,
+          )
+          .bind(
+            `involuntary epoch bump at ${sess.last_involuntary_bump_at} is not earlier than approval at ${row.updated_at}; claim_ref inert`,
+            now(),
+            row.item_id,
+            row.item_id,
+          )
+          .run();
+      } catch {
+        /* the record of an inert ref must not itself answer the caller */
+      }
+      return { minted: false, item_id: row.item_id };
+    } else epochAtApproval = sess.session_epoch;
+  }
+  if ((await currentCreatorEpoch(db, row.subject)) !== epochAtApproval) return { minted: false, item_id: row.item_id };
+
+  // D-1060(3): the confirmed age rides the spending write, so a spent ref always carries it (as /claim/start's challenge does).
+  const ageAck = minAge ?? (await creatorMinAge(db));
+  const spentAt = now();
+  const taken = await db
+    .prepare(
+      `UPDATE review_queue SET payload = json_set(payload, '$.claim_ref_consumed_at', ?, '$.epoch_at_approval', ?, '$.age_ack_min_age', ?, '$.age_ack_at', ?)
+       WHERE item_id = ? AND json_extract(payload, '$.claim_ref_consumed_at') IS NULL RETURNING item_id`,
+    )
+    .bind(spentAt, epochAtApproval, ageAck, spentAt, row.item_id)
+    .all<{ item_id: string }>();
+  // Enumerate, never count: one returned row is one consumption by THIS caller.
+  if ((taken.results ?? []).length !== 1) return { minted: false, item_id: row.item_id };
+  return { minted: true, epoch: epochAtApproval, item_id: row.item_id };
+}
+===== END FILE: services/trust-core/src/manual-claims.ts =====
+
+===== END OF CHUNK 59 OF 75 =====
