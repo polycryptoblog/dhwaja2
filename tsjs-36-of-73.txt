@@ -1,0 +1,3354 @@
+DHWAJA CODE REVIEW — tsjs — CHUNK 36 OF 73
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (assertions*), services/trust-core/src (attribution*), services/trust-core/src (auth*), services/trust-core/src (back*), services/trust-core/src (badge*), services/trust-core/src (billing*), services/trust-core/src (bot*), services/trust-core/src (brand*)
+Files in this chunk (9):
+  - services/trust-core/src/assertions.ts
+  - services/trust-core/src/attribution.ts
+  - services/trust-core/src/auth.ts
+  - services/trust-core/src/back-catalog.ts
+  - services/trust-core/src/badge.ts
+  - services/trust-core/src/billing.ts
+  - services/trust-core/src/bot-check.ts
+  - services/trust-core/src/brand-enrolment.ts
+  - services/trust-core/src/brand-index.ts
+
+
+===== BEGIN FILE: services/trust-core/src/assertions.ts =====
+import { subjectForAccount } from "@dhwaja/canonical";
+import { freshProofBounds } from "./account-standing.js";
+import { inChunks, type DbLike, type DbStatement } from "./db.js";
+
+/**
+ * X1 — PRIVATE ASSERTIONS: the bound on what a creator may CLAIM without
+ * proving it, and the read the contested-account door is built on.
+ *
+ * S101 already decided that an unproven assertion buys no trust: it is not
+ * served in the registry, it is dropped from `/p/:id` and from every card. What
+ * nobody had bounded is what an assertion COSTS everybody else. `account_added`
+ * refuses a duplicate `account_key` outright, and until `contested-accounts.ts`
+ * there was no self-serve door onto a key that sits on somebody else's passport
+ * — so the first party to assert a key owned it permanently, against a person
+ * who could prove control of it, silently, at 20 drafts a signed batch with no
+ * cap of any kind.
+ *
+ * See `migrations/0044_assertion_gate.sql` for the full argument.
+ */
+
+/**
+ * How many UNPROVEN assertions one passport may hold at once.
+ *
+ * On outstanding rather than lifetime, because proving an account frees a slot:
+ * a creator working through a genuine roster is never capped, and a squatter —
+ * who by definition can prove none of them — is stopped at ten. Ten is generous
+ * against the largest real first-session roster we have seen in the fixtures and
+ * still small enough that a land-grab is not worth attempting.
+ */
+/**
+ * "NOBODY HAS PROVED THIS ROW" — the two freshness legs, written once.
+ *
+ * Byte-identical to `creatorHandleCollision`'s and to `deriveStanding`'s
+ * arithmetic: an explicit `valid_until` wins while it is in the future,
+ * otherwise `proved_at` (falling back to `created_at`) plus the default TTL.
+ * Three readers in this file ask the same question and a second copy of it is
+ * how two of them would come to disagree. Each use binds
+ * `nowIso, provedSince, nowIso, provedSince`, in that order.
+ */
+const UNPROVEN_LEGS =
+  `AND NOT EXISTS (SELECT 1 FROM claim_challenges cc WHERE cc.account_key = a.account_key AND cc.status = 'used' AND cc.purpose <> 'contest' ` +
+  `AND cc.passport_id = a.passport_id AND (cc.valid_until > ? OR (cc.valid_until IS NULL AND COALESCE(cc.proved_at, cc.created_at) > ?))) ` +
+  `AND NOT EXISTS (SELECT 1 FROM oauth_challenges oc WHERE oc.account_key = a.account_key AND oc.status = 'proven' ` +
+  `AND oc.passport_id = a.passport_id AND (oc.valid_until > ? OR (oc.valid_until IS NULL AND COALESCE(oc.proved_at, oc.created_at) > ?)))`;
+
+/**
+ * The rows a passport asserted on its OWN authority (`creator`/`agency` — the
+ * unforgeable actor mark, never the client's label) and has not proved.
+ *
+ * NO `status = 'active'` FILTER, and that omission is the whole bound (review,
+ * HIGH). `account_revoked` is signable, uncapped, and only sets
+ * `status = 'revoked'` — while `account_added`'s duplicate check has no status
+ * filter at all, so a revoked row STILL HOLDS THE KEY against its real owner,
+ * permanently. Counting only active rows therefore let a squatter launder slots:
+ * assert ten, revoke ten, assert ten more, forever, with every key still taken.
+ * Measured before the fix at ten new permanently-squatted keys per day per
+ * passport, which is the daily rate this ceiling exists to be more than.
+ *
+ * So the ceiling counts what the passport is HOLDING — which is exactly what the
+ * duplicate check reserves — and the only thing that frees a slot is the one
+ * thing that should: proving the account. Revoking an account you asserted does
+ * not give the slot back, because revoking it does not give the KEY back.
+ */
+const ASSERTED_LEG = `COALESCE(a.added_by, 'operator') IN ('creator', 'agency')`;
+
+export const MAX_OUTSTANDING_ASSERTIONS = 10;
+
+/**
+ * And a rate, because the ceiling alone would let a squatter cycle: assert ten,
+ * have them revoked or aged out, assert ten more. Enforced at the door with the
+ * shared `consumeRateLimit` (one atomic statement), keyed per passport.
+ */
+export const ASSERTIONS_PER_DAY = 10;
+
+/**
+ * THE CEILING, AS A STATEMENT THAT THROWS.
+ *
+ * Returned for the caller to ride in `appendCreatorSigned`'s `extraStatements`,
+ * which `appendEventsOnce` appends LAST
+ * (`[...nameStatements, ...statements, ...extraStatements]`). Two consequences,
+ * both wanted:
+ *
+ *  1. The count already includes the batch's own new rows, so a batch of three
+ *     against eight outstanding is refused rather than landing at eleven. The
+ *     ceiling is a property of the state after the write, not of what the caller
+ *     happened to read before it.
+ *  2. A violation throws inside the batch, so the LEDGER APPEND rolls back with
+ *     it. There is no state in which the event landed and the guard did not.
+ *
+ * `ok` is NOT NULL and is fed by a CASE that yields NULL over the ceiling. This
+ * is the shape the codebase uses wherever a guard must ride inside a write
+ * (`fan-auth.ts`'s "ceiling re-asserted inside the INSERT"): a guarded UPDATE
+ * matching zero rows does NOT fail its batch, and a read-then-decide is
+ * check-then-act whose burst width is the overshoot.
+ *
+ * "Outstanding" is derived live — an active account on this passport, added on
+ * the passport's own authority (`creator`/`agency`, the unforgeable actor mark,
+ * never the client's label), with no CURRENT proof in either proof table. The
+ * freshness legs are byte-identical to `creatorHandleCollision`'s, which is the
+ * same question asked for a different reason.
+ */
+export function assertionCeilingStatement(
+  db: DbLike,
+  passportId: string,
+  accountKey: string,
+  nowMs: number,
+  now: () => string = () => new Date().toISOString(),
+): DbStatement {
+  const { nowIso, provedSince } = freshProofBounds(nowMs);
+  return db
+    .prepare(
+      `INSERT INTO assertion_gate (account_key, passport_id, created_at, ok)
+       VALUES (?, ?, ?, (SELECT CASE WHEN COUNT(*) <= ? THEN 1 END FROM passport_accounts a
+                          WHERE a.passport_id = ? AND ${ASSERTED_LEG} ${UNPROVEN_LEGS}))`,
+    )
+    .bind(accountKey, passportId, now(), MAX_OUTSTANDING_ASSERTIONS, passportId, nowIso, provedSince, nowIso, provedSince);
+}
+
+/** How many unproven assertions this passport holds right now — the console's
+ * read, so a creator can see the budget rather than discover it as a refusal. */
+export async function outstandingAssertions(db: DbLike, passportId: string, nowMs: number): Promise<number> {
+  const { nowIso, provedSince } = freshProofBounds(nowMs);
+  const r = await db
+    .prepare(`SELECT COUNT(*) AS n FROM passport_accounts a WHERE a.passport_id = ? AND ${ASSERTED_LEG} ${UNPROVEN_LEGS}`)
+    .bind(passportId, nowIso, provedSince, nowIso, provedSince)
+    .first<{ n: number }>();
+  return r?.n ?? 0;
+}
+
+/**
+ * WHICH OF THESE LEDGER EVENTS NAME AN ACCOUNT NOBODY HAS PROVED — the read the
+ * alert fan-out needs so it stops announcing claims.
+ *
+ * `account_added` fanned out "added a <platform> account" to every fan who
+ * tapped Save, for an assertion S101 refuses to serve anywhere else: not on
+ * /p/:id, not on a card, not in the registry. The announcement is the one
+ * surface that published what all the others withhold, and it belongs to the
+ * PROOF rather than to the claim.
+ *
+ * ONE STATEMENT PER CHUNK for the whole page, the shape `alerts.ts` already uses
+ * for its display-name lookup. Returns the set of EVENT IDS to skip.
+ *
+ * FAILS TOWARD SILENCE. An event whose payload cannot yield an account key is
+ * treated as unproven — this decides whether to publish, so the unknown case
+ * must not publish.
+ */
+export async function unprovenAssertionEvents(
+  db: DbLike,
+  rows: readonly { event_id: string; event_type: string; subject: string; payload: string }[],
+  nowMs: number,
+): Promise<ReadonlySet<string>> {
+  const skip = new Set<string>();
+  const keyed: { event_id: string; subject: string; key: string }[] = [];
+  for (const r of rows) {
+    const key = accountKeyOfEvent(r);
+    if (key === null) {
+      skip.add(r.event_id);
+      continue;
+    }
+    keyed.push({ event_id: r.event_id, subject: r.subject, key });
+  }
+  if (keyed.length === 0) return skip;
+
+  const { nowIso, provedSince } = freshProofBounds(nowMs);
+  const unproven = new Set<string>();
+  for (const chunk of inChunks(keyed.map((k) => k.key), 4)) {
+    const { results } = await db
+      .prepare(
+        `SELECT a.passport_id AS psp, a.account_key AS k FROM passport_accounts a
+          WHERE a.account_key IN (${chunk.map(() => "?").join(",")}) AND ${ASSERTED_LEG} ${UNPROVEN_LEGS}`,
+      )
+      .bind(...chunk, nowIso, provedSince, nowIso, provedSince)
+      .all<{ psp: string; k: string }>();
+    for (const r of results) unproven.add(`${r.psp}\u0000${r.k}`);
+  }
+  for (const k of keyed) if (unproven.has(`${k.subject}\u0000${k.key}`)) skip.add(k.event_id);
+  return skip;
+}
+
+/** `account_revoked` carries the key; `account_added` does
+ * not, so it is derived exactly as `events.ts` derives it for the INSERT. */
+function accountKeyOfEvent(r: { event_type: string; payload: string }): string | null {
+  let p: Record<string, unknown>;
+  try {
+    const parsed: unknown = JSON.parse(r.payload);
+    if (parsed === null || typeof parsed !== "object") return null;
+    p = parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (typeof p.account_key === "string" && p.account_key.length > 0) return p.account_key;
+  if (r.event_type !== "account_added") return null;
+  try {
+    return subjectForAccount(String(p.platform), String(p.id_kind), String(p.id)).canonical;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * CRON HYGIENE for `assertion_gate` (X1 review, hardening).
+ *
+ * The table is INSERT-only from one door and its PRIMARY KEY is the account key,
+ * so a row outlives the thing it bounded. It cannot block a legitimate add today
+ * — the fold never DELETES a `passport_accounts` row, so a key with a gate row
+ * is a key the duplicate check already refuses — but that is a coincidence of
+ * the fold, exactly the kind this repo has been bitten by before (see migration
+ * 0028's note on `suppressed_account_keys`). The first path that removes an
+ * account row (an erasure, a merge, a repair) would turn a stale gate row into a
+ * permanent, unexplainable refusal.
+ *
+ * So the promise is asserted directly: a gate row is dead the moment no
+ * `passport_accounts` row holds its key, and the sweep says so rather than
+ * inheriting it.
+ */
+export async function pruneAssertionGate(db: DbLike): Promise<void> {
+  await db.prepare("DELETE FROM assertion_gate WHERE NOT EXISTS (SELECT 1 FROM passport_accounts a WHERE a.account_key = assertion_gate.account_key)").run();
+}
+===== END FILE: services/trust-core/src/assertions.ts =====
+
+===== BEGIN FILE: services/trust-core/src/attribution.ts =====
+import { DAY_CELL, type DayCells, type LegacyFacts } from "./roi.js";
+
+/**
+ * S87 — revenue / conversion attribution. The honest funnel Dhwaja can observe
+ * per reverse-code pool:
+ *
+ *     ELIGIBLE  →  CLAIMED  →  REDEEMED
+ *   (reachable   (a fan     (the creator marked a
+ *    audience)    grabbed     generated voucher USED —
+ *                 the code)   the closest thing to a sale)
+ *
+ * What it deliberately does NOT do:
+ *  - Invent a "views" count. The k-anonymous check means Dhwaja never learns who
+ *    looked at a profile, so the top of the funnel is the ELIGIBLE population (who
+ *    *could* claim: savers / acquirers / achievement-holders), not impressions.
+ *  - Show external revenue. For UPLOADED codes the sale happens on the creator's
+ *    own platform and Dhwaja never sees the redemption — those pools are labelled
+ *    `redemption_observable: false`. Only Dhwaja-GENERATED vouchers carry a
+ *    creator-marked `redeemed_at`, so only they have an observable conversion.
+ *
+ * Privacy: creator-PRIVATE (own verified session, gated at the HTTP layer like the
+ * ROI dashboard). The ELIGIBLE population is a passive fan count, so it is
+ * k-floored (small non-zero → null) — and a rate that would divide by a suppressed
+ * eligible is withheld. Claims/redemptions are the creator's own code funnel
+ * (unfloored, same stance as /account/supporters + the S86 ROI dashboard).
+ * Aggregates only; no fan ids or handles leave this module.
+ */
+
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+
+/** A ratio in [0,1] to 3dp, or null when the denominator is absent/suppressed. */
+function rate(num: number, den: number | null): number | null {
+  if (den === null || den <= 0) return null;
+  return Math.round((num / den) * 1000) / 1000;
+}
+
+/**
+ * THE ONE HONEST LABEL FOR EVERY `redemption_rate` THIS MODULE SERVES (I3-1043,
+ * D-0829). The rate divides by `observableClaimed` — claims in pools that have
+ * a GENERATED voucher (see `conversionAttribution`) — not by every claim the
+ * creator's `claimed` total counts, so a bare "Redeem %" read as a share of all
+ * claims. Wherever a creator surface shows the rate, it shows it under this
+ * label. No handed-out or currently-usable split is served: neither has an
+ * analytics cell.
+ */
+export const REDEMPTION_RATE_LABEL = "Redeemed ÷ claimed, in pools with a generated voucher";
+
+export interface PoolFunnel {
+  pool_id: string;
+  title: string;
+  eligibility_kind: string;
+  eligible: number | null; // reachable audience (k-floored)
+  claimed: number; // leads — fans who claimed a code
+  redeemed: number; // conversions the creator marked used (generated vouchers)
+  redemption_observable: boolean; // false for uploaded pools (external redemption is blind)
+  claim_rate: number | null; // claimed / eligible (when eligible is shown)
+  redemption_rate: number | null; // REDEMPTION_RATE_LABEL: redeemed / claimed, this pool, only when it has a generated voucher
+}
+
+export interface ConversionAttribution {
+  passport_id: string;
+  generated_at: string;
+  totals: {
+    pools: number;
+    claimed: number;
+    redeemed: number; // across observable (generated) pools
+    redemption_rate: number | null; // REDEMPTION_RATE_LABEL: redeemed / claimed summed over generated-voucher pools only (NOT over `claimed` above)
+  };
+  pools: PoolFunnel[];
+}
+
+/**
+ * The conversion funnel, re-expressed over the analytics store (S-002 S-1).
+ *
+ * WHAT EACH TERM IS NOW.
+ *  - `claimed` / `redeemed` are the pool's own creator-scoped day counters
+ *    (`pool_code_claimed` / `pool_code_redeemed`), summed over sealed days and
+ *    served through `serveDay` like every other population. A withheld pool
+ *    counter is served as `0` — the type has no null and zero is INCLUDED in
+ *    the floor, so a pool nobody claimed and a pool four people claimed produce
+ *    the same bytes.
+ *  - `eligible` is a LIVE per-fan population (savers / acquirers / achievement
+ *    holders) with no cell in the store, so it is WITHHELD — `null`, which is
+ *    exactly what this field already meant for a population that is not the
+ *    creator's to see. It was the one number here that moved the instant one
+ *    named fan qualified.
+ *  - Every RATE is served only when BOTH its operands are (ADR §0 P1, §6 row
+ *    3). With `eligible` withheld, `claim_rate` is null by construction rather
+ *    than by a second rule.
+ *
+ * The pool ROW ITSELF (id, title, eligibility kind, whether a generated voucher
+ * exists) is the creator's own property read as of `created_at < T`, so the set
+ * of pools is a function of (creator, T) and carries no fan.
+ */
+export function conversionAttribution(cells: DayCells, facts: LegacyFacts, passportId: string, generatedAt: string): ConversionAttribution {
+  if (!PSP_RE.test(passportId)) throw new Error("bad passport id");
+  const out: PoolFunnel[] = [];
+  let totalRedeemed = 0;
+  let observableClaimed = 0; // claims in observable (generated) pools — the redemption-rate denominator
+  let observableWithheld = false; // an observable pool contributed a WITHHELD cell to the two sums above
+  for (const p of facts.pools) {
+    const claimedCell = cells.get(DAY_CELL.poolClaimed(p.pool_id));
+    const redeemedCell = cells.get(DAY_CELL.poolRedeemed(p.pool_id));
+    const claimed = claimedCell ?? 0;
+    const redeemed = redeemedCell ?? 0;
+    if (p.observable) {
+      totalRedeemed += redeemed;
+      observableClaimed += claimed;
+      // I3-0482. A withheld cell enters these sums as 0 (`?? 0` above), so the
+      // rate below would be computed over a population narrower than the one
+      // its gate tests — see the gate's own note.
+      if (claimedCell === null || redeemedCell === null) observableWithheld = true;
+    }
+    out.push({
+      pool_id: p.pool_id,
+      title: p.title,
+      eligibility_kind: p.eligibility_kind,
+      eligible: null, // WITHHELD: no store cell for the reachable audience
+      claimed,
+      redeemed,
+      redemption_observable: p.observable,
+      claim_rate: null, // both operands must be served; `eligible` never is
+      redemption_rate: p.observable && claimedCell !== null && redeemedCell !== null ? rate(redeemed, claimed) : null,
+    });
+  }
+  const totals = cells.get(DAY_CELL.codeClaims);
+  const redeemedTotal = cells.get(DAY_CELL.redemptions);
+  return {
+    passport_id: passportId,
+    generated_at: generatedAt,
+    totals: {
+      pools: out.length,
+      claimed: totals ?? 0,
+      redeemed: redeemedTotal ?? 0,
+      // I3-0482 — THE GATE MUST TEST THE POPULATION THE RATE DIVIDES. This
+      // gated on the creator-wide stocks (`code_claims`, `redemptions`) while
+      // dividing per-pool sums over OBSERVABLE pools only, so the served rate
+      // and the served `claimed` were two different populations and the reader
+      // could form `redeemed / redemption_rate` to recover `observableClaimed`
+      // — pinning `claimed - observableClaimed`, the exact value of a cell
+      // `serveDay` withheld (INV-004 clause 2 / FAMILY-001 v2). The per-pool
+      // row at :109 already applies this rule to its own two operands; this is
+      // the same rule, on the totals. The added term only ever WITHHOLDS.
+      redemption_rate: totals === null || redeemedTotal === null || observableWithheld ? null : rate(totalRedeemed, observableClaimed),
+    },
+    pools: out,
+  };
+}
+===== END FILE: services/trust-core/src/attribution.ts =====
+
+===== BEGIN FILE: services/trust-core/src/auth.ts =====
+import { bodyLimit } from "hono/body-limit";
+
+/**
+ * Cloudflare Access authentication for the ops console.
+ *
+ * Access sits in front of this Worker as infrastructure — but we STILL verify
+ * the assertion JWT here. Never trust a header because a proxy "should have"
+ * set it: a misconfigured route, a direct-to-origin request, or a bypassed
+ * Access policy would otherwise hand an attacker the console. Defense in depth
+ * is the whole point of an auth layer.
+ *
+ * Verification (all required, fail closed on any):
+ *  - RS256 signature against the team JWKS (matched by kid).
+ *  - iss === the team domain.
+ *  - aud includes the configured Access application AUD tag.
+ *  - a numeric iat is present; nbf/iat not in the future, exp not in the past (small skew allowed).
+ *  - the email claim is in the operator allowlist.
+ *
+ * Missing/!invalid config → the surface is CLOSED (caller returns 503), never
+ * open. There is no dev bypass, no "skip in test" flag — tests inject a real
+ * keypair and JWKS.
+ */
+
+export interface AccessConfig {
+  teamDomain: string; // e.g. https://dhwaja.cloudflareaccess.com  (iss)
+  aud: string; // Access application AUD tag
+  operatorEmails: readonly string[]; // allowlist (lowercased) — the ENTRY gate
+  /** Access group whose members are FULL operators. Absent → no group gating,
+   * every allowlisted operator is full (backward-compatible single-operator). */
+  fullGroup?: string | null;
+  /** JWT claim carrying the caller's Access group names. Default "groups"; a
+   * dotted name (`custom.groups`) names a nested claim. */
+  groupsClaim?: string;
+  /** I3-0857: a token whose `iat` is older than this many seconds is refused (401).
+   * Absent → DEFAULT_OPS_MAX_TOKEN_AGE_SECONDS; a larger value is clamped to it (I16-RG-AUTH:1). */
+  maxTokenAgeSeconds?: number;
+}
+
+export interface Jwk {
+  kid: string;
+  kty: "RSA";
+  n: string;
+  e: string;
+  alg?: string;
+}
+
+/** Operator privilege tier. `support` is a restricted seat (reads + a couple of
+ * low-risk writes); `full` can perform every operator action. */
+export type OperatorRole = "full" | "support";
+
+export interface OperatorIdentity {
+  email: string;
+  role: OperatorRole;
+}
+
+export type AuthResult =
+  | { ok: true; operator: OperatorIdentity }
+  | { ok: false; status: 401 | 403 | 503; reason: string };
+
+const SKEW_SECONDS = 60;
+
+export function b64urlToBytes(s: string): Uint8Array {
+  const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/") + pad;
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+export function b64urlToString(s: string): string {
+  return new TextDecoder().decode(b64urlToBytes(s));
+}
+
+interface JwtHeader {
+  alg?: string;
+  kid?: string;
+  typ?: string;
+}
+interface JwtClaims {
+  iss?: string;
+  aud?: string | string[];
+  exp?: number;
+  nbf?: number;
+  iat?: number;
+  email?: string;
+}
+
+/** Parse without verifying — callers MUST verify before trusting anything. */
+function decodeSegments(
+  token: string,
+): { header: JwtHeader; claims: JwtClaims; signingInput: string; sig: Uint8Array } | null {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [h, p, s] = parts as [string, string, string];
+  // Reject anything that isn't strict base64url (defends against smuggled bytes).
+  if (![h, p, s].every((seg) => /^[A-Za-z0-9_-]+$/.test(seg))) return null;
+  try {
+    const header = JSON.parse(b64urlToString(h)) as JwtHeader;
+    const claims = JSON.parse(b64urlToString(p)) as JwtClaims;
+    return { header, claims, signingInput: `${h}.${p}`, sig: b64urlToBytes(s) };
+  } catch {
+    return null;
+  }
+}
+
+/** I3-0483: the `kid` a token's header NAMES, read without verifying anything.
+ * Used only to decide whether the JWKS cache should refresh early for a key it
+ * has not seen; verification still finds the key by kid and checks the
+ * signature, so a forged kid can at most spend the bounded refresh. */
+export function unverifiedKid(token: string | null | undefined): string | undefined {
+  if (!token) return undefined;
+  const kid = decodeSegments(token)?.header.kid;
+  return typeof kid === "string" && kid.length > 0 && kid.length <= 256 ? kid : undefined;
+}
+
+export async function verifyRs256(
+  jwk: Jwk,
+  signingInput: string,
+  sig: Uint8Array,
+): Promise<boolean> {
+  const key = await crypto.subtle.importKey(
+    "jwk",
+    { kty: "RSA", n: jwk.n, e: jwk.e, alg: "RS256", ext: true },
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["verify"],
+  );
+  return crypto.subtle.verify(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    sig as unknown as ArrayBuffer,
+    new TextEncoder().encode(signingInput) as unknown as ArrayBuffer,
+  );
+}
+
+/**
+ * Verify an Access JWT against explicit config + keys. `now` is seconds.
+ * Pure: no network — the caller supplies the JWKS (fetched+cached separately).
+ */
+export async function verifyAccessJwt(
+  token: string,
+  config: AccessConfig,
+  jwks: readonly Jwk[],
+  now: number,
+): Promise<AuthResult> {
+  if (!config.teamDomain || !config.aud || config.operatorEmails.length === 0) {
+    return { ok: false, status: 503, reason: "access not configured" };
+  }
+  if (jwks.length === 0) {
+    return { ok: false, status: 503, reason: "no signing keys available" };
+  }
+  const decoded = decodeSegments(token);
+  if (!decoded) return { ok: false, status: 401, reason: "malformed token" };
+
+  const { header, claims, signingInput, sig } = decoded;
+  // Pin the algorithm: reject "none" and any non-RS256, which blocks alg-confusion.
+  if (header.alg !== "RS256") return { ok: false, status: 401, reason: "unexpected alg" };
+  if (!header.kid) return { ok: false, status: 401, reason: "no kid" };
+
+  const jwk = jwks.find((k) => k.kid === header.kid);
+  if (!jwk) return { ok: false, status: 401, reason: "unknown kid" };
+
+  const validSig = await verifyRs256(jwk, signingInput, sig).catch(() => false);
+  if (!validSig) return { ok: false, status: 401, reason: "bad signature" };
+
+  // Claims — only after the signature is proven.
+  if (claims.iss !== config.teamDomain) return { ok: false, status: 401, reason: "bad iss" };
+  const auds = Array.isArray(claims.aud) ? claims.aud : claims.aud ? [claims.aud] : [];
+  if (!auds.includes(config.aud)) return { ok: false, status: 401, reason: "bad aud" };
+  // Finite checks reject JSON literals like 1e400 → Infinity (an exp that
+  // never expires). Defense in depth — still needs a valid signature.
+  if (!Number.isFinite(claims.exp) || (claims.exp as number) + SKEW_SECONDS < now) {
+    return { ok: false, status: 401, reason: "expired or non-finite exp" };
+  }
+  if (typeof claims.nbf === "number") {
+    if (!Number.isFinite(claims.nbf) || claims.nbf - SKEW_SECONDS > now) {
+      return { ok: false, status: 401, reason: "not yet valid" };
+    }
+  }
+  // I16-RG-AUTH:1: no numeric iat means no age to bound, so the token is refused rather than let past the ceiling.
+  if (typeof claims.iat !== "number" || !Number.isFinite(claims.iat)) {
+    return { ok: false, status: 401, reason: "missing iat" };
+  }
+  if (claims.iat - SKEW_SECONDS > now) {
+    return { ok: false, status: 401, reason: "issued in the future" };
+  }
+  // I3-0857 (D-0920 option A): a stolen operator token dies within this ceiling
+  // whatever Access's own session length is; immediate removal is the E-26 lever.
+  // A config may LOWER the ceiling, never raise it past the ruled default (I16-RG-AUTH:1).
+  if (now - claims.iat > Math.min(config.maxTokenAgeSeconds ?? DEFAULT_OPS_MAX_TOKEN_AGE_SECONDS, DEFAULT_OPS_MAX_TOKEN_AGE_SECONDS)) {
+    return { ok: false, status: 401, reason: "token too old" };
+  }
+
+  const email = typeof claims.email === "string" ? claims.email.toLowerCase() : "";
+  if (!email || !config.operatorEmails.includes(email)) {
+    return { ok: false, status: 403, reason: "not an operator" };
+  }
+  return { ok: true, operator: { email, role: operatorRole(claims, config) } };
+}
+
+/**
+ * Role from Access group membership. LEAST PRIVILEGE, INCLUDING WHEN THE CONFIG
+ * IS ABSENT — and that last clause is the fix (review A6).
+ *
+ * This docblock used to end "Fail-safe: any ambiguity resolves DOWN to support,
+ * never up" directly above `if (!fullGroup) return "full"`, which is the one
+ * case that resolved UP. Absent `OPS_FULL_GROUP` ESCALATED: every allowlisted
+ * email became a full operator, including a token carrying no groups claim at
+ * all. `OPS_FULL_GROUP` is declared EMPTY in every wrangler environment
+ * (`services/trust-core/wrangler.jsonc:133`, `:464`, `:559`) and `""` resolves
+ * to `null` in `accessConfigFromEnv` (:232), so "absent" was not an edge case —
+ * it was the only configuration any deployment had, and
+ * the support tier the whole S53 restricted-admin slice exists to provide was
+ * off with nothing saying so. Measured: `/ops/whoami` reported `full` and
+ * `POST /ops/fold/rebuild` (a full-only lever) returned 200.
+ *
+ * Absent config must DISABLE a capability, never grant the widest one
+ * (invariant 6). So: no `fullGroup` configured → `support`, the same answer a
+ * non-member gets. Once a `fullGroup` IS set, ONLY members of it are `full`.
+ * Every path through this function now resolves down.
+ *
+ * OPERATIONAL CONSEQUENCE, stated because it is real and it is the point: a
+ * deployment that never set `OPS_FULL_GROUP` now has NO full operator, and the
+ * high-liability writes in `OPS_ROLE_POLICY` answer 403 until the group is
+ * configured and the operator is in it. That is a deliberate lockout of
+ * privilege, not of access — reads and the two low-risk writes still work — and
+ * `configHealth`'s `ops_role_gating` row now says so on the console instead of
+ * leaving an operator to discover it from a 403.
+ */
+function operatorRole(claims: JwtClaims, config: AccessConfig): OperatorRole {
+  const fullGroup = config.fullGroup ?? null;
+  if (!fullGroup) return "support"; // absent config disables the privilege; it never grants it
+  const raw = claimAt(claims as unknown as Record<string, unknown>, config.groupsClaim ?? "groups");
+  const groups = Array.isArray(raw) ? raw.map((g) => String(g)) : typeof raw === "string" ? [raw] : [];
+  return groups.includes(fullGroup) ? "full" : "support";
+}
+
+/** #138PV-03: the claim named by `OPS_GROUPS_CLAIM`. An own key of that exact name
+ * wins; otherwise a dotted name (`custom.groups`) is walked one own property per
+ * segment, so a nested group claim is read instead of silently demoting every
+ * operator to `support`. Anything that is not a plain object on the way is absent. */
+function claimAt(claims: Record<string, unknown>, name: string): unknown {
+  if (Object.hasOwn(claims, name)) return claims[name];
+  if (!name.includes(".")) return undefined;
+  let cur: unknown = claims;
+  for (const seg of name.split(".")) {
+    if (cur === null || typeof cur !== "object" || Array.isArray(cur) || !Object.hasOwn(cur, seg)) return undefined;
+    cur = (cur as Record<string, unknown>)[seg];
+  }
+  return cur;
+}
+
+/** I3-0857 (D-0920 option A): default ceiling on an operator token's age. */
+export const DEFAULT_OPS_MAX_TOKEN_AGE_SECONDS = 12 * 3600;
+
+/** Parse operator config from env; returns null if incomplete (→ fail closed). */
+export function accessConfigFromEnv(env: Record<string, unknown>): AccessConfig | null {
+  const teamDomain = typeof env.ACCESS_TEAM_DOMAIN === "string" ? env.ACCESS_TEAM_DOMAIN.trim() : "";
+  const aud = typeof env.ACCESS_AUD === "string" ? env.ACCESS_AUD.trim() : "";
+  const emailsRaw = typeof env.OPERATOR_EMAILS === "string" ? env.OPERATOR_EMAILS : "";
+  const operatorEmails = emailsRaw
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+  // Reject unfilled placeholders: a deploy that forgot to set a real value must
+  // fail closed (503), never authenticate against a literal "TODO-..." aud.
+  const placeholder = (v: string) => v === "" || /TODO/i.test(v);
+  if (placeholder(teamDomain) || placeholder(aud) || operatorEmails.length === 0) return null;
+  if (operatorEmails.some((e) => /todo/i.test(e))) return null;
+  // Optional role gating (Cloudflare Access groups). Absent → no gating.
+  const fullGroupRaw = typeof env.OPS_FULL_GROUP === "string" ? env.OPS_FULL_GROUP.trim() : "";
+  const fullGroup = fullGroupRaw && !/TODO/i.test(fullGroupRaw) ? fullGroupRaw : null;
+  const claimRaw = typeof env.OPS_GROUPS_CLAIM === "string" ? env.OPS_GROUPS_CLAIM.trim() : "";
+  const groupsClaim = claimRaw && !/TODO/i.test(claimRaw) ? claimRaw : "groups";
+  // I3-0857: OPS_MAX_TOKEN_AGE_SECONDS, a positive integer no larger than the default (it may only lower the
+  // ceiling, I16-RG-AUTH:1); anything else keeps the default.
+  const ageRaw = typeof env.OPS_MAX_TOKEN_AGE_SECONDS === "string" ? env.OPS_MAX_TOKEN_AGE_SECONDS.trim() : "";
+  const maxTokenAgeSeconds = /^[1-9]\d{0,8}$/.test(ageRaw) ? Math.min(Number(ageRaw), DEFAULT_OPS_MAX_TOKEN_AGE_SECONDS) : DEFAULT_OPS_MAX_TOKEN_AGE_SECONDS;
+  return { teamDomain, aud, operatorEmails, fullGroup, groupsClaim, maxTokenAgeSeconds };
+}
+
+/** Fetch + cache the team JWKS. Cache is best-effort; a fetch failure returns
+ * the last good keys or []. Keys rotate rarely; a short TTL is fine —
+ * EXCEPT for a kid the cache has never seen: honoring the TTL there would
+ * make a legitimate token, signed under a just-rotated key, unverifiable
+ * for up to an hour (PV-07). `wantKid`, when given, bypasses the TTL (never
+ * the "keys.length > 0" gate -- an empty cache always fetches) so a caller
+ * that knows which kid it needs gets a fresh fetch instead of a stale miss. */
+/** I17-FXA H3 (landed by I17-L03): the certs fetch's deadline — the module idiom of stripe.ts TRANSFER_TIMEOUT_MS.
+ * Aborted at it, the fetch throws and `get`'s catch treats it as a failed refresh. Defender:
+ * `i17-l03-jwks-deadline.test.ts`. */
+export const CERTS_FETCH_TIMEOUT_MS = 10_000;
+
+export class JwksCache {
+  private keys: Jwk[] = [];
+  private fetchedAt = 0;
+  /** Clock for the last FAILED refresh. Separate from `fetchedAt` on purpose: a
+   * failure does not make the keys any newer, so it must not restart the TTL —
+   * it only rate-limits the next ATTEMPT (:268). Sentinel is -Infinity, not 0:
+   * 0 is a real instant, and `now - 0 < retryMs` would back off a cache that
+   * has never failed whenever `now` is smaller than `retryMs`. */
+  private failedAt = Number.NEGATIVE_INFINITY;
+  /** I3-0483: clock of the last refresh FORCED by an unseen `wantKid` on a fresh
+   * cache. At most one such fetch per `retryMs`: a successful fetch that still
+   * lacks the kid sets no `failedAt`, so without this bound an attacker-chosen
+   * kid would force one certs fetch per request. */
+  private kidRefetchAt = Number.NEGATIVE_INFINITY;
+  constructor(
+    private readonly certsUrl: string,
+    private readonly ttlMs = 3600_000,
+    private readonly retryMs = 60_000,
+  ) {}
+
+  async get(now: number, fetchImpl: typeof fetch = fetch, wantKid?: string): Promise<Jwk[]> {
+    const fresh = now - this.fetchedAt < this.ttlMs;
+    const haveWantedKid = wantKid === undefined || this.keys.some((k) => k.kid === wantKid);
+    if (this.keys.length > 0 && fresh && haveWantedKid) return this.keys;
+    if (this.keys.length > 0 && fresh) {
+      if (now - this.kidRefetchAt < this.retryMs) return this.keys;
+      this.kidRefetchAt = now;
+    }
+    // Back off after a FAILED attempt, so a certs-endpoint outage costs one
+    // subrequest per `retryMs` instead of one per request. Gated on
+    // `keys.length > 0` for the same reason the TTL is: an empty cache has
+    // nothing to serve, so it always fetches.
+    if (this.keys.length > 0 && now - this.failedAt < this.retryMs) return this.keys;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), CERTS_FETCH_TIMEOUT_MS);
+    try {
+      const res = await fetchImpl(this.certsUrl, { redirect: "manual", signal: ctl.signal });
+      if (res.ok) {
+        const body = (await res.json()) as { keys?: Jwk[] };
+        // QUEUE #605: filter BEFORE adopting. A 200 carrying only non-RSA keys is
+        // a failed refresh (falls through to `failedAt` below), never an empty cache.
+        const usable = Array.isArray(body.keys) ? body.keys.filter((k) => k.kty === "RSA" && k.kid && k.n && k.e) : [];
+        if (usable.length > 0) {
+          this.keys = usable;
+          this.fetchedAt = now;
+          this.failedAt = Number.NEGATIVE_INFINITY;
+          return this.keys;
+        }
+      }
+    } catch {
+      // keep last-good keys; never throw into the request path
+    } finally {
+      clearTimeout(timer);
+    }
+    // Every other exit — !ok, a throw, a body with no usable keys — is a failed
+    // attempt: record it so the next one is not on the very next request.
+    this.failedAt = now;
+    return this.keys;
+  }
+}
+
+// Applied as PER-ROUTE middleware on every door that parses a JSON body
+// (anonymous doors since day one; session and /ops doors since I3-1773 and the
+// W2A hand-offs). Declared in this import-free module (I15-W3B) so console.ts
+// can use the one const without an import cycle through route-helpers.ts ->
+// env.ts; route-helpers.ts re-exports it for every other importer.
+const anonBodyLimitInner = bodyLimit({
+  maxSize: 64 * 1024,
+  onError: (c) => c.json({ error: "payload_too_large" }, 413),
+});
+// CEN-edge-country (I16-L12 HO-L12-2, I16-W13S): Hono's bodyLimit replaces c.req.raw with `new Request(c.req.raw, init)`
+// whenever the request carries a body (hono body-limit/index.js `c.req.raw = new Request(...)`). Workerd keeps `cf` on
+// that copy (I32-EDGE harness/cfprobe-workerd-keeps-cf.mjs under miniflare: country "ZZ" survives `new Request(req,
+// init)`); Node test doubles lose it, and there every door behind this middleware lost request.cf.country and fell back
+// to the forgeable CF-IPCountry header path (I3-1489). The re-attach is for those: the edge's `cf` is carried onto the
+// replacement before the handler runs.
+// Typed as the inner middleware (no `hono` import here: route-registration.test.ts treats one as a router file).
+export const anonBodyLimit: typeof anonBodyLimitInner = async (c, next) => {
+  const cf = (c.req.raw as { cf?: unknown }).cf;
+  return anonBodyLimitInner(c, async () => {
+    if (cf !== undefined && (c.req.raw as { cf?: unknown }).cf === undefined) Object.defineProperty(c.req.raw, "cf", { value: cf, enumerable: true });
+    await next();
+  });
+};
+
+export function extractToken(req: Request): string | null {
+  const header = req.headers.get("Cf-Access-Jwt-Assertion");
+  if (header) return header;
+  // Cookie fallback (Access also sets CF_Authorization).
+  const cookie = req.headers.get("Cookie") ?? "";
+  const m = /(?:^|;\s*)CF_Authorization=([^;]+)/.exec(cookie);
+  if (!m) return null;
+  try {
+    return decodeURIComponent(m[1]!); // malformed cookie → no token, not a 500
+  } catch {
+    return null;
+  }
+}
+===== END FILE: services/trust-core/src/auth.ts =====
+
+===== BEGIN FILE: services/trust-core/src/back-catalog.ts =====
+import type { DbLike } from "./db.js";
+import { isLeapYear, parseStrictDate } from "./dates.js";
+import { archiveDemand, type ArchiveDemand } from "./requests.js";
+
+/**
+ * S88 — the Back Catalog Wizard read. Helps a verified creator turn OLD work into
+ * signed Dhwaja collectibles. It hosts NO media and mints NOTHING itself — the
+ * actual mint is the existing S75 signed drop. This is the guided surface:
+ *
+ *  - DEMAND: what fans have literally asked the creator to catalog (S23 archive
+ *    requests + their notes) — the "dig this out of the archive" backlog. It is
+ *    a DISTINCT-FAN population, so it arrives day-lagged and k-floored from
+ *    `requests.ts archiveDemand`; today's requests are not in it, and a
+ *    population below the floor is withheld rather than served as a small
+ *    integer or as zero.
+ *  - RELEASES: the creator's existing releases, with their creator-asserted
+ *    original date + edition, so the wizard can show what's already catalogued.
+ *  - ANNIVERSARIES: releases whose `released_at` anniversary is coming up — the
+ *    throwback candidates ("5 years ago this month you dropped X — re-drop it").
+ *
+ * Authenticated editions (feature 54) are NOT a new mechanism here: a limited-run
+ * edition is a release signed with an `edition_size` baked into the manifest
+ * (provable scarcity) + the original `released_at` (provable provenance) — both
+ * already ride the S75 drop. S88 just surfaces the opportunity and threads the
+ * original date into the console drop form.
+ *
+ * Creator-PRIVATE: gated at the HTTP layer to the creator's own verified passport.
+ * The archive-demand notes are already creator-only (S23); no fan ids leave here.
+ */
+
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+const ANNIVERSARY_WINDOW_DAYS = 45; // surface an anniversary this many days ahead
+const DAY_MS = 86_400_000;
+/** I3-2009: the release LIST is a page, not the catalog. `releases_total` and
+ * `releases_truncated` say so, so a reader never concludes anything about the
+ * releases past this bound from their absence. */
+export const BACK_CATALOG_RELEASE_LIMIT = 100;
+/** Anniversary candidates are read from the WHOLE catalog (filtered in SQL by
+ * the window's month-days), bounded here; past it `anniversaries_truncated`. */
+export const ANNIVERSARY_CANDIDATE_LIMIT = 200;
+
+export interface BackCatalogRelease {
+  release_id: string;
+  title: string;
+  edition: string | null;
+  released_at: string | null; // creator-asserted original date
+  item_count: number;
+  status: string;
+  /** I6-Q3 (D-1030 (b)): true iff the history row that decides `status` was GUESSED by a backfill (migration 0259
+   * marks the 0147/0155 rows), not recorded when the transition happened. false for a release with no row. */
+  status_inferred: boolean;
+}
+
+export interface Anniversary {
+  release_id: string;
+  title: string;
+  released_at: string; // the original date
+  anniversary_date: string; // next YYYY-MM-DD anniversary on/after today
+  years: number; // full years since the original at that anniversary
+  days_until: number;
+}
+
+export interface BackCatalog {
+  passport_id: string;
+  generated_at: string;
+  /** Day-lagged and k-floored at source (requests.ts `archiveDemand`):
+   * `request_count` is null and `withheld` true below the floor, and the notes
+   * are day-granular. NOT a passthrough of a live count any more. */
+  demand: ArchiveDemand;
+  /** Every release in scope (same `created_at < asOf` bound), not just the
+   * `BACK_CATALOG_RELEASE_LIMIT` newest that `releases` lists. */
+  releases_total: number;
+  /** true iff `releases` is a strict prefix of the catalog. */
+  releases_truncated: boolean;
+  /** true iff more than `ANNIVERSARY_CANDIDATE_LIMIT` releases fall on the
+   * window's month-days, so `anniversaries` may be missing some. */
+  anniversaries_truncated: boolean;
+  releases: BackCatalogRelease[];
+  anniversaries: Anniversary[];
+}
+
+/** Compute the next anniversary of an original date on/after `nowMs`, or null if
+ * the date isn't a STRICT `YYYY-MM-DD` real calendar date. UTC calendar arithmetic
+ * (deterministic, DST-free — a "date" here is a day, not a timestamp).
+ *
+ * Leap day, EXACT: a Feb-29 original observes its anniversary on Feb 29 in a leap
+ * year and on **Feb 28** in a common year — never silently rolling into March 1
+ * (the old `Date.UTC(y, 1, 29)` overflow). So a Feb-29 release still gets a
+ * throwback candidate EVERY year, and always inside February. */
+function nextAnniversary(releasedAt: string, nowMs: number): { anniversary_date: string; years: number; days_until: number } | null {
+  const p = parseStrictDate(releasedAt);
+  if (!p) return null;
+  const { y: oy, m: om, d: od } = p; // om 1..12, od 1..31
+  const now = new Date(nowMs);
+  const ny = now.getUTCFullYear();
+  const todayMs = Date.UTC(ny, now.getUTCMonth(), now.getUTCDate());
+  // The observed anniversary DAY for a given target year (leap-exact for Feb 29).
+  const annDay = (year: number): number => (om === 2 && od === 29 && !isLeapYear(year) ? 28 : od);
+  let annYear = ny;
+  let annMs = Date.UTC(annYear, om - 1, annDay(annYear));
+  if (annMs < todayMs) {
+    annYear = ny + 1;
+    annMs = Date.UTC(annYear, om - 1, annDay(annYear));
+  }
+  const years = annYear - oy;
+  if (years <= 0) return null; // future-dated release — not a throwback
+  const daysUntil = Math.round((annMs - todayMs) / DAY_MS);
+  return { anniversary_date: new Date(annMs).toISOString().slice(0, 10), years, days_until: daysUntil };
+}
+
+/**
+ * Build the Back Catalog Wizard view for a creator's own passport. CALLER-GATING:
+ * the HTTP layer must pass the AUTHENTICATED creator's own passport and must have
+ * checked verified status (like the ROI dashboard).
+ */
+export async function backCatalog(db: DbLike, passportId: string, nowMs: number = Date.now(), now: () => string = () => new Date().toISOString()): Promise<BackCatalog> {
+  if (!PSP_RE.test(passportId)) throw new Error("bad passport id");
+
+  // Same clock as the anniversaries below, so one read is internally consistent.
+  const demand = await archiveDemand(db, passportId, nowMs);
+
+  // AS OF `nowMs`, NOT LIVE. `analytics-read.ts:429` hands this `startOfDayMs(T)`
+  // so the day object's release list is `created_at < T 00:00Z`, the same bound
+  // `readLegacyFacts` puts on `releases_total` / `releases_published`. Without
+  // it a release created AFTER T landed in T's sealed object and the two halves
+  // of one object disagreed about the same release set.
+  const asOf = new Date(nowMs).toISOString();
+  // I3-2132: `status` read AS-OF `asOf`, not live — a release published or
+  // withdrawn AFTER this instant must still show what it was AT it. The latest
+  // release_status_history row before `asOf` carries that; a release with none
+  // yet (created but never published/withdrawn as of `asOf`) was `registered`.
+  // I6-Q3: `status` and `status_inferred` come from ONE row — the join picks that row once — so the flag can never
+  // describe a different row than the status beside it.
+  const { results } = await db
+    .prepare(
+      `SELECT r.release_id, r.title, r.edition, r.released_at, r.item_count,
+              COALESCE(h.status, 'registered') AS status, COALESCE(h.inferred, 0) AS status_inferred
+         FROM releases r
+         LEFT JOIN release_status_history h
+           ON h.rowid = (SELECT h2.rowid FROM release_status_history h2 WHERE h2.release_id = r.release_id AND h2.at < ? ORDER BY h2.at DESC LIMIT 1)
+        WHERE r.passport_id = ? AND r.created_at < ? ORDER BY r.released_at DESC, r.created_at DESC LIMIT ?`,
+    )
+    .bind(asOf, passportId, asOf, BACK_CATALOG_RELEASE_LIMIT)
+    .all<{ release_id: string; title: string; edition: string | null; released_at: string | null; item_count: number; status: string; status_inferred: number }>();
+  const releases: BackCatalogRelease[] = results.map((r) => ({
+    release_id: r.release_id,
+    title: r.title,
+    edition: r.edition ?? null,
+    released_at: r.released_at ?? null,
+    item_count: typeof r.item_count === "number" ? r.item_count : 0,
+    status: r.status,
+    status_inferred: r.status_inferred === 1,
+  }));
+
+  const totalRow = await db
+    .prepare("SELECT COUNT(*) AS n FROM releases WHERE passport_id = ? AND created_at < ?")
+    .bind(passportId, asOf)
+    .first<{ n: number }>();
+  const releasesTotal = Math.max(Number(totalRow?.n ?? 0), releases.length);
+
+  // THE ANNIVERSARY READ IS NOT THE LIST READ (I3-2009). The list is the newest
+  // `BACK_CATALOG_RELEASE_LIMIT` by `released_at`, so the OLDEST releases — the
+  // ones a throwback is about — were exactly the ones cut. Candidates are every
+  // release whose month-day falls in the window (a superset: `nextAnniversary`
+  // below is still the judge, leap-day rule included — a Feb-29 original is a
+  // candidate whenever Feb 28 is in the window).
+  // The window as a month-day RANGE ('MM-DD' compares lexically), one arm or,
+  // across the new year, two — four bound parameters whatever the window. The
+  // end is widened to 02-29 when it lands on 02-28, so a Feb-29 original whose
+  // common-year anniversary is Feb 28 is a candidate.
+  const startDay = new Date(nowMs);
+  const startMs = Date.UTC(startDay.getUTCFullYear(), startDay.getUTCMonth(), startDay.getUTCDate());
+  const mdFrom = new Date(startMs).toISOString().slice(5, 10);
+  const mdEndRaw = new Date(startMs + ANNIVERSARY_WINDOW_DAYS * DAY_MS).toISOString().slice(5, 10);
+  const mdTo = mdEndRaw === "02-28" ? "02-29" : mdEndRaw;
+  const wraps = mdFrom > mdTo;
+  const { results: candRows } = await db
+    .prepare(
+      "SELECT release_id, title, released_at FROM releases WHERE passport_id = ? AND created_at < ? AND released_at IS NOT NULL " +
+        `AND ${wraps ? "(substr(released_at, 6, 5) >= ? OR substr(released_at, 6, 5) <= ?)" : "substr(released_at, 6, 5) BETWEEN ? AND ?"} ` +
+        "ORDER BY released_at ASC, release_id ASC LIMIT ?",
+    )
+    .bind(passportId, asOf, mdFrom, mdTo, ANNIVERSARY_CANDIDATE_LIMIT + 1)
+    .all<{ release_id: string; title: string; released_at: string }>();
+  const anniversariesTruncated = candRows.length > ANNIVERSARY_CANDIDATE_LIMIT;
+
+  const anniversaries: Anniversary[] = [];
+  for (const r of candRows.slice(0, ANNIVERSARY_CANDIDATE_LIMIT)) {
+    if (!r.released_at) continue;
+    const a = nextAnniversary(r.released_at, nowMs);
+    if (a && a.days_until <= ANNIVERSARY_WINDOW_DAYS) {
+      anniversaries.push({ release_id: r.release_id, title: r.title, released_at: r.released_at, anniversary_date: a.anniversary_date, years: a.years, days_until: a.days_until });
+    }
+  }
+  anniversaries.sort((x, y) => x.days_until - y.days_until);
+
+  return {
+    passport_id: passportId,
+    generated_at: now(),
+    demand,
+    releases,
+    releases_total: releasesTotal,
+    releases_truncated: releasesTotal > releases.length,
+    anniversaries,
+    anniversaries_truncated: anniversariesTruncated,
+  };
+}
+===== END FILE: services/trust-core/src/back-catalog.ts =====
+
+===== BEGIN FILE: services/trust-core/src/badge.ts =====
+import { xml, textClamp } from "@dhwaja/card-render";
+import { cardData, type Badge } from "./cards.js";
+import { FOUNDING_CAPACITY } from "./founding.js";
+import type { DbLike } from "./db.js";
+
+/**
+ * S84 — the embeddable "Verified by Dhwaja" badge. A compact, self-contained SVG
+ * pill a creator can drop on their own site to prove their Dhwaja standing. It is
+ * HONEST by construction: the class and the name come from `cardData`'s FOLD
+ * reads, so those can never overclaim — an unclaimed/retracted/SUPPRESSED passport returns null (no badge
+ * for a listing nobody has claimed, and none for a subject an operator agreed to
+ * delist), and the label is exactly the passport's current class. No external refs, no script, no remote fetch — safe to inline anywhere.
+ *
+ * The badge shows the class, the name and a few standing marks — the subject
+ * kind, `SINCE <year>`, a founding rank — and NEVER accounts, so the S101
+ * asserted-account laundering surface (which lives on the full card) does not
+ * exist here. "Never accounts" is the load-bearing half.
+ *
+ * ONE FIELD IS NOT FOLD-DERIVED, and it is the one this badge started showing
+ * most recently. `founding_rank` comes from the `founding` table — a side table
+ * allocated by the `sweepFounding` cron, with no event type and no `fold.ts`
+ * entry behind it — so "reads the fold, therefore cannot overclaim" does not
+ * cover it. It is RANGE-VALIDATED here instead (integer, 1..`FOUNDING_CAPACITY`)
+ * rather than trusted. Whether a scarce, public, permanent award ought to be a
+ * ledger row under invariant 2 is a real question and is written up as a known
+ * gap; it is not one this badge can answer.
+ */
+
+/**
+ * THE FOUNDING STARBURST, small enough for a pill.
+ *
+ * `cards.ts:110` sets `founding-<base>` iff `founding_rank !== null`, so these
+ * two facts always arrive together — and the badge read the first and ignored
+ * the second, mapping `founding-verified` to bytes IDENTICAL to plain
+ * `verified`. A creator in the first `FOUNDING_CAPACITY` had a distinction the
+ * product computed, stored, awarded and then rendered away.
+ *
+ * The CONSTRUCTION is the foil card's, deliberately (`card-render/src/card.ts`
+ * `foundingChip`): sixteen points, alternating radii, same angular phase.
+ * Scaled and softened for a pill — 17/11 rather than 26/15, a low-opacity fill
+ * rather than a stroked metal one — so it is a family resemblance and not a
+ * copy. Inventing a second founding glyph for the same award, one pill apart,
+ * is how two surfaces end up meaning different things by the same picture.
+ *
+ * It sits BEHIND the mark circle (r 12) at low opacity, so it reads as a halo
+ * rather than competing with the ✓/◐ — and, unlike text, it costs none of the
+ * 236px the name and the label are already fighting over.
+ */
+function starburst(cx: number, cy: number, outer: number, inner: number): string {
+  const pts: string[] = [];
+  for (let i = 0; i < 16; i++) {
+    const ang = (i / 16) * Math.PI * 2;
+    const r = i % 2 === 0 ? outer : inner;
+    pts.push(`${(cx + Math.cos(ang) * r).toFixed(1)},${(cy + Math.sin(ang) * r).toFixed(1)}`);
+  }
+  return pts.join(" ");
+}
+
+const LABEL: Record<string, { text: string; fg: string; bg: string; mark: string }> = {
+  verified: { text: "Verified on Dhwaja", fg: "#0b3d1e", bg: "#d8f5e3", mark: "✓" },
+  "founding-verified": { text: "Verified on Dhwaja", fg: "#0b3d1e", bg: "#d8f5e3", mark: "✓" },
+  // ◆ is reserved across all four clients for the subject-kind glyph ("not a
+  // real person"), chosen deliberately outside the verdict set. The claimed
+  // verdict glyph everywhere else is ◐ (M-12) — this badge must match it.
+  claimed: { text: "Claimed on Dhwaja", fg: "#5c3d00", bg: "#fdecc8", mark: "◐" },
+  "founding-claimed": { text: "Claimed on Dhwaja", fg: "#5c3d00", bg: "#fdecc8", mark: "◐" },
+};
+
+/** The year the passport's CURRENT verified standing began — the MOST RECENT
+ * `verification_granted` event. A re-grant can only follow a downgrade to claimed
+ * (the ledger requires `claimed` to grant), so the latest grant is the start of
+ * the current continuous verification — never overstating tenure across a lapse.
+ * Returned as a 4-digit string (ISO prefix, no Date needed), or null when there
+ * is no such event (never verified). */
+async function verifiedSinceYear(db: DbLike, passportId: string): Promise<string | null> {
+  const row = await db
+    .prepare("SELECT MAX(created_at) AS at FROM trust_events WHERE subject = ? AND event_type = 'verification_granted'")
+    .bind(passportId)
+    .first<{ at: string | null }>();
+  const at = row?.at;
+  return typeof at === "string" && /^\d{4}-/.test(at) ? at.slice(0, 4) : null;
+}
+
+/** Render a compact verified/claimed badge SVG, or null if the passport is not
+ * badge-eligible (unknown, retracted, suppressed, or still unclaimed). */
+/** An origin the badge may print as its verify link: `https://host[:port]`, no
+ * path, no credentials. Anything else is dropped and the badge carries the bare
+ * `/p/<id>` path instead — never a string an embedder could steer. */
+const BADGE_ORIGIN_RE = /^https:\/\/[a-z0-9.-]+(?::\d{1,5})?$/i;
+
+/**
+ * The founding rank a badge (or any other surface stating the same fact) may
+ * SHOW, or null. Range-validated (integer, 1..FOUNDING_CAPACITY) rather than
+ * trusted, because `founding_rank` is not fold-derived (see the header) — this
+ * is the one check that decides whether a rank is fit to render, on the pill
+ * (`rankEl` below, and the aria-label) and anywhere else that states the same
+ * fact (I3-1453: the dashboard's plain-text "You're Founding Creator #N.").
+ */
+export function validFoundingRank(badge: Badge, rank: number | null | undefined): number | null {
+  return badge.startsWith("founding-") && typeof rank === "number" && Number.isInteger(rank) && rank >= 1 && rank <= FOUNDING_CAPACITY ? rank : null;
+}
+
+/**
+ * I3-1985 — THE BADGE NAMES WHOSE IT IS AND WHEN IT WAS TRUE. It used to carry
+ * neither, so a copy was a bearer artifact: rehosted, or pasted onto somebody
+ * else's site, it said "Verified on Dhwaja" about nobody in particular, forever.
+ * Every render now states, visibly and in its accessible text, the passport it
+ * describes and the UTC day it was rendered (`AS OF`), plus the page a reader
+ * checks it against (`<origin>/p/<id>`, the origin only when the caller passes
+ * one that matches `BADGE_ORIGIN_RE`). Pixels can always be copied; what this
+ * buys is that a copy names the record it must match and the day it stops
+ * being news.
+ */
+export async function buildBadgeSvg(db: DbLike, passportId: string, opts: { nowMs?: number; origin?: string | null } = {}): Promise<string | null> {
+  const card = await cardData(db, passportId, opts.nowMs ?? Date.now());
+  if (!card) return null;
+  // F-51: fail CLOSED on an unrecognized badge value, matching every other
+  // branch in this file (unclaimed/retracted/suppressed all return null).
+  // Unreachable today (claim_state is DB-CHECK-constrained), but a future
+  // badge class must not silently render as "Claimed on Dhwaja".
+  const meta = LABEL[card.badge];
+  if (!meta) return null;
+  const label = xml(meta.text);
+  const mark = xml(meta.mark);
+  // "Verified since <year>" — only for a verified/founding-verified badge (a
+  // claimed passport has no verification date). Rendered top-right in the pill's
+  // whitespace, so it never collides with the label (top-left) or name (below).
+  // The year is a ledger-derived 4-digit string, so it can't overflow or inject.
+  // THE SAME ARGUMENT THE SHARE CARD MAKES. This badge is embedded on the
+  // creator's OWN site, under their own name, with no Dhwaja page around it —
+  // the most context-free artifact the product serves. `cardData` now hands it
+  // the subject kind and it ignored it, so a verified brand mascot's badge read
+  // `aria-label="Verified on Dhwaja: Nova"` and nothing else, to a screen reader
+  // most of all. There is no room for a chip in a 236×44 pill, so the disclosure
+  // rides the SECOND LINE — replacing the name is not an option, and the name is
+  // already the line that says who this is.
+  const kindWord = card.subject_kind === "ai_character" ? "AI character" : card.subject_kind === "brand" ? "Brand character" : "";
+  // A rank OUTSIDE THE AWARDED RANGE is not rendered — a range check, not a
+  // provenance check, because the `founding` table is not a fold and this file
+  // cannot tell who wrote a row in it (see the header). `FOUNDING_CAPACITY`
+  // bounds it to at most four characters (`#500`), which is what the width
+  // reasoning below is allowed to assume — the same discipline `textClamp`
+  // applies to the name, for the same reason.
+  const rank = validFoundingRank(card.badge, card.founding_rank);
+  const founding = rank !== null;
+  const isVerified = card.badge === "verified" || card.badge === "founding-verified";
+  const year = isVerified ? await verifiedSinceYear(db, passportId) : null;
+  // I3-0088 (D-0838(4)): secondary lines use the name line's 0.82 — the lowest
+  // opacity at which every line clears 4.5:1 on both palettes (claimed 5.32:1);
+  // computed by test/i4-16-r3-badge-contrast.test.ts.
+  const sinceEl = year ? `\n<text x="${236 - 12}" y="16" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-size="9" font-weight="700" fill="${meta.fg}" opacity="0.82" text-anchor="end" letter-spacing="0.3">SINCE ${xml(year)}</text>` : "";
+  const W = 236;
+  const H = 54;
+  const asOf = new Date(opts.nowMs ?? Date.now()).toISOString().slice(0, 10);
+  const origin = typeof opts.origin === "string" && BADGE_ORIGIN_RE.test(opts.origin) ? opts.origin : "";
+  const verifyAt = xml(`${origin}/p/${passportId}`);
+  const pid = xml(passportId);
+  const bindEl = `\n<text x="44" y="47" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-size="7.5" fill="${meta.fg}" opacity="0.82" letter-spacing="0.2">AS OF ${asOf} · ${pid}</text>`;
+  // A single self-contained SVG: rounded pill, mark chip, two lines of text.
+  // The name is clamped harder when a kind rides beside it, so the two together
+  // cannot overflow the fixed 236px width — the same reason the name was clamped
+  // in the first place.
+  const kindEl = kindWord ? ` · ${xml(kindWord)}` : "";
+  // THE NAME IS CLAMPED HARDER AGAIN WHEN A RANK RIDES BESIDE IT, and the rule
+  // is stated in CHARACTERS because that is the only unit this file controls.
+  //
+  // An earlier version of this comment did the arithmetic in pixels at a flat
+  // ~6.3px per character and got it wrong: it reported the kind-plus-rank line
+  // as ending near x=182 when the same rate gives 8 + " · Brand character" = 26
+  // characters and x≈208, past the x≈204 where an end-anchored `#500` begins.
+  // The figure was the 22-character case carried over from the wrong branch.
+  //
+  // A flat rate is also the wrong tool: system-ui is proportional, and the
+  // kind-WITHOUT-rank line already ships at 12 + " · Brand character" = 30
+  // characters, which that rate would put past the pill's right inset entirely.
+  // So the honest rule is the conservative one — keep the second line under ~24
+  // characters whenever a rank shares it, which clears the rank anchor even at a
+  // rate the file's existing cases already prove too pessimistic.
+  const nameChars = kindWord ? (founding ? 6 : 12) : founding ? 20 : 22;
+  // Name clamped + escaped (textClamp does both). Width is fixed; the name is
+  // truncated so a long/hostile name can never break the layout or overflow.
+  // ONE clamp for both the visible line and the aria-label (I3-2038): the
+  // screen reader is told the same name a sighted reader sees.
+  const name = textClamp(card.display_name ?? "", nameChars);
+  const nameLine = kindWord ? `${name}${kindEl}` : name;
+  const burstEl = founding
+    ? `\n<polygon points="${starburst(24, 22, 17, 11)}" fill="${meta.fg}" opacity="0.22"/>`
+    : "";
+  const rankEl = founding
+    ? `\n<text x="${236 - 12}" y="34" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-size="9" font-weight="700" fill="${meta.fg}" opacity="0.82" text-anchor="end" letter-spacing="0.3">#${rank}</text>`
+    : "";
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="${label}: ${name}${kindWord ? `, ${xml(kindWord)}` : ""}${founding ? `, founding creator number ${rank} of ${FOUNDING_CAPACITY}` : ""}${year ? `, verified since ${xml(year)}` : ""}, passport ${pid}, as of ${asOf}">
+<title>${label}: ${pid} (as of ${asOf})</title>
+<desc>Dhwaja passport ${pid} as of ${asOf}. Check it at ${verifyAt}</desc>
+<rect x="0.5" y="0.5" width="${W - 1}" height="${H - 1}" rx="10" fill="${meta.bg}" stroke="#00000018"/>
+${burstEl}
+<circle cx="24" cy="22" r="12" fill="${meta.fg}"/>
+<text x="24" y="27" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-size="15" font-weight="700" fill="${meta.bg}" text-anchor="middle">${mark}</text>
+<text x="44" y="19" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-size="12.5" font-weight="700" fill="${meta.fg}">${label}</text>
+<text x="44" y="34" font-family="system-ui,-apple-system,Segoe UI,Roboto,sans-serif" font-size="12" fill="${meta.fg}" opacity="0.82">${nameLine}</text>${sinceEl}${rankEl}${bindEl}
+</svg>`;
+}
+===== END FILE: services/trust-core/src/badge.ts =====
+
+===== BEGIN FILE: services/trust-core/src/billing.ts =====
+import type { DbLike } from "./db.js";
+import { type StripeConfig, TRANSFER_TIMEOUT_MS } from "./stripe.js";
+
+/**
+ * The fan SUBSCRIPTION state machine — `subscriptions` + `billing_events`.
+ *
+ * ONE ROW PER (ACCOUNT, RAIL) since `0022_atomic_gates_store_rails.sql` (audit
+ * item #30). It was one row per ACCOUNT for two stores, and that single row was
+ * the collapse: an Apple grant and a Google grant shared it, so the later event
+ * simply overwrote the earlier one and a live subscription became invisible.
+ * The rail is part of the KEY now, so there is nothing to collide, the
+ * cross-rail guard that used to be bolted into the upsert is gone, and every
+ * read below is a FOLD OVER ALL LIVE RAILS instead of a lookup of whichever one
+ * happened to own the row. See the migration for the conversion of existing data.
+ *
+ * WHAT THIS IS NOW. It shipped (S45) as the generic-processor rail: an
+ * HMAC-signed webhook drove the state machine and a hosted checkout sold into
+ * it. That WEB rail was deleted in the pre-launch window (item 14) — one web
+ * rail, Stripe, and no second one to reconcile against. The state machine
+ * itself is very much alive, because native IAP writes THROUGH it: Apple
+ * StoreKit and Google Play receipts are validated in iap.ts, normalized into a
+ * `SubscriptionEvent`, and applied here by `applySubscriptionEvent`, so store
+ * purchases and store notifications share one tier source of truth.
+ *
+ * WHAT WENT WITH THE WEB RAIL: `verifyWebhook` (the generic processor's HMAC
+ * webhook parser), `customerIdFor` (the processor-portal link) and the
+ * `BILLING_*` config block. What stayed: this state machine, the grace window,
+ * `currentTier` (the authoritative read), `billingStatus` (what the mobile apps
+ * read back), the expiry sweep and the dedup prune.
+ *
+ * Security properties, unchanged and still load-bearing for IAP: events are
+ * deduped by id (replay-safe), applied in order (a stale event can't downgrade
+ * a live paid user), and the dedup marker + subscription upsert + tier update
+ * commit in ONE batch. Nothing reaches here unvalidated — the store's
+ * authenticated API is the only thing that mints an `IapGrant`.
+ */
+
+export type SubStatus = "active" | "canceled" | "expired" | "none";
+
+export interface SubscriptionEvent {
+  event_id: string;
+  account_id: string;
+  status: SubStatus;
+  current_period_end: string | null; // RFC3339
+  event_time: string; // RFC3339 — the store event's timestamp (ordering)
+  /** I3-1300: RFC3339 tie-break within one event_time (iap.ts IapGrant.event_tiebreak). */
+  event_tiebreak?: string;
+  customer_id?: string | null; // store subscription identifier ("apple:…" / "google:…"), for support reference
+}
+
+/**
+ * Grace window applied to an ACTIVE subscription past its stored period end.
+ * Auto-renewals happen at the store with no purchase call, so our stored
+ * period end can lag a real renewal until a store notification or an app-launch
+ * resubmit arrives — this keeps a renewed-but-not-yet-heard subscriber premium
+ * instead of flapping to free. A store notification (the primary signal) makes
+ * this a backstop, not the main mechanism. It does NOT apply to non-active
+ * statuses (an explicit cancel/expire downgrades immediately).
+ */
+export const SUBSCRIPTION_GRACE_MS = 3 * 24 * 60 * 60 * 1000;
+
+/** Compute the tier from ONE rail's subscription row + current time (grace-aware). */
+function tierFor(status: SubStatus, periodEnd: string | null, nowMs: number): "free" | "premium" {
+  if (status !== "active") return "free";
+  if (!periodEnd) return "free";
+  const end = Date.parse(periodEnd);
+  return Number.isFinite(end) && end + SUBSCRIPTION_GRACE_MS > nowMs ? "premium" : "free";
+}
+
+/** The store rails this table can hold. `unknown` is the honest bucket for a
+ * row whose `customer_id` names no rail — a NULL id, or a legacy unprefixed
+ * one. It is a real key value rather than NULL so the primary key stays total
+ * (SQLite treats NULLs in a PK as distinct, which would let one account
+ * accumulate unbounded rows). */
+export type StoreRail = "apple" | "google" | "unknown";
+
+/**
+ * THE RAIL, DERIVED FROM THE STORE'S OWN IDENTIFIER. iap.ts writes
+ * `customer_id` as `apple:…` / `google:…`; this is the JS twin of the
+ * `substr(customer_id, 1, instr(customer_id, ':') - 1)` the old cross-rail guard
+ * computed in SQL, and the migration uses the same rule to place existing rows.
+ *
+ * ANYTHING UNRECOGNISED IS `unknown`, NEVER GUESSED INTO A RAIL. A row that
+ * names no rail is exactly the row the old guard refused to infer anything
+ * from, and putting it in its own bucket keeps that stance: it can neither
+ * shorten nor be shortened by a real store's grant, because it is not the same
+ * key.
+ */
+export function railOf(customerId: string | null | undefined): StoreRail {
+  if (typeof customerId !== "string") return "unknown";
+  const at = customerId.indexOf(":");
+  if (at <= 0) return "unknown";
+  const prefix = customerId.slice(0, at);
+  return prefix === "apple" || prefix === "google" ? prefix : "unknown";
+}
+
+/**
+ * Canonical ISO form of a store event's timestamp — the ORDERING KEY.
+ *
+ * `last_event_at` is compared IN SQL now (see below), and SQL compares TEXT
+ * lexicographically, so two spellings of the same instant ("…T00:00:00Z" vs
+ * "…T00:00:00.000Z") would order by punctuation instead of by time. Both store
+ * rails already emit `new Date(ms).toISOString()`, so this normalizes what is
+ * in practice already canonical and pins it for anything that isn't.
+ *
+ * Null = unorderable. An event whose time we cannot place cannot be ordered
+ * against the one we already applied, so it is recorded for dedup and changes
+ * nothing (fail closed) rather than being applied on the strength of a NaN
+ * comparison, which is what the old JS guard did.
+ */
+function orderingKey(eventTime: string, tiebreak?: string): string | null {
+  const ms = Date.parse(eventTime);
+  if (!Number.isFinite(ms)) return null;
+  const base = new Date(ms).toISOString();
+  const tb = tiebreak === undefined ? Number.NaN : Date.parse(tiebreak);
+  // I3-1300: (event_time, tiebreak) as ONE TEXT key. Both halves are fixed-width
+  // ISO, so TEXT order is pair order; an unsuffixed key sorts before any
+  // suffixed key of the same instant.
+  return Number.isFinite(tb) ? `${base}|${new Date(tb).toISOString()}` : base;
+}
+
+/** ORDERING GUARD, folded into the upsert. An event older than the one already
+ * applied matches no row and changes nothing — including its `current_period_end`.
+ *
+ * It used to be a JS `isStale` computed from a SELECT taken before the write,
+ * which is check-then-act: a cancel and a renewal that both read the row before
+ * either wrote both decided they were current, and whichever committed last won.
+ * Measured against a barrier that holds both at that read (test/db-recorder.ts):
+ * a renewal to 2026-10-08 followed by a cancel carrying the PREVIOUS period end
+ * left `current_period_end` at 2026-09-08, `status = 'canceled'` and the fan on
+ * `free` — a paying subscriber downgraded and 30 days of paid time erased, and
+ * sticky, because nothing re-reads a store subscription until the next store
+ * notification. `>=` (not `>`) keeps the pre-existing tie rule: same instant
+ * resolves by arrival, which is all a one-second store timestamp can support.
+ */
+/**
+ * THE CROSS-RAIL GUARD IS GONE, AND ITS ABSENCE IS THE FIX (audit item #30).
+ *
+ * What it was for, kept because the measurement is the record. `subscriptions`
+ * held ONE row per account while a fan can hold a StoreKit subscription and a
+ * Play subscription at the same time (an iPad and an Android phone on one
+ * Dhwaja account is an ordinary thing), so the ordering guard alone let the two
+ * rails overwrite each other by arrival time. Measured: an Apple ANNUAL paid
+ * through 2027-08-09, then a Google MONTHLY lapsing the next day → status
+ * `expired`, period end 2026-09-09, tier `free`, 364 paid days erased; and the
+ * quieter mirror, a Google monthly PURCHASE silently shortening the same annual
+ * to one month. A guard was bolted into the upsert — a stack of `instr`/`substr`
+ * rail comparisons whose rule was "a store event never takes away access the
+ * OTHER rail's still-live grant is providing" — and it named its own residual:
+ * *"one row still tracks one rail, so a second live subscription is invisible
+ * until the tracked one lapses. Ending that needs a per-rail `subscriptions`
+ * key, which is a migration plus every reader of the table."*
+ *
+ * That migration is `0022_atomic_gates_store_rails.sql` and this is the reader
+ * side. The rail is part of the PRIMARY KEY, so two rails cannot contend for one
+ * row and there is nothing to guard: what is left is the ORDERING guard, per
+ * rail, which is all it ever should have been. A Google event orders against
+ * Google's own last event and cannot see Apple's row at all.
+ *
+ * THE ORDERING GUARD ITSELF IS UNCHANGED and still load-bearing. `last_event_at`
+ * is stored ISO-8601 and compared IN SQL, so an event older than the one already
+ * applied to THIS rail matches no row and changes nothing — including its
+ * `current_period_end`. It used to be a JS `isStale` computed from a SELECT
+ * taken before the write, which is check-then-act: a cancel and a renewal that
+ * both read the row before either wrote both decided they were current, and
+ * whichever committed last won. Measured against a barrier held on that read
+ * (test/db-recorder.ts): a renewal to 2026-10-08 followed by a cancel carrying
+ * the PREVIOUS period end left `current_period_end` at 2026-09-08, `status =
+ * 'canceled'` and the fan on `free` — a paying subscriber downgraded and 30 days
+ * of paid time erased, and sticky, because nothing re-reads a store subscription
+ * until the next store notification. `>=` (not `>`) keeps the pre-existing tie
+ * rule: same instant resolves by arrival, which is all a one-second store
+ * timestamp can support.
+ */
+const SUB_UPSERT =
+  // I3-1652: the account's existence is asked IN the statement. An erased (or
+  // never-created) account inserts nothing here, so the batch commits the
+  // `billing_events` marker alone and the delivery is acked as an unapplied
+  // no-op — instead of the 0083 FK aborting the batch, writing no marker, and
+  // the store redelivering an event for an account that no longer exists.
+  // (The WHERE clause is also what SQLite needs to parse `SELECT … ON CONFLICT`.)
+  "INSERT INTO subscriptions (account_id, rail, status, current_period_end, last_event_at, updated_at, customer_id) " +
+  "SELECT ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM accounts WHERE account_id = ?) " +
+  "ON CONFLICT(account_id, rail) DO UPDATE SET status = excluded.status, current_period_end = excluded.current_period_end, " +
+  // customer_id is never clobbered with null (a later event may omit it);
+  // COALESCE keeps the first-seen id — kept for support reference only (see
+  // the field's own docstring above); this store rail opens no portal (AS-141).
+  "last_event_at = excluded.last_event_at, updated_at = excluded.updated_at, customer_id = COALESCE(excluded.customer_id, subscriptions.customer_id) " +
+  "WHERE excluded.last_event_at >= subscriptions.last_event_at";
+
+/**
+ * THE CACHED TIER IS NOW A DERIVATION OVER EVERY STORE RAIL, not a copy of the
+ * tier this one event implies.
+ *
+ * With one row per account the two were the same thing. With one row per rail
+ * they are not: a Google cancel arriving while an Apple annual is live implies
+ * `free` for its own rail and says nothing about the account, and writing that
+ * implication into `accounts.tier` would reintroduce the erase the per-rail key
+ * exists to stop — from the cache instead of from the row. So the tier is
+ * COMPUTED IN THE STATEMENT, from whatever rails exist at that moment, and this
+ * event's own `tierFor` result is not used for it at all.
+ *
+ * The guard is unchanged in shape and still per-rail: "the row for MY rail now
+ * carries MY event's timestamp", which is true only of the event that won the
+ * upsert. Batched statements apply in order, so by the time this runs the upsert
+ * above has already decided. Without it a losing cancel still wrote
+ * `accounts.tier = 'free'` over a live subscription.
+ *
+ * WHAT `accounts.tier` IS, stated plainly because it has been mistaken for more:
+ * a STORE-RAIL CACHE and nothing else. It has never known about Stripe, so it
+ * reads `free` for a paying Stripe fan, and no gate may consult it —
+ * `effectiveFanTier` (entitlements-store.ts) is the authoritative read and folds
+ * both rails. The GDPR export used to report this column as "your tier" and now
+ * reports the derivation instead (account_data.ts).
+ */
+const ACCOUNT_TIER =
+  "UPDATE accounts SET tier = CASE WHEN EXISTS (" +
+  "  SELECT 1 FROM subscriptions live WHERE live.account_id = ? AND live.status = 'active' " +
+  "    AND live.current_period_end IS NOT NULL AND live.current_period_end > ?" +
+  ") THEN 'premium' ELSE 'free' END " +
+  "WHERE account_id = ? AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.account_id = ? AND s.rail = ? AND s.last_event_at = ?)";
+
+/**
+ * Apply a verified subscription event. Idempotent (deduped by event id),
+ * ordered (an event older than the last applied changes nothing — the guard is
+ * IN the upsert, not in a decision taken before it), and sets the account tier
+ * from the resulting subscription state.
+ */
+export async function applySubscriptionEvent(db: DbLike, event: SubscriptionEvent, nowMs: number, now: () => string = () => new Date().toISOString()): Promise<{ applied: boolean; tier: "free" | "premium" }> {
+  // Dedup: a replayed event id is a no-op.
+  const seen = await db.prepare("SELECT 1 AS x FROM billing_events WHERE event_id = ?").bind(event.event_id).first();
+  if (seen) {
+    const acct = await db.prepare("SELECT tier FROM accounts WHERE account_id = ?").bind(event.account_id).first<{ tier: "free" | "premium" }>();
+    return { applied: false, tier: acct?.tier ?? "free" };
+  }
+
+  const ts = now();
+  const eventAt = orderingKey(event.event_time, event.event_tiebreak);
+  const rail = railOf(event.customer_id);
+  // The "still live" threshold the cached tier is derived against: a grant past
+  // its period end + grace is protecting nothing. Same threshold `tierFor` and
+  // `sweepExpiredSubscriptions` use, so the cache and the reads agree.
+  const liveThrough = new Date(nowMs - SUBSCRIPTION_GRACE_MS).toISOString();
+  // ATOMIC: the dedup marker, the subscription upsert, and the account tier
+  // update commit together (D1 batch). Previously these were three separate
+  // round-trips — if the marker committed but a later write failed, the retried
+  // event would dedup-skip and the paying account would never become premium.
+  // An unorderable event_time gets the marker alone (see orderingKey).
+  try {
+    await db.batch(
+      eventAt === null
+        ? [db.prepare("INSERT INTO billing_events (event_id, applied_at) VALUES (?, ?)").bind(event.event_id, ts)]
+        : [
+            db.prepare("INSERT INTO billing_events (event_id, applied_at) VALUES (?, ?)").bind(event.event_id, ts),
+            db.prepare(SUB_UPSERT).bind(event.account_id, rail, event.status, event.current_period_end, eventAt, ts, event.customer_id ?? null, event.account_id),
+            // Set the account tier (only if the account exists — a webhook for an
+            // unknown account records the subscription but can't create an account).
+            // The value is DERIVED over every rail inside the statement; this
+            // event's own tier is deliberately not passed in. See ACCOUNT_TIER.
+            db.prepare(ACCOUNT_TIER).bind(event.account_id, liveThrough, event.account_id, event.account_id, rail, eventAt),
+          ],
+    );
+  } catch (e) {
+    // A truly simultaneous duplicate delivery: the dedup SELECT above missed,
+    // but the billing_events PK now rejects this second insert and rolls the
+    // whole batch back. That's the correct idempotent outcome, not a 500 —
+    // re-read and report the current tier as an unapplied no-op.
+    //
+    // The match is EXACTLY the billing_events PK, same shape as
+    // DUPLICATE_EVENT_RE in entitlements-store.ts — the old `/UNIQUE|constraint/i`
+    // also swallowed CHECK, NOT NULL and FK failures from the other two
+    // statements as "duplicate", so a future schema constraint could silently
+    // eat a paid state change (the store gets a 200 and never redelivers).
+    // Anything else rethrows and the store retries.
+    if (e instanceof Error && /UNIQUE constraint failed:\s*billing_events\.event_id/i.test(e.message)) {
+      const acct = await db.prepare("SELECT tier FROM accounts WHERE account_id = ?").bind(event.account_id).first<{ tier: "free" | "premium" }>();
+      return { applied: false, tier: acct?.tier ?? "free" };
+    }
+    throw e;
+  }
+  // A D1 batch cannot report per-statement rows-affected, and after the guard
+  // moved into the statement "did this event win?" is a fact about the ROW, not
+  // about anything we read beforehand. So read it back: the answer the caller
+  // ships to the app has to be the state that actually landed, not the state
+  // this delivery hoped for.
+  //
+  // TWO DIFFERENT QUESTIONS, TWO DIFFERENT SCOPES, and conflating them is the
+  // per-rail bug in miniature. `applied` is about THIS RAIL's row — did my event
+  // win its own ordering race — so it reads that rail. `tier` is about the
+  // ACCOUNT, so it folds every rail: a Google cancel that lands correctly must
+  // still answer `premium` to an app whose user also holds a live Apple annual.
+  const after = await db
+    .prepare("SELECT last_event_at FROM subscriptions WHERE account_id = ? AND rail = ?")
+    .bind(event.account_id, rail)
+    .first<{ last_event_at: string }>();
+  return {
+    applied: eventAt !== null && after?.last_event_at === eventAt,
+    tier: await currentTier(db, event.account_id, nowMs),
+  };
+}
+
+/** One rail's stored grant, as the reads below fold them. */
+interface RailRow {
+  rail: StoreRail;
+  status: SubStatus;
+  current_period_end: string | null;
+  customer_id: string | null;
+}
+
+/**
+ * EVERY store rail this account holds. Bounded by the CHECK on `rail` — at most
+ * three rows, one per allowed value — so this needs no LIMIT and no chunking;
+ * the key itself is the bound.
+ */
+async function railRows(db: DbLike, accountId: string): Promise<RailRow[]> {
+  const { results } = await db
+    .prepare("SELECT rail, status, current_period_end, customer_id FROM subscriptions WHERE account_id = ?")
+    .bind(accountId)
+    .all<RailRow>();
+  return results;
+}
+
+/**
+ * Resolve an account's CURRENT store-rail tier, re-checking period expiry. THIS
+ * is the authoritative STORE read — any premium gate MUST use it (through
+ * `effectiveFanTier`, which folds Stripe in beside it), never the cached
+ * `accounts.tier`, because a subscription can lapse at its period end with no
+ * further webhook.
+ *
+ * MOST GENEROUS WINS, over every rail. That is the same rule
+ * `effectiveFanTier` applies between Stripe and the store, applied one level
+ * down between the stores: a fan who holds Apple and Google at once is premium
+ * while EITHER is live, and a lapse on one rail can no longer take away what
+ * the other is paying for.
+ */
+export async function currentTier(db: DbLike, accountId: string, nowMs: number): Promise<"free" | "premium"> {
+  for (const r of await railRows(db, accountId)) {
+    if (tierFor(r.status, r.current_period_end, nowMs) === "premium") return "premium";
+  }
+  return "free";
+}
+
+export interface BillingStatus {
+  tier: "free" | "premium";
+  status: SubStatus;
+  current_period_end: string | null;
+  // AS-141: NOT "a portal can be opened" — this rail is Apple/Google IAP
+  // only and opens no Dhwaja portal (that exists solely for Stripe, gated in
+  // entitlements-store.ts's `entitlementView`, AS-047). True meaning: at
+  // least one store rail carries an id, kept for support reference.
+  has_customer: boolean;
+  /**
+   * BF-05 — WHICH STORE RAIL the `status` / `current_period_end` above belong
+   * to. Null when there is no store row at all.
+   *
+   * The wire shape had a status and a period with nothing saying whose they
+   * were, so every consumer that wanted to NAME the rail (the operator dossier,
+   * the mobile "manage in the App Store" copy) had to select a row of its own —
+   * and `admin.ts` selects by `current_period_end DESC` regardless of whether
+   * that row is live, which is how a revoked Apple annual came to be named as
+   * the source of a live Google grant. The rail belongs to the same resolver
+   * that chose the grant; it is not a second question.
+   */
+  rail: StoreRail | null;
+}
+
+/**
+ * The account's store billing status for display (authoritative tier via
+ * `tierFor`, folded over every rail).
+ *
+ * WHICH RAIL'S `status` AND `current_period_end` ARE SHOWN. The wire shape is
+ * one subscription and the account may now hold several, so the reported rail is
+ * the one that is actually holding the fan up: the live grant reaching FURTHEST
+ * FORWARD, or — when nothing is live — the most recent period end, which is the
+ * lapse the fan needs to be told about. Anything else would show a cancelled
+ * Google row to someone whose Apple annual runs for another year. `has_customer`
+ * is true if ANY rail carries an id — for support reference ONLY (AS-141): no
+ * rail in this table opens a portal, so this is never a portal-availability
+ * signal, unlike `entitlementView.has_customer` in entitlements-store.ts.
+ *
+ * The shape is deliberately unchanged: the mobile apps read it back, and
+ * widening it is a client change, not a billing-structure one.
+ */
+export async function billingStatus(db: DbLike, accountId: string, nowMs: number): Promise<BillingStatus> {
+  const rows = await railRows(db, accountId);
+  if (rows.length === 0) return { tier: "free", status: "none", current_period_end: null, has_customer: false, rail: null };
+  const rank = (r: RailRow): [number, string] => [tierFor(r.status, r.current_period_end, nowMs) === "premium" ? 1 : 0, r.current_period_end ?? ""];
+  const best = rows.reduce((a, b) => {
+    const [la, ea] = rank(a);
+    const [lb, eb] = rank(b);
+    if (la !== lb) return la > lb ? a : b;
+    return eb > ea ? b : a;
+  });
+  return {
+    tier: rows.some((r) => tierFor(r.status, r.current_period_end, nowMs) === "premium") ? "premium" : "free",
+    status: best.status,
+    current_period_end: best.current_period_end,
+    has_customer: rows.some((r) => !!r.customer_id),
+    // BF-05: from the SAME `best` the status and period came from.
+    rail: best.rail,
+  };
+}
+
+/** Cron sweep: downgrade accounts whose store subscriptions have ALL lapsed
+ * (no cancel webhook arrived) so the cached accounts.tier stays honest.
+ *
+ * PER-RAIL MAKES THIS A `NOT EXISTS`, NOT AN `IN`. The old form downgraded any
+ * account that had A lapsed subscription row; with one row per rail that is the
+ * cross-rail erase again, wearing the sweep's clothes — a fan with a cancelled
+ * Google row and a live Apple annual would be flapped to `free` on the next
+ * cron tick. An account is downgraded only when NO rail is still live. */
+export async function sweepExpiredSubscriptions(db: DbLike, nowMs: number): Promise<number> {
+  // Only downgrade once we're PAST the grace window (matches tierFor), so a
+  // renewed-but-not-yet-heard subscriber isn't flapped to free.
+  const graceIso = new Date(nowMs - SUBSCRIPTION_GRACE_MS).toISOString();
+  const res = await db
+    .prepare(
+      `UPDATE accounts SET tier = 'free' WHERE tier = 'premium'
+         AND EXISTS (SELECT 1 FROM subscriptions any_rail WHERE any_rail.account_id = accounts.account_id)
+         AND NOT EXISTS (
+           SELECT 1 FROM subscriptions live WHERE live.account_id = accounts.account_id
+             AND live.status = 'active' AND live.current_period_end IS NOT NULL AND live.current_period_end > ?
+         )`,
+    )
+    .bind(graceIso)
+    .run();
+  return res.changes;
+}
+
+/** Prune old dedup rows so billing_events doesn't grow unbounded. */
+export async function pruneBillingEvents(db: DbLike, olderThanIso: string): Promise<number> {
+  const res = await db.prepare("DELETE FROM billing_events WHERE applied_at < ?").bind(olderThanIso).run();
+  return res.changes;
+}
+
+/**
+ * QUEUE #419 (D-0577): the CANCEL-ONLY Stripe portal session a SUSPENDED fan
+ * is given at `GET /billing/portal` (index.ts). Null on any failure.
+ *
+ * `flow_data[type]=subscription_cancel` deep-links the portal straight into
+ * cancelling THIS subscription, and `after_completion` sends the person back
+ * to the return URL rather than to the portal home — so the session minted for
+ * a suspended account carries no plan-switch, upgrade or payment-method flow.
+ * A live account keeps `createStripePortalSession` (stripe.ts), unchanged.
+ */
+export async function createStripeCancelFlowSession(cfg: StripeConfig, customerId: string, subscriptionId: string, fetchImpl: typeof fetch = fetch): Promise<string | null> {
+  if (!/^cus_[A-Za-z0-9]+$/.test(customerId) || !/^sub_[A-Za-z0-9]+$/.test(subscriptionId)) return null;
+  const body = new URLSearchParams({
+    customer: customerId,
+    return_url: cfg.portalReturnUrl,
+    "flow_data[type]": "subscription_cancel",
+    "flow_data[subscription_cancel][subscription]": subscriptionId,
+    "flow_data[after_completion][type]": "redirect",
+    "flow_data[after_completion][redirect][return_url]": cfg.portalReturnUrl,
+  });
+  // #352b sibling (I17-W2A): stripe.ts's deadline idiom — TRANSFER_TIMEOUT_MS, aborted at it.
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TRANSFER_TIMEOUT_MS);
+  try {
+    const res = await fetchImpl(`${cfg.apiBase}/v1/billing_portal/sessions`, { redirect: "manual",
+      method: "POST",
+      headers: { authorization: `Bearer ${cfg.secretKey}`, "content-type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+      signal: ctl.signal,
+    });
+    if (!res.ok) return null;
+    const url = ((await res.json()) as { url?: unknown }).url;
+    return typeof url === "string" && /^https:\/\//.test(url) && url.length <= 2048 ? url : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+===== END FILE: services/trust-core/src/billing.ts =====
+
+===== BEGIN FILE: services/trust-core/src/bot-check.ts =====
+/**
+ * I21-Q152 (D-1030, Jason: "turnstile and solvemedia captcha to be added") — the sign-up bot check.
+ *
+ * Two providers, each OFF until all of its keys are set: Cloudflare Turnstile (TURNSTILE_SECRET_KEY) and Solve Media
+ * (SOLVEMEDIA_VERIFY_KEY + SOLVEMEDIA_HASH_KEY). `signupBotCheck` requires EVERY configured provider and passes when
+ * none is. A provider that cannot answer is a 503 with a plain sentence, never a pass. Callers: fan-account-routes.ts
+ * POST /fan/passkey/register/start (join only), POST /fan/otp/start (every call), POST /account/oauth/:provider/signin
+ * (only when the provider identity is new).
+ *
+ * Solve Media signs its answer with sha1(line1 + challenge + hash key). Hashing lives in packages/canonical alone
+ * (tests/invariants/single-hasher.test.ts), which exports no SHA-1, so the hasher is injected (`deps.sha1Hex`); with
+ * Solve Media configured and no hasher the check is UNAVAILABLE (503), never skipped.
+ */
+
+export const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+export const SOLVEMEDIA_VERIFY_URL = "https://verify.solvemedia.com/papi/verify";
+
+/** DRAFT (I30-WEB ## JASON): a missing or failed answer. */
+export const BOT_CHECK_FAILED_MESSAGE = "Please finish the check that shows you're a person, then try again.";
+/** DRAFT (I30-WEB ## JASON): a provider that could not be asked. */
+export const BOT_CHECK_UNAVAILABLE_MESSAGE = "We can't run the check that shows you're a person right now. Nothing was created. Please try again in a few minutes.";
+
+export type BotVerdict = "pass" | "fail" | "unavailable";
+export type BotCheckResult = { ok: true } | { ok: false; status: 403 | 503; error: "bot_check_failed" | "bot_check_unavailable"; message: string };
+
+export interface BotCheckDeps {
+  fetch?: typeof fetch;
+  sha1Hex?: (input: string) => Promise<string>;
+}
+
+export interface BotCheckKeys {
+  turnstile: { secret: string } | null;
+  solvemedia: { verifyKey: string; hashKey: string } | null;
+}
+
+const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
+/** D-1467 (Jason): a server key that is blank, whitespace or contains TODO (any case) is unset, as for every other
+ * reader. Keys only: a client token is read with `str`, since a random token may contain those four letters. */
+const key = (v: unknown): string => (/TODO/i.test(str(v)) ? "" : str(v));
+
+/** A provider is configured only when every one of its server keys is a non-empty string with no TODO in it. */
+export function botCheckKeys(env: Record<string, unknown>): BotCheckKeys {
+  const secret = key(env.TURNSTILE_SECRET_KEY);
+  const verifyKey = key(env.SOLVEMEDIA_VERIFY_KEY);
+  const hashKey = key(env.SOLVEMEDIA_HASH_KEY);
+  return { turnstile: secret ? { secret } : null, solvemedia: verifyKey && hashKey ? { verifyKey, hashKey } : null };
+}
+
+function form(fields: Record<string, string | undefined>): string {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(fields)) if (v !== undefined && v !== "") p.set(k, v);
+  return p.toString();
+}
+
+const FORM_HEADERS = { "Content-Type": "application/x-www-form-urlencoded" };
+
+/** POST siteverify {secret, response, remoteip}; `success: true` passes, `success: false` fails, anything else
+ * (network error, non-2xx, unparseable body) is unavailable. */
+export async function verifyTurnstile(secret: string, token: string, ip: string | undefined, fetchFn: typeof fetch = fetch): Promise<BotVerdict> {
+  if (!token) return "fail";
+  try {
+    const r = await fetchFn(TURNSTILE_VERIFY_URL, { method: "POST", headers: FORM_HEADERS, body: form({ secret, response: token, remoteip: ip }) });
+    if (!r.ok) return "unavailable";
+    const j = (await r.json()) as { success?: unknown };
+    if (j?.success === true) return "pass";
+    if (j?.success === false) return "fail";
+    return "unavailable";
+  } catch {
+    return "unavailable";
+  }
+}
+
+/** POST papi/verify {privatekey, challenge, response, remoteip}; the answer is lines `true|false`, an error code, and
+ * sha1(line1 + challenge + hashKey) in hex. A hash that does not match is not Solve Media's answer: unavailable. */
+export async function verifySolveMedia(
+  keys: { verifyKey: string; hashKey: string },
+  challenge: string,
+  response: string,
+  ip: string | undefined,
+  sha1Hex: ((input: string) => Promise<string>) | undefined,
+  fetchFn: typeof fetch = fetch,
+): Promise<BotVerdict> {
+  if (!challenge || !response) return "fail";
+  if (!sha1Hex) return "unavailable";
+  try {
+    const r = await fetchFn(SOLVEMEDIA_VERIFY_URL, { method: "POST", headers: FORM_HEADERS, body: form({ privatekey: keys.verifyKey, challenge, response, remoteip: ip }) });
+    if (!r.ok) return "unavailable";
+    const lines = (await r.text()).split(/\r?\n/).map((l) => l.trim());
+    const answer = lines[0] ?? "";
+    if (answer !== "true" && answer !== "false") return "unavailable";
+    const expected = await sha1Hex(`${answer}${challenge}${keys.hashKey}`);
+    if ((lines[2] ?? "").toLowerCase() !== expected.toLowerCase()) return "unavailable";
+    return answer === "true" ? "pass" : "fail";
+  } catch {
+    return "unavailable";
+  }
+}
+
+/** The body fields a client sends: `turnstile_token`, `solvemedia_challenge`, `solvemedia_response`. */
+export async function signupBotCheck(env: Record<string, unknown>, body: unknown, ip: string | undefined, deps: BotCheckDeps = {}): Promise<BotCheckResult> {
+  const keys = botCheckKeys(env);
+  const b = body !== null && typeof body === "object" ? (body as Record<string, unknown>) : {};
+  const fetchFn = deps.fetch ?? fetch;
+  const verdicts: BotVerdict[] = [];
+  if (keys.turnstile) verdicts.push(await verifyTurnstile(keys.turnstile.secret, str(b.turnstile_token), ip, fetchFn));
+  if (keys.solvemedia) verdicts.push(await verifySolveMedia(keys.solvemedia, str(b.solvemedia_challenge), str(b.solvemedia_response), ip, deps.sha1Hex, fetchFn));
+  if (verdicts.includes("fail")) return { ok: false, status: 403, error: "bot_check_failed", message: BOT_CHECK_FAILED_MESSAGE };
+  if (verdicts.includes("unavailable")) return { ok: false, status: 503, error: "bot_check_unavailable", message: BOT_CHECK_UNAVAILABLE_MESSAGE };
+  return { ok: true };
+}
+===== END FILE: services/trust-core/src/bot-check.ts =====
+
+===== BEGIN FILE: services/trust-core/src/brand-enrolment.ts =====
+import { canonicalAccount } from "@dhwaja/canonical";
+import { logError } from "./log.js";
+import { chargeAttempt, subjectMayAddAccounts } from "./claims.js";
+import type { DbLike, DbStatement } from "./db.js";
+import {
+  DomainClaimError,
+  MAX_DOMAIN_VERIFY_ATTEMPTS,
+  TXT_PREFIX,
+  type DomainStartResult,
+  type TxtLookup,
+  issueDomainChallenge,
+  lookupTxtUncharged,
+} from "./domain-claims.js";
+import { domainAddGate, sameScriptGate } from "./domain-gate.js";
+import { registrable } from "./domain-match.js";
+import { agencyGatingApexes } from "./agencies.js";
+import { suppressedKeyStmt } from "./seeding.js";
+import { appendEvents, nameClaimsPlatformAuthority } from "./events.js";
+import { mintId, randomHex } from "./ids.js";
+import { consumeRateLimit } from "./ratelimit.js";
+import { auditStmt } from "./review.js";
+import { hasUnsafeDisplayText, hasVisibleText, mintPassportId, type DraftEvent } from "@dhwaja/schema";
+
+/**
+ * SELF-SERVE BRAND ENROLMENT (slice 35) — the door `startDomainProof` has been
+ * pointing at since it was written.
+ *
+ * Its refusal reads "claim the passport first, then prove additional domains
+ * here", and there was no *first*. Every domain ceremony binds a challenge to a
+ * passport that already exists, `events.ts` refuses a self-asserted domain
+ * account ("control is proven separately"), and the only path to
+ * `passport_created` is an operator running a profile import. A brand that had
+ * never been listed could not start anywhere: they had to find a human.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS MINTS: NOTHING
+ * ---------------------------------------------------------------------------
+ * A proof lands a row in `brand_enrolments`, and an operator decides. That is
+ * the same line `nominations.ts` draws — "the suggestion box, never the printing
+ * press" — and it is drawn here for a stronger reason. A self-serve path into
+ * `passport_created` is a self-serve path into the registry, and the registry is
+ * the thing fans trust. What the proof buys is not automation; it is that the
+ * operator CONFIRMS instead of INVESTIGATES. The queue row arrives saying "this
+ * person controls this name, here is the receipt", and the human decides the
+ * only two questions a proof cannot answer: is this identity real, and is this
+ * name theirs to use.
+ *
+ * ---------------------------------------------------------------------------
+ * THE NAME IS A SUGGESTION AND THE DOMAIN IS A PROOF
+ * ---------------------------------------------------------------------------
+ * Proving DNS control of a domain proves control of that domain. It proves
+ * nothing about what the holder may call themselves. A path from "I control
+ * esdfgh.example" to a passport displaying "Netflix Support" would be the
+ * impersonation this product exists to prevent, wearing a proof as a hat — so
+ * `suggested_name` never reaches the ledger. The operator types the display
+ * name at approval, and the console pre-fills the box with what was suggested.
+ *
+ * ---------------------------------------------------------------------------
+ * THE START DOOR ASKS NOTHING ABOUT THE DOMAIN'S STANDING
+ * ---------------------------------------------------------------------------
+ * Precisely: it reads nothing about whether the domain is LISTED, SUPPRESSED or
+ * RESEMBLES anything. It does touch `claim_challenges` for that exact account
+ * key — the per-day count and the single-live-slot index — so it can answer
+ * "somebody has a ceremony open on this name" (409). That is an ACTIVITY bit,
+ * not a standing bit, and it is the same one `/claim/domain/start` has always
+ * carried; an earlier draft of this comment said "reads NOTHING about the
+ * domain", which was four sentences of overclaim in three files.
+ * Slice 32's lesson, applied to an anonymous door where it matters more. A start
+ * door that screens must answer "here is your token" or "no", and of the reasons
+ * for "no", already-listed is public via the k-anon lookup and resembles-a-brand
+ * is computable offline — so a "no" that neither explains IS the delisting bit,
+ * free and unmetered, to anybody at all. So it does not screen. Every
+ * eligibility question is asked in `verifyBrandEnrol`, behind the TXT record,
+ * where the only caller who can reach it is the domain's own controller.
+ */
+
+/** Every eligibility refusal at the verify door wears this one sentence.
+ *
+ * `NOT_CLAIMABLE`'s doctrine at a third door. Naming which predicate failed is
+ * how a delisting bit gets on the wire, and this door is reachable by anyone who
+ * controls any domain — including somebody who just bought a lapsed one, which
+ * is precisely the caller `removal.ts` spends the product's whole decoy
+ * apparatus keeping that fact from. */
+export const NOT_ENROLLABLE = "this domain cannot be enrolled";
+
+/** Per-caller day cap, charged at BOTH halves — ten is generous for somebody
+ * enrolling their own brand and small enough that the door is never a bulk
+ * instrument. Keyed on the masked caller because there is no session here: this
+ * is the one domain door with no principal at all, which is also why a caller
+ * that cannot be masked at all is refused rather than pooled. */
+export const BRAND_ENROL_CAP_PER_DAY = 10;
+
+/** Day cap on the REGISTRABLE domain, across all its subdomains and all callers.
+ * A wildcard TXT record makes every subdomain provable at once, so a per-host
+ * cap bounds nothing; this is what stops one registration filling the queue. */
+export const BRAND_ENROL_CAP_PER_REGISTRABLE_DAY = 3;
+
+/** Longest suggested name and contact address the row will hold. Neither is
+ * trusted; both are clamped so the queue cannot be used as free storage. */
+/** The LEDGER's own bound, not a number of our own choosing. `events.ts` refuses
+ * a `display_name` over 100 characters or carrying control or angle-bracket
+ * characters, and an earlier draft clamped the suggestion at 120 and validated
+ * the operator's name not at all — so a 101-character brand name was a 500 with
+ * the sign-off already banked, invited by an admin input whose `maxlength` said
+ * 120 (adversarial review, MEDIUM). The suggestion and the name are bounded by
+ * the same rule because one is the default for the other. */
+const MAX_NAME = 100;
+const MAX_CONTACT = 200;
+export type EnrolLane = "standard" | "scrutiny";
+export const ENROL_STATES = ["open", "listed", "declined"] as const;
+export type EnrolState = (typeof ENROL_STATES)[number];
+
+export interface BrandEnrolVerifyResult {
+  ok: boolean;
+  // No unreachable outcome: a lookup with no answer throws DomainClaimError 503 (dohTxtLookup, I16-RG-CLIENT:2).
+  outcome: "enrolled" | "record_absent" | "expired";
+  enrolment_id?: string;
+  attempts_remaining?: number;
+}
+
+/**
+ * START — mint a TXT token for a domain nobody has listed. Reads NOTHING about
+ * the domain; see the module docblock.
+ */
+export async function startBrandEnrol(
+  db: DbLike,
+  rawDomain: string,
+  now: () => string = () => new Date().toISOString(),
+  nowMs: number = Date.now(),
+  caller: string | null = null,
+): Promise<DomainStartResult> {
+  // A malformed domain is a 400 and NOT part of the uniform refusal: it is a
+  // fact about the caller's own input, carries no bit about anybody else, and
+  // costs zero statements — which is why it may precede the throttle.
+  let accountKey: string;
+  let domainId: string;
+  try {
+    const canon = canonicalAccount("domain", "domain", rawDomain);
+    accountKey = canon.canonical;
+    domainId = canon.id;
+  } catch {
+    throw new DomainClaimError("that is not a usable domain", 400);
+  }
+
+  // THROTTLE BEFORE ANY READ, AND KEYED ON THE PAIR. There is no session on this
+  // door, so the masked caller is the only principal there is — which is exactly
+  // why the bucket cannot be keyed on the caller ALONE. `callerPrefix` returns
+  // null whenever `CF-Connecting-IP` is absent, and an earlier draft collapsed
+  // that whole population onto one bucket: five requests from anybody closed
+  // self-serve enrolment for everybody for 24 hours (adversarial review,
+  // MEDIUM). Every sibling cap in this codebase is per (account, caller) or per
+  // passport for the same reason, and `startDomainAdd`'s docblock names a
+  // header-less deployment as one of the two reasons it stopped trusting
+  // `callerKey`. Keyed on the pair, a header-less deployment degrades to
+  // per-domain rather than global.
+  // AN UNMASKABLE CALLER FALLS BACK TO A PER-DOMAIN BUDGET, and is neither
+  // pooled nor refused. `callerPrefix` returns null whenever `CF-Connecting-IP`
+  // is absent, and the two obvious answers are both wrong:
+  //
+  //   pool them on one key — five requests from anybody closed self-serve
+  //   enrolment for EVERYBODY for 24 hours (adversarial review, MEDIUM);
+  //   sharing a budget among strangers is not failing closed, it is failing
+  //   closed for somebody else.
+  //
+  //   refuse them (503) — honest, and it was the next draft, but it turns a
+  //   missing header into a dead feature and `suppression-oracles.test.ts`
+  //   refused the pass it produced, correctly: "these routes answered 503 in
+  //   BOTH worlds, so the equality above is about a config gate and not about
+  //   the subject."
+  //
+  // So the bucket degrades rather than collapsing: a masked caller gets a
+  // caller-wide budget, which bounds their TOTAL work; an unmaskable one gets a
+  // per-domain budget, which bounds the work aimed at any one target without
+  // letting one stranger spend another's. The registrable-domain cap below binds
+  // in both cases, and it is what actually stops a flood.
+  const dayKey = caller !== null ? `brandenrol:${caller}` : `brandenrolanon:${accountKey}`;
+  if (!(await consumeRateLimit(db, dayKey, nowMs, BRAND_ENROL_CAP_PER_DAY))) {
+    const e = new DomainClaimError("too many enrolment attempts today", 429);
+    // D-1004(1): `brandenrol:<masked ip>` is keyed on the caller's network alone (route-helpers.ts errorBody); the anon key is per-account.
+    throw caller !== null ? Object.assign(e, { ipKeyed: true }) : e;
+  }
+  // THE REGISTRABLE-DOMAIN CEILING IS NOT CHARGED HERE (I3-1317). A start
+  // proves nothing, so charging the shared per-registration budget at this door
+  // let a stranger spend a real brand's daily capacity. The flood that ceiling
+  // guards against is QUEUE ROWS, which are only filed behind a DNS proof, so it
+  // is charged there — see `chargeRegistrableOnProof`.
+  return issueDomainChallenge(db, null, accountKey, domainId, caller, now, nowMs, "brand_enrol");
+}
+
+/**
+ * THE CEILING ON THE REGISTRABLE DOMAIN (I3-1317), charged only once a TXT
+ * record has MATCHED — i.e. by the party who controls the name. A single
+ * wildcard TXT record proves control of unboundedly many subdomains and each one
+ * is its own account key, its own live slot and its own queue row; one
+ * registration filed 25 rows in the review's harness with nothing to stop it.
+ * `nominations.ts` — the sibling queue this module keeps citing — has
+ * anti-flood; this is ours. Both doors that spend a `brand_enrol` credential
+ * (enrolment and contest) file a queue row, so both charge it.
+ */
+async function chargeRegistrableOnProof(db: DbLike, host: string, nowMs: number): Promise<void> {
+  const reg = registrable(host);
+  if (reg && !(await consumeRateLimit(db, `brandenrolreg:${reg.domain}`, nowMs, BRAND_ENROL_CAP_PER_REGISTRABLE_DAY))) {
+    throw new DomainClaimError("too many enrolment attempts today", 429);
+  }
+}
+
+/** Did THIS verify's spend land? The row-filing INSERT is bound to it by `WHERE
+ * EXISTS`; this read turns a spend that matched zero rows (the challenge expired
+ * or was spent between the door's read and its batch) into a refusal rather than
+ * a success report about a row that was never written (I16 #609o/#609p). */
+async function spendLanded(db: DbLike, challengeId: string, ts: string): Promise<boolean> {
+  const r = await db
+    .prepare("SELECT 1 AS x FROM claim_challenges WHERE challenge_id = ? AND status = 'used' AND proved_at = ?")
+    .bind(challengeId, ts)
+    .first<{ x: number }>();
+  return r !== null;
+}
+
+/** The `claim_challenges` row both brand doors read (`SELECT *`). */
+interface BrandChallengeRow {
+  challenge_id: string;
+  account_key: string;
+  caller: string;
+  platform_key: string;
+  handle: string;
+  code: string;
+  status: string;
+  attempts: number;
+  created_at: string;
+  expires_at: string;
+  purpose: string;
+}
+
+/** I26-W1-MONEY (I3-0696 sibling, I22 RJ-02): THE SPEND, as an UPSERT — the agency door's shape
+ * (agency-domains.ts verifyAgencyDomain). A guarded `status = 'issued'` UPDATE lost a TXT record that MATCHED while the
+ * challenge was live whenever hygiene (`pruneClaimChallenges`) flipped the row to `expired`, or deleted it, during the
+ * lookup. Every value is `chg`'s own and the row is written `used`, so it mints nothing; a row ALREADY `used` (a
+ * concurrent verify won) is left alone, so `proved_at = ts` still binds the filing to THIS spend and `spendLanded`
+ * still refuses the loser. A replay is refused before the lookup by the `status !== 'issued'` gate. */
+function spendChallenge(db: DbLike, chg: BrandChallengeRow, challengeId: string, ts: string): DbStatement {
+  return db
+    .prepare(
+      `INSERT INTO claim_challenges (challenge_id, passport_id, account_key, caller, platform_key, handle, code, status, attempts, created_at, expires_at, purpose, proved_at, method)
+       VALUES (?, NULL, ?, '-', 'domain', ?, ?, 'used', ?, ?, ?, 'brand_enrol', ?, 'domain_dns')
+       ON CONFLICT(challenge_id) DO UPDATE SET status = 'used', proved_at = excluded.proved_at, method = excluded.method WHERE claim_challenges.status <> 'used'`,
+    )
+    .bind(challengeId, chg.account_key, chg.handle, chg.code, chg.attempts + 1, chg.created_at, chg.expires_at, ts);
+}
+
+/**
+ * VERIFY — spend the token, then ask every eligibility question, then file the
+ * queue row.
+ *
+ * The order is the whole design. Nothing about the domain is read until the TXT
+ * record has matched, so the only caller who reaches a refusal is the one who
+ * controls the name — and a delisting is not a secret from the person holding
+ * the domain it was filed against.
+ */
+export async function verifyBrandEnrol(
+  db: DbLike,
+  challengeId: string,
+  lookupTxt: TxtLookup,
+  input: { suggestedName?: string | null; contactEmail?: string | null } = {},
+  now: () => string = () => new Date().toISOString(),
+  nowMs: number = Date.now(),
+): Promise<BrandEnrolVerifyResult> {
+  const chg = await db
+    .prepare("SELECT * FROM claim_challenges WHERE challenge_id = ?")
+    .bind(challengeId)
+    .first<BrandChallengeRow>();
+  if (!chg) throw new DomainClaimError("no such challenge", 404);
+  // Purpose FIRST, and byte-identical to "no such challenge": a credential
+  // minted at any other door is not something this door has ever heard of, and
+  // a distinguishable refusal would tell an anonymous caller which challenge ids
+  // are real — which is exactly what `removal.ts`'s decoy ids exist to prevent.
+  if (chg.purpose !== "brand_enrol") throw new DomainClaimError("no such challenge", 404);
+  if (chg.platform_key !== "domain") throw new DomainClaimError("no such challenge", 404);
+  if (chg.status !== "issued") throw new DomainClaimError("challenge is not open", 409);
+  if (Date.parse(chg.expires_at) < nowMs) {
+    await db.prepare("UPDATE claim_challenges SET status = 'expired' WHERE challenge_id = ? AND status = 'issued'").bind(challengeId).run();
+    return { ok: false, outcome: "expired" };
+  }
+  await chargeAttempt(db, challengeId, MAX_DOMAIN_VERIFY_ATTEMPTS, (m) => new DomainClaimError(m, 409));
+
+  // THE DAY BUDGET IS CHARGED HERE TOO — the MEDIUM slice 32 fixed in
+  // `verifyDomainAdd`, arriving again at a door with no session at all. Each
+  // challenge carries ten verify attempts, and every one of them runs a DoH
+  // lookup and, past the TXT match, two paged scans of the listed world. Metering
+  // only the start half bought an attacker fifty of each per masked /24 for five
+  // starts. Charged AFTER `chargeAttempt` so the per-challenge debit cannot be
+  // dodged by exhausting the day budget first.
+  if (!(await consumeRateLimit(db, chg.caller === "-" ? `brandenrolanon:${chg.account_key}` : `brandenrol:${chg.caller}`, nowMs, BRAND_ENROL_CAP_PER_DAY))) {
+    const e = new DomainClaimError("too many enrolment attempts today", 429);
+    throw chg.caller !== "-" ? Object.assign(e, { ipKeyed: true }) : e; // D-1004(1): the masked-ip key is network-keyed
+  }
+
+  const want = `${TXT_PREFIX}${chg.code}`;
+  const records = await lookupTxtUncharged(db, challengeId, lookupTxt, chg.handle);
+  if (!records.includes(want)) {
+    const row = await db.prepare("SELECT attempts FROM claim_challenges WHERE challenge_id = ?").bind(challengeId).first<{ attempts: number }>();
+    return { ok: false, outcome: "record_absent", attempts_remaining: Math.max(0, MAX_DOMAIN_VERIFY_ATTEMPTS - (row?.attempts ?? MAX_DOMAIN_VERIFY_ATTEMPTS)) };
+  }
+  await chargeRegistrableOnProof(db, chg.handle, nowMs);
+
+  // ---- EVERY ELIGIBILITY QUESTION, ASKED HERE AND ONLY HERE ----------------
+  // All refuse with the SAME sentence and status, for the reason `NOT_ENROLLABLE`
+  // states. The operator log carries a reason CODE and the challenge id — never
+  // the domain, because "refused: suppressed <domain>" writes the delisting fact
+  // in clear into a log stream with a different audience and a different
+  // retention from the console.
+  const uniform = (why: string): never => {
+    logError({ cid: challengeId, hop: "http", msg: "brand_enrol_refused", kind: why });
+    throw new DomainClaimError(NOT_ENROLLABLE, 409);
+  };
+
+  // Already a listed account, anywhere. `account_added` would refuse it at
+  // approval anyway; refusing here keeps the two doors from drifting and stops a
+  // queue row being filed that can never be approved.
+  // ONE STATEMENT FOR ALL THREE PREDICATES, and the reason is a measured oracle
+  // rather than tidiness. An earlier draft awaited them in sequence, so the
+  // three "uniform" refusals cost 3, 4 and 5 D1 round trips — and `db-recorder.ts`
+  // names that as the oracle class this repo instruments for, "a difference that
+  // needs no timing calibration at all". The residue was the protected bit:
+  // already-registered is publicly checkable through the k-anon lookup and
+  // declined is the caller's own history, so subtracting both leaves SUPPRESSED,
+  // delivered to exactly the caller this door was built to keep it from — the
+  // person who just bought a lapsed domain (adversarial review, MEDIUM).
+  //
+  // `suppressedKeyStmt`'s two legs are inlined here rather than called, because
+  // the shared statement returns rows and this one returns flags; the WHERE is
+  // the same one, and `slice35` asserts the two agree.
+  const elig = await db
+    .prepare(
+      `SELECT
+         EXISTS(SELECT 1 FROM passport_accounts WHERE account_key = ?) AS registered,
+         EXISTS(SELECT 1 FROM suppressed_account_keys WHERE account_key = ?
+                UNION ALL
+                SELECT 1 FROM passport_accounts a JOIN request_suppressions r ON r.passport_id = a.passport_id
+                 WHERE a.account_key = ?) AS suppressed,
+         (SELECT enrolment_id FROM brand_enrolments WHERE account_key = ?) AS existing_id,
+         (SELECT state FROM brand_enrolments WHERE account_key = ?) AS existing_state`,
+    )
+    .bind(chg.account_key, chg.account_key, chg.account_key, chg.account_key, chg.account_key)
+    .first<{ registered: number; suppressed: number; existing_id: string | null; existing_state: string | null }>();
+  if (elig?.registered) uniform("already registered");
+  if (elig?.suppressed) uniform("suppressed");
+  // A DECLINED domain is not re-queued by re-proving. An operator's no is not a
+  // thing volume overturns — the rule `nominations.ts` states for its own state
+  // column, and the reason fan input never touches state there.
+  if (elig?.existing_state === "declined") uniform("declined");
+  // A LISTED row means the passport already exists, which `registered` caught —
+  // unless the account was later removed, in which case this is still a decided
+  // question and not a new one.
+  if (elig?.existing_state === "listed") uniform("already decided");
+
+  // THE LOOKALIKE GATE IS A LANE, NOT A REFUSAL, and this is the one place in
+  // the codebase where a gate hit does not end the conversation.
+  //
+  // `domainAddGate` exists to stop a stranger attaching `netflix-support.com` to
+  // a passport that already carries standing. Here there is no standing yet —
+  // the question is whether this name should become an identity at all, which is
+  // a question for a person. Refusing outright would leave a real brand with an
+  // unlucky name no self-serve road AND no way to ask, which is worse than the
+  // laundering risk it would avoid: the risk is bounded by the operator, and the
+  // brand's silence is not. So a hit routes to a lane that carries the two-person
+  // rule, the same treatment `warnings.ts` gives the one other act where being
+  // wrong is expensive in a direction that cannot be undone.
+  // "-" AND NOT A PLAUSIBLE-LOOKING FAKE. The gate uses this argument only to
+  // exclude the caller's own rows, and an earlier draft passed
+  // `psp_0000000000000000` — a well-formed value `mintPassportId` can emit, so
+  // the gate would have been blind to a real passport holding it. 2^-64 by
+  // chance, but sound by luck is not sound (adversarial review, LOW). There is
+  // no self passport here at all: this is the door for somebody who has none.
+  const gate = await domainAddGate(db, chg.handle, "-");
+  // #116 (I16, D-0920): the same-script comparison the Latin skeleton cannot
+  // make. Asked for EVERY caller (one statement either way); a hit is the same
+  // lane as a gate hit, never a refusal.
+  const same = await sameScriptGate(db, chg.handle, "-");
+  const lane: EnrolLane = gate.blocked || same.hit ? "scrutiny" : "standard";
+  const gateReason = gate.blocked
+    ? gate.reason === "resembles"
+      ? `resembles ${gate.matched} (${gate.kind}) on ${gate.matched_passport_id}`
+      : gate.reason
+    : same.hit
+      ? same.reason === "same_script"
+        ? `same-script ${same.matched} (${same.script}) on ${same.matched_passport_id}`
+        : "same-script scan cap"
+      : null;
+
+  const ts = now();
+  // RJb-T2-AS-014 (I16-W04C): the id is now a bearer reference (POST /brand/enrol/status answers by it alone), so it
+  // takes `trk`'s 128-bit width rather than the 20-hex row-id default. Ids minted before this stay 20 hex.
+  const enrolmentId = elig?.existing_id ?? mintId("enr", 32);
+  // AN EMPTY STRING IS A CLEAR, NOT AN OMISSION. `COALESCE` below only ever
+  // overwrites with a non-null, so without this a new controller of a RECYCLED
+  // domain who re-proves and submits nothing keeps the PREVIOUS controller's
+  // name and address on the row — and the operator may then email the previous
+  // owner about the new owner's request (adversarial review, MEDIUM). "Somebody
+  // re-proving is not somebody retracting" is true within one owner and false
+  // across a transfer, which is exactly the caller this door is designed for.
+  // Sending the field empty says "clear it"; omitting it says "leave it".
+  const field = (v: string | null | undefined, max: number): string | null => {
+    if (v === null || v === undefined) return null;
+    const t = v.trim();
+    return t.length === 0 ? "" : t.slice(0, max);
+  };
+  // Shape-checked, because it is rendered beside an Approve button. It is NOT
+  // verified — nothing sends to it — and the panel says so.
+  const contact = field(input.contactEmail, MAX_CONTACT);
+  const contactOk = contact === null || contact === "" || /^[^\s@<>]{1,64}@[^\s@<>.]+(\.[^\s@<>.]+)+$/.test(contact);
+  if (!contactOk) throw new DomainClaimError("that contact address is not usable", 400);
+  const clamp = field;
+  const spend = spendChallenge(db, chg, challengeId, ts); // verifyBrandEnrol
+  // ONE BATCH: the proof is spent and the row is filed together. The spend
+  // (`spendChallenge`) leaves a row a concurrent verify already spent alone, and
+  // a batch statement changing zero rows does not abort the batch — so the
+  // INSERT is an `INSERT … SELECT … WHERE EXISTS` on THIS batch's spend
+  // (`status = 'used' AND proved_at = ts`, the domain-claims.ts claim-enqueue
+  // shape): a challenge spent between the read above and this batch files
+  // nothing and refreshes nothing (an expired or deleted one is re-spent, I26), and
+  // `spendLanded` below turns that into a 409 instead of `enrolled` (I16 #609o).
+  // `UNIQUE(account_key)` is still what prevents a second row.
+  //
+  // An OPEN row is refreshed rather than refused: the same brand re-proving is
+  // somebody who lost the reply, not a new question, and answering them with the
+  // uniform refusal would be a lie about their own domain.
+  //
+  // `WHERE brand_enrolments.state = 'open'` on the DO UPDATE is what stops that
+  // courtesy becoming a hole. The read above is not in this batch, so a decline
+  // landing between them would otherwise let the declined-against party rewrite
+  // the receipt — `proved_at` and `challenge_id` are the record of which proof
+  // justified a mint — and drop fresh attacker-supplied text into the operator's
+  // declined view, while being told `enrolled` (adversarial review, MEDIUM).
+  await db.batch([
+    spend,
+    db
+      .prepare(
+        `INSERT INTO brand_enrolments
+           (enrolment_id, account_key, domain, challenge_id, proved_at, lane, gate_reason, state, contact_email, suggested_name, created_at, updated_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?
+          WHERE EXISTS (SELECT 1 FROM claim_challenges c WHERE c.challenge_id = ? AND c.status = 'used' AND c.proved_at = ?)
+         ON CONFLICT(account_key) DO UPDATE SET
+           challenge_id = excluded.challenge_id,
+           proved_at    = excluded.proved_at,
+           lane         = excluded.lane,
+           gate_reason  = excluded.gate_reason,
+           contact_email = CASE WHEN excluded.contact_email IS NULL THEN brand_enrolments.contact_email
+                                WHEN excluded.contact_email = '' THEN NULL ELSE excluded.contact_email END,
+           suggested_name = CASE WHEN excluded.suggested_name IS NULL THEN brand_enrolments.suggested_name
+                                 WHEN excluded.suggested_name = '' THEN NULL ELSE excluded.suggested_name END,
+           updated_at   = excluded.updated_at
+         WHERE brand_enrolments.state = 'open'`,
+      )
+      .bind(enrolmentId, chg.account_key, chg.handle, challengeId, ts, lane, gateReason, contact, clamp(input.suggestedName, MAX_NAME), ts, ts, challengeId, ts),
+  ]);
+  if (!(await spendLanded(db, challengeId, ts))) throw new DomainClaimError("challenge is not open", 409);
+  const filed = await db.prepare("SELECT enrolment_id FROM brand_enrolments WHERE account_key = ?").bind(chg.account_key).first<{ enrolment_id: string }>();
+  return { ok: true, outcome: "enrolled", enrolment_id: filed?.enrolment_id ?? enrolmentId };
+}
+
+export interface BrandEnrolRow {
+  enrolment_id: string;
+  domain: string;
+  lane: EnrolLane;
+  gate_reason: string | null;
+  state: EnrolState;
+  suggested_name: string | null;
+  contact_email: string | null;
+  proved_at: string;
+  created_at: string;
+  updated_at: string;
+  result_passport: string | null;
+}
+
+const ENROL_LIST_MAX = 200;
+
+/** The operator's view. Bounded, and an unknown filter returns nothing rather
+ * than everything — `nominationQueue`'s rule, for the same reason. */
+export async function brandEnrolQueue(
+  db: DbLike,
+  opts: { state?: string; lane?: string; limit?: number; offset?: number } = {},
+): Promise<{ rows: BrandEnrolRow[] }> {
+  const state = opts.state ?? "open";
+  if (!(ENROL_STATES as readonly string[]).includes(state)) return { rows: [] };
+  const lane = opts.lane;
+  if (lane !== undefined && lane !== "standard" && lane !== "scrutiny") return { rows: [] };
+  const limit = Math.min(Math.max(Math.trunc(opts.limit ?? 50) || 50, 1), ENROL_LIST_MAX);
+  const offset = Math.min(Math.max(Math.trunc(opts.offset ?? 0) || 0, 0), 100_000);
+  const { results } = await db
+    .prepare(
+      `SELECT enrolment_id, domain, lane, gate_reason, state, suggested_name, contact_email,
+              proved_at, created_at, updated_at, result_passport
+         FROM brand_enrolments
+        WHERE state = ? AND (? IS NULL OR lane = ?)
+        ORDER BY (lane = 'scrutiny') DESC, created_at ASC, enrolment_id ASC
+        LIMIT ? OFFSET ?`,
+    )
+    .bind(state, lane ?? null, lane ?? null, limit, offset)
+    .all<BrandEnrolRow>();
+  return { rows: results };
+}
+
+/**
+ * RJb-T2-AS-014 (I16-W04C; D-0920 options (b)+(c)): what a brand that proved its domain and left no email can learn —
+ * the STATE of its own enrolment, by the `enrolment_id` the verify answer returned (and the console now prints), and
+ * nothing else: no domain, no lane, no name, no contact, no decider. The id is the only key (a bearer reference, as
+ * `removal.ts removalStatus`'s request id is), so an unknown id and a malformed one get the same 404. The public words
+ * are the console's: `open` is "pending", `listed` is "approved", `declined` is "declined".
+ */
+export type BrandEnrolPublicState = "pending" | "approved" | "declined";
+const ENROLMENT_ID_RE = /^enr_[0-9a-f]{16,64}$/;
+const PUBLIC_STATE: Readonly<Record<EnrolState, BrandEnrolPublicState>> = { open: "pending", listed: "approved", declined: "declined" };
+export async function brandEnrolStatus(db: DbLike, enrolmentId: unknown): Promise<{ enrolment_id: string; state: BrandEnrolPublicState }> {
+  if (typeof enrolmentId !== "string" || !ENROLMENT_ID_RE.test(enrolmentId)) throw new EnrolError("no such enrolment", 404);
+  const row = await db.prepare("SELECT enrolment_id, state FROM brand_enrolments WHERE enrolment_id = ?").bind(enrolmentId).first<{ enrolment_id: string; state: string }>();
+  const state = row ? PUBLIC_STATE[row.state as EnrolState] : undefined;
+  if (!row || !state) throw new EnrolError("no such enrolment", 404);
+  return { enrolment_id: row.enrolment_id, state };
+}
+
+export class EnrolError extends Error {
+  constructor(
+    message: string,
+    public readonly status: 400 | 404 | 409 = 400,
+  ) {
+    super(message);
+  }
+}
+
+/** The one-shot decision lock, in the shape `claims.ts claimConsumedGateStmt`
+ * established: a PK on the enrolment makes a second decision impossible, and
+ * `decided_at NOT NULL` fed from a subquery that returns NO ROW when the
+ * enrolment is not open makes a losing decision ABORT ITS WHOLE BATCH.
+ *
+ * A guarded `UPDATE … WHERE state='open'` cannot do this. A batch statement that
+ * matches zero rows commits happily beside the statements around it, which is
+ * how an approve racing a decline minted a live, registry-served passport next
+ * to a queue row reading `declined` with no pointer to it (adversarial review,
+ * HIGH). */
+function decisionLockStmt(db: DbLike, enrolmentId: string, decision: "listed" | "declined", operator: string, ts: string, lane?: EnrolLane): DbStatement {
+  // I3-1289: with `lane`, the lock also requires the lane the operator acted on, so a re-proof that
+  // rewrote it after the caller's read aborts the batch here instead of listing on the wrong lane.
+  return db
+    .prepare(
+      `INSERT INTO brand_enrol_decided (enrolment_id, decision, decided_by, decided_at)
+       VALUES (?, ?, ?, (SELECT ? FROM brand_enrolments WHERE enrolment_id = ? AND state = 'open'${lane === undefined ? "" : " AND lane = ?"}))`,
+    )
+    .bind(enrolmentId, decision, operator, ts, enrolmentId, ...(lane === undefined ? [] : [lane]));
+}
+
+/** Did the lock refuse this batch? Matched on the EXACT column, exactly as
+ * `isClaimGateRefusal` does — a broad `/constraint/i` would swallow the PK loss
+ * in the same statement, which is a different answer ("somebody already decided
+ * this") that the callers already translate correctly. */
+const DECISION_LOCK_RE = /NOT NULL constraint failed:\s*brand_enrol_decided\.decided_at/i;
+const PK_LOST_RE = /UNIQUE constraint failed:\s*brand_enrol_decided\.enrolment_id/i;
+export function isDecisionRace(e: unknown): boolean {
+  const m = e instanceof Error ? e.message : String(e);
+  return DECISION_LOCK_RE.test(m) || PK_LOST_RE.test(m);
+}
+
+/** The ledger's own rule for a display name, asked BEFORE the append.
+ *
+ * `events.ts` refuses over 100 characters or any control or angle-bracket
+ * character. Letting it refuse instead produced an untranslated `LedgerError` →
+ * `500 {"error":"internal"}`, with a dual-control sign-off already banked
+ * (adversarial review, MEDIUM). A name a person typed deserves a sentence. */
+export function validDisplayName(name: string): boolean {
+  return name.length >= 1 && name.length <= 100 && !/[<>]/.test(name) && !hasUnsafeDisplayText(name) && !nameClaimsPlatformAuthority(name);
+}
+
+/**
+ * I3-0306 — THE PROOF-TO-PASSPORT BIND, run inside a decision's own batch AFTER
+ * that batch's state UPDATE: the challenge is the one the decided row names at
+ * commit (`state = <decided>`), on the same account key, still a spent
+ * `brand_enrol` proof with no subject. Matching zero rows binds nothing.
+ */
+function bindBrandProofStmt(
+  db: DbLike,
+  passportId: string,
+  table: "brand_enrolments" | "brand_contests",
+  idCol: "enrolment_id" | "contest_id",
+  id: string,
+  decided: "listed" | "admitted",
+  accountKey: string,
+) {
+  return db
+    .prepare(
+      `UPDATE claim_challenges SET passport_id = ?
+        WHERE challenge_id = (SELECT challenge_id FROM ${table} WHERE ${idCol} = ? AND state = ?)
+          AND account_key = ? AND purpose = 'brand_enrol' AND status = 'used' AND passport_id IS NULL`,
+    )
+    .bind(passportId, id, decided, accountKey);
+}
+
+/**
+ * APPROVE — mint the passport, and stop there.
+ *
+ * The passport is born UNCLAIMED with its proven domain attached, which is the
+ * state the rest of the ladder already knows how to move: the brand then claims
+ * it through `/claim/domain/*`, which works now precisely because the
+ * `passport_accounts` row exists. That second ceremony is not redundant — the
+ * first proves control of a NAME, the second asserts an IDENTITY — and routing
+ * through the existing door leaves `claim_proven`'s consumption gate, its
+ * one-shot lock and its proof-row upsert exactly where they are rather than
+ * growing a second implementation here.
+ *
+ * `subject_kind` is `person` at birth and stays there. Declaring a passport a
+ * BRAND is `subject_kind_declared`, which is operator-only by design, and
+ * bundling it into an approval would make one click do two things of different
+ * weight.
+ *
+ * THE SCRUTINY LANE IS CHECKED HERE, NOT IN THE ROUTE. It was in the route, and
+ * three things were wrong with that at once: this function minted from a
+ * scrutiny row with one operator when called directly; the lane is a column the
+ * ENROLLER can rewrite by re-proving, so a banked sign-off could be dissolved
+ * and the same operator could then approve alone; and no test drove the route at
+ * all, so deleting the whole `withDualControl` wrapper left the suite green
+ * (adversarial review, HIGH). The caller must now assert that a second operator
+ * has signed off, and it must pass the lane it acted on — so a lane that moved
+ * under the sign-off is a refusal rather than a shortcut.
+ */
+export async function approveBrandEnrol(
+  db: DbLike,
+  enrolmentId: string,
+  operator: string,
+  displayName: string,
+  /** The lane the CALLER checked, and the second-operator witness for it. A
+   * `scrutiny` approval without `dualControlSatisfied` is refused here even if
+   * the route forgot. */
+  auth: { lane: EnrolLane; dualControlSatisfied: boolean } = { lane: "standard", dualControlSatisfied: false },
+  now: () => string = () => new Date().toISOString(),
+): Promise<{ passport_id: string; contact_email: string | null }> {
+  const name = displayName.trim();
+  if (!validDisplayName(name)) throw new EnrolError("a display name is required: up to 100 characters, no angle brackets, no verification mark, no platform name", 400);
+  const row = await db
+    .prepare("SELECT enrolment_id, account_key, domain, state, lane, contact_email FROM brand_enrolments WHERE enrolment_id = ?")
+    .bind(enrolmentId)
+    .first<{ enrolment_id: string; account_key: string; domain: string; state: string; lane: EnrolLane; contact_email: string | null }>();
+  if (!row) throw new EnrolError("no such enrolment", 404);
+  if (row.state !== "open") throw new EnrolError("that enrolment is already decided", 409);
+  // The lane the caller acted on must still be the lane on the row. A re-proof
+  // between the sign-off and the click rewrites it, and "the gate stopped
+  // objecting while you were deciding" is not a reason to need one fewer pair of
+  // eyes — it is a reason to look again.
+  if (row.lane !== auth.lane) throw new EnrolError("this enrolment changed while you were deciding — look again", 409);
+  if (row.lane === "scrutiny" && !auth.dualControlSatisfied) {
+    throw new EnrolError("a scrutiny-lane listing needs a second operator", 409);
+  }
+
+  // The domain may have been listed by an import between the proof and this
+  // click. `account_added` refuses a duplicate on its own read; asking here
+  // turns a ledger error into a sentence an operator can act on.
+  const taken = await db.prepare("SELECT 1 AS x FROM passport_accounts WHERE account_key = ? LIMIT 1").bind(row.account_key).first<{ x: number }>();
+  if (taken) throw new EnrolError("that domain is already listed", 409);
+
+  const ts = now();
+  // The importer's own shape (`mintPassportId(randomHex(16))`), not `mintId` —
+  // `events.ts` pins `passport_created` subjects to `psp_` + 16 hex.
+  const passportId = mintPassportId(randomHex(16));
+  const drafts: DraftEvent[] = [
+    { event_type: "passport_created", subject: passportId, actor_kind: "operator", actor_id: operator, payload: { display_name: name } },
+    {
+      event_type: "account_added",
+      subject: passportId,
+      actor_kind: "operator",
+      actor_id: operator,
+      payload: { platform: "domain", id_kind: "domain", id: row.domain, relationship_basis: "creator_claimed", observed_at: ts },
+    },
+  ] as DraftEvent[];
+  // The lock, the ledger append, the queue row and the audit line commit
+  // together — and the lock is first because it is the one that can ABORT.
+  try {
+    await appendEvents(db, drafts, now, [], [
+      decisionLockStmt(db, enrolmentId, "listed", operator, ts, auth.lane),
+      db.prepare("UPDATE brand_enrolments SET state = 'listed', result_passport = ?, updated_at = ? WHERE enrolment_id = ?").bind(passportId, ts, enrolmentId),
+      // I3-0306: bind the DNS proof the LISTED row names to the passport it
+      // justified — the registry's (passport, account) proof pair
+      // (registry-build.ts readRange) never matches a NULL passport_id.
+      bindBrandProofStmt(db, passportId, "brand_enrolments", "enrolment_id", enrolmentId, "listed", row.account_key),
+      auditStmt(db, operator, "brand_enrol:listed", enrolmentId, row.domain, ts),
+    ]);
+  } catch (e) {
+    if (isDecisionRace(e)) {
+      const now2 = await db.prepare("SELECT state, lane FROM brand_enrolments WHERE enrolment_id = ?").bind(enrolmentId).first<{ state: string; lane: EnrolLane }>();
+      if (now2?.state === "open" && now2.lane !== auth.lane) throw new EnrolError("this enrolment changed while you were deciding — look again", 409);
+      throw new EnrolError("that enrolment is already decided", 409);
+    }
+    throw e;
+  }
+  return { passport_id: passportId, contact_email: row.contact_email };
+}
+
+/** I8-FX2 (I8RG-01/02/03): the most characters of a brand decline note (removals' `DECLINE_NOTE_MAX` in console.ts is the same 1000). */
+export const BRAND_DECLINE_NOTE_MAX = 1000;
+/** The ONE gate for a brand decline note, and it returns the value that is stored: a string
+ * with at least one character a reader can see (`hasVisibleText`, the shared #565 predicate),
+ * trimmed at the ends and no longer than the cap. Non-string, blank, invisible-only and
+ * over-long are all the same 400 EnrolError; the caller writes what this returns, never `note`. */
+function requireDeclineNote(note: unknown): string {
+  if (typeof note !== "string") throw new EnrolError("a reason is required", 400);
+  const stored = note.trim();
+  if (!hasVisibleText(stored)) throw new EnrolError("a reason is required", 400);
+  if (stored.length > BRAND_DECLINE_NOTE_MAX) throw new EnrolError("the reason is too long", 400);
+  return stored;
+}
+
+/** DECLINE — an operator's no. Recorded, and final for that domain: the verify
+ * door refuses a declined key with the uniform sentence rather than re-queueing
+ * it, so volume cannot overturn a decision. */
+export async function declineBrandEnrol(
+  db: DbLike,
+  enrolmentId: string,
+  operator: string,
+  note: string,
+  now: () => string = () => new Date().toISOString(),
+): Promise<{ contact_email: string | null; domain: string }> {
+  const row = await db
+    .prepare("SELECT state, domain, contact_email FROM brand_enrolments WHERE enrolment_id = ?")
+    .bind(enrolmentId)
+    .first<{ state: string; domain: string; contact_email: string | null }>();
+  if (!row) throw new EnrolError("no such enrolment", 404);
+  if (row.state !== "open") throw new EnrolError("that enrolment is already decided", 409);
+  // #177: the note is the audit detail of a final decision; refused before any write.
+  const stored = requireDeclineNote(note);
+  const ts = now();
+  // Through the SAME lock the approval uses, so an approve and a decline racing
+  // each other cannot both believe they won.
+  try {
+    await db.batch([
+      decisionLockStmt(db, enrolmentId, "declined", operator, ts),
+      db.prepare("UPDATE brand_enrolments SET state = 'declined', updated_at = ? WHERE enrolment_id = ?").bind(ts, enrolmentId),
+      auditStmt(db, operator, "brand_enrol:declined", enrolmentId, stored, ts),
+    ]);
+  } catch (e) {
+    if (isDecisionRace(e)) throw new EnrolError("that enrolment is already decided", 409);
+    throw e;
+  }
+  return { contact_email: row.contact_email, domain: row.domain };
+}
+
+/** REOPEN — F-30 (ADR-0007 batch S-050): a decline was permanent, reason-free
+ * and one-operator, while the approval it mirrors takes two — the wrong
+ * asymmetry, since the caller here has already proved DNS control of the name
+ * the decision is about. "Volume cannot overturn a decision" still holds: this
+ * is not the verify door re-queueing on a re-proof, it is an OPERATOR choosing
+ * to look again, and it costs the same two-person rule the scrutiny lane
+ * charges for the opposite mistake.
+ *
+ * A brand-new enrolment row (the finder's first-cut shape) cannot exist beside
+ * the declined one: `idx_brand_enrol_account` is UNIQUE on `account_key`, and
+ * loosening that is a migration, not a reversible in-package call. So this
+ * reopens the SAME row in place — flips it back to `open` and releases the
+ * one-shot lock that made a second decision on this `enrolment_id` impossible
+ * — and only for a `declined` row; a `listed` one (a minted passport) is never
+ * touched here, because unwinding a mint is a different, irreversible act with
+ * its own door if one is ever built. */
+export async function reopenBrandEnrol(
+  db: DbLike,
+  enrolmentId: string,
+  operator: string,
+  auth: { dualControlSatisfied: boolean },
+  note: string,
+  now: () => string = () => new Date().toISOString(),
+): Promise<{ domain: string }> {
+  if (!auth.dualControlSatisfied) throw new EnrolError("reopening a decline needs a second operator", 409);
+  const row = await db
+    .prepare("SELECT state, domain FROM brand_enrolments WHERE enrolment_id = ?")
+    .bind(enrolmentId)
+    .first<{ state: string; domain: string }>();
+  if (!row) throw new EnrolError("no such enrolment", 404);
+  if (row.state !== "declined") throw new EnrolError("only a declined enrolment can be reopened", 409);
+  const ts = now();
+  // The lock row is DELETED, not overwritten: `decisionLockStmt` still fires on
+  // whatever decision follows, so a fresh approve/decline gets its own
+  // one-shot guard rather than fighting the old PK. Scoped to `decision =
+  // 'declined'` so this can never touch a `listed` row's lock even if called
+  // against one — belt beside the state check above.
+  await db.batch([
+    db.prepare("DELETE FROM brand_enrol_decided WHERE enrolment_id = ? AND decision = 'declined'").bind(enrolmentId),
+    db.prepare("UPDATE brand_enrolments SET state = 'open', updated_at = ? WHERE enrolment_id = ? AND state = 'declined'").bind(ts, enrolmentId),
+    auditStmt(db, operator, "brand_enrol:reopened", enrolmentId, note.slice(0, 300), ts),
+  ]);
+  return { domain: row.domain };
+}
+
+// ---------------------------------------------------------------------------
+// BRAND CONTEST (D-0561 / J-02) — THE FILING CHANNEL FOR A REFUSAL THE GATE
+// ALREADY ISSUES.
+//
+// WHAT IS BEING FIXED, precisely. `domainAddGate` refuses a host that resembles
+// a name listed under somebody else, and `verifyDomainAdd` answers that refusal
+// UNIFORMLY: `409 this domain cannot be added to this passport` plus one
+// subject-free operator line (`domain-claims.ts:1105-1108`, `:1141`). The
+// uniformity is right — naming the matched listing would put a delisting bit on
+// the wire — but it left the refused party with NOTHING TO DO. Where the
+// incumbent is a first-mover lookalike and the refused party is the real brand
+// owner, both are domain-proven, the machine cannot tell them apart, and there
+// was no way to put the question to a human at all. `domain-claims.ts:1133-1136`
+// claims "a hit routes to an operator … rather than to a refusal a creator can
+// grind against"; the executable path at `:1141` writes no queue row. This is
+// the queue row.
+//
+// STANDING IS A DNS PROOF AND NOTHING ELSE (D-0593). A filing requires the
+// filer to have proven control of the contested host through the same ceremony
+// `/brand/enrol/start` mints — so the ceremony, its caps and its issuer are
+// reused whole. An unproven filing would need its own abuse bound built from
+// nothing and would turn an operator queue into an open complaint channel
+// against any brand holder. Both parties being domain-proven is the POINT: the
+// machine cannot decide between them, but it can insist they are in the same
+// class before a human is asked to.
+//
+// THE PASSPORT ON THE ROW IS A CLAIM, NOT AN AUTHORIZATION. The proof
+// authorizes the FILING, not the passport it names; before an operator reads
+// the row the only thing `filer_passport_id` does is exclude the filer's own
+// listings from the gate scan, exactly as `verifyDomainAdd` does. Attaching the
+// domain to that passport is `admitBrandContest`, under the two-person rule.
+//
+// WHAT AN ADMIT DOES, AND WHAT IT REFUSES TO DO (D-0594). It attaches the
+// CONTESTED domain to the filer's passport and records the conflict. It does not
+// strip, suppress or re-fold the incumbent's brand: the incumbent proved their
+// domain too, so an automatic unwind would let one operator decision silently
+// revoke a standing another operator granted, and it would reach
+// `brand-index.ts`'s cache and the gate's served standing. NO READER in this
+// codebase behaves differently because a contest row exists.
+//
+// WHY THE CREDENTIAL IS A `brand_enrol` PURPOSE AND NOT ITS OWN. `purpose` is
+// the anti-cross-door device and a dedicated `brand_contest` would be cleaner,
+// but `CHALLENGE_PURPOSES` lives in `claims.ts`, outside this row's ownership
+// list, so minting one here would be an edit this room may not make (B2). The
+// two doors that spend `brand_enrol` both require the SAME artefact — a Dhwaja
+// token published in the contested host's own DNS — and neither grants anything
+// without an operator, so the credential is not wider than its proof. The
+// separation is filed as an ownership diff, not taken.
+
+/** Every eligibility refusal at the contest door wears this one sentence, for
+ * the reason `NOT_ENROLLABLE` states one door over: the set of reasons includes
+ * "that name resembles a listing you cannot see", and a refusal that named
+ * which predicate failed would hand the caller the delisting bit the uniform
+ * 409 at `domain-claims.ts:1141` exists to withhold. */
+export const NOT_CONTESTABLE = "this domain cannot be contested";
+
+/** The bind value an EMPTY filer spends its reads against, so that a caller
+ * who sends no passport id pays the same statements as one who sends a real
+ * one (D-0604). Not an identifier: see `filerProbe`. */
+const UNMATCHABLE_FILER = "(no filer)";
+
+export const CONTEST_STATES = ["open", "admitted", "declined"] as const;
+export type ContestState = (typeof CONTEST_STATES)[number];
+
+export interface BrandContestVerifyResult {
+  ok: boolean;
+  /** No `unreachable`, for the reason `BrandEnrolVerifyResult` gives: a resolver
+   * failure is indistinguishable here from a missing record. */
+  outcome: "filed" | "record_absent" | "expired";
+  contest_id?: string;
+  attempts_remaining?: number;
+  /** THE COUNTERPARTY, FOR THE CALLER'S SERVER AND NOT FOR THE CALLER. The route
+   * hands this to the incumbent's notice (D-0595) and returns an explicitly
+   * whitelisted body; echoing it to the filer would publish the matched listing
+   * this module's uniform refusal is built to withhold. */
+  notify?: { incumbent_passport_id: string; incumbent_host: string };
+}
+
+export interface BrandContestRow {
+  contest_id: string;
+  filer_passport_id: string;
+  domain: string;
+  incumbent_passport_id: string;
+  incumbent_host: string;
+  gate_kind: string;
+  lane: EnrolLane;
+  state: ContestState;
+  contact_email: string | null;
+  proved_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * VERIFY — spend the proof, ask every eligibility question, then file the row.
+ *
+ * The order is `verifyBrandEnrol`'s and for its reason: nothing about the
+ * domain or the incumbent is read until the TXT record has matched, so the only
+ * caller who can reach a refusal is the one who controls the contested name.
+ */
+export async function verifyBrandContest(
+  db: DbLike,
+  challengeId: string,
+  lookupTxt: TxtLookup,
+  input: { passportId: string; contactEmail?: string | null },
+  now: () => string = () => new Date().toISOString(),
+  nowMs: number = Date.now(),
+): Promise<BrandContestVerifyResult> {
+  const chg = await db
+    .prepare("SELECT * FROM claim_challenges WHERE challenge_id = ?")
+    .bind(challengeId)
+    .first<BrandChallengeRow>();
+  if (!chg) throw new DomainClaimError("no such challenge", 404);
+  // Byte-identical to "no such challenge" for a wrong purpose or platform, which
+  // is `CHALLENGE_PURPOSES`' rule: a distinguishable "wrong door" tells an
+  // anonymous caller which challenge ids are real.
+  if (chg.purpose !== "brand_enrol") throw new DomainClaimError("no such challenge", 404);
+  if (chg.platform_key !== "domain") throw new DomainClaimError("no such challenge", 404);
+  if (chg.status !== "issued") throw new DomainClaimError("challenge is not open", 409);
+  if (Date.parse(chg.expires_at) < nowMs) {
+    await db.prepare("UPDATE claim_challenges SET status = 'expired' WHERE challenge_id = ? AND status = 'issued'").bind(challengeId).run();
+    return { ok: false, outcome: "expired" };
+  }
+  await chargeAttempt(db, challengeId, MAX_DOMAIN_VERIFY_ATTEMPTS, (m) => new DomainClaimError(m, 409));
+  // The same day budget the enrolment verify charges, on the same keys: this
+  // door drives the same DoH lookup and the same two paged scans of the listed
+  // world, and metering only the start half bought an attacker ten of each per
+  // challenge.
+  if (!(await consumeRateLimit(db, chg.caller === "-" ? `brandenrolanon:${chg.account_key}` : `brandenrol:${chg.caller}`, nowMs, BRAND_ENROL_CAP_PER_DAY))) {
+    const e = new DomainClaimError("too many enrolment attempts today", 429);
+    throw chg.caller !== "-" ? Object.assign(e, { ipKeyed: true }) : e; // D-1004(1): the masked-ip key is network-keyed
+  }
+
+  const want = `${TXT_PREFIX}${chg.code}`;
+  const records = await lookupTxtUncharged(db, challengeId, lookupTxt, chg.handle);
+  if (!records.includes(want)) {
+    const row = await db.prepare("SELECT attempts FROM claim_challenges WHERE challenge_id = ?").bind(challengeId).first<{ attempts: number }>();
+    return { ok: false, outcome: "record_absent", attempts_remaining: Math.max(0, MAX_DOMAIN_VERIFY_ATTEMPTS - (row?.attempts ?? MAX_DOMAIN_VERIFY_ATTEMPTS)) };
+  }
+  await chargeRegistrableOnProof(db, chg.handle, nowMs);
+
+  // ---- EVERY ELIGIBILITY QUESTION, ASKED HERE AND ONLY HERE ----------------
+  // All refuse with the SAME sentence and status. The operator log carries a
+  // reason CODE and the challenge id and never a subject — `verifyBrandEnrol`'s
+  // rule, and here it matters twice over, because the subjects available to
+  // write would be the contested host AND the incumbent's.
+  // FAMILY-003: each exit below leaves NO row, leaves the caller free to
+  // re-prove within their day budget, and leaves the operator a code in the log;
+  // the state nobody is left in is the point — a refusal here never banks a
+  // half-filing an operator would have to resolve.
+  // ANNOTATED, NOT INFERRED. The type on the BINDING (rather than only on the
+  // arrow) is what makes the compiler treat a call as terminating control flow,
+  // which is how the gate verdict below narrows to the one union member that
+  // carries a counterparty. Without it every eligibility refusal still threw and
+  // the union stayed unnarrowed, so the row could be built from a verdict with
+  // no incumbent in it.
+  const uniform: (why: string) => never = (why) => {
+    // STRUCTURED, not raw. `log-no-raw-console.test.ts`'s ratchet caught the
+    // first version of this line: it copied the neighbouring `brand enrol
+    // refused` call at :258 verbatim, which is exactly how a ratchet is
+    // defeated by precedent — the neighbour predates the logger and its
+    // ceiling grandfathers it, a new call site gets no such grant.
+    // `why` and `challengeId` are developer-written labels and an opaque id,
+    // both inside ALLOWED_KEYS' floor; the CONTESTED HOST is deliberately not
+    // logged, which is the same uniformity the 409 itself keeps.
+    logError({ cid: "brand-contest", hop: "http", msg: "brand_contest_refused", err: why, route: "/account/brand-contest/verify" });
+    throw new DomainClaimError(NOT_CONTESTABLE, 409);
+  };
+
+  const filer = input.passportId.trim();
+  // ---- EVERY READ, UNCONDITIONALLY, BEFORE ANY REFUSAL --------------------
+  // W309-FX1 / J-02 measured the half of the uniformity that the bytes do not
+  // carry: three refusals this door means to be indistinguishable cost 4, 5
+  // and 9 database round trips, because each predicate refused as soon as it
+  // could. A caller who controls the contested host can time that, and the
+  // gap answers exactly the question the uniform 409 withholds — whether
+  // anything in the listed world resembles their name. So every read the
+  // ladder below consults is drawn here, for every caller, and the refusals
+  // are decided afterwards from values already in hand. The reads are all
+  // read-only (`domainAddGate` and `agencyGatingApexes` write nothing), and
+  // the extra work an ineligible filer now costs is already bounded twice
+  // above this line — `chargeAttempt` per challenge and the day budget per
+  // caller — and is reachable only after a TXT proof for the host.
+  //
+  // A SENTINEL RATHER THAN A SKIPPED QUERY. An empty or ineligible filer must
+  // still spend the same statements, so the probe substitutes a value that
+  // cannot match any row rather than short-circuiting: `filer.length === 0 &&`
+  // in front of the await is precisely the leak being closed.
+  //
+  // DELIBERATELY NOT ID-SHAPED. The first version of this line was
+  // `"psp_" + "0".repeat(16)`, and `tests/invariants/id-entropy.test.ts` was
+  // right to redden on it: a `psp_` literal assembled in a source file reads
+  // as an id MINT, and a mint drawn from a constant is exactly what that
+  // invariant exists to catch. This is not a mint and must never be mistaken
+  // for one, so it is not an id at all — no passport id can contain a space
+  // or a parenthesis, which is what makes it unmatchable by construction.
+  const filerProbe = filer.length === 0 ? UNMATCHABLE_FILER : filer;
+  // The gate's own accountability string, not a hand-copy: `subjectMayAddAccounts`
+  // is built from `ACCOUNTABLE_SUBJECT_SQL`, and every hand-copy of it in this
+  // repo has lost the same clause (`domain-claims.ts:1109-1116`).
+  const filerAccountable = await subjectMayAddAccounts(db, filerProbe, nowMs);
+  const elig = await db
+    .prepare(
+      `SELECT
+         EXISTS(SELECT 1 FROM passport_accounts WHERE account_key = ?) AS registered,
+         (SELECT contest_id FROM brand_contests WHERE account_key = ?) AS existing_id,
+         (SELECT state FROM brand_contests WHERE account_key = ?) AS existing_state`,
+    )
+    .bind(chg.account_key, chg.account_key, chg.account_key)
+    .first<{ registered: number; existing_id: string | null; existing_state: string | null }>();
+  const suppressed = await suppressedKeyStmt(db, chg.account_key).first<{ x: number }>();
+  // THE GATE HIT IS THE STANDING TO FILE. Called with the FILER as self and with
+  // their own roster apexes, so this verdict is the same predicate, with the same
+  // inputs, that produced the refusal being contested (the ordinary add door's
+  // `domainAddGate` call in domain-claims.ts; D-0781 corrected the old line cite)
+  // — a contest filed against a refusal that would not happen is not a contest.
+  const apexes = await agencyGatingApexes(db, filerProbe, nowMs);
+  const gate = await domainAddGate(db, chg.handle, filerProbe, apexes);
+
+  // ---- THE LADDER, IN ITS ORIGINAL ORDER, OVER VALUES ALREADY DRAWN -------
+  if (filer.length === 0 || !filerAccountable) uniform("filer ineligible");
+  // Already listed SOMEWHERE — there is nothing here for an operator to weigh:
+  // either it is the filer's own (no refusal to contest) or it is somebody
+  // else's registration, which is a takeover question and has its own door
+  // (`contested-accounts.ts`), not a gate-hit question.
+  if (elig?.registered) uniform("already registered");
+  // Delisted at its subject's request is never re-listed, and a contest that
+  // would end in an `account_added` is a re-listing. Same statement
+  // `nominations.ts`, the importer and both verify doors use.
+  if (suppressed) uniform("suppressed");
+  // An operator's no is not a thing volume overturns, and an admitted contest is
+  // a decided question rather than a new one — `verifyBrandEnrol`'s rule for its
+  // own two terminal states.
+  if (elig?.existing_state === "declined") uniform("declined");
+  if (elig?.existing_state === "admitted") uniform("already decided");
+  // NO CONFLICT IS A UNIFORM REFUSAL, NOT AN ANSWER. Telling the caller "nothing
+  // resembles this" would answer, for an arbitrary passport id they typed, a
+  // question about which names are listed — the bit the refusal at
+  // `domain-claims.ts:1141` withholds. A filer with no conflict does not need
+  // this door: their ordinary add succeeds.
+  // Checked inside the narrowed branch rather than after the refusal:
+  // `GateVerdict` is a union and only the `resembles` member carries a
+  // counterparty, so the row cannot be built from a verdict that has none.
+  if (!gate.blocked) uniform("no_conflict");
+  // `unparseable` and `candidate_cap` are blocked verdicts with NO counterparty:
+  // there is nobody to contest and nobody to notify, so they are refused rather
+  // than filed as a complaint against an unnamed party.
+  if (gate.reason !== "resembles") uniform(`gate:${gate.reason}`);
+  const matchedHost = gate.matched;
+  const incumbent = gate.matched_passport_id;
+  const gateKind = gate.kind;
+
+  const ts = now();
+  const contestId = elig?.existing_id ?? mintId("cst");
+  // An empty string is a CLEAR, not an omission — `verifyBrandEnrol`'s rule,
+  // for its reason: a new controller of a recycled host who re-proves and sends
+  // nothing must not inherit the previous controller's address, or an operator
+  // answers the wrong person.
+  const field = (v: string | null | undefined, max: number): string | null => {
+    if (v === null || v === undefined) return null;
+    const t = v.trim();
+    return t.length === 0 ? "" : t.slice(0, max);
+  };
+  const contact = field(input.contactEmail, MAX_CONTACT);
+  const contactOk = contact === null || contact === "" || /^[^\s@<>]{1,64}@[^\s@<>.]+(\.[^\s@<>.]+)+$/.test(contact);
+  if (!contactOk) throw new DomainClaimError("that contact address is not usable", 400);
+
+  const spend = spendChallenge(db, chg, challengeId, ts); // verifyBrandContest
+  // ONE BATCH, and `UNIQUE(account_key)` — not the guard on the spend — is what
+  // prevents a second row: a batch statement matching zero rows does not abort
+  // the batch (0055's own lesson, restated because this is the same shape). So
+  // the INSERT is bound to THIS batch's spend by `WHERE EXISTS` (I16 #609p,
+  // `verifyBrandEnrol`'s shape) and `spendLanded` refuses a spend that missed.
+  // `WHERE brand_contests.state = 'open'` on the DO UPDATE is what stops the
+  // refresh courtesy becoming a hole: a decision landing between the read above
+  // and this batch would otherwise let the decided-against party rewrite the
+  // receipt and drop fresh text into the operator's decided view while being
+  // told the filing landed.
+  await db.batch([
+    spend,
+    db
+      .prepare(
+        `INSERT INTO brand_contests
+           (contest_id, filer_passport_id, account_key, domain, challenge_id, proved_at,
+            incumbent_passport_id, incumbent_host, gate_kind, lane, state, contact_email, created_at, updated_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, 'scrutiny', 'open', ?, ?, ?
+          WHERE EXISTS (SELECT 1 FROM claim_challenges c WHERE c.challenge_id = ? AND c.status = 'used' AND c.proved_at = ?)
+         ON CONFLICT(account_key) DO UPDATE SET
+           filer_passport_id     = excluded.filer_passport_id,
+           challenge_id          = excluded.challenge_id,
+           proved_at             = excluded.proved_at,
+           incumbent_passport_id = excluded.incumbent_passport_id,
+           incumbent_host        = excluded.incumbent_host,
+           gate_kind             = excluded.gate_kind,
+           contact_email = CASE WHEN excluded.contact_email IS NULL THEN brand_contests.contact_email
+                                WHEN excluded.contact_email = '' THEN NULL ELSE excluded.contact_email END,
+           updated_at            = excluded.updated_at
+         WHERE brand_contests.state = 'open'`,
+      )
+      .bind(contestId, filer, chg.account_key, chg.handle, challengeId, ts, incumbent, matchedHost, gateKind, contact, ts, ts, challengeId, ts),
+  ]);
+  if (!(await spendLanded(db, challengeId, ts))) throw new DomainClaimError("challenge is not open", 409);
+  const filed = await db.prepare("SELECT contest_id FROM brand_contests WHERE account_key = ?").bind(chg.account_key).first<{ contest_id: string }>();
+  return {
+    ok: true,
+    outcome: "filed",
+    contest_id: filed?.contest_id ?? contestId,
+    notify: { incumbent_passport_id: incumbent, incumbent_host: matchedHost },
+  };
+}
+
+const CONTEST_LIST_MAX = 200;
+
+/** The operator's view. Bounded, and an unknown filter returns nothing rather
+ * than everything — `brandEnrolQueue`'s rule and `nominationQueue`'s before it.
+ * FAMILY-012: the empty result is a returned `{rows: []}`, never an early exit
+ * that skips the caller's own heading. */
+export async function brandContestQueue(
+  db: DbLike,
+  opts: { state?: string; lane?: string; limit?: number; offset?: number } = {},
+): Promise<{ rows: BrandContestRow[] }> {
+  const state = opts.state ?? "open";
+  if (!(CONTEST_STATES as readonly string[]).includes(state)) return { rows: [] };
+  const lane = opts.lane;
+  if (lane !== undefined && lane !== "standard" && lane !== "scrutiny") return { rows: [] };
+  const limit = Math.min(Math.max(Math.trunc(opts.limit ?? 50) || 50, 1), CONTEST_LIST_MAX);
+  const offset = Math.min(Math.max(Math.trunc(opts.offset ?? 0) || 0, 0), 100_000);
+  const { results } = await db
+    .prepare(
+      `SELECT contest_id, filer_passport_id, domain, incumbent_passport_id, incumbent_host,
+              gate_kind, lane, state, contact_email, proved_at, created_at, updated_at
+         FROM brand_contests
+        WHERE state = ? AND (? IS NULL OR lane = ?)
+        ORDER BY (lane = 'scrutiny') DESC, created_at ASC, contest_id ASC
+        LIMIT ? OFFSET ?`,
+    )
+    .bind(state, lane ?? null, lane ?? null, limit, offset)
+    .all<BrandContestRow>();
+  return { rows: results };
+}
+
+/** The contest's one-shot decision lock — `decisionLockStmt`'s shape on its own
+ * table, and for the same executable reason: a guarded `UPDATE … WHERE
+ * state='open'` inside a batch commits happily when it matches zero rows, so an
+ * admit racing a decline would leave a minted `account_added` beside a row
+ * reading `declined`. */
+function contestLockStmt(db: DbLike, contestId: string, decision: "admitted" | "declined", operator: string, ts: string, filer?: string): DbStatement {
+  // I16 #932d (the I3-1289 shape on the FILER): with `filer`, the lock also
+  // requires the filer the decider read. A refile by another passport rewrites
+  // `filer_passport_id` on an OPEN row (the verify door's DO UPDATE), so without
+  // this an admit that read filer A would mint to A beside a row naming B.
+  return db
+    .prepare(
+      `INSERT INTO brand_contest_decided (contest_id, decision, decided_by, decided_at)
+       VALUES (?, ?, ?, (SELECT ? FROM brand_contests WHERE contest_id = ? AND state = 'open'${filer === undefined ? "" : " AND filer_passport_id = ?"}))`,
+    )
+    .bind(contestId, decision, operator, ts, contestId, ...(filer === undefined ? [] : [filer]));
+}
+
+const CONTEST_LOCK_RE = /NOT NULL constraint failed:\s*brand_contest_decided\.decided_at/i;
+const CONTEST_PK_LOST_RE = /UNIQUE constraint failed:\s*brand_contest_decided\.contest_id/i;
+/** Matched on the EXACT columns, as `isDecisionRace` is: a broad `/constraint/i`
+ * would swallow an unrelated constraint loss in the same batch. */
+export function isContestDecisionRace(e: unknown): boolean {
+  const m = e instanceof Error ? e.message : String(e);
+  return CONTEST_LOCK_RE.test(m) || CONTEST_PK_LOST_RE.test(m);
+}
+
+/**
+ * ADMIT — attach the CONTESTED domain to the FILER's passport, record the
+ * conflict, and stop there (D-0594).
+ *
+ * What it deliberately does NOT do: touch the incumbent's rows, their brand
+ * fold, `brand_index`, or anything served. Both parties proved their domains;
+ * the incumbent has done nothing the machine can call wrong, and an automatic
+ * unwind would make one operator decision revoke a standing another operator
+ * granted. The conflict is recorded by this row's `admitted` state and by the
+ * `brand_contest:admitted` audit line, which names the incumbent — a record for
+ * people to read, and no reader in this codebase branches on it.
+ *
+ * THE TWO-PERSON RULE IS CHECKED HERE, NOT ONLY IN THE ROUTE, for the three
+ * reasons `approveBrandEnrol`'s docblock gives: a direct caller would otherwise
+ * mint on one operator, a route-only check dissolves if the route is edited, and
+ * no test drives a wrapper that can be deleted while the suite stays green.
+ * Every contest row is born in the `scrutiny` lane (the gate hit is what makes
+ * it one), so there is no lane under which one operator may act alone — and the
+ * lane the caller acted on must still be the lane on the row.
+ */
+export async function admitBrandContest(
+  db: DbLike,
+  contestId: string,
+  operator: string,
+  auth: { lane: EnrolLane; dualControlSatisfied: boolean; filer?: string } = { lane: "scrutiny", dualControlSatisfied: false },
+  now: () => string = () => new Date().toISOString(),
+): Promise<{ passport_id: string; domain: string; incumbent_passport_id: string; contact_email: string | null }> {
+  const row = await db
+    .prepare("SELECT contest_id, filer_passport_id, account_key, domain, state, lane, incumbent_passport_id, contact_email FROM brand_contests WHERE contest_id = ?")
+    .bind(contestId)
+    .first<{ contest_id: string; filer_passport_id: string; account_key: string; domain: string; state: string; lane: EnrolLane; incumbent_passport_id: string; contact_email: string | null }>();
+  if (!row) throw new EnrolError("no such contest", 404);
+  if (row.state !== "open") throw new EnrolError("that contest is already decided", 409);
+  if (row.lane !== auth.lane) throw new EnrolError("this contest changed while you were deciding — look again", 409);
+  // I16 #932d: the filer the operators agreed on, when the caller states it, must
+  // still be the row's filer — a refile by another passport is a different decision.
+  if (auth.filer !== undefined && row.filer_passport_id !== auth.filer) throw new EnrolError("this contest changed while you were deciding — look again", 409);
+  if (!auth.dualControlSatisfied) throw new EnrolError("admitting a contested domain needs a second operator", 409);
+  // The filer's standing is re-asked at the decision, not inherited from the
+  // filing: the row can be days old and a passport can be retracted inside that
+  // window (`verifyDomainAdd`'s "a screen taken 24 hours ago is not a screen").
+  if (!(await subjectMayAddAccounts(db, row.filer_passport_id, Date.parse(now())))) throw new EnrolError("that passport can no longer hold accounts", 409);
+  // The domain may have been listed by an import or another ceremony since the
+  // filing. `account_added` refuses a duplicate on its own read; asking here
+  // turns a ledger error into a sentence an operator can act on.
+  const taken = await db.prepare("SELECT 1 AS x FROM passport_accounts WHERE account_key = ? LIMIT 1").bind(row.account_key).first<{ x: number }>();
+  if (taken) throw new EnrolError("that domain is already listed", 409);
+
+  const ts = now();
+  const drafts: DraftEvent[] = [
+    {
+      event_type: "account_added",
+      subject: row.filer_passport_id,
+      actor_kind: "operator",
+      actor_id: operator,
+      payload: { platform: "domain", id_kind: "domain", id: row.domain, relationship_basis: "creator_claimed", observed_at: ts },
+    },
+  ] as DraftEvent[];
+  try {
+    await appendEvents(db, drafts, now, [], [
+      contestLockStmt(db, contestId, "admitted", operator, ts, row.filer_passport_id),
+      db.prepare("UPDATE brand_contests SET state = 'admitted', updated_at = ? WHERE contest_id = ?").bind(ts, contestId),
+      // I3-0306, the contest door: the same bind, to the filer's passport.
+      bindBrandProofStmt(db, row.filer_passport_id, "brand_contests", "contest_id", contestId, "admitted", row.account_key),
+      // THE CONFLICT RECORD. It names the incumbent because that is the fact a
+      // later operator needs and cannot re-derive: the fold moves, and the
+      // verdict that justified this decision was taken at `proved_at`.
+      auditStmt(db, operator, "brand_contest:admitted", contestId, `${row.domain} vs ${row.incumbent_passport_id}`, ts),
+    ]);
+  } catch (e) {
+    if (isContestDecisionRace(e)) throw new EnrolError("that contest is already decided", 409);
+    throw e;
+  }
+  return { passport_id: row.filer_passport_id, domain: row.domain, incumbent_passport_id: row.incumbent_passport_id, contact_email: row.contact_email };
+}
+
+/** DECLINE — an operator's no, through the SAME lock the admit uses, so an
+ * admit and a decline racing each other cannot both believe they won. Final for
+ * that host: the verify door refuses a declined key with the uniform sentence
+ * rather than re-queueing it, so volume cannot overturn a decision. */
+export async function declineBrandContest(
+  db: DbLike,
+  contestId: string,
+  operator: string,
+  note: string,
+  now: () => string = () => new Date().toISOString(),
+): Promise<{ contact_email: string | null; domain: string; incumbent_passport_id: string }> {
+  const row = await db
+    .prepare("SELECT state, domain, incumbent_passport_id, contact_email FROM brand_contests WHERE contest_id = ?")
+    .bind(contestId)
+    .first<{ state: string; domain: string; incumbent_passport_id: string; contact_email: string | null }>();
+  if (!row) throw new EnrolError("no such contest", 404);
+  if (row.state !== "open") throw new EnrolError("that contest is already decided", 409);
+  // #177: same guard as declineBrandEnrol; refused before any write.
+  const stored = requireDeclineNote(note);
+  const ts = now();
+  try {
+    await db.batch([
+      contestLockStmt(db, contestId, "declined", operator, ts),
+      db.prepare("UPDATE brand_contests SET state = 'declined', updated_at = ? WHERE contest_id = ?").bind(ts, contestId),
+      auditStmt(db, operator, "brand_contest:declined", contestId, stored, ts),
+    ]);
+  } catch (e) {
+    if (isContestDecisionRace(e)) throw new EnrolError("that contest is already decided", 409);
+    throw e;
+  }
+  return { contact_email: row.contact_email, domain: row.domain, incumbent_passport_id: row.incumbent_passport_id };
+}
+
+/**
+ * THE INCUMBENT IS TOLD A CONTEST WAS OPENED (D-0595).
+ *
+ * A queue that decides against somebody who was never told is the shape this
+ * whole row exists to fix, reproduced one level up: the incumbent is
+ * domain-proven, has done nothing the machine can call wrong, and is the second
+ * interested party in every contest. No existing notification kind addresses
+ * them, so this is one new kind, `brand_contest_opened`.
+ *
+ * THE MODEL CARRIES THE INCUMBENT'S OWN HOST AND NOTHING ELSE — INV-025's
+ * wording as `notifyIncumbentAccountTransferred` (`console.ts:236-249`) applies
+ * it: point only at the real account, never name the challenger. The contested
+ * host, the filer's passport and the gate's match class are the operator's
+ * facts; putting any of them in a mail to the incumbent would turn a filing
+ * into an intelligence channel about who is moving against them, and the
+ * contested host is exactly the string the uniform refusal withholds from the
+ * filer in the other direction.
+ *
+ * BEST-EFFORT AND AUDITED EITHER WAY, which is the same stance
+ * `sendDecisionMail` takes: a lost notice never unwinds a filing that already
+ * committed, and an incumbent with no verified address leaves an
+ * `brand_contest:notice_unsent` line with the reason, so "nobody told them" is
+ * a fact in the audit log rather than an absence. UNVERIFIED ADDRESSES ARE NOT
+ * USED: `creator_contacts.email_verified` must be 1, the rule the transfer
+ * notice follows, because a contest notice sent to an unproven address is a
+ * disclosure to whoever typed it.
+ *
+ * THE TEMPLATE ALIAS IS MAPPED, AND THE VARS ARE READ BY NAME. The filed diff
+ * landed: `mailer.ts:143` maps `brand_contest_opened` -> `brand-contest-opened`,
+ * so this send reaches the provider. `sanitizeTemplateModel` (mailer.ts:229-236)
+ * sanitizes VALUES and carries every KEY through unchanged, so the key written
+ * here is the key the body looks up: `brand-contest-opened.html:13,15` reads
+ * `{{brand_domain}}` and nothing else. A key this template does not read is not
+ * refused anywhere — it renders empty and still returns 200, which is the whole
+ * of #516 (it shipped as `{ domain }`), and the `notice_sent` audit below cannot
+ * see it.
+ */
+export async function notifyIncumbentBrandContestOpened(
+  db: DbLike,
+  mailer: { send(template: string, to: string, vars: Record<string, string>): Promise<boolean> },
+  incumbentPassportId: string,
+  incumbentHost: string,
+  actorId: string,
+  contestId: string,
+  ts: string,
+): Promise<void> {
+  try {
+    const contact = await db
+      .prepare("SELECT email, email_verified FROM creator_contacts WHERE passport_id = ?")
+      .bind(incumbentPassportId)
+      .first<{ email: string | null; email_verified: number }>();
+    if (!contact?.email || contact.email_verified !== 1) {
+      await auditStmt(db, actorId, "brand_contest:notice_unsent", contestId, "no_verified_address", ts).run();
+      return;
+    }
+    let sent = false;
+    try {
+      sent = await mailer.send("brand_contest_opened", contact.email, { brand_domain: incumbentHost });
+    } catch {
+      sent = false;
+    }
+    if (!sent) await auditStmt(db, actorId, "brand_contest:notice_unsent", contestId, "mailer_refused", ts).run();
+    else await auditStmt(db, actorId, "brand_contest:notice_sent", contestId, incumbentPassportId, ts).run();
+  } catch {
+    // A notice failure never unwinds a committed filing. Swallowed here rather
+    // than in the caller so every caller gets the same posture.
+  }
+}
+===== END FILE: services/trust-core/src/brand-enrolment.ts =====
+
+===== BEGIN FILE: services/trust-core/src/brand-index.ts =====
+import type { DbLike } from "./db.js";
+import { legalHoldOpenSql, PASSPORT_LEGAL_HOLD_SQL } from "./legal-hold-sql.js";
+import { BRAND_FOLD_VERSION, brandsOfHost, foldInput, nameSkeleton } from "./domain-gate.js";
+
+/**
+ * F13 / HANDOFF §1.1 — THE PRECOMPUTED BRAND INDEX.
+ *
+ * `0071_brand_index.sql` carries the argument; the short version is that
+ * `domain-gate.ts` fails closed at ~30,000 rows per arm because it re-folds
+ * every listed domain and name on every verify, and this caches that fold.
+ *
+ * IT IS A CACHE OF A PURE FUNCTION, KEYED ON ITS OWN INPUT. The scan still
+ * walks every row and `gateMatch` still decides — no verdict moves, and a
+ * stale, corrupt or orphaned entry is ignored rather than trusted. It is
+ * deliberately NOT a shortlist: an index that chose which rows to compare would
+ * be fail-open, because the gate's matching is fuzzy and an exact-token lookup
+ * misses what it finds.
+ */
+
+const DAY_MS = 86_400_000;
+
+/**
+ * Rows folded per sweep, per arm.
+ *
+ * The whole point is to remove CPU from the VERIFY path, so spending an
+ * unbounded amount of it on the cron would move the problem rather than solve
+ * it — the F12 lesson, one slice later. At this size a 30,000-row registry is
+ * fully indexed within a couple of days of sweeps and stays indexed, because
+ * only changed rows ever need refolding.
+ */
+const BRAND_INDEX_BATCH = 4000;
+
+/** Refold an entry this old even if its input has not changed, so a change to
+ * the skeleton ALGORITHM propagates without anybody remembering to purge. */
+export const BRAND_INDEX_MAX_AGE_DAYS = 30;
+
+/** QUEUE #732: the `sweep_cursor` row (migration 0026) the domain arm resumes from. `cursor_id` is the last
+ * `account_key` of a FULL batch, so the next call reads only keys after it; a short batch reached the end and puts it
+ * back to '' (the start). */
+export const BRAND_INDEX_DOMAIN_CURSOR = "brand_index_domain";
+
+/** W3REVIEW-BRAND-NAMES-SCAN (I38-CPROD1 B15): the `sweep_cursor` row the NAME arm resumes from. `cursor_id` is the
+ * last `passport_id` of a FULL batch of visited passports; a short batch reached the end and puts it back to ''. */
+export const BRAND_INDEX_NAME_CURSOR = "brand_index_name";
+
+interface BrandIndexReport {
+  domains: number;
+  names: number;
+}
+
+/**
+ * Fold the rows whose entry is missing, stale-by-input, or older than the max
+ * age, and write them back.
+ *
+ * ORDERED BY THE ROW'S OWN KEY. An earlier version of this comment claimed the
+ * order was "not anything a caller influences" — which is false, and review
+ * said so: `account_key` is `v1|domain|domain|<host>`, so the order is the host
+ * string the registrant chose, and an early-sorting name is folded first.
+ *
+ * The property that actually holds is weaker and sufficient: an unindexed row
+ * is FOLDED LIVE, so a creator who never reaches the front of a batch loses the
+ * CPU saving and nothing else. No verdict depends on being indexed, which is
+ * why an influenceable order is a cost question rather than a security one.
+ */
+export async function buildBrandIndex(
+  db: DbLike,
+  nowMs: number = Date.now(),
+  now: () => string = () => new Date().toISOString(),
+  batch: number = BRAND_INDEX_BATCH,
+): Promise<BrandIndexReport> {
+  const stale = new Date(nowMs - BRAND_INDEX_MAX_AGE_DAYS * DAY_MS).toISOString();
+  const ts = now();
+  const cursor = (await db.prepare("SELECT cursor_id FROM sweep_cursor WHERE name = ?").bind(BRAND_INDEX_DOMAIN_CURSOR).first<{ cursor_id: string }>())?.cursor_id ?? "";
+  const nameCursor = (await db.prepare("SELECT cursor_id FROM sweep_cursor WHERE name = ?").bind(BRAND_INDEX_NAME_CURSOR).first<{ cursor_id: string }>())?.cursor_id ?? "";
+  // The composed value the entry SHOULD hold, per arm — SQLite does the
+  // comparison, so the version travels into the query rather than being checked
+  // in JS after the rows come back.
+  // The version PREFIX, composed with each row's own input inside SQL — so the
+  // staleness test is per row and the version is one bind value rather than a
+  // second pass in JS.
+  const prefix = `${BRAND_FOLD_VERSION}\u0000`;
+
+  // RG2C-04 / QUEUE #732 (D-1117(10); I34-W3-REVIEW): the domain arm VISITS the next `batch` rows after the cursor,
+  // fresh or not, and refreshes the due ones among them; the cursor moves past every visited row and goes back to ''
+  // only after a short read (the end). So a call reads at most `batch` domain rows, also in the steady state, and a row
+  // that goes stale is refreshed within one lap (rows / batch calls); until then it is folded live (see above).
+  const { results: visited } = await db
+    .prepare(
+      `SELECT a.account_key AS key, a.id AS input,
+              (b.key IS NULL OR b.input <> (? || a.id) OR b.built_at < ?) AS due
+         FROM passport_accounts a
+         JOIN passports p ON p.passport_id = a.passport_id
+    LEFT JOIN brand_index b ON b.kind = 'domain' AND b.key = a.account_key
+        WHERE a.id_kind = 'domain' AND p.retracted = 0 AND a.account_key > ?
+          -- The stored input carries the FOLD VERSION as well as the value (the due column above), so
+          -- a release that changes the skeleton algorithm invalidates every
+          -- entry at once. Without that, the cache served the OLD fold for up
+          -- to thirty days and the gate was WEAKER with it than without — a
+          -- fail-open that opens precisely when somebody tightens the gate
+        ORDER BY a.account_key
+        LIMIT ?`,
+    )
+    .bind(prefix, stale, cursor, batch)
+    .all<{ key: string; input: string; due: number }>();
+  const domains = visited.filter((r) => r.due === 1);
+
+  // W3REVIEW-BRAND-NAMES-SCAN (I38-CPROD1 B15; D-1120(9)): the name arm's key (`passport_id|name`) is derived, so no
+  // index serves a cursor on it; the arm instead VISITS the next `batch` passports after its own cursor by primary key
+  // (retracted ones too, so the read is bounded), fresh or not, with their handles (idx_accounts_passport; CROSS JOIN keeps v the outer loop), and
+  // refreshes the due ones among them. `head = 1` marks each visited passport's own row, which the cursor counts.
+  const { results: nameRows } = await db
+    .prepare(
+      `WITH v AS (SELECT passport_id, display_name, retracted FROM passports WHERE passport_id > ? ORDER BY passport_id LIMIT ?)
+       SELECT n.pid AS pid, n.head AS head, n.live AS live, n.key AS key, n.input AS input,
+              (b.key IS NULL OR b.input <> (? || n.input) OR b.built_at < ?) AS due FROM (
+         SELECT v.passport_id AS pid, 1 AS head, v.retracted = 0 AS live, v.passport_id || '|' || v.display_name AS key, v.display_name AS input
+           FROM v
+         UNION ALL
+         SELECT a.passport_id, 0, 1, a.passport_id || '|' || a.id, a.id
+           FROM v CROSS JOIN passport_accounts a ON a.passport_id = v.passport_id
+          WHERE a.id_kind = 'handle' AND v.retracted = 0
+       ) n
+    LEFT JOIN brand_index b ON b.kind = 'name' AND b.key = n.key`,
+    )
+    .bind(nameCursor, batch, prefix, stale)
+    .all<{ pid: string; head: number; live: number; key: string; input: string; due: number }>();
+  const names = nameRows.filter((r) => r.live === 1 && r.due === 1);
+  const heads = nameRows.filter((r) => r.head === 1).map((r) => r.pid).sort();
+  const lastPassport = heads[heads.length - 1];
+
+  const last = visited[visited.length - 1];
+  const stmts = [
+    ...domains.map((r) => upsert(db, "domain", r.key, foldInput(r.input), JSON.stringify(brandsOfHost(r.input)), ts)),
+    ...names.map((r) => upsert(db, "name", r.key, foldInput(r.input), JSON.stringify(nameSkeleton(r.input)), ts)),
+    db
+      .prepare("INSERT INTO sweep_cursor (name, cursor_seq, cursor_id, updated_at) VALUES (?, 0, ?, ?) ON CONFLICT(name) DO UPDATE SET cursor_id = excluded.cursor_id, updated_at = excluded.updated_at")
+      .bind(BRAND_INDEX_DOMAIN_CURSOR, visited.length === batch && last ? last.key : "", ts),
+    db
+      .prepare("INSERT INTO sweep_cursor (name, cursor_seq, cursor_id, updated_at) VALUES (?, 0, ?, ?) ON CONFLICT(name) DO UPDATE SET cursor_id = excluded.cursor_id, updated_at = excluded.updated_at")
+      .bind(BRAND_INDEX_NAME_CURSOR, heads.length === batch && lastPassport ? lastPassport : "", ts),
+  ];
+  // Chunked: one batch of eight thousand statements is a different kind of
+  // budget problem from the one this slice exists to fix.
+  for (let i = 0; i < stmts.length; i += 250) await db.batch(stmts.slice(i, i + 250));
+  return { domains: domains.length, names: names.length };
+}
+
+function upsert(db: DbLike, kind: "domain" | "name", key: string, input: string, skeletons: string, ts: string) {
+  return db
+    .prepare(
+      `INSERT INTO brand_index (kind, key, input, skeletons, built_at) VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(kind, key) DO UPDATE SET input = excluded.input, skeletons = excluded.skeletons, built_at = excluded.built_at`,
+    )
+    .bind(kind, key, input, skeletons, ts);
+}
+
+/**
+ * I3-1494 — THE RETRACTION'S OWN ERASURE of this passport's index entries, to
+ * ride the SAME batch as the `retract_passport` correction (events.ts), so a
+ * retracted creator's name and id leave the index at retraction rather than up
+ * to one six-hourly sweep later. `sweepBrandIndex` stays as the backstop.
+ *
+ * Name entries are keyed `<passport_id>|<name>`, matched by prefix with
+ * `substr` (not LIKE: `_` in a passport id is a LIKE wildcard). Domain entries
+ * are keyed by `account_key`, which `passport_accounts` holds once globally, so
+ * the passport's own domain rows name exactly its entries.
+ *
+ * I29-FX10 (D-1047(1)): an open legal hold on the passport (legal-hold-sql.ts PASSPORT_LEGAL_HOLD_SQL, asked in this
+ * statement) deletes nothing; `sweepBrandIndex` takes the entries on its first run after release.
+ */
+export function brandIndexErasureStmt(db: DbLike, passportId: string) {
+  return db
+    .prepare(
+      `DELETE FROM brand_index
+        WHERE ((kind = 'name' AND substr(key, 1, length(?) + 1) = ? || '|')
+           OR (kind = 'domain' AND key IN (SELECT a.account_key FROM passport_accounts a WHERE a.passport_id = ? AND a.id_kind = 'domain')))
+         AND NOT ${PASSPORT_LEGAL_HOLD_SQL}`,
+    )
+    .bind(passportId, passportId, passportId, passportId);
+}
+
+/**
+ * Drop entries whose row is gone — a retracted passport, a removed account, a
+ * renamed subject.
+ *
+ * An orphan is already harmless (its `input` cannot match a row that does not
+ * exist, and nothing joins to it), so this is hygiene rather than a control.
+ * It matters anyway: the index holds a passport id beside a public host or
+ * display name, and keeping that after the subject is retracted is keeping a
+ * record of somebody who asked to be gone.
+ */
+/* I29-FX10 (D-1047(1), census row 172): an entry whose passport an open legal hold names is kept by both arms
+ * (legalHoldOpenSql in each), and taken on the first sweep after release. */
+export async function sweepBrandIndex(db: DbLike, limit = BRAND_INDEX_BATCH): Promise<number> {
+  // `NOT EXISTS`, NOT `NOT IN`. SQLite lets a TEXT PRIMARY KEY hold NULL, so a
+  // single NULL anywhere in either subquery makes `NOT IN` never true and
+  // silently disables BOTH arms of this sweep — fail-safe in direction and
+  // silent in a way that would leave the erasure promise quietly unkept.
+  //
+  // BOUNDED, like the builder: an unbounded DELETE with two full-registry
+  // subqueries on every six-hourly tick is the cost problem this slice exists
+  // to remove, moved onto the cron.
+  const res = await db
+    .prepare(
+      `DELETE FROM brand_index WHERE rowid IN (
+         SELECT rowid FROM brand_index bi
+          WHERE (bi.kind = 'domain' AND NOT EXISTS (
+                   SELECT 1 FROM passport_accounts a
+                     JOIN passports p ON p.passport_id = a.passport_id
+                    WHERE a.id_kind = 'domain' AND p.retracted = 0 AND a.account_key = bi.key)
+                 AND NOT EXISTS (SELECT 1 FROM passport_accounts ha WHERE ha.id_kind = 'domain' AND ha.account_key = bi.key AND ${legalHoldOpenSql("passport", "ha.passport_id")}))
+             OR (bi.kind = 'name' AND NOT EXISTS (
+                   SELECT 1 FROM passports p2
+                    WHERE p2.passport_id = substr(bi.key, 1, instr(bi.key, '|') - 1)
+                      AND p2.retracted = 0 AND p2.display_name = substr(bi.key, instr(bi.key, '|') + 1))
+                 AND NOT EXISTS (
+                   SELECT 1 FROM passport_accounts a2
+                     JOIN passports p3 ON p3.passport_id = a2.passport_id
+                    WHERE a2.passport_id = substr(bi.key, 1, instr(bi.key, '|') - 1)
+                      AND a2.id_kind = 'handle' AND p3.retracted = 0 AND a2.id = substr(bi.key, instr(bi.key, '|') + 1))
+                 AND NOT ${legalHoldOpenSql("passport", "substr(bi.key, 1, instr(bi.key, '|') - 1)")})
+          LIMIT ?)`,
+    )
+    .bind(limit)
+    .run();
+  return res.changes ?? 0;
+}
+===== END FILE: services/trust-core/src/brand-index.ts =====
+
+===== END OF CHUNK 36 OF 73 =====

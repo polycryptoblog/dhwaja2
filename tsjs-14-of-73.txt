@@ -1,0 +1,751 @@
+DHWAJA CODE REVIEW — tsjs — CHUNK 14 OF 73
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: apps/web
+Files in this chunk (2):
+  - apps/web/src/upgrade.ts
+  - apps/web/src/verdict.ts
+
+
+===== BEGIN FILE: apps/web/src/upgrade.ts =====
+import { textClamp, xml } from "@dhwaja/card-render";
+import type { EntitlementDto, PromoWeekOfferDto } from "./api.js";
+
+/** I3-1785 — " (until YYYY-MM-DD)" from the server's exact cutoff, or "" when absent/unparseable (never a guessed date). */
+function graceUntilSuffix(until: string | null | undefined): string {
+  const ms = typeof until === "string" ? Date.parse(until) : Number.NaN;
+  return Number.isFinite(ms) ? ` (until ${new Date(ms).toISOString().slice(0, 10)})` : "";
+}
+
+/**
+ * The plan page (`#/upgrade`) — mock 36's pricing surface plus the five billing
+ * states of mock 67. It lives in its OWN module on purpose.
+ *
+ * `views.ts` renders verdicts (checkCard, the passport views, the badge) and is
+ * region-scanned by `tests/invariants/paywall.test.ts`, where exactly one region
+ * (`fn billingStateCopy`) may name an entitlement. Rather than widen that
+ * exemption, every entitlement-shaped read for this page is parked here: this
+ * module renders no verdict, is imported by no verdict path, and is reachable
+ * only from the router (`app.ts`, static copy) and the DOM controller
+ * (`main.ts`, which does the fetch). Nothing here can influence what a fan is
+ * told about anyone.
+ *
+ * Three product rules the copy encodes and must keep encoding:
+ *   - PROTECTION IS NEVER PAYWALLED. Premium buys convenience, not trust. The
+ *     honest block is load-bearing; softening it is a product regression.
+ *   - SEEN SOONER IS NOT COUNTS FOR MORE (product decision 2026-08-15). A
+ *     supporter's report is looked at earlier by an operator — queue ORDER,
+ *     bounded by `PRIORITY_COMPARABILITY_STEP` in
+ *     `services/trust-core/src/reports.ts`, and only among reports whose EARNED
+ *     priority was already comparable. It buys no weight: not the corroboration
+ *     threshold behind a Caution, not the per-reporter cap, not the priority
+ *     score, not whether anything is published. The page must sell the first
+ *     sentence and must never imply the second — advertising "your reports
+ *     count more" would be selling something that does not exist.
+ *   - FAIL CLOSED. Billing unconfigured (503) is a designed state with its own
+ *     card and NO button — never an error, never a dead control.
+ */
+
+// --- Ratified launch pricing (claude/BILLING-AGENCY-DECISIONS.md, 2026-08-14).
+// Kept as data so the copy and the button label can never disagree.
+export const PRICING = {
+  premium: { month: "US$3/mo", year: "US$30/yr", monthlyTotal: "US$36", saving: "US$6", savingPct: "17%" },
+  pro: { month: "US$12/mo", year: "US$99/yr", monthlyTotal: "US$144", saving: "US$45", savingPct: "31%" },
+} as const;
+
+export type PlanStateName = "signed-out" | "free" | "active" | "grace" | "lapsed" | "unavailable" | "processing";
+
+/**
+ * What the page's one button does.
+ *
+ * `legacy-portal` is GONE (item 14). It existed for the pre-M7 subscriber who
+ * paid through the second web processor; that rail was deleted, so there is no
+ * second portal to open. The shape it used to catch — paying, but with no
+ * Stripe customer — did not go away though: it is now the STORE subscriber, who
+ * bought Premium inside the iOS or Android app. Apple and Google own that
+ * subscription and Dhwaja cannot manage it, so the page renders NO button and
+ * says where to go instead. Offering Stripe checkout to them would open a
+ * SECOND subscription and bill them twice, which is why `checkout` is never
+ * offered on an active/grace state.
+ */
+export type PlanActionKind = "checkout" | "portal" | "signin" | "none";
+
+export interface PlanAction {
+  kind: PlanActionKind;
+  label: string;
+  /** Only meaningful for `checkout`. */
+  interval: "month" | "year";
+}
+
+export interface PlanState {
+  name: PlanStateName;
+  /** "Premium" for a fan session, "Creator Pro" for a creator session. */
+  product: "Premium" | "Creator Pro";
+  tone: "quiet" | "good";
+  headline: string;
+  body: string;
+  /** The "your protection is untouched" strip; "" when the state doesn't need it. */
+  unaffected: string;
+  /** Right-hand meta line (dates, price, "no reactivation fee"). */
+  meta: string;
+  /** The small print under the action. */
+  fine: string;
+  action: PlanAction;
+}
+
+/** Everything the state machine is allowed to see. Nothing else exists here. */
+export interface PlanRead {
+  /** HTTP status of GET /billing/entitlement. 0 = the request never completed. */
+  status: number;
+  ent: EntitlementDto | null;
+  signedIn: boolean;
+  /** Stripe's success URL carries ?upgraded=1 in the SEARCH string. */
+  justUpgraded?: boolean;
+  /**
+   * FU-14 (S-068) — WHICH ADVERTISED INTERVAL THE FAN HAS CHOSEN. Absent means
+   * ANNUAL, which is what every action on this page used to be hardcoded to.
+   * The product supports both (`stripe.ts:799,844` reads a
+   * STRIPE_PRICE_PREMIUM_MONTH price id; the web API sends either), this page
+   * ADVERTISES both ($3/mo · $30/yr in the comparison table), and the sibling
+   * creator surface already offers the choice as two radios feeding this same
+   * field (`apps/creator-console/src/billing.ts:384-387`). Only the fan surface
+   * had no way to pick, so the $3 plan it offers could not be bought.
+   */
+  interval?: "month" | "year";
+}
+
+/** The advertised price for the chosen interval — the one the button charges. */
+function priceOf(price: { month: string; year: string }, interval: "month" | "year"): string {
+  return interval === "month" ? price.month : price.year;
+}
+
+/** I3-0015 / D-0911(2): the "still stuck" sentence names the server-served support
+ * address (`support_to`, index.ts GET /billing/entitlement) only when it is a plain
+ * address; unset, absent or the operator placeholder it promises no contact. Plain text. */
+function stuckLine(supportTo: unknown): string {
+  const to = typeof supportTo === "string" ? supportTo.trim().slice(0, 200) : "";
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) return `Still stuck after a few minutes? Contact support at ${to} with your Stripe receipt.`;
+  return "Still stuck after a few minutes? Keep your Stripe receipt — no support inbox is set up yet, so there is no address to send it to.";
+}
+
+function iso(d: unknown): string {
+  return typeof d === "string" ? d.slice(0, 10) : "";
+}
+
+/**
+ * The whole state machine, pure. Order matters and is deliberate:
+ *
+ *   1. 503 — billing is switched off on this deployment. Wins over everything,
+ *      including a tier we may have read a moment ago: if the surface is off we
+ *      say so and offer no control (invariant 6, fail closed).
+ *   2. signed out / 401 — the pricing is public, buying is not.
+ *   3. any other unreadable answer — the SAME fail-closed card. Mock 67 pins
+ *      this: "same card whether the keys are absent, the provider is
+ *      unreachable, or an operator paused sales". Guessing "free" here would
+ *      invent a state we did not read.
+ *   4. in grace  → quiet grey, never red.
+ *   5. paying    → active (a STORE subscriber gets no button — see PlanActionKind).
+ *   6. purchased before, not now → lapsed.
+ *   7. otherwise → free, which is not an error and not a trial.
+ */
+/** What Premium buys (I21-Q77, D-1030; H16). The one copy: the upgrade page, the web welcome note (views.ts
+ * billingStateCopy), iOS `premiumBenefit` and Android `PREMIUM_BENEFIT` carry it whole (D-1059(16)). Copy approved (D-1365 W64). */
+export const PREMIUM_BENEFIT =
+  "You can save more creators. Your reports are seen sooner by an operator — a purchased place in the queue, never counting for more. Everything that keeps you safe is already free; Premium is a way to give back.";
+
+export function planState(read: PlanRead): PlanState {
+  const ent = read.ent;
+  const pro = ent?.subject_kind === "creator";
+  const product: PlanState["product"] = pro ? "Creator Pro" : "Premium";
+  const price = pro ? PRICING.pro : PRICING.premium;
+  // Anything that is not the literal "month" is annual: an unrecognised value
+  // must never silently change what a click buys (FU-14).
+  const interval: "month" | "year" = read.interval === "month" ? "month" : "year";
+
+  if (read.status === 503) return unavailableState(product);
+  if (!read.signedIn || read.status === 401) {
+    return {
+      name: "signed-out",
+      product,
+      tone: "quiet",
+      headline: "Sign in to see your plan",
+      body: "Prices and what each tier includes are on this page either way. You only ever need an account to buy — never to be protected.",
+      unaffected: "",
+      meta: "",
+      fine: "Checks, verdicts and warnings work signed out, exactly as they do signed in.",
+      action: { kind: "signin", label: "Sign in", interval: "year" },
+    };
+  }
+  if (ent === null || read.status !== 200) return unavailableState(product);
+
+  if (ent.in_grace) {
+    const days = Math.max(0, Math.trunc(Number(ent.grace_days) || 0));
+    const keep = `you keep every ${product} extra for ${days} more ${days === 1 ? "day" : "days"}`;
+    const meta = (days === 1 ? "grace ends tomorrow" : `grace ends in ${days} days`) + graceUntilSuffix(ent.grace_until);
+    // RJb-T2-AS-012 (D-0920 option b): only a Stripe customer can have had a
+    // charge fail. Without one there was no charge to fail, so the card says the
+    // period ended and has not been renewed — never that a payment was refused.
+    if (!ent.has_customer) {
+      return {
+        name: "grace",
+        product,
+        tone: "quiet",
+        headline: `Your ${product} period has ended`,
+        body: `It hasn't been renewed yet. Nothing has changed so far: ${keep}. If it isn't renewed by then you go back to the free tier — no other consequence, ever.`,
+        unaffected: "Either way, your protection and every verdict are untouched. Warnings, verification, proven accounts and your passport do not depend on this plan and never will.",
+        meta,
+        fine: "Grey, never red. A plan that ran out is an admin matter, not an accusation — and red on this page would be a lie about how serious it is.",
+        action: { kind: "none", label: "", interval: "year" },
+      };
+    }
+    return {
+      name: "grace",
+      product,
+      tone: "quiet",
+      headline: `We couldn't take this ${product} payment`,
+      body: `The charge didn't go through. Nothing has changed yet: ${keep}. If it's still unpaid then you go back to the free tier — no other consequence, ever.`,
+      unaffected: "Either way, your protection and every verdict are untouched. Warnings, verification, proven accounts and your passport do not depend on this payment and never will.",
+      meta,
+      fine: "Grey, never red. A card that expired is an admin problem, not an accusation — and red on this page would be a lie about how serious it is.",
+      action: { kind: "portal", label: "Update payment ↗ Stripe", interval: "year" },
+    };
+  }
+
+  if (ent.tier !== "free") {
+    const through = iso(ent.paid_through);
+    // RJb-T2-AS-013 / #609q (D-0920; I16-W09B H7, landed by I16-L10): a subscription the subscriber asked to cancel
+    // carries `cancel_at` (entitlements-store.ts entitlementView, migration 0198). Read off the wire shape here; the
+    // typed field in apps/web/src/api.ts is a hand-off.
+    const endsOn = iso((ent as { cancel_at?: unknown }).cancel_at);
+    // No Stripe customer + paying = bought in the app. The store holds the
+    // subscription; Dhwaja can neither manage nor cancel it.
+    const viaStore = !ent.has_customer;
+    const extras = pro
+      ? "Your caps are up: 50 likes a day, 5 named recognitions a day, 250 follows, one broadcast a day."
+      // H16: sell only what actually exists. Premium's concrete perks are the
+      // supporter queue position (reports seen sooner) and, since I21-Q77
+      // (D-1030, I30-PREMIUM), a higher saved-creator cap (accounts.ts
+      // fanSavedCap); everything protective is already the free tier. (Flair,
+      // early drop access and Codex themes were advertised but not built —
+      // removed rather than sold as vapor.)
+      // D-1059(16): PREMIUM_BENEFIT is the one copy; iOS, Android and the web welcome note carry it whole
+      // (apps/web/test/i30-fx-client.test.ts, apps/mobile-check/test/i30-fx-client.test.ts).
+      : PREMIUM_BENEFIT;
+    return {
+      name: "active",
+      product,
+      tone: "good",
+      headline: read.justUpgraded ? `Welcome to ${product}` : `You're on ${product}`,
+      body: `${extras} Everything protective was already yours, and none of it moved.`,
+      unaffected: "",
+      meta: endsOn ? `Your plan ends on ${endsOn} and won't renew` : through ? `renews ${through}` : "",
+      fine: viaStore
+        ? `You bought ${product} inside the app, so Apple or Google holds this subscription — manage or cancel it in your App Store or Google Play subscription settings, not here. There is deliberately no button: buying again on this page would start a SECOND subscription on top of the one you already pay for.`
+        : `Manage opens Stripe's portal — change the card, switch monthly/annual, download invoices, or cancel. Cancelling there leaves ${product} running until the date you already paid through.`,
+      action: viaStore ? { kind: "none", label: "", interval: "year" } : { kind: "portal", label: "Manage your subscription and receipts ↗ Stripe", interval: "year" },
+    };
+  }
+
+  // M10: Stripe's success URL returns the fan here with ?upgraded=1, but the
+  // webhook that flips the entitlement to paid can lag behind the redirect by a
+  // few seconds. In that window the entitlement still reads free, and without
+  // this branch the fan who JUST PAID was shown "Go Premium" — a button that
+  // would start a second checkout. Show a self-clearing "confirming…" state
+  // instead (the controller re-checks the entitlement while it's up). Guarded on
+  // tier === free so a confirmed payment always wins to the active card above.
+  if (read.justUpgraded && ent.tier === "free") {
+    return {
+      name: "processing",
+      product,
+      tone: "quiet",
+      headline: `Confirming your ${product} payment…`,
+      body: `Thanks — Stripe has your payment. It can take a moment for the confirmation to reach Dhwaja; this page updates itself the instant it does, so there's nothing you need to do.`,
+      unaffected: "Your protection was never waiting on this — checks, verdicts and warnings have worked the whole time.",
+      meta: "usually a few seconds",
+      fine: `If ${product} hasn't appeared after a minute, refresh the page. You haven't been charged twice — there's no button on this screen, so it will never quietly start a second checkout. ${stuckLine(ent.support_to)}`,
+      action: { kind: "none", label: "", interval: "year" },
+    };
+  }
+
+  if (ent.purchased_tier !== null && ent.purchased_tier !== undefined) {
+    const through = iso(ent.paid_through);
+    return {
+      name: "lapsed",
+      product,
+      tone: "quiet",
+      headline: through ? `${product} ended on ${through}` : `${product} ended`,
+      body: pro
+        ? "You're on the free caps again: 10 likes a day, 1 named recognition, 25 follows, one broadcast a week. Nothing you made was removed — your drops, collectibles, codes and recognitions all stand exactly as published."
+        : "You're on the free tier again. Nothing you made was removed — your collection, your codes and your Codex all stand exactly as they were.",
+      unaffected: "Your verification, your warnings and your proven accounts are unchanged. Money buys capacity here, never safety — so losing it costs you capacity, never safety.",
+      meta: "no reactivation fee · no lost history",
+      fine: `No countdown, no "you're missing out," no dimmed features dangling behind a lock. Someone who stops paying is a ${pro ? "creator" : "fan"}, full stop.`,
+      action: { kind: "checkout", label: `Start ${product} again — ${priceOf(price, interval)}`, interval },
+    };
+  }
+
+  return {
+    name: "free",
+    product,
+    tone: "quiet",
+    headline: "You're on Free",
+    body: `Free isn't a trial and it isn't a lapsed state — it's the whole protective product. Checks, verdicts, warnings, reports, removal and your passport are yours permanently, at no cost. ${product} raises the ceilings on the tools, and nothing else.`,
+    unaffected: "",
+    // AS-048/O-06 (S-035): this meta sits beside the button on this card and
+    // must never advertise a purchase the button can't start. That was fixed by
+    // DELETING the monthly mention; FU-14 (S-068) fixes the other half — the
+    // button can now start either interval, so the meta names the one that is
+    // actually selected and the fan sees the charge before they leave the page.
+    // It never names the OTHER interval, which is what AS-048 forbade.
+    meta: `${priceOf(price, interval)} · billed ${interval === "month" ? "monthly" : "annually"}`,
+    fine: "Checkout happens on Stripe, not here. You'll leave Dhwaja, pay on Stripe's page, and come back to this one. Dhwaja never sees or stores your card number.",
+    action: { kind: "checkout", label: `Go ${product} — ${priceOf(price, interval)} →`, interval },
+  };
+}
+
+/**
+ * Invariant 6 made visible. One card for every reason billing can't run —
+ * absent keys, an unreachable provider, an operator pausing sales — and NO
+ * button, because a dead button reads as a bug and a queued checkout would be a
+ * lie. It never suggests that anything protective is degraded, because nothing
+ * protective depends on this.
+ */
+function unavailableState(product: PlanState["product"]): PlanState {
+  return {
+    name: "unavailable",
+    product,
+    tone: "quiet",
+    headline: "Billing isn't set up yet — everything protective still works",
+    body: `Payments aren't configured on this deployment, so ${product} can't be bought right now. This is the safe failure, not a broken page: when Dhwaja can't run something correctly it switches it off rather than half-run it. Your checks, your saved creators, your Codex, reports and every free feature are working normally.`,
+    unaffected: "",
+    meta: "",
+    fine: 'Same card whether the keys are absent, the provider is unreachable, or an operator paused sales. No "try again in a moment," no queued checkout, and no card details collected in the meantime — the button is gone rather than dead.',
+    action: { kind: "none", label: "", interval: "year" },
+  };
+}
+
+// ===========================================================================
+// Views — pure data → HTML string, same contract as views.ts.
+// ===========================================================================
+
+/** The one action control for a state. `none` renders nothing at all. */
+function actionHtml(state: PlanState): string {
+  const a = state.action;
+  if (a.kind === "none") return "";
+  if (a.kind === "signin") return `<a href="#/signin" data-nav="#/signin" class="ds-btn nav primary">${xml(a.label)}</a>`;
+  return `<button data-act="plan-action" data-plan-kind="${xml(a.kind)}" data-plan-interval="${xml(a.interval)}" class="ds-btn act primary">${xml(a.label)}</button>`;
+}
+
+/**
+ * FU-14 — the monthly/annual choice for a card that actually sells. Checked on
+ * `state.action.interval`, so a re-paint after a change reopens on the fan's own
+ * choice rather than snapping back to the default.
+ */
+function intervalPicker(state: PlanState): string {
+  const price = state.product === "Creator Pro" ? PRICING.pro : PRICING.premium;
+  const on = state.action.interval;
+  const opt = (value: "month" | "year", label: string, amount: string, note: string): string =>
+    `<label class="pint"><input type="radio" name="tier_interval" value="${value}"${on === value ? " checked" : ""}> <span class="pl">${xml(label)}</span> <span class="amt">${xml(amount)}</span> <span class="d">${xml(note)}</span></label>`;
+  return `<div class="pints" role="group" aria-label="Billing interval">${opt("month", "Monthly", price.month, "Billed every month. Cancel any time; it runs to the end of the month you paid for.")}${opt("year", "Annual", price.year, `Twelve monthly payments would be ${price.monthlyTotal}, so this saves ${price.saving} (${price.savingPct}) — paid up front, in one charge.`)}</div>`;
+}
+
+/** The state card that sits at the top of the plan page. */
+export function planStateView(state: PlanState): string {
+  const unaffected = state.unaffected ? `<p class="unaffected">🛡 ${xml(state.unaffected)}</p>` : "";
+  // PS-103: textClamp() already escapes (packages/card-render/src/svg.ts) —
+  // wrapping its output in xml() again double-escapes (V12-MANIFEST.md #11).
+  const meta = state.meta ? `<span class="planmeta">${textClamp(state.meta, 120)}</span>` : "";
+  const acts = actionHtml(state);
+  // FU-14 — THE INTERVAL CHOICE, ON THE SELLING CARDS ONLY. A non-selling state
+  // (active, grace, portal, signed-out, 503, processing) carries no checkout
+  // button, and an input beside no button is a dead control — the same reason
+  // those cards carry no button at all. Mirrors the creator console's
+  // `pro_interval` radios; the controller re-paints on change, so the price on
+  // the button can never disagree with the option the fan has selected.
+  const pick = state.action.kind === "checkout" ? intervalPicker(state) : "";
+  const actRow = acts || meta ? `<div class="planacts">${acts}${meta}</div>` : "";
+  return `<div class="plancard s-${xml(state.name)} t-${xml(state.tone)}">
+<div class="planhead">${xml(state.headline)}</div>
+<p class="planbody">${xml(state.body)}</p>
+${unaffected}${pick}${actRow}
+<p class="planfine">${xml(state.fine)}</p>
+<span data-plan-msg class="rmsg" aria-live="polite"></span>
+</div>`;
+}
+
+/**
+ * The static half of the page: the two plan columns, the "what money never
+ * buys" strip, and the honest block. It takes NO entitlement — the router can
+ * render it without ever reading billing, and the DOM controller drops the
+ * state card into `[data-plan-state]` once the read comes back. Fail-closed by
+ * construction: if that read never lands, the page is still a complete, honest
+ * pricing page with no dead controls.
+ */
+/** I3-0072 (D-1082(11)) — approved by Jason (D-1365 W57). The plans page's "Unlimited checks" line said "nothing was sent"; a check
+ * fetches `/v1/bucket/<prefix>` (registry.ts), so it now says what it sends — the same claim as views.ts HOME_ONDEVICE_LINE. */
+export const PLAN_CHECKS_LINE = "checked on your device — all it sends us is a short prefix of a hash of what you check, never the link or handle itself";
+
+export function upgradeView(): string {
+  const p = PRICING.premium;
+  const c = PRICING.pro;
+  return `<section class="upgrade">
+<h2>Premium &amp; Pro</h2>
+<p class="lede">Everything that keeps you safe is free, for everyone, permanently. Premium and Pro buy extras — never trust.</p>
+
+<div data-plan-state class="planstate"></div>
+
+<div class="plans">
+<div class="plan fan">
+<div class="phead"><span class="aud">For fans</span><h3>Fan Premium</h3><p class="sub">The whole safety product is the free tier. Premium is for the fans who want to give more back.</p></div>
+<div class="cols">
+<div class="col"><div class="tier"><b>Free</b> <span class="price">US$0 · always</span></div>
+<ul class="feat"><li>Unlimited checks<span class="d">${xml(PLAN_CHECKS_LINE)}</span></li><li>Save creators<span class="d">up to the free limit, with every protection alert they trigger</span></li><li>Full Codex<span class="d">your log of the real ones</span></li><li>Collecting &amp; code redemption<span class="d">cards, editions, acquisitions</span></li><li>Reporting an impostor<span class="d">what your report counts for comes from evidence and your account history — never from what you pay</span></li></ul></div>
+<div class="col paid"><div class="tier"><b>Premium</b> <span class="price">${xml(p.month)} · ${xml(p.year)}</span></div>
+<ul class="feat plus"><li>More saved creators<span class="d">a higher limit on how many creators you can save — each save still counts once, paid or not</span></li><li>Your reports seen sooner<span class="d">an operator reaches a supporter's report earlier in the queue — a purchased place in the line, it never counts for more</span></li><li>You support Dhwaja<span class="d">the whole safety product stays free for everyone; Premium is how it's paid for</span></li></ul></div>
+</div>
+<p class="pfine">Annual is ${xml(p.year)}. Twelve monthly payments would be ${xml(p.monthlyTotal)}, so it saves ${xml(p.saving)} (${xml(p.savingPct)}). Annual is a subscription: it renews yearly; cancel any time.</p>
+</div>
+
+<div class="plan creator">
+<div class="phead"><span class="aud">For creators</span><h3>Creator Pro</h3><p class="sub">Pro raises the ceilings on your tools. It never touches what protects you.</p></div>
+<div class="cols">
+<div class="col"><div class="tier"><b>Free</b> <span class="price">US$0 · always</span></div>
+<ul class="feat"><li>Listing &amp; claiming<span class="d">your passport, proven account by account</span></li><li>Account proofs<span class="d">bio-code / OAuth, per account</span></li><li>Impostor warnings<span class="d">every warning protecting you, no tier attached</span></li><li>Verification review<span class="d">the human review that grants Verified</span></li><li>Demand page, drops, collectibles, codes, returns<span class="d">the whole toolkit, uncapped by tier</span></li></ul></div>
+<div class="col paid"><div class="tier"><b>Pro</b> <span class="price">${xml(c.month)} · ${xml(c.year)}</span></div>
+<ul class="feat plus"><li>Likes 10 → 50 a day<span class="d">a quiet thanks to a fan</span></li><li>Named recognitions 1 → 5 a day<span class="d">a signed, public thank-you naming one fan</span></li><li>Follows 25 → 250<span class="d">creators you can follow from your passport</span></li><li>Broadcasts weekly → daily<span class="d">still one-way, still signed — never DMs</span></li></ul></div>
+</div>
+<p class="pfine">Annual is ${xml(c.year)}. Twelve monthly payments would be ${xml(c.monthlyTotal)}, so it saves ${xml(c.saving)} (${xml(c.savingPct)}). Annual is a subscription: it renews yearly; cancel any time. Pro moves four numbers; there is no fifth column of hidden perks.</p>
+</div>
+</div>
+
+<div class="never">
+<b>What money never buys:</b>
+<span class="nbs"><span class="nb">✕ a verdict</span><span class="nb">✕ a verified badge</span><span class="nb">✕ report weight</span><span class="nb">✕ faster verification</span><span class="nb">✕ protection</span><span class="nb">✕ ranking position</span></span>
+</div>
+
+<div class="honest">
+<h3>Premium buys convenience. It does not buy trust.</h3>
+<p><b>Paying changes nothing about anyone's verdict.</b> Verified is a human review of who someone is; Claimed is a proof they passed. Neither is for sale, and no amount of money moves anyone between them. If a card on file could buy a badge, the badge would be worth nothing — to you most of all.</p>
+<p><b>Verification is not affected.</b> Paying does not start a review, does not speed one up, and does not change its outcome.</p>
+<p><b>Warnings work the same either way.</b> A warning protecting someone from an impostor is published because the evidence says so, not because anyone is paying; and a warning against someone would stand for exactly the same reason. Premium can't buy one, and it can't call one off. What your report counts for comes from evidence and your account history — never from what you pay.</p>
+<p><b>Seen sooner is not counts for more.</b> Premium does exactly one thing to a report you file: an operator gets to it earlier. That's a place in the line, and it's the only thing here that money moves. Your report doesn't count for more towards a caution, your daily reporting limit doesn't go up, the priority number an operator reads doesn't change, and nothing about whether a warning gets published changes. The queue effect is bounded too: a supporter's report only ever moves ahead of reports that were already comparable to it, and never past a stronger one. Where an operator sees that a reporter is a supporter, it is labelled as a purchased queue position — never as a reason to believe them.</p>
+<p><b>Protection is never paywalled.</b> Checks, verdicts, warnings, caution, reports, removal, claiming, account proofs and the passport page are the free tier, permanently. Losing a subscription costs you capacity, never safety.</p>
+<p><b>Dhwaja never holds your card — Stripe does.</b> Checkout and card management both happen on Stripe's pages. What Dhwaja stores is one line: which tier you're on, and until when.</p>
+</div>
+</section>`;
+}
+
+/**
+ * I16-S4-I3-0758 (D-1030; I30-PREMIUM) — the promotional week, as GET /account/premium/promo-week answers it
+ * (services/trust-core/src/premium-routes.ts). The control renders ONLY when the fan's promotional credit covers a
+ * week (`eligible`); a running promotional week is shown either way. `null` (signed out, or the read failed) renders
+ * nothing: no dead control. The DOM controller (main.ts) fetches the offer and POSTs on `[data-promo-week]`. DRAFT copy.
+ */
+export type PromoWeekOffer = PromoWeekOfferDto;
+export function promoWeekView(offer: PromoWeekOffer | null): string {
+  if (!offer) return "";
+  const until = typeof offer.premium_until === "string" && Number.isFinite(Date.parse(offer.premium_until)) ? new Date(Date.parse(offer.premium_until)).toISOString().slice(0, 10) : null;
+  const running = until ? `<p class="planbody">You have Premium from promotional credits until ${xml(until)}.</p>` : "";
+  const control = offer.eligible
+    ? `<div class="planacts"><button class="ds-btn act primary" data-promo-week>${xml(`Use ${offer.cost} promotional credits for ${offer.days} days of Premium`)}</button></div>
+<p class="planfine">Only promotional credits are spent — credits you paid for never are, and no creator is paid from this.</p>`
+    : "";
+  if (!running && !control) return "";
+  return `<div class="plancard promo-week">${running}${control}<span data-promo-msg class="rmsg" aria-live="polite"></span></div>`;
+}
+
+/** Every state this page ships, so the count is assertable in one place. */
+export const PLAN_STATES: readonly PlanStateName[] = ["signed-out", "free", "active", "grace", "lapsed", "unavailable", "processing"];
+===== END FILE: apps/web/src/upgrade.ts =====
+
+===== BEGIN FILE: apps/web/src/verdict.ts =====
+/**
+ * Verdict presentation for the fan web app — the web's mirror of
+ * `apps/mobile-check/src/verdict-presentation.ts`.
+ *
+ * WHY THIS FILE EXISTS. The SPA painted its verdicts from a palette that was
+ * nobody's. Measured against docs/DESIGN-SYSTEM.md v0.2 §3, not one of its six hexes
+ * was a reserved token, and two of them were the WRONG TOKEN'S COLOUR:
+ *
+ *     verified   #38d39f   (token #18e6a0)
+ *     claimed    #5b8cff   BLUE, where the design system and both native apps
+ *                          say amber #ffb020 — and where the SPA's own
+ *                          "unclaimed" was amber
+ *     unclaimed  #c9a13b   AMBER, where the token is slate #8b93a7
+ *     reported   #e0555f   (token #ff3b5c)
+ *     caution    —         NO CSS RULE AT ALL: it fell through to the default
+ *                          grey dot and painted identically to "Not recognized",
+ *                          "Unsupported link" and "Couldn't check"
+ *
+ * So the colour a fan learned as Claimed on their phone meant Unclaimed in the
+ * browser, and a Caution — the one machine-served signal that exists to make a
+ * fan look twice — was indistinguishable from "we have no record". Colour is the
+ * fastest channel a verdict has; a cross-surface swap of two verdict hues is
+ * worse than no colour at all, because the fan has been taught the wrong thing.
+ *
+ * THE OTHER HALF: there was no icon. The design system's law is `verdict =
+ * colour + icon + label, always` (§4, §8 greyscale test), and the SPA rendered a
+ * bare coloured dot that means nothing in a greyscale screenshot and nothing to a
+ * colour-blind reader. Every entry below carries a glyph, and `checkResultView`
+ * renders it.
+ *
+ * The hexes are copied BY VALUE from docs/DESIGN-SYSTEM.md v0.2 §3, the same
+ * convention `card-render`, `badge.ts`, `seo-page.ts` and the two native verdict
+ * tables use (an SVG string and a Compose `Color` cannot read a CSS custom
+ * property either). `apps/web/test/verdict.test.ts` pins these against the CSS
+ * in index.html, and the cross-client guard
+ * `apps/mobile-check/test/verdict-cross-client.test.ts` pins them against the
+ * Swift, the Kotlin, the extension and the mobile-check table — so a fifth
+ * palette cannot appear. (This line used to name `verdict-parity.test.ts`,
+ * which does not exist. `parity.test.ts` next door does, and is about
+ * server-parity of the CHECK rather than about colour, so the pointer resolved
+ * to something real and wrong — the worst kind. Every repo path a source
+ * comment names is now checked by `apps/web/test/failure-states.test.ts`.)
+ *
+ * LABELS ARE THE WEB'S OWN and deliberately not the natives'. The share sheet
+ * says "Verified on Dhwaja" because it has no other context; a result card in
+ * the app that just said "Checked: <url>" says "Verified". Copy is per surface;
+ * colour, icon and meaning are not.
+ */
+
+/** Reserved verdict tokens, by value from docs/DESIGN-SYSTEM.md v0.2 §3. */
+export const TOKEN = {
+  verified: "#18e6a0", // --verified  teal-green — operator-vetted
+  claimed: "#ffb020", // --claimed   amber      — proved control, NOT vetted
+  unclaimed: "#8b93a7", // --unclaimed slate      — listed, no owner yet
+  reported: "#ff3b5c", // --reported  red        — active operator warning
+  caution: "#ff8a3d", // --caution   orange     — machine-served soft signal
+  notlisted: "#838aa6", // --notlisted faint      — no record (#217: was #636a80, sub-AA)
+  muted: "#9aa0b4", // --muted     secondary  — NOT a verdict hue
+} as const;
+
+/** Brand hues. Here so a test can assert they never reach a verdict rule. */
+export const BRAND = { pink: "#ff2d7e", violet: "#a63cff" } as const;
+
+export type TokenName = keyof typeof TOKEN;
+
+export interface WebVerdictStyle {
+  /** The mandatory text label — what carries the meaning in greyscale. */
+  label: string;
+  /**
+   * The mandatory icon, as a monochrome text glyph. Same family as the native
+   * tables (○ → ◐ → ✓ reads as nothing-proved → control-proved → vetted) so the
+   * three surfaces teach a fan ONE vocabulary.
+   *
+   * Empty ONLY for `unsupported`, which is the absence of a verdict rather than
+   * a weak one — matching `CHECK_STYLE.unsupported` in mobile-check.
+   */
+  glyph: string;
+  /** The CSS class that carries the hue. One class per token. */
+  cls: string;
+  /** The token this class must paint. */
+  token: TokenName;
+  /** The sentence under the verdict — precise, in this product's own words. */
+  blurb: string;
+  /**
+   * N2 — the SAME state, said to somebody who is frightened.
+   *
+   * `blurb` is accurate and it is written in Dhwaja's vocabulary; a fan who
+   * clicked because something felt wrong is not reading for a taxonomy. This is
+   * the lead line on the card and `blurb` is the second one: plain answer first,
+   * precise answer under it. Mirrors `CHECK_PLAIN` in
+   * apps/mobile-check/src/verdict-presentation.ts and is pinned against all four
+   * clients there. Empty for row badges, which carry no sentence at all.
+   */
+  plain: string;
+}
+
+/**
+ * ONE CLASS PER TOKEN, not one per status. `unsupported` and `failed` share
+ * `--muted` on purpose (neither is a verdict, so neither may own a reserved
+ * verdict hue) and are told apart by label and glyph — exactly as in
+ * `CHECK_STYLE`. `unknown` is `--notlisted` and is NOT muted: "we looked and
+ * there is no record" is a real answer; "we could not look" is not.
+ */
+import { EN } from "@dhwaja/i18n";
+import { isWarningKindCode, type WarningKindCode } from "@dhwaja/schema";
+
+export const VERDICT_CLASS: Record<TokenName, string> = {
+  verified: "v",
+  claimed: "c",
+  unclaimed: "u",
+  reported: "w",
+  caution: "cau",
+  notlisted: "k",
+  muted: "m",
+};
+
+/** I3-1998 (D-0705): Jason's approved sentence for what a Verified result does
+ * and doesn'''t vouch for, rendered under the Verified plain line. The warning
+ * line is untouched. Exported (not inlined in `plain`) because `plain` is
+ * pinned byte-identical across all four clients by
+ * verdict-cross-client.test.ts's N2 block — this sentence is web-only.
+ * D-1073(12): Jason's approved I21-Q145 sentence follows it, verbatim, as it does in the How page's
+ * `how.never_scope` (packages/i18n) — the same identity-only green answer. Both renders (views.ts check card and
+ * tip note) are Verified-only. */
+export const VERIFIED_CONDUCT_NOTE =
+  "A green answer is about identity, not about conduct. It also says nothing about whether any particular post, photo or video was really made by them.";
+
+/** The check-result vocabulary, keyed by the status the registry check returns. */
+/**
+ * I3-0072 (D-1082(11), D-1078(28)) — approved by Jason (D-1365 W57). A failed check is not a check that sent nothing: every
+ * `failed` the Registry returns after `/v1/bucket/<prefix>` (registry.ts checkSubjectFresh) has already sent the hash
+ * prefix, and an earlier failure (`/v1/info`) sent less. What it never sends is the link or handle: the Registry's only
+ * requests are `/v1/info`, `/v1/bucket/<prefix>` and `/v1/proof/<prefix>`. The iOS and Android ResultView carry this
+ * sentence verbatim (apps/web/test/i32-fx1-web-sent-copy.test.ts pins all three).
+ */
+export const FAILED_CHECK_BLURB = "The check couldn't complete, so nothing was verified. At most a short prefix of a hash of what you checked was sent to us, never the link or handle itself. Treat this account as unverified and try again.";
+
+export const CHECK_VERDICT: Record<string, WebVerdictStyle> = {
+  verified: { label: EN["web.label_verified"], glyph: "✓", cls: VERDICT_CLASS.verified, token: "verified", blurb: "Account control and identity confirmed by Dhwaja.", plain: EN["check.plain_verified"] },
+  claimed: { label: EN["web.label_claimed"], glyph: "◐", cls: VERDICT_CLASS.claimed, token: "claimed", blurb: "This creator controls this account. Identity not independently verified.", plain: EN["check.plain_claimed"] },
+  unclaimed: { label: EN["web.label_unclaimed"], glyph: "○", cls: VERDICT_CLASS.unclaimed, token: "unclaimed", blurb: "Listed from public information; not confirmed by this creator.", plain: EN["check.plain_unclaimed"] },
+  warning: { label: EN["web.label_warning"], glyph: "⚠", cls: VERDICT_CLASS.reported, token: "reported", blurb: "A published warning applies to this account: possible impersonator or fraudulent activity.", plain: EN["check.plain_warning"] },
+  caution: { label: EN["web.label_caution"], glyph: "!", cls: VERDICT_CLASS.caution, token: "caution", blurb: "This account isn't proven on Dhwaja and should be checked carefully — it is not a published warning.", plain: EN["check.plain_caution"] },
+  // The `unknown` blurb used to be "Dhwaja has no record for this account." —
+  // the `plain` sentence's own first clause, one word apart, rendered five lines
+  // under it on every not-listed check. The card is two tiers on purpose (plain
+  // answer first, Dhwaja's vocabulary second), and a second tier that restates
+  // the first is not a second tier: it is the same sentence twice, on the
+  // verdict a fan sees most often. Insistence about an ABSENCE is the one tone
+  // this verdict must never take — a reader takes emphasis for a hint, and there
+  // is nothing to hint at. The blurb now says what the plain line does not: WHAT
+  // WAS SEARCHED. Both natives carried the same duplicate and lost theirs in the
+  // same slice (18); `safety-handoff-parity.test.ts` holds all three.
+  unknown: { label: EN["web.label_unknown"], glyph: "?", cls: VERDICT_CLASS.notlisted, token: "notlisted", blurb: "No listing, no claim and no warning for this account.", plain: EN["check.plain_unknown"] },
+  unsupported: { label: EN["web.label_unsupported"], glyph: "", cls: VERDICT_CLASS.muted, token: "muted", blurb: "That link isn't a supported creator profile.", plain: EN["check.plain_unsupported"] },
+  // flag 23: the fail-closed copy law — a failed check states what is unknown
+  // and never reassures. NOT --notlisted (that means "we looked"), and
+  // deliberately not red (red is reserved for Reported).
+  failed: { label: EN["web.label_failed"], glyph: "↻", cls: VERDICT_CLASS.muted, token: "muted", blurb: FAILED_CHECK_BLURB, plain: EN["check.plain_failed"] },
+};
+
+/** I62 P7a (I45-8, D-1522): the check card's heading for a warning is its served kind's short label (Jason's words);
+ * a warning with no known kind keeps CHECK_VERDICT.warning.label. Only the heading changes: the sentences under it do not. */
+export const WARNING_KIND_LABEL: Readonly<Record<WarningKindCode, string>> = {
+  i: EN["web.label_warning_impersonation"],
+  f: EN["web.label_warning_confirmed_fraud"],
+};
+
+export function warningLabelFor(code: unknown): string {
+  return isWarningKindCode(code) ? WARNING_KIND_LABEL[code] : CHECK_VERDICT.warning!.label;
+}
+
+/**
+ * THE SAME TWO VERDICTS, SAID AT THE LEVEL THEY ARE TRUE AT — the web's mirror
+ * of `UNCONFIRMED_STYLE` in apps/mobile-check/src/verdict-presentation.ts.
+ *
+ * "Claimed — This creator controls this account" is a sentence about the ACCOUNT
+ * the fan just checked, and `claimed` is a fact about a PASSPORT. With
+ * per-account standing off (the default) an operator/OSINT-seeded handle on a
+ * claimed passport is served `claimed`, and nobody has ever confirmed it belongs
+ * to that creator. The passport page has always said so on the row itself ("!
+ * not confirmed"); this card could not, because the bucket entry carried nothing
+ * to say it with. It does now (`p`), and `checkVerdict` picks the sentence.
+ *
+ * Hue, glyph and class are unchanged — the passport really is claimed/verified,
+ * and re-colouring a true verdict teaches a fan that the colour means something
+ * else. Only the words move. Absence of the flag lands here, which under-claims
+ * and can never over-claim.
+ */
+export const UNCONFIRMED_VERDICT: Record<string, WebVerdictStyle> = {
+  verified: {
+    label: EN["web.label_verified_unconfirmed"],
+    glyph: "✓",
+    cls: VERDICT_CLASS.verified,
+    token: "verified",
+    blurb: "Dhwaja verified this creator's identity. This account is listed under their passport and Dhwaja has not confirmed control of it.",
+    plain: EN["check.plain_verified_unconfirmed"],
+  },
+  claimed: {
+    label: EN["web.label_claimed_unconfirmed"],
+    glyph: "◐",
+    cls: VERDICT_CLASS.claimed,
+    token: "claimed",
+    blurb: "This creator has claimed a Dhwaja passport; this account is listed under it and Dhwaja has not independently confirmed it.",
+    plain: EN["check.plain_claimed_unconfirmed"],
+  },
+};
+
+/**
+ * HOW AN ACCOUNT IS PRINTED — the web's copy of the shared rule (see
+ * `accountDisplay` in apps/mobile-check/src/verdict-presentation.ts and in
+ * services/trust-core/src/passport-view.ts; all four are pinned together by
+ * tests/invariants/safety-handoff-parity.test.ts).
+ *
+ * A generic Tier-2 `link` is a URL, not a platform. This card rendered
+ * `link @livejasmin.com/en/chat/RileyMoon` — a fake platform and a fake handle
+ * in one line — for the whole life of the M3 link tier, while the server-side
+ * page next door had the rule written down and fixed.
+ *
+ * Returns PLAIN TEXT; the caller escapes for its own sink.
+ */
+export const LINK_PLATFORM = "link";
+
+export function accountDisplay(platform: string, handle: string): { platform: string; ident: string } {
+  return platform === LINK_PLATFORM ? { platform: "web link", ident: handle } : { platform, ident: `@${handle}` };
+}
+
+/**
+ * Row badges — the small pill on a Codex row, a discovery rail, a leaderboard.
+ *
+ * These were one flat `.badge` rule: a Verified creator and a Claimed one
+ * rendered in the same blue pill, distinguished only by the word inside. Same
+ * law, same table.
+ */
+export const ROW_VERDICT: Record<string, WebVerdictStyle> = {
+  verified: { label: EN["web.label_verified"], glyph: "✓", cls: VERDICT_CLASS.verified, token: "verified", blurb: "", plain: "" },
+  claimed: { label: EN["web.label_claimed"], glyph: "◐", cls: VERDICT_CLASS.claimed, token: "claimed", blurb: "", plain: "" },
+  unclaimed: { label: EN["web.label_unclaimed"], glyph: "○", cls: VERDICT_CLASS.unclaimed, token: "unclaimed", blurb: "", plain: "" },
+};
+
+/**
+ * Resolve a check status to its style. An UNRECOGNISED status — a server newer
+ * than this build, a truncated response, a typo — falls through to `failed`,
+ * never to the reassuring `unknown`. An app that does not understand the answer
+ * has not checked anything.
+ *
+ * `confirmed` defaults to false, so a caller that has not been told the entry
+ * confirmed this account gets the passport-level sentence by construction.
+ */
+
+/**
+ * WHAT THE SUBJECT IS — this file's mirror of `KIND_STYLE` / `KIND_PLAIN` in
+ * apps/mobile-check/src/verdict-presentation.ts, pinned across the four clients
+ * by verdict-cross-client.test.ts.
+ *
+ * NOT A VERDICT AND MUST NOT LOOK LIKE ONE: no verdict token, no verdict glyph
+ * (◆ is outside ✓ ◐ ○ ⚠ ! ? ↻), and nothing here widens the status vocabulary.
+ * A verified character is exactly as verified as a verified person — the kind
+ * says WHAT the subject is, never how far to trust it.
+ */
+export type SubjectKind = "ai_character" | "brand";
+
+/** Wire → kind. ANYTHING ELSE IS A PERSON, which is what every entry meant
+ * before characters existed: absence under-claims and can never over-claim. */
+export function kindFromWire(k: unknown): SubjectKind | undefined {
+  return k === "a" ? "ai_character" : k === "b" ? "brand" : undefined;
+}
+
+/** The consumer-side narrowing: the LONG form, which is what `CheckResult.kind`
+ * carries once `kindFromWire` has done its job at the bucket-parse boundary.
+ * Calling `kindFromWire` on a long-form value returns nothing and renders
+ * nothing — silently, which is why these are two functions and not one. */
+export function asSubjectKind(v: unknown): SubjectKind | undefined {
+  return v === "ai_character" || v === "brand" ? v : undefined;
+}
+
+export const KIND_STYLE: Record<SubjectKind, { label: string; glyph: string; plain: string }> = {
+  ai_character: { label: "AI character", glyph: "◆", plain: "This is an AI character, not a real person. The account you checked is run by whoever operates it." },
+  brand: { label: "Brand character", glyph: "◆", plain: "This is a brand character, not a real person. The account you checked is run by whoever operates it." },
+};
+
+export function checkVerdict(status: unknown, confirmed = false): WebVerdictStyle {
+  const key = typeof status === "string" ? status : "";
+  const weaker = confirmed ? undefined : UNCONFIRMED_VERDICT[key];
+  return weaker ?? CHECK_VERDICT[key] ?? CHECK_VERDICT.failed!;
+}
+===== END FILE: apps/web/src/verdict.ts =====
+
+===== END OF CHUNK 14 OF 73 =====

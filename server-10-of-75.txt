@@ -1,0 +1,3123 @@
+DHWAJA CODE REVIEW — server — CHUNK 10 OF 75
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: apps/extension, apps/mobile-check, apps/web
+Files in this chunk (12):
+  - apps/extension/src/verdict.ts
+  - apps/extension/src/watch.ts
+  - apps/mobile-check/build.mjs
+  - apps/mobile-check/src/index.ts
+  - apps/mobile-check/src/registry-keys.ts
+  - apps/mobile-check/src/registry-proof.ts
+  - apps/mobile-check/src/safety-handoff.ts
+  - apps/mobile-check/src/url-polyfill.ts
+  - apps/mobile-check/src/verdict-presentation.ts
+  - apps/web/build.mjs
+  - apps/web/preview/mock.mjs
+  - apps/web/src/a11y.ts
+
+
+===== BEGIN FILE: apps/extension/src/verdict.ts =====
+export type TrustStatus = "verified" | "claimed" | "unclaimed" | "warning" | "caution" | "unknown" | "unsupported" | "failed"; // check.ts re-exports it; declared here so this module does not import check.ts back (I13-ARCH, QUEUE #902: the cycle)
+import { EN } from "@dhwaja/i18n";
+
+/**
+ * THE POST-CHECK HANDOFF — a literal mirror of
+ * `apps/mobile-check/src/safety-handoff.ts` (same hashes, same labels), pinned
+ * across the four clients by `tests/invariants/safety-handoff-parity.test.ts`.
+ * It lives beside the verdict mirror because it is the same kind of thing: a
+ * table this client cannot import from the spec module and must therefore be
+ * held to it by a guard.
+ *
+ * WHY THE POPUP NEEDED ONE. It appended a link only when the result carried a
+ * validated real-creator pointer, or when the verdict was positive. A `warning`
+ * WITHOUT a pointer — the most dangerous thing this extension can say — got a
+ * red line of text and no link of any kind, and so did `caution`, `unclaimed`,
+ * `unknown` and `failed`.
+ *
+ * Every hash is a bare route fragment on the app's own origin and carries
+ * nothing about the page that was checked: the k-anonymous check keeps the
+ * subject on the device, so a link must not take it off.
+ */
+export interface SafetyHandoff {
+  hash: string;
+  label: string;
+}
+
+/** "Is this listing me?" — rendered on EVERY verdict, as on the web, because
+ * somebody arriving at their own listing does not know which verdict is being
+ * served about them and the removal valve must not be gated on it. */
+export const HANDOFF_MINE: SafetyHandoff = { hash: "#/remove", label: "Is this listing me? →" };
+
+export const SAFETY_HANDOFF: Record<TrustStatus, SafetyHandoff> = {
+  verified: { hash: "#/discover", label: "Open Dhwaja →" },
+  claimed: { hash: "#/discover", label: "Open Dhwaja →" },
+  unclaimed: { hash: "#/nominate", label: "Ask for a creator on Dhwaja →" },
+  warning: { hash: "#/report", label: "Report this account →" },
+  // A caution's primary door is the DISPUTE, not the report: a caution is
+  // machine-served and always contestable, and the person most likely to be
+  // reading one is its subject — a creator whose own unproven listing was
+  // cautioned. "Report this account" invited them to report themselves.
+  caution: { hash: "#/contest", label: "Dispute this caution →" },
+  unknown: { hash: "#/nominate", label: "Suggest this creator →" },
+  unsupported: { hash: "#/safety", label: "What can I do? →" },
+  // I3-0451 (D-0920): a check that could not complete offers the re-run, not the hub.
+  failed: { hash: "#/check", label: "Try again →" },
+};
+
+/** Fail closed: a status this build does not know gets the safety hub (the
+ * `unsupported` row) — never an accusation, never a reassurance. */
+export function safetyHandoff(status: unknown): SafetyHandoff {
+  return (typeof status === "string" ? SAFETY_HANDOFF[status as TrustStatus] : undefined) ?? SAFETY_HANDOFF.unsupported;
+}
+
+/** I3-0375 (D-0992(7)) — the warning's dispute door, painted in ADDITION to the
+ * primary door and the valve. Mirror of SAFETY_DISPUTE in
+ * apps/mobile-check/src/safety-handoff.ts (held equal by
+ * apps/mobile-check/test/i23-l04-landing.test.ts); `#/remove/dispute` opens the
+ * web removal form with dispute preselected. Only `warning` has a row. */
+export const SAFETY_DISPUTE: Partial<Record<TrustStatus, SafetyHandoff>> = {
+  warning: { hash: "#/remove/dispute", label: "Dispute this warning →" },
+};
+export function safetyDispute(status: unknown): SafetyHandoff | null {
+  return (typeof status === "string" && Object.hasOwn(SAFETY_DISPUTE, status) ? SAFETY_DISPUTE[status as TrustStatus] : undefined) ?? null;
+}
+
+/**
+ * PER-KIND WARNING WORDING (I3-0122, D-0992(9)). A served `warning` entry carries
+ * `w`, a one-character kind code; the popup adds that kind's sentence under the
+ * fixed one, which stays the fallback for an absent or unknown code. The texts are
+ * a literal mirror of `WARNING_KIND_WORDINGS` in packages/schema (this
+ * package does not depend on @dhwaja/schema), held byte-equal by
+ * apps/mobile-check/test/i23-l04-landing.test.ts. Approved there (status `approved`;
+ * Jason, docket I23-Q9a; trust-core migration 0270).
+ */
+export const WARNING_KIND_WORDINGS: Readonly<Record<"i" | "f", string>> = {
+  i: "Dhwaja reviewed reports about this account and published a warning that it presents itself as another creator who does not control it.",
+  f: "Dhwaja reviewed evidence about this account and published a warning that it has been used to take money or information from people under false pretences.",
+};
+/** I63 K1 (D-1537, D-1522): the warning heading per served kind, the two catalogue keys the web heading reads. */
+export const WARNING_KIND_LABEL: Readonly<Record<"i" | "f", string>> = {
+  i: EN["web.label_warning_impersonation"],
+  f: EN["web.label_warning_confirmed_fraud"],
+};
+/** D-0996(1): the kind-neutral safety line kept ABOVE a kind's sentence (mirror of @dhwaja/schema WARNING_SAFETY_LINE). */
+export const WARNING_SAFETY_LINE = "Don't send money.";
+/** The kind's sentence, or null for an absent or unknown code — and null is the
+ * fallback: the fixed warning label and plain sentence stand alone, as before I23. */
+export function warningKindSentence(code: unknown): string | null {
+  return code === "i" || code === "f" ? WARNING_KIND_WORDINGS[code] : null;
+}
+
+/**
+ * Verdict presentation for the extension — the extension's mirror of
+ * `apps/mobile-check/src/verdict-presentation.ts` and `apps/web/src/verdict.ts`.
+ *
+ * WHY IT EXISTS. The popup rendered every verdict as one line of `#333` text.
+ * All seven states — Verified, Claimed, Unclaimed, Reported, Caution, Not
+ * listed, Couldn't check — were the same colour, the same weight and the same
+ * shape. There was no icon anywhere. Measured: rendering NO VERDICT AT ALL
+ * passed the whole extension suite, because nothing asserted that the popup
+ * showed anything.
+ *
+ * That is worse in the popup than anywhere else. The popup is what a fan opens
+ * *deliberately*, on the page they are about to trust with money — it is the one
+ * surface where the answer is the entire product, and it was rendering the
+ * strongest warning this system can issue in the same grey as "not listed".
+ *
+ * TWO PALETTES, ONE VOCABULARY. The popup is our own surface, so it runs the
+ * design system dark (docs/DESIGN-SYSTEM.md §3 is dark-first) and uses the reserved
+ * token hexes UNCHANGED — the same bytes the web app and both native apps paint.
+ * The on-page badge is not our surface: it renders on a white card over
+ * somebody else's site (§2, "embeddable surfaces can't assume a dark
+ * background"), where #18e6a0 on white is about 1.6:1 and unreadable. So the
+ * badge uses ON_LIGHT — one documented darkened variant PER TOKEN, never a
+ * second vocabulary. Every status still resolves through the same `token` field,
+ * so "claimed is amber" holds on both, and `test/verdict-render.test.ts:86` asserts ON_LIGHT is
+ * total over TOKEN so a status can never acquire a colour with no token behind
+ * it.
+ */
+
+/** Reserved verdict tokens, by value from docs/DESIGN-SYSTEM.md v0.2 §3. */
+export const TOKEN = {
+  verified: "#18e6a0", // --verified  teal-green — operator-vetted
+  claimed: "#ffb020", // --claimed   amber      — proved control, NOT vetted
+  unclaimed: "#8b93a7", // --unclaimed slate      — listed, no owner yet
+  reported: "#ff3b5c", // --reported  red        — active operator warning
+  caution: "#ff8a3d", // --caution   orange     — machine-served soft signal
+  notlisted: "#838aa6", // --notlisted faint      — no record (AA: 5.85:1 on the popup ground #08080f; was #636a80, 3.71:1 — #217)
+  muted: "#9aa0b4", // --muted     secondary  — NOT a verdict hue
+} as const;
+
+export type TokenName = keyof typeof TOKEN;
+
+/**
+ * WHICH VERDICTS INTERRUPT A SCREEN READER (D-0652; extended to the on-page
+ * badge by D-0810(13)). `reported` is `warning`'s reserved token and `caution`
+ * is `caution`'s; keyed on the RESOLVED token so the politeness comes from the
+ * same resolution as the colour. The popup and the badge both read this set.
+ */
+export const INTERRUPTING_TOKENS: ReadonlySet<string> = new Set(["reported", "caution"]);
+
+/**
+ * The same seven verdicts, darkened for a WHITE card on a host page.
+ *
+ * These are not a free choice: each is the same hue family as its token,
+ * darkened until it clears WCAG AA (4.5:1) against #fff, which the dark-surface
+ * tokens do not. The badge also draws its own white background and a 2px border
+ * in the same colour, so it stays legible whatever the host page is doing behind
+ * it. The old badge palette had no such relationship to the tokens at all — its
+ * "claimed" was BLUE (#1a56c4) while claimed is amber on every other surface.
+ *
+ * AND THEY ARE ALL DIFFERENT, which is the part that was missing. `muted` and
+ * `notlisted` were BOTH #5b5b5b, so on the on-page badge "Couldn't check" wore
+ * the exact colour of "Not listed" — against the cross-client guard's own words,
+ * "a FAILED check never wears the `not listed` colour, on any client". It was
+ * latent only because `failed`/`unknown` are outside `BADGE_STATUSES` today: one
+ * entry added to that set and an outage would have painted itself as "we looked
+ * and there is no record" on somebody else's page. The dark palette keeps the
+ * two apart by value (--muted #9aa0b4 vs --notlisted #838aa6); this table was
+ * the only place in the product where a verdict lost its own colour, and
+ * `verdict-render.test.ts` now asserts injectivity rather than only totality.
+ */
+export const ON_LIGHT: Record<TokenName, string> = {
+  verified: "#0a7d34", // deep green
+  claimed: "#8a5a00", // dark amber — NOT blue; claimed is amber everywhere
+  unclaimed: "#4a5060", // slate, darkened
+  reported: "#b3261e", // accusatory red
+  caution: "#8a4b12", // burnt orange — softer than the red, and not the amber
+  notlisted: "#5b5b5b", // neutral grey — "we looked; no record"
+  muted: "#3f4450", // darker slate — "we could not look". 9.75:1 on white,
+  // and never #5b5b5b: on this surface it is the only thing separating a
+  // failed check from a completed one.
+};
+
+export interface ExtVerdictStyle {
+  /** The mandatory text label. Empty ONLY for `unsupported` (no verdict). */
+  label: string;
+  /**
+   * The mandatory icon, as a monochrome text glyph — same family as every other
+   * client (○ → ◐ → ✓ = nothing proved → control proved → operator-vetted), so
+   * one fan learns one vocabulary across the browser, the app and the phone.
+   */
+  glyph: string;
+  /** Which reserved token this verdict owns. */
+  token: TokenName;
+  /**
+   * N2 — the same state, said to somebody who is frightened.
+   *
+   * The label is this product's vocabulary and is what the toolbar badge and the
+   * verdict line carry; the popup is opened deliberately, on the page a fan is
+   * about to send money to, so it can afford one plain sentence underneath.
+   * Mirrors `CHECK_PLAIN` in apps/mobile-check/src/verdict-presentation.ts and
+   * is pinned against all four clients there. Empty for `unsupported`, which is
+   * the absence of a verdict.
+   */
+  plain: string;
+}
+
+/**
+ * The full check vocabulary, and the extension's ONLY copy of its labels:
+ * popup.ts and content.ts paint from it through `verdictStyle`. check.ts's old
+ * `statusLabel` duplicate (no production caller) was retired in I16
+ * (RJ13b-R8-11, #609l); i16 census in apps/extension/test/check.test.ts.
+ */
+export const CHECK_STYLE: Record<TrustStatus, ExtVerdictStyle> = {
+  verified: { label: EN["ext.label_verified"], glyph: "✓", token: "verified", plain: EN["check.plain_verified"] },
+  claimed: { label: EN["ext.label_claimed"], glyph: "◐", token: "claimed", plain: EN["check.plain_claimed"] },
+  unclaimed: { label: EN["ext.label_unclaimed"], glyph: "○", token: "unclaimed", plain: EN["check.plain_unclaimed"] },
+  // PS-243: the glyph is a SEPARATE channel (an aria-hidden icon span in both
+  // popup.ts and content.ts) — the label must never repeat it as text, or the
+  // single most important badge the product shows renders "⚠ ⚠ Reported…".
+  warning: { label: EN["ext.label_warning"], glyph: "⚠", token: "reported", plain: EN["check.plain_warning"] },
+  caution: { label: EN["ext.label_caution"], glyph: "!", token: "caution", plain: EN["check.plain_caution"] },
+  unknown: { label: EN["ext.label_unknown"], glyph: "?", token: "notlisted", plain: EN["check.plain_unknown"] },
+  // Fail-closed copy law: state what is unknown, never reassure — and never
+  // wear --notlisted, which means "we looked and there is no record".
+  failed: { label: EN["ext.label_failed"], glyph: "↻", token: "muted", plain: EN["check.plain_failed"] },
+  unsupported: { label: "", glyph: "", token: "muted", plain: EN["check.plain_unsupported"] },
+};
+
+/**
+ * WHAT THE SUBJECT IS — the extension's mirror of `KIND_STYLE` / `KIND_PLAIN` in
+ * apps/mobile-check/src/verdict-presentation.ts.
+ *
+ * NOT A VERDICT AND MUST NOT LOOK LIKE ONE. It takes no `TokenName` from the
+ * verdict set — `muted` is marked "NOT a verdict hue" in this file's own token
+ * table — and `◆` is outside the verdict glyph set (✓ ◐ ○ ⚠ ! ? ↻). `TrustStatus`
+ * is not widened, so nothing that enumerates verdicts sees a ninth case.
+ *
+ * A verified character is exactly as verified as a verified person. This says
+ * WHAT the subject is, not how far to trust it.
+ */
+export type SubjectKind = "ai_character" | "brand";
+
+/** Wire → kind. ANYTHING ELSE IS A PERSON — which is what every entry meant
+ * before characters existed, so a bucket without the field, or with a value this
+ * build does not know, under-claims rather than inventing a disclosure. */
+export function kindFromWire(k: unknown): SubjectKind | undefined {
+  return k === "a" ? "ai_character" : k === "b" ? "brand" : undefined;
+}
+
+/** The consumer-side narrowing: the LONG form, which is what `CheckResult.kind`
+ * carries once `kindFromWire` has done its job at the bucket-parse boundary.
+ * Calling `kindFromWire` on a long-form value returns nothing and renders
+ * nothing — silently, which is why these are two functions and not one. */
+export function asSubjectKind(v: unknown): SubjectKind | undefined {
+  return v === "ai_character" || v === "brand" ? v : undefined;
+}
+
+export const KIND_STYLE: Record<SubjectKind, { label: string; glyph: string; token: TokenName; plain: string }> = {
+  ai_character: { label: "AI character", glyph: "◆", token: "muted", plain: "This is an AI character, not a real person. The account you checked is run by whoever operates it." },
+  brand: { label: "Brand character", glyph: "◆", token: "muted", plain: "This is a brand character, not a real person. The account you checked is run by whoever operates it." },
+};
+
+/**
+ * THE SAME TWO VERDICTS, SAID AT THE LEVEL THEY ARE TRUE AT — the extension's
+ * mirror of `UNCONFIRMED_STYLE` in apps/mobile-check/src/verdict-presentation.ts.
+ *
+ * "Claimed on Dhwaja" is a sentence about the ACCOUNT the fan is looking at, and
+ * `claimed` is a fact about a PASSPORT. With per-account standing off (the
+ * default) an operator-seeded handle on a claimed passport is served `claimed`
+ * and nobody has ever confirmed it is theirs — so the popup asserted control of
+ * an account no one had checked, on the surface a fan opens deliberately while
+ * deciding whether to pay someone.
+ *
+ * Hue and glyph are unchanged (the passport really is claimed/verified); only
+ * the sentence moves. Absence of the flag lands here, which under-claims and
+ * never over-claims.
+ */
+export const UNCONFIRMED_STYLE: Partial<Record<TrustStatus, ExtVerdictStyle>> = {
+  verified: { label: EN["ext.label_verified_unconfirmed"], glyph: "✓", token: "verified", plain: EN["check.plain_verified_unconfirmed"] },
+  claimed: { label: EN["ext.label_claimed_unconfirmed"], glyph: "◐", token: "claimed", plain: EN["check.plain_claimed_unconfirmed"] },
+};
+
+/**
+ * Resolve a status to its style, failing closed. An unrecognised status — a
+ * registry newer than this build, a mangled message — resolves to `failed`,
+ * never to `unknown`: an extension that cannot interpret the answer has not
+ * checked anything, and must not say "not listed" about it.
+ *
+ * `confirmed` defaults to false, so every caller that has not been told the
+ * entry confirmed this account gets the weaker sentence by construction.
+ *
+ * I63 K1 (Jason D-1537 I62-Q5; I45-8's words, D-1522): a warning whose entry carried a known kind code (`i` / `f`,
+ * CheckResult.warningKind) is headed by that kind's label; glyph, token and plain sentence stay CHECK_STYLE.warning's.
+ * No code, or any other code, keeps the kind-less label.
+ */
+export function verdictStyle(status: unknown, confirmed = false, warningKind?: unknown): ExtVerdictStyle {
+  const key = typeof status === "string" ? (status as TrustStatus) : undefined;
+  if (key === "warning" && (warningKind === "i" || warningKind === "f")) return { ...CHECK_STYLE.warning, label: WARNING_KIND_LABEL[warningKind] };
+  const weaker = key !== undefined && !confirmed ? UNCONFIRMED_STYLE[key] : undefined;
+  return weaker ?? (key !== undefined ? CHECK_STYLE[key] : undefined) ?? CHECK_STYLE.failed;
+}
+
+/** The popup's colour (dark surface → the reserved token, unchanged). The
+ * confirmation flag never moves a colour, only a sentence. */
+export function popupColor(status: unknown): string {
+  return TOKEN[verdictStyle(status).token];
+}
+
+/** The on-page badge's colour (white card on a host page → the light variant). */
+export function badgeColor(status: unknown): string {
+  return ON_LIGHT[verdictStyle(status).token];
+}
+
+/**
+ * QUEUE #204 — THE TOOLBAR BADGE, THE ONE SURFACE THAT SAID IT IN COLOUR ONLY.
+ *
+ * `CHECK_STYLE` gives every verdict a distinct GLYPH and a distinct WORD, and
+ * the four in-page clients emit both. The toolbar action badge emitted `"!"` for
+ * `warning` AND for `caution` and changed only `setBadgeBackgroundColor` between
+ * them — so the difference between "an operator published an impersonation
+ * report about this account" and "nobody has proved this account yet" was
+ * carried by hue alone. That is WCAG 1.4.1, and it is not a cosmetic failure
+ * here: `watch.ts levelOf` puts these at different rungs precisely because
+ * collapsing them "made the single most important transition in the product
+ * silent". It was also, specifically, WRONG: `"!"` is `caution`'s glyph in the
+ * table above, so the badge was labelling the stronger state with the weaker
+ * state's mark.
+ *
+ * WHY THIS LIVES HERE. Same reason `badgeColor` does: the badge vocabulary is
+ * part of the verdict vocabulary, and a second table in background.ts is how
+ * two surfaces start disagreeing about what `caution` looks like. The TITLE is
+ * read off `verdictStyle(status, true, warningKind).label` — `CHECK_STYLE[status].label`,
+ * or for a warning with a known kind code that kind's heading (I64 J2, D-1553) — this module's docblock already
+ * claims "the label is this product's vocabulary and is what the toolbar badge
+ * and the verdict line carry", which was true of the verdict line and not of the
+ * badge until now.
+ *
+ * WHAT A TOOLBAR BADGE CAN ACTUALLY RENDER, and why the glyphs are not simply
+ * the table's. `chrome.action.setBadgeText` paints into a small pill in browser
+ * chrome: Chrome's own documentation says only about four characters fit, the
+ * text is rasterized by the browser at roughly 8px in a system font we do not
+ * choose, and there is no fallback we can observe or test from the extension —
+ * a character the platform lacks is tofu or an unpredictable colour-emoji
+ * substitution, silently, on the most important signal the product emits.
+ * `CHECK_STYLE.warning.glyph` is `⚠` (U+26A0), whose presentation is AMBIGUOUS
+ * by Unicode default: the same codepoint is a thin monochrome triangle on one
+ * platform and a full-colour emoji on the next, and at badge size the emoji
+ * form is mush. So the badge alphabet is restricted to ASCII, the only text
+ * guaranteed to rasterize identically in every browser build:
+ *
+ *   caution → "!"  the table's own caution glyph, unchanged. The badge now
+ *                  AGREES with the other four clients about `caution` instead
+ *                  of contradicting them about `warning`.
+ *   warning → "X"  ASCII, one character, and a wholly different letterform —
+ *                  not a repetition of "!" (`"!!"` would differ only in LENGTH,
+ *                  which at 8px is close to the same failure in a new form).
+ *                  `X` is deliberately NOT in the verdict glyph set
+ *                  (✓ ◐ ○ ⚠ ! ? ↻), so it collides with no other verdict's
+ *                  meaning, and it is the universally-read counterpart of the
+ *                  `✓` this very table already uses for `verified`.
+ *
+ * AND THE WORD CHANNEL IS NOT OPTIONAL. Two ASCII marks at 8px satisfy 1.4.1
+ * literally, but they do not NAME anything, and the badge has no room to. The
+ * action surface has a second text channel that is not the pill —
+ * `chrome.action.setTitle` — which is unconstrained, is what a screen reader
+ * announces for the toolbar button, and is what a hover reveals. That carries
+ * the full `CHECK_STYLE` label, so the state is available as real words on the
+ * same surface. Glyph AND word, as on every other client; the surface just
+ * splits them across two calls.
+ */
+export interface ToolbarBadge {
+  /** ASCII only, ≤4 chars — see the docblock. Never the empty string. */
+  text: string;
+  /** `verdictStyle(status, true, warningKind).label`, verbatim: the `CHECK_STYLE` label, or a known kind's heading. The word channel. */
+  title: string;
+  color: string;
+}
+
+const TOOLBAR_TEXT: Partial<Record<TrustStatus, string>> = {
+  warning: "X",
+  caution: "!",
+};
+
+/**
+ * The toolbar badge for a verdict, or `null` for a verdict that must not light
+ * it. `null` is the answer for everything outside `BADGE_STATUSES` — staying
+ * silent is correct there, and a caller that clears the text must clear the
+ * TITLE too, or a stale word outlives the mark it belonged to.
+ */
+export function toolbarBadge(status: unknown, warningKind?: unknown): ToolbarBadge | null {
+  const text = typeof status === "string" ? TOOLBAR_TEXT[status as TrustStatus] : undefined;
+  if (text === undefined) return null;
+  // I64 J2 (D-1553): the title goes through verdictStyle's own kind predicate (:290), never a second copy.
+  return { text, title: verdictStyle(status, true, warningKind).label, color: badgeColor(status) };
+}
+===== END FILE: apps/extension/src/verdict.ts =====
+
+===== BEGIN FILE: apps/extension/src/watch.ts =====
+import type { CheckResult, TrustStatus } from "./check.js";
+import { MAX_WATCHES, sanitizeCover, type CoverState, type WatchRow } from "./cover.js";
+/** Declared in cover.ts since I13-ARCH (QUEUE #902) so cover.ts need not import this module back; re-exported unchanged. */
+export { MAX_WATCHES, type WatchRow };
+
+/**
+ * N1 — "tell me if this ever changes", WITHOUT a server-side watch list.
+ *
+ * The obvious build is a row on the server and an email. That row is a listing
+ * oracle: `safety.ts` tells a fan in the product's own words that the nomination
+ * form answers the same whether a creator is listed, suppressed or unknown, and
+ * `tests/invariants/suppression-oracles.test.ts` pins identical status, headers,
+ * bytes, D1 sequence AND object-store access between a suppressed subject and a
+ * never-listed one. One server-side watch defeats all of it.
+ *
+ * So the device keeps the list and re-runs the ordinary k-anonymous lookup. The
+ * server sees check traffic and learns nothing it would not have learned from a
+ * fan opening the popup. This module adds no route, no schema and no server code.
+ *
+ * Everything here except the four `chrome.*` wrappers at the bottom is PURE, so
+ * the properties that matter — what fires, what is silent, what is capped — are
+ * unit-testable without a browser.
+ */
+
+/** The three grants a background watcher needs. Requested TOGETHER, from the
+ * popup's click, so a fan sees one prompt at the moment they ask for the
+ * feature — and never at install. */
+export const WATCH_PERMISSIONS = ["storage", "alarms", "notifications"] as const;
+
+
+/**
+ * BUCKET FETCHES per wake.
+ *
+ * Twenty fetches back to back is a burst nothing else in this extension
+ * produces. Five at a time, six-hourly, covers a full cycle about daily — the
+ * right resolution for "tell me if this ever gets listed" — while the traffic
+ * stays shaped like somebody browsing.
+ *
+ * SLICE 30 CHANGED WHAT IS COUNTED, not how many. This was five WATCHED
+ * SUBJECTS; it is now five PREFIXES from the cover set, which contains the
+ * watched ones and some that nobody watches (`cover.ts`). The wire cost per wake
+ * is identical — five bucket fetches — and it no longer varies with the length
+ * of the list, which is the point: a constant is what stops the traffic
+ * describing the list.
+ */
+export const SWEEP_BUDGET = 5;
+
+/** The registry rebuilds six-hourly behind a five-minute edge cache, so a
+ * shorter period is pure waste: it cannot see anything a six-hourly one misses. */
+export const SWEEP_PERIOD_MINUTES = 360;
+
+export const WATCH_ALARM = "dhwaja-watch-sweep";
+
+/**
+ * The notification icon, INLINE.
+ *
+ * `chrome.notifications.create` requires `iconUrl` for a basic notification and
+ * fails the whole call — showing nothing — if the image cannot be loaded. The
+ * first version passed `"icon128.png"`, which `build.mjs` does not emit and
+ * which does not exist anywhere in this tree, so every notification this feature
+ * could ever fire would have failed silently. A data URL has no build step and
+ * no file to go missing: a 1x1 transparent PNG, because the notification's
+ * words are the content and Chrome supplies its own extension badge beside them.
+ */
+export const NOTIFY_ICON =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+const STORAGE_KEY = "watches";
+const COVER_KEY = "cover";
+
+
+const HASH_RE = /^[0-9a-f]{64}$/;
+const MAX_LABEL = 64;
+/** The top rung `levelOf` can return. Used to reject a stored level that no
+ * verdict could have produced. */
+export const MAX_LEVEL = 3;
+
+/**
+ * A verdict's INFORMATION LEVEL, or `null` for a result that is not one.
+ *
+ *   0  `unknown`      Dhwaja looked and has no record
+ *   1  listed         unclaimed / claimed / verified
+ *   2  `caution`      a machine signal — looks like a creator, nobody proved it
+ *   3  `warning`      an operator-PUBLISHED impersonation report
+ *
+ * CAUTION AND WARNING ARE NOT THE SAME RUNG, and collapsing them (the first
+ * version of this did) made the single most important transition in the product
+ * silent: a fan watching an account sitting at `caution` — which is exactly the
+ * population that later earns a warning — would never be told when the warning
+ * published. `check.ts` calls `warning` "the single most important state to
+ * show"; a watch that cannot show it is not worth having.
+ *
+ * `unsupported` and `failed` are `null`, and that is the load-bearing case.
+ * `check.ts` separates "we looked and found nothing" from "we could not look"
+ * (flag 23) precisely so that an unreachable registry is never read as an
+ * answer. Folding `failed` into 0 would fire a false "now listed!" on the next
+ * success and silently discard a real level on the way down.
+ */
+export function levelOf(status: TrustStatus): number | null {
+  switch (status) {
+    case "unknown":
+      return 0;
+    case "unclaimed":
+    case "claimed":
+    case "verified":
+      return 1;
+    case "caution":
+      return 2;
+    case "warning":
+      return 3;
+    default:
+      return null;
+  }
+}
+
+/**
+ * Does this transition earn a notification?
+ *
+ * ONLY A STRICT INCREASE. The decision, taken before this was built: fire on
+ * "not listed → listed" and on "listed → flagged", and say NOTHING when a
+ * subject goes the other way.
+ *
+ * A removal is usually a person exercising a removal right, and `removal.ts` is
+ * built end to end so that a delisting is not detectable — never re-seeded, no
+ * oracle, constant work. A watch that announced removals would hand every fan
+ * holding one a cheap, continuous, automated delisting detector aimed at the
+ * person who asked to be removed. This is the one answer the feature refuses to
+ * give, on purpose.
+ */
+export function shouldNotify(prev: number, next: number | null): boolean {
+  return next !== null && next > prev;
+}
+
+/**
+ * Mark a row as VISITED without believing anything about it.
+ *
+ * Used for a check that failed and for a notification that could not be shown.
+ * The first version left `checkedAt` alone on a failure, reasoning that a clock
+ * should not record a check that never happened — which is true and was the
+ * wrong call, because `sweepSlice` orders by that clock. A row that always
+ * fails then sits at the head of the queue forever, and five of them starve the
+ * other fifteen permanently. `checkHash` returns `failed` for any hash the
+ * registry serves under a class this build does not know, so that is a
+ * per-subject freeze the SERVER can choose to apply to every fan's list.
+ *
+ * Rotating is the lesser evil: the row is retried on the next full cycle, and
+ * nothing about the level is asserted from a check that did not happen.
+ */
+export function touch(row: WatchRow, now: number): WatchRow {
+  return { ...row, checkedAt: now };
+}
+
+/**
+ * The row after a believed check.
+ *
+ * A DECREASE IS APPLIED AND SILENT, and the row SURVIVES it. "Forget the watch"
+ * was the obvious reading of going quiet, and it is wrong: deleting the row
+ * shrinks the fan's list, and they can see which entry left. The deletion would
+ * BE the disclosure. So the level drops, the row stays, and the list renders no
+ * per-watch verdict at all — it shows what you are watching, never what Dhwaja
+ * currently says about it. That is what makes the silence silent.
+ */
+export function advance(row: WatchRow, level: number, now: number): WatchRow {
+  return { ...row, level, checkedAt: now };
+}
+
+/** Trim a label to something a notification and a list row can hold. Plain text
+ * everywhere it lands (`chrome.notifications` takes strings, the popup uses
+ * `textContent`), so this is a length bound, not an escaping step. */
+function label(v: unknown): string {
+  return typeof v === "string" ? v.slice(0, MAX_LABEL) : "";
+}
+
+/**
+ * Rows we are willing to act on, from whatever was in storage.
+ *
+ * Storage is writable by anything holding this extension's context, and a
+ * corrupt or hand-edited row must not reach a fetch. Anything without a
+ * well-formed hash or a level in range is DROPPED rather than repaired: a
+ * repaired row is a guess about what a fan asked to watch.
+ */
+export function sanitizeRows(raw: unknown): WatchRow[] {
+  if (!Array.isArray(raw)) return [];
+  const out: WatchRow[] = [];
+  const seen = new Set<string>();
+  for (const r of raw) {
+    if (!r || typeof r !== "object") continue;
+    const { hash, platform, handle, level, addedAt, checkedAt } = r as Record<string, unknown>;
+    if (typeof hash !== "string" || !HASH_RE.test(hash) || seen.has(hash)) continue;
+    if (typeof level !== "number" || !Number.isInteger(level) || level < 0 || level > MAX_LEVEL) continue;
+    seen.add(hash);
+    out.push({
+      hash,
+      platform: label(platform),
+      handle: label(handle),
+      level,
+      addedAt: typeof addedAt === "number" && Number.isFinite(addedAt) ? addedAt : 0,
+      checkedAt: typeof checkedAt === "number" && Number.isFinite(checkedAt) ? checkedAt : 0,
+    });
+    // The cap is enforced on READ as well as on write: a list that grew by some
+    // other route still cannot drive more fetches than one that did not.
+    if (out.length >= MAX_WATCHES) break;
+  }
+  return out;
+}
+
+/** Add one, or return the list unchanged. Full is not an error the caller has to
+ * distinguish — `added` says what happened and the popup says it in words. */
+export function addRow(rows: WatchRow[], row: WatchRow): { rows: WatchRow[]; added: boolean } {
+  if (rows.some((r) => r.hash === row.hash)) return { rows, added: true }; // idempotent
+  if (rows.length >= MAX_WATCHES) return { rows, added: false };
+  return { rows: [...rows, row], added: true };
+}
+
+export function removeRow(rows: WatchRow[], hash: string): WatchRow[] {
+  return rows.filter((r) => r.hash !== hash);
+}
+
+/**
+ * Least-recently-checked first — the ordering a list-driven sweep used.
+ *
+ * NO LONGER ON THE SWEEP PATH. Slice 30 chooses fetches from the cover set
+ * rather than from the list, precisely so the choice cannot depend on the list;
+ * an ordering over watched rows is the shape of the defect. Kept, and kept
+ * tested, because it is the honest answer to "which rows are most overdue" and
+ * the popup will want it the day the list gets a staleness column — but if that
+ * day does not come, this is dead weight and should go rather than sit here
+ * looking like a sweep primitive.
+ */
+export function sweepSlice(rows: WatchRow[], budget = SWEEP_BUDGET): WatchRow[] {
+  return [...rows].sort((a, b) => a.checkedAt - b.checkedAt).slice(0, Math.max(0, budget));
+}
+
+/** A watch row from a check the fan just ran. `null` when the result carries
+ * nothing to watch — an unsupported page, or a check that failed. */
+export function rowFromResult(result: CheckResult, hash: string, now: number): WatchRow | null {
+  const level = levelOf(result.status);
+  if (level === null) return null;
+  if (!HASH_RE.test(hash)) return null;
+  return { hash, platform: label(result.platform), handle: label(result.handle), level, addedAt: now, checkedAt: now };
+}
+
+/** The sentence a fired watch shows. Plain text, and only the two label fields —
+ * never a URL, which is the one thing this whole architecture keeps on device. */
+export function notificationText(row: WatchRow, level: number, showAccount = false): { title: string; message: string } {
+  // I3-1443 a (D-0993(1) pick A): a desktop banner is readable by whoever stands near the screen, and the
+  // account may be a scammer or an abuser they should not learn is being watched. The DEFAULT names neither
+  // platform nor handle; `showAccount` is the fan's opt-in (`readShowAccount`).
+  const who = showAccount && row.handle ? `${row.platform ? `${row.platform} · ` : ""}${row.handle}` : "An account you're watching";
+  if (level >= 3) return { title: levelTitle(level), message: `${who} — don't send money. Open Dhwaja.` };
+  if (level === 2) return { title: levelTitle(level), message: `${who} — look more carefully before sending anything.` };
+  return { title: levelTitle(level), message: `${who} — there's a record to read now.` };
+}
+
+function levelTitle(level: number): string {
+  if (level >= 3) return "Dhwaja: an account you're watching was reported";
+  if (level === 2) return "Dhwaja: an account you're watching was flagged";
+  return "Dhwaja: an account you're watching is now listed";
+}
+
+/** I3-1443 a: the opt-in to name the account in a banner. Absent, unreadable or anything but `true` is OFF. */
+const SHOW_ACCOUNT_KEY = "notifyShowAccount";
+export async function readShowAccount(): Promise<boolean> {
+  if (!hasWatchApis()) return false;
+  try {
+    return ((await chrome.storage.local.get(SHOW_ACCOUNT_KEY)) as Record<string, unknown>)[SHOW_ACCOUNT_KEY] === true;
+  } catch {
+    return false;
+  }
+}
+export async function saveShowAccount(on: boolean): Promise<boolean> {
+  if (!hasWatchApis()) return false;
+  try {
+    await chrome.storage.local.set({ [SHOW_ACCOUNT_KEY]: on === true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// --- the four chrome wrappers -----------------------------------------------
+//
+// EVERY ONE IS GUARDED. These permissions are optional and a fan can revoke them
+// in browser settings at any moment, which makes `chrome.storage` and
+// `chrome.alarms` genuinely `undefined` at runtime rather than merely empty. The
+// honest response to a revoked grant is to do nothing — never to half-run.
+
+export function hasWatchApis(): boolean {
+  return typeof chrome !== "undefined" && !!chrome.storage?.local && !!chrome.alarms;
+}
+
+/**
+ * The watch list, or `null` when it could not be READ (grant revoked, or
+ * `chrome.storage.local.get` rejected). A readable store with no list is `[]`.
+ *
+ * Every caller that WRITES a list derived from what it read must use this and
+ * refuse the write on `null`: `saveWatches` replaces the whole key, so a failed
+ * read treated as empty erases the fan's list (#173).
+ */
+export async function readWatches(): Promise<WatchRow[] | null> {
+  if (!hasWatchApis()) return null;
+  try {
+    const got = await chrome.storage.local.get(STORAGE_KEY);
+    return sanitizeRows((got as Record<string, unknown>)[STORAGE_KEY]);
+  } catch {
+    return null;
+  }
+}
+
+/** Read-only callers only: an unreadable list is treated as empty, which skips
+ * one sweep or re-arm and writes nothing. Its result must never reach
+ * `saveWatches`. background.ts's sweep write-back and `handleWatch` add/remove
+ * call `readWatches` and skip the write on `null` (#173, fixed in B23-B2). */
+export async function loadWatches(): Promise<WatchRow[]> {
+  return (await readWatches()) ?? [];
+}
+
+export async function saveWatches(rows: WatchRow[]): Promise<boolean> {
+  if (!hasWatchApis()) return false;
+  try {
+    await chrome.storage.local.set({ [STORAGE_KEY]: rows.slice(0, MAX_WATCHES) });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The persisted cover set (slice 30). Same guarded shape as `loadWatches`, for
+ * the same reason: these are optional permissions a fan can revoke at any
+ * moment, and the honest response to a revoked grant is to do nothing.
+ *
+ * A cover that cannot be READ is `null`, which `coverIsStale` treats as stale
+ * and the sweep rebuilds. A cover that cannot be WRITTEN is the interesting
+ * case: the sweep uses the one it just built anyway, so the wake is still
+ * covered, and the next wake rebuilds. That is a rebuild more often than
+ * designed — the residual is defect (2) reappearing for as long as storage is
+ * broken — and it is strictly better than sweeping the watch list bare.
+ */
+export async function loadCover(width: number): Promise<CoverState | null> {
+  if (!hasWatchApis()) return null;
+  try {
+    const got = await chrome.storage.local.get(COVER_KEY);
+    return sanitizeCover((got as Record<string, unknown>)[COVER_KEY], width);
+  } catch {
+    return null;
+  }
+}
+
+export async function saveCover(state: CoverState): Promise<boolean> {
+  if (!hasWatchApis()) return false;
+  try {
+    await chrome.storage.local.set({ [COVER_KEY]: state });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Minutes until the next sweep: the period, plus up to a quarter of it. */
+export function nextSweepDelay(random: () => number = Math.random): number {
+  return SWEEP_PERIOD_MINUTES + random() * (SWEEP_PERIOD_MINUTES / 4);
+}
+
+/**
+ * Arm the next sweep — ONE SHOT, re-armed after every fire.
+ *
+ * Not `periodInMinutes`. A fixed period jitters only the FIRST fire and then
+ * beats on an exact 360-minute clock forever, which is a stable per-install
+ * phase offset and a traffic shape nothing else in this extension produces. A
+ * one-shot alarm re-armed with fresh jitter each time has neither.
+ *
+ * `force: false` (the default) is the other half: `chrome.alarms.create` with an
+ * existing name REPLACES it, so re-arming on every add let a fan who watched
+ * several accounts in an afternoon push the first fire out indefinitely and
+ * never sweep at all. Adding a watch must not reset the clock.
+ */
+export async function armSweep(random: () => number = Math.random, force = false): Promise<void> {
+  if (!hasWatchApis()) return;
+  try {
+    if (!force && (await chrome.alarms.get(WATCH_ALARM))) return;
+    await chrome.alarms.create(WATCH_ALARM, { delayInMinutes: nextSweepDelay(random) });
+  } catch {
+    /* revoked between the check and the call — nothing to arm */
+  }
+}
+
+
+/**
+ * What `watch:list` is allowed to say.
+ *
+ * The LEVEL never crosses the message boundary. The safety argument for this
+ * whole feature is that the list renders no per-watch verdict — and a `level`
+ * sitting in the reply makes that a promise about restraint at the render site
+ * rather than a property of the data. `level` is also exactly the delisting bit
+ * the design refuses to disclose, so it stays in the worker.
+ */
+export interface WatchView {
+  hash: string;
+  platform: string;
+  handle: string;
+  addedAt: number;
+}
+
+export function toView(rows: WatchRow[]): WatchView[] {
+  return rows.map((r) => ({ hash: r.hash, platform: r.platform, handle: r.handle, addedAt: r.addedAt }));
+}
+===== END FILE: apps/extension/src/watch.ts =====
+
+===== BEGIN FILE: apps/mobile-check/build.mjs =====
+import { build } from "esbuild";
+import { mkdirSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/**
+ * Bundle the check core to ONE self-contained IIFE exposing
+ * globalThis.DhwajaCheck. The SAME artifact is loaded by BOTH mobile clients:
+ * iOS in a JSContext (CheckEngine.swift) and Android in the
+ * androidx.javascriptengine sandbox (CheckEngine.kt). It inlines the shared
+ * @dhwaja/canonical — no remote code; the engine evaluates only this
+ * first-party bundle, never network content. The exposed object comes from the
+ * one shared `nativeBridge()` factory (tested in test/bridge.test.ts), so the
+ * bundle can't drift from what the native bridges expect.
+ *
+ * es2020 target = the common baseline of both engines (JavaScriptCore and the
+ * Chromium JS engine behind androidx.javascriptengine), so iOS and Android load
+ * byte-identical JS.
+ */
+
+const root = dirname(fileURLToPath(import.meta.url));
+/**
+ * THE CHOKEPOINT. Under a test runner, building into `dist/` is REFUSED
+ * outright — not warned about, not tolerated. `pnpm test` used to run four of
+ * these builds with no env on every invocation, so a real
+ * `OPS_BASE=… node build.mjs` followed by the suite left the deploy artifact
+ * rebuilt from the `dhwaja.example` defaults (exit 0, no warning), and the
+ * console's `connect-src` named a domain we do not own. A test that wants a
+ * build must say where to put it.
+ */
+if (process.env.VITEST && !process.env.BUILD_OUT_DIR) {
+  throw new Error(
+    "refusing to build into dist/ under a test runner: dist/ is the deploy artifact. " +
+      "Set BUILD_OUT_DIR to a temp directory.",
+  );
+}
+
+/**
+ * OUTPUT DIRECTORY. `dist/` is the DEPLOY ARTIFACT — the checklist is
+ * build-then-deploy and `wrangler pages deploy` ships exactly what is in it —
+ * so nothing may write there implicitly. A caller that is not deploying MUST
+ * pass BUILD_OUT_DIR and gets a directory of its own.
+ *
+ * This exists because `pnpm test` used to silently rebuild `dist/` from the
+ * `dhwaja.example` defaults: a real `OPS_BASE=... node build.mjs` followed by
+ * the test suite left the shipped bundle pointed at a domain we do not own,
+ * exit 0, no warning. tests/invariants/build-artifacts.test.ts pins that a
+ * test can never write into an app's dist/ again.
+ */
+const out = process.env.BUILD_OUT_DIR
+  ? resolve(process.env.BUILD_OUT_DIR)
+  : join(root, "dist");
+/**
+ * NO PLACEHOLDER CHOKEPOINT HERE, AND THAT IS A FINDING NOT AN OMISSION.
+ *
+ * Every sibling build injects an origin at build time and therefore owes the
+ * refusal added in audit v10 (B4). This one injects nothing: the
+ * mobile core is a library whose bases are supplied by the host app AT RUNTIME,
+ * so no `dhwaja.example` string can reach its artifact. `build-artifacts.test.ts`
+ * does not take that on trust — it BUILDS this app and reads the output bytes,
+ * and only exempts it because the placeholder host is genuinely absent from
+ * them. If a default origin is ever added here, that guard starts demanding a
+ * refusal the same day.
+ */
+mkdirSync(out, { recursive: true });
+
+await build({
+  stdin: {
+    contents: `
+      import { installURLPolyfillIfMissing } from ${JSON.stringify(join(root, "src/url-polyfill.ts"))};
+      import { nativeBridge } from ${JSON.stringify(join(root, "src/index.ts"))};
+      // A-017: JSContext (iOS) and androidx.javascriptengine (Android) are bare
+      // JS engines with no Web-platform URL global — install one before any
+      // bridge call can reach @dhwaja/canonical's \`new URL(...)\`. One
+      // artifact, both native bridges (see url-polyfill.ts).
+      installURLPolyfillIfMissing();
+      globalThis.DhwajaCheck = nativeBridge();
+    `,
+    resolveDir: root,
+    loader: "ts",
+  },
+  outfile: join(out, "dhwaja-check.js"),
+  bundle: true,
+  format: "iife",
+  target: "es2020", // common baseline: JavaScriptCore + androidx.javascriptengine
+  legalComments: "none",
+});
+
+// eslint-disable-next-line no-console
+console.log(`built mobile check core → ${join(out, "dhwaja-check.js")}`);
+===== END FILE: apps/mobile-check/build.mjs =====
+
+===== BEGIN FILE: apps/mobile-check/src/index.ts =====
+import { bucketPrefix, canonicalize, type CanonicalSubject } from "@dhwaja/canonical";
+import { kindFromWire, type SubjectKind, type TrustClass, type TrustStatus, type WarningKindCode, warningKindFromWire } from "./verdict-presentation.js";
+import { inclusionApply, inclusionPlan, MAX_CLIENT_WIDTH, verificationAction, versionAccepted, type InclusionMaterial, type InclusionResult, type PolicyAction, type SignatureOutcome } from "@dhwaja/registry-proof/registry-proof";
+
+/**
+ * Mobile check core — the SAME canonicalizer as every other surface, exposed as
+ * three PURE, SYNC functions for an on-device JS engine. BOTH native mobile
+ * clients run this one bundle: iOS in JavaScriptCore (a JSContext) and Android
+ * in the androidx.javascriptengine sandbox (an isolated JS process). Each app
+ * provides the two platform primitives the core deliberately does NOT contain:
+ * SHA-256 (CryptoKit / java.security.MessageDigest) and the network fetch
+ * (URLSession / OkHttp, registry-host only, cert-pinned). So the canonical
+ * logic is shared JS; neither iOS nor Android re-implements it.
+ *
+ *   native: canonical = DhwajaCheck.canonicalize(url)      // pure JS
+ *           if null → unsupported
+ *           hash    = SHA256(canonical) as hex             // platform primitive
+ *           width   = GET /v1/info                          // pinned fetch
+ *           prefix  = DhwajaCheck.bucketPrefix(hash,width)  // pure JS (capped)
+ *           bucket  = GET /v1/bucket/<prefix>               // pinned fetch
+ *           status  = DhwajaCheck.matchBucket(bucket,hash)  // pure JS
+ *
+ * Privacy: only `prefix` ever leaves the device. The full hash/handle/URL do
+ * not. Width is client-capped (rogue-registry defense) and under-padded
+ * buckets are distrusted — identical rules to the browser extension.
+ */
+
+export { MAX_CLIENT_WIDTH, type TrustClass, type TrustStatus };
+
+export interface CanonResult {
+  canonical: string | null; // null → not a checkable profile
+  platform?: string;
+  handle?: string;
+}
+
+/** Canonicalize a shared URL. Returns null for non-profile / URL-fallback. */
+export function canonicalizeForCheck(url: string): CanonResult {
+  let subject: CanonicalSubject;
+  try {
+    subject = canonicalize(url);
+  } catch {
+    return { canonical: null };
+  }
+  if (subject.platform === "url" || subject.idKind === "norm") return { canonical: null };
+  return { canonical: subject.canonical, platform: subject.platform, handle: subject.id };
+}
+
+/**
+ * Prefix for the served width, capped. Returns null if the width is out of the
+ * safe range (a rogue registry serving an over-wide width → the caller treats
+ * it as unknown and sends NO wide prefix). `hashHex` is the CryptoKit digest.
+ */
+export function bucketPrefixFor(hashHex: string, servedWidth: number): string | null {
+  if (!Number.isInteger(servedWidth) || servedWidth < 1 || servedWidth > MAX_CLIENT_WIDTH) return null;
+  if (!/^[0-9a-f]{64}$/.test(hashHex)) return null;
+  return bucketPrefix(hashHex, servedWidth);
+}
+
+interface RawEntry {
+  h?: unknown;
+  c?: unknown;
+  /** Per-account confirmation (`1`) — see `MatchDetail.confirmed`. */
+  p?: unknown;
+  /** The subject kind (`"a"` / `"b"`) — see `MatchDetail.kind`. */
+  k?: unknown;
+  r?: unknown;
+  /** The warning kind code (`"i"` / `"f"`) — see `MatchDetail.warningKind`. */
+  w?: unknown;
+  /** I3-0526: the Founding rank — see `MatchDetail.founding`. */
+  f?: unknown;
+}
+
+/** Find-the-real-one: the verified creator an impersonation warning protects.
+ * p = passport id (strict shape), n = display name (clamped; native renders it
+ * as TEXT — never markup/format-string input). */
+export interface RealOne {
+  p: string;
+  n: string;
+}
+
+/**
+ * THE passport-id shape, shared by every client and by the server's own pointer
+ * validator (`PASSPORT_ID_RE` in services/trust-core/src/passport-view.ts).
+ *
+ * It used to be two shapes on one code path: this client accepted 8–64
+ * alphanumerics, the SPA's router required exactly 16 hex, and the pointer they
+ * pass between them is the redirect a frightened fan is offered on a Reported
+ * verdict. A widened id would have been accepted here, rendered as "See the real
+ * X on Dhwaja →", and then silently collapsed to the home page on arrival. A
+ * shape mismatch must fail at the VALIDATOR, where the answer is "no pointer"
+ * and the warning still stands.
+ */
+export const PASSPORT_ID_RE = /^psp_[0-9a-f]{16}$/;
+const PSP_RE = PASSPORT_ID_RE;
+
+/** The soft pointer on a warning OR caution entry, strict shapes; anything
+ * off-shape → no pointer, never junk. Strip/clamp FIRST, then require a non-empty
+ * name — a name that is all markup (e.g. "<><>") must yield NO pointer, not an
+ * empty label. */
+function realFromEntry(e: RawEntry): RealOne | undefined {
+  const rr = e.r as { p?: unknown; n?: unknown } | null | undefined;
+  if (!rr || typeof rr !== "object" || typeof rr.p !== "string" || !PSP_RE.test(rr.p) || typeof rr.n !== "string") return undefined;
+  const name = rr.n.replace(/[<>]/g, "").slice(0, 64).trim();
+  return name.length > 0 ? { p: rr.p, n: name } : undefined;
+}
+
+/**
+ * Match the full hash against a bucket. A match REQUIRES full-hash equality, so
+ * a hostile/garbled bucket can only fail to match — never forge a positive.
+ * `minEntries` distrusts an under-padded bucket — a registry not padding to its
+ * k-floor is not following the protocol, so its answers are not believed. (A
+ * compliance check, not an anonymity lever: padding buys nothing against the
+ * server. See docs/REGISTRY-PRIVACY-CLAIMS.md.) Input is the bucket JSON text
+ * (as URLSession returns it) to keep the Swift bridge simple.
+ */
+/** Safe-by-default k-floor: a host that forgets to set one still distrusts a
+ * thin/non-padded bucket. Tests that use small fixtures pass 0 explicitly.
+ * I3-0241 / D-0882(2): the server's published pad floor (`K_FLOOR`,
+ * services/trust-core/src/registry-build.ts) — no honest bucket is smaller. */
+export const DEFAULT_MIN_BUCKET = 1000;
+
+/** D-0708 — the `/v1/info` manifest formats this reader understands (see
+ * `versionAccepted`). The builder writes `MANIFEST_FORMAT_VERSION` in
+ * services/trust-core/src/registry-build.ts; test/b27-vergate.test.ts couples them. */
+export const MANIFEST_VERSIONS_UNDERSTOOD: readonly number[] = [3];
+/** D-0708 — the bucket-body formats this reader understands (`BUCKET_FORMAT_VERSION`). */
+export const BUCKET_VERSIONS_UNDERSTOOD: readonly number[] = [1];
+
+/**
+ * D-0708 — the served width out of a `/v1/info` text, or null when the text is
+ * unreadable, the width is out of range, or the manifest's version is one this
+ * reader does not understand (`versionAccepted`). Null is the natives' existing
+ * "response unreadable" path, which renders `failed`.
+ */
+export function widthFromInfo(infoText: string): number | null {
+  let body: unknown;
+  try {
+    body = JSON.parse(infoText) as unknown;
+  } catch {
+    return null;
+  }
+  if (!versionAccepted(body, MANIFEST_VERSIONS_UNDERSTOOD)) return null;
+  const width = (body as { width?: unknown }).width;
+  return Number.isInteger(width) && (width as number) >= 1 && (width as number) <= MAX_CLIENT_WIDTH ? (width as number) : null;
+}
+
+export function matchBucket(bucketJsonText: string, hashHex: string, minEntries: number = DEFAULT_MIN_BUCKET): TrustStatus {
+  return matchBucketDetail(bucketJsonText, hashHex, minEntries).status;
+}
+
+export interface MatchDetail {
+  status: TrustStatus;
+  /**
+   * Did the matched entry say that THIS account's own control proof is current
+   * (`p` on the bucket entry)?
+   *
+   * Only meaningful on `verified`/`claimed`, and ABSENT means NOT confirmed —
+   * an older bucket, a registry that stops sending the flag, or an account
+   * nobody has ever proved all land on the weaker, passport-level sentence. A
+   * client must never infer confirmation from silence.
+   */
+  confirmed?: boolean;
+  /**
+   * WHAT THE SUBJECT IS, when the matched entry said so. Absent means a person —
+   * which is what every entry meant before characters existed, so an older
+   * bucket, a registry that stops sending it, and a real human creator all land
+   * on the same (weaker) rendering.
+   */
+  kind?: SubjectKind;
+  /** Present only on a "warning" or "caution" match whose entry carried a valid
+   * pointer. */
+  real?: RealOne;
+  /** I3-0122: the warning's kind code (`w` on the entry), present only on a
+   * `warning` match and only as `"i"`/`"f"`. Absent = the fixed sentence
+   * (`warningWordingText` in verdict-presentation.ts). */
+  warningKind?: WarningKindCode;
+  /** I3-0526 (D-1078(13)): the Founding rank (`f` on the entry), present only on a `verified` match and only as an
+   * integer 1..500 (trust-core founding.ts FOUNDING_CAPACITY). Absent = no Founding line, which under-claims. */
+  founding?: number;
+}
+
+/** matchBucket plus the find-the-real-one pointer. Separate function so the
+ * long-standing string-out matchBucket contract (and its native callers) stays
+ * byte-identical; new native code uses the matchBucketInfo shim instead. */
+export function matchBucketDetail(bucketJsonText: string, hashHex: string, minEntries: number = DEFAULT_MIN_BUCKET): MatchDetail {
+  // flag 23: anything that prevents a trustworthy look at the bucket is
+  // "failed" (asserts nothing), never "unknown" (asserts "no record").
+  if (!/^[0-9a-f]{64}$/.test(hashHex)) return { status: "failed" };
+  let parsed: { entries?: unknown };
+  try {
+    parsed = JSON.parse(bucketJsonText) as { entries?: unknown };
+  } catch {
+    return { status: "failed" };
+  }
+  // D-0708: a bucket format this reader does not understand — or one carrying
+  // no version at all — is not read. `failed`, never `unknown`.
+  if (!versionAccepted(parsed, BUCKET_VERSIONS_UNDERSTOOD)) return { status: "failed" };
+  const raw = parsed.entries;
+  if (!Array.isArray(raw)) return { status: "failed" };
+  // Non-padding registry → distrust. I3-0236: counted over DISTINCT well-formed
+  // hashes (case-folded, any class), never raw rows — junk or a repeated hash
+  // must not buy compliance; the builder never serves a duplicate (registry-build.ts:1800).
+  // I12-RG-PRIVACY-03: a non-finite or negative floor is a host bug, never a way
+  // to turn the floor off — it falls back to the default. 0 stays the documented
+  // off switch for JS callers with small fixtures; the NATIVE door cannot reach it
+  // (`nativeBridge` clamps to at least DEFAULT_MIN_BUCKET, D-0883(6)).
+  const floor = Number.isFinite(minEntries) && minEntries >= 0 ? minEntries : DEFAULT_MIN_BUCKET;
+  if (floor > 0) {
+    const seen = new Set<string>();
+    for (const e of raw as RawEntry[]) {
+      const h = e && typeof e.h === "string" ? e.h.toLowerCase() : "";
+      if (/^[0-9a-f]{64}$/.test(h)) seen.add(h);
+    }
+    if (seen.size < floor) return { status: "failed" };
+  }
+  for (const e of raw as RawEntry[]) {
+    if (e && typeof e.h === "string" && e.h.toLowerCase() === hashHex) {
+      const c = e.c;
+      if (c === "verified" || c === "claimed" || c === "unclaimed") {
+        // Strictly `1`: anything else — `true`, "1", 0, a missing field — is not
+        // a confirmation this client will repeat to a fan.
+        // The KIND rides the same entry — no second fetch, for the reason the
+        // confirmation flag does not have one either: asking the server about a
+        // specific subject after a local match is exactly what the prefix design
+        // exists to prevent. Anything the wire vocabulary does not name reads as
+        // a person, which under-claims.
+        const kind = kindFromWire(e.k);
+        const founding = c === "verified" && typeof e.f === "number" && Number.isInteger(e.f) && e.f >= 1 && e.f <= 500 ? e.f : undefined;
+        return { status: c, confirmed: e.p === 1, ...(kind ? { kind } : {}), ...(founding !== undefined ? { founding } : {}) };
+      }
+      if (c === "warning") {
+        const real = realFromEntry(e);
+        const warningKind = warningKindFromWire(e.w);
+        return { status: "warning", ...(real ? { real } : {}), ...(warningKind ? { warningKind } : {}) };
+      }
+      // "caution" is the soft class: amber, weaker than a warning, carrying the
+      // same optional soft real-creator pointer.
+      if (c === "caution") {
+        const real = realFromEntry(e);
+        return real ? { status: "caution", real } : { status: "caution" };
+      }
+      // A hit whose class this client doesn't know: the registry is newer than
+      // this build — the answer can't be interpreted, so the check FAILED
+      // (asserting "not listed" about a listed subject is the worst lie here).
+      return { status: "failed" };
+    }
+  }
+  return { status: "unknown" };
+}
+
+/** Host interface for a full resolve (tests + any JS host). Swift orchestrates
+ * these steps itself; this convenience mirrors that orchestration exactly. */
+export interface CheckHost {
+  hash(canonical: string): Promise<string>; // hex sha256 (CryptoKit on iOS)
+  getWidth(): Promise<number | null>; // GET /v1/info → width
+  getBucketText(prefix: string): Promise<string | null>; // GET /v1/bucket/<prefix>
+  minEntries?: number;
+}
+
+export interface CheckResult {
+  status: TrustStatus;
+  platform?: string;
+  handle?: string;
+  /** Whether the matched entry confirmed THIS account — see `MatchDetail`.
+   * Absent/false => the passport-level sentence. */
+  confirmed?: boolean;
+  /** What the subject is — see `MatchDetail.kind`. Absent = a person. */
+  kind?: SubjectKind;
+  /** Find-the-real-one (warning or caution hits): who is really behind the name. */
+  real?: RealOne;
+  /** I3-0122: the warning's kind code — see `MatchDetail.warningKind`. */
+  warningKind?: WarningKindCode;
+  /** I3-0526: the Founding rank — see `MatchDetail.founding`; shown as "Founding Creator #N" (verdict-presentation.ts `foundingLabel`). */
+  founding?: number;
+}
+
+function withMeta(status: TrustStatus, canon: CanonResult, real?: RealOne, confirmed?: boolean, kind?: SubjectKind, warningKind?: WarningKindCode, founding?: number): CheckResult {
+  return {
+    status,
+    ...(canon.platform ? { platform: canon.platform } : {}),
+    ...(canon.handle ? { handle: canon.handle } : {}),
+    ...(confirmed ? { confirmed: true } : {}),
+    ...(kind ? { kind } : {}),
+    ...(real ? { real } : {}),
+    ...(warningKind ? { warningKind } : {}),
+    ...(founding !== undefined ? { founding } : {}),
+  };
+}
+
+export async function resolveStatus(url: string, host: CheckHost): Promise<CheckResult> {
+  const canon = canonicalizeForCheck(url);
+  if (!canon.canonical) return { status: "unsupported" };
+  const hashHex = await host.hash(canon.canonical);
+  const width = await host.getWidth();
+  // flag 23: an unreachable registry / unbuildable prefix / missing bucket is
+  // a FAILED check ("couldn't look"), never "unknown" ("looked; no record").
+  if (width === null) return withMeta("failed", canon);
+  const prefix = bucketPrefixFor(hashHex, width);
+  if (prefix === null) return withMeta("failed", canon);
+  const text = await host.getBucketText(prefix);
+  if (text === null) return withMeta("failed", canon);
+  const detail = matchBucketDetail(text, hashHex, host.minEntries ?? DEFAULT_MIN_BUCKET);
+  return withMeta(detail.status, canon, detail.real, detail.confirmed === true, detail.kind, detail.warningKind, detail.founding);
+}
+
+export interface CheckFunnel {
+  /** Nudge the fan into `#/discover` (a positive verdict has no id to link). */
+  discover: boolean;
+  /** `#/p/<psp>` when a warning/caution carried a valid pointer; else null. */
+  passportHash: string | null;
+}
+
+/**
+ * The post-check funnel — IDENTICAL rules to the browser extension's
+ * `checkFunnel` (`apps/extension/src/check.ts`), so the native share-sheet leads
+ * the fan to the same next step as the extension badge:
+ *  - a `warning`/`caution` hit carrying a valid real-creator pointer → that
+ *    verified creator's profile hash (`#/p/<psp>`);
+ *  - a positive verdict (`verified`/`claimed`) → discovery (`#/discover`).
+ * Pure + string-safe: a hash is returned ONLY for a `PSP_RE`-validated id, so the
+ * native side can join it to its app base and never render a junk deep link. */
+export function checkFunnel(result: CheckResult): CheckFunnel {
+  const real = result.real;
+  const pointered = (result.status === "warning" || result.status === "caution") && real !== undefined && PSP_RE.test(real.p);
+  return {
+    discover: result.status === "verified" || result.status === "claimed",
+    passportHash: pointered ? `#/p/${real!.p}` : null,
+  };
+}
+
+/** Parse a MatchDetail (`{status, real?}`) JSON string — as produced by
+ * `matchBucketInfo` — and compute the funnel. Tolerant of junk: an unparseable
+ * or off-shape input yields the inert `{discover:false, passportHash:null}`
+ * (never throws into the native caller). */
+function funnelFromDetailJson(detailJsonText: string): CheckFunnel {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(detailJsonText);
+  } catch {
+    return { discover: false, passportHash: null };
+  }
+  // JSON.parse can yield null / an array / a scalar — anything non-object is inert.
+  if (!parsed || typeof parsed !== "object") return { discover: false, passportHash: null };
+  const d = parsed as { status?: unknown; real?: unknown };
+  const status = (typeof d.status === "string" ? d.status : "unknown") as TrustStatus;
+  // Reconstruct `real` fail-closed: require BOTH string fields (matchBucketInfo,
+  // the only real producer, always emits a non-empty `n` or omits `real`), so a
+  // partial `{p}` yields no pointer. `checkFunnel` then re-tests PSP_RE on `p`.
+  const rr = d.real as { p?: unknown; n?: unknown } | null | undefined;
+  const real = rr && typeof rr === "object" && typeof rr.p === "string" && typeof rr.n === "string" ? { p: rr.p, n: rr.n } : undefined;
+  return checkFunnel({ status, ...(real ? { real } : {}) });
+}
+
+/**
+ * The EXACT surface the native bridges call, as string-in/string-out shims so
+ * the Swift (JSContext) and Kotlin (JavaScriptSandbox) bridges are trivial and
+ * identical. `canonicalInfo` returns a JSON string (the native side JSON-parses
+ * it); `bucketPrefix` returns a string or null; `matchBucket` coerces an
+ * optional numeric `minEntries`. `build.mjs` assigns this to
+ * `globalThis.DhwajaCheck`; the bridge test asserts this contract so a change
+ * to a shim can't silently break the native callers (which aren't in CI).
+ */
+export interface NativeBridge {
+  canonicalize(url: string): string | null;
+  canonicalInfo(url: string): string;
+  bucketPrefix(hashHex: string, width: number): string | null;
+  /** D-0708: the served width from a `/v1/info` text, or null when the text is
+   * unreadable, out of range, or of a manifest version this build does not
+   * understand. The natives call this instead of reading `width` themselves. */
+  infoWidth(infoText: string): number | null;
+  matchBucket(bucketJsonText: string, hashHex: string, minEntries?: unknown): TrustStatus;
+  /** matchBucket + find-the-real-one, as a JSON string {status, real?} the
+   * native side parses — string-in/string-out like every other shim. */
+  matchBucketInfo(bucketJsonText: string, hashHex: string, minEntries?: unknown): string;
+  /** The post-check funnel, as a JSON string `{discover, passportHash}`. Takes
+   * the MatchDetail JSON `matchBucketInfo` returns and tells the share-sheet the
+   * next step (same rails as the extension). String-in/string-out; a hostile or
+   * unparseable input yields the inert `{discover:false, passportHash:null}`. */
+  checkFunnelInfo(detailJsonText: string): string;
+  /**
+   * SLICE 28, part one of the publication check. Takes the three served bodies
+   * plus the prefix and this build's arming state, and returns a JSON string:
+   * either `{"done":{verdict,…}}` when the answer needs no platform work, or
+   * `{"material":{preimage,sig,leafInput,path,index,…}}` when it does.
+   *
+   * TWO CALLS AND NOT A CALLBACK, because `androidx.javascriptengine` runs this
+   * bundle in a separate, isolated process whose entire API is
+   * `evaluateJavaScriptAsync(String) -> String`. There is no host-function
+   * injection, so a callback cannot exist there; and the fold is a chain, so it
+   * cannot be batched into one round trip either. The native does the two
+   * pieces of arithmetic — verify the signature over `preimage`, then hash
+   * `leafInput` and fold `path` — and hands the answers to
+   * `verifyApply`. Every RULE stays here.
+   *
+   * `minSeq` is the highest publication `seq` this install has seen, or a
+   * negative number for "no memory". See `InclusionInput.minSeq`.
+   *
+   * I15-NATIVE-34 (D-0913(3)), both OPTIONAL so a six-argument call keeps
+   * today's behaviour: `everSigned` is the install's ever-signed bit for this
+   * key set (only `true` arms it; `InclusionInput.everSigned`), and `nowMs` is
+   * the device clock in epoch ms for the 14-day age (a negative or non-finite
+   * number means "no clock", the same encoding as `minSeq`; `InclusionInput.nowMs`).
+   */
+  verifyPlan(infoText: string, proofText: string, bucketText: string, prefix: string, armed: boolean, minSeq: number, everSigned?: boolean, nowMs?: number): string;
+  /**
+   * SLICE 28, part two. Takes the `material` object `verifyPlan` returned (as
+   * JSON), the signature outcomes — a JSON array string with one of `"ok"` /
+   * `"bad"` / `"unknown-key"` per `material.candidates` entry (absent
+   * `candidates` = one entry; a bare word is still read as a one-entry array,
+   * QUEUE #165 stage 1) — and the folded root — or an empty string when the native did not fold, which is
+   * correct and expected whenever the signature did not verify.
+   *
+   * Returns `{"verdict":…,"action":"accept"|"retry"|"fail",…}`. The `action` is
+   * the policy, computed here so that no client decides it for itself.
+   */
+  verifyApply(materialJson: string, signature: string, rootHex: string): string;
+}
+
+/** D-0883(6), I12-RG-PRIVACY-03: the floor a NATIVE host may set is clamped to at
+ * least the server's published pad floor, whatever it passes — 500 (the old
+ * native constant), 0, a negative, NaN or a non-number all become
+ * DEFAULT_MIN_BUCKET. A host may only ask for MORE padding, never less. */
+export function nativeFloor(minEntries: unknown): number {
+  return typeof minEntries === "number" && Number.isFinite(minEntries) ? Math.max(DEFAULT_MIN_BUCKET, minEntries) : DEFAULT_MIN_BUCKET;
+}
+
+export function nativeBridge(): NativeBridge {
+  return {
+    canonicalize: (url) => canonicalizeForCheck(url).canonical,
+    canonicalInfo: (url) => JSON.stringify(canonicalizeForCheck(url)),
+    bucketPrefix: (hash, width) => bucketPrefixFor(hash, width),
+    infoWidth: (infoText) => widthFromInfo(typeof infoText === "string" ? infoText : ""),
+    matchBucket: (json, hash, minEntries) => matchBucket(json, hash, nativeFloor(minEntries)),
+    matchBucketInfo: (json, hash, minEntries) => JSON.stringify(matchBucketDetail(json, hash, nativeFloor(minEntries))),
+    checkFunnelInfo: (detailJson) => JSON.stringify(funnelFromDetailJson(detailJson)),
+    verifyPlan: (infoText, proofText, bucketText, prefix, isArmed, minSeq, everSigned, nowMs) =>
+      JSON.stringify(
+        withDoneAction(
+          inclusionPlan({
+          infoText: typeof infoText === "string" ? infoText : "",
+          proofText: typeof proofText === "string" ? proofText : "",
+          bucketText: typeof bucketText === "string" ? bucketText : "",
+          prefix: typeof prefix === "string" ? prefix : "",
+          armed: isArmed === true,
+          // A NEGATIVE minSeq means "this install has no memory". Encoded that
+          // way rather than as null because both bridges carry numbers across
+          // as numbers and null as something else on each platform, and a
+          // rollback check that silently stopped running would be invisible.
+            ...(typeof minSeq === "number" && Number.isSafeInteger(minSeq) && minSeq >= 0 ? { minSeq } : {}),
+            ...(everSigned === true ? { everSigned: true } : {}),
+            ...(typeof nowMs === "number" && Number.isFinite(nowMs) && nowMs >= 0 ? { nowMs } : {}),
+          }),
+        ),
+      ),
+    verifyApply: (materialJson, signature, rootHex) => JSON.stringify(applyFromNative(materialJson, signature, rootHex)),
+  };
+}
+
+/**
+ * The native side of `verifyApply`: parse what it was handed, refuse anything
+ * off-shape, and never let a malformed input become a pass.
+ *
+ * The material came from `verifyPlan` in this same isolate moments earlier, so
+ * it is not hostile input in the usual sense — but it crossed a process
+ * boundary as text on Android, and a check that answered `verified` because a
+ * field went missing would be the worst possible failure here. So it is parsed
+ * as strictly as anything off the wire.
+ */
+/**
+ * Stamp the policy onto an early-out plan, so a native that short-circuits
+ * reads an ACTION rather than mapping a verdict itself.
+ *
+ * Without this each native would carry its own copy of `verificationAction`,
+ * which is a policy — the one thing that must not have four implementations.
+ */
+function withDoneAction(plan: ReturnType<typeof inclusionPlan>): unknown {
+  return "done" in plan ? { done: { ...plan.done, action: verificationAction(plan.done.verdict) } } : plan;
+}
+
+function applyFromNative(materialJson: string, signature: string, rootHex: string): InclusionResult & { action: PolicyAction } {
+  const withAction = (r: InclusionResult): InclusionResult & { action: PolicyAction } => ({ ...r, action: verificationAction(r.verdict) });
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(typeof materialJson === "string" ? materialJson : "");
+  } catch {
+    return withAction({ verdict: "unverifiable", reason: "material unreadable" });
+  }
+  const m = parsed as Partial<InclusionMaterial> | null;
+  if (
+    !m ||
+    typeof m !== "object" ||
+    typeof m.preimage !== "string" ||
+    typeof m.sig !== "object" ||
+    m.sig === null ||
+    (m.candidates !== undefined && !Array.isArray(m.candidates)) ||
+    typeof m.seq !== "number" ||
+    typeof m.width !== "number" ||
+    typeof m.leafInput !== "string" ||
+    !Array.isArray(m.path) ||
+    typeof m.index !== "number"
+  ) {
+    return withAction({ verdict: "unverifiable", reason: "material off-shape" });
+  }
+  // `deferred` IS RE-VALIDATED, and this is the sharp edge of the whole bridge.
+  // `inclusionApply` returns it verbatim ahead of every root check, so on
+  // Android — where this object crosses a PROCESS BOUNDARY as JSON and comes
+  // back — a tampered `deferred: {verdict:"verified"}` bought a clean pass with
+  // no root ever compared. Adversarial review demonstrated it against a real
+  // injected entry. A deferred verdict may only ever be one of the three the
+  // planner actually defers, and `verified` is not among them: a deferral is by
+  // construction a REASON NOT TO PASS.
+  const DEFERRABLE = ["rolled-back", "stale", "unverifiable"];
+  if (m.deferred !== undefined) {
+    const d = m.deferred as { verdict?: unknown } | null;
+    if (!d || typeof d !== "object" || typeof d.verdict !== "string" || !DEFERRABLE.includes(d.verdict)) {
+      return withAction({ verdict: "unverifiable", reason: "deferred verdict is not one the planner defers" });
+    }
+  }
+  // A JSON ARRAY is one outcome per candidate (QUEUE #165 stage 1); its length
+  // and words are refused in `inclusionApply` (B4'(d)). A bare word keeps the
+  // pre-#165 reading, an unknown one being "unknown-key".
+  let sig: SignatureOutcome | SignatureOutcome[];
+  if (typeof signature === "string" && signature.startsWith("[")) {
+    let list: unknown;
+    try {
+      list = JSON.parse(signature);
+    } catch {
+      list = null;
+    }
+    if (!Array.isArray(list)) return withAction({ verdict: "unverifiable", reason: "signature outcomes unreadable" });
+    sig = list as SignatureOutcome[];
+  } else {
+    sig = signature === "ok" || signature === "bad" || signature === "unknown-key" ? signature : "unknown-key";
+  }
+  // An empty root string is "the native did not fold", which is what happens
+  // whenever the signature failed. `inclusionApply` refuses it as a pass.
+  return withAction(inclusionApply(m as InclusionMaterial, sig, typeof rootHex === "string" && rootHex.length > 0 ? rootHex : null));
+}
+===== END FILE: apps/mobile-check/src/index.ts =====
+
+===== BEGIN FILE: apps/mobile-check/src/registry-keys.ts =====
+/** I19-W1H (#940(2a), #902b): moved to packages/registry-proof/src/registry-keys.ts. This path re-exports the package entry (a superset of this module's
+names, one module instance) so mobile-check's own tests and the harness placer (scripts/lib/harness-placement.mjs follows a bare @dhwaja/<pkg>) still resolve it. */
+export * from "@dhwaja/registry-proof";
+===== END FILE: apps/mobile-check/src/registry-keys.ts =====
+
+===== BEGIN FILE: apps/mobile-check/src/registry-proof.ts =====
+/** I19-W1H (#940(2a), #902b): moved to packages/registry-proof/src/registry-proof.ts. This path re-exports the package entry (a superset of this module's
+names, one module instance) so mobile-check's own tests and the harness placer (scripts/lib/harness-placement.mjs follows a bare @dhwaja/<pkg>) still resolve it. */
+export * from "@dhwaja/registry-proof";
+===== END FILE: apps/mobile-check/src/registry-proof.ts =====
+
+===== BEGIN FILE: apps/mobile-check/src/safety-handoff.ts =====
+import type { TrustStatus } from "./index.js";
+
+/**
+ * THE POST-CHECK HANDOFF — the ONE table the non-web clients mirror.
+ *
+ * WHAT THIS FIXES. On the web, every check result carries a row of safety doors
+ * (`safetyActions` in `apps/web/src/views.ts`): report an impostor, dispute a
+ * caution, suggest a creator, and — on every verdict without exception — "Is
+ * this listing me?". On iOS, Android and the extension popup there was nothing.
+ * `ResultView.swift` and `ResultView.kt` ended in a **Done** button; the popup
+ * appended a link only when a validated real-creator pointer existed
+ * (`warning`/`caution`) or the verdict was positive, which left the single most
+ * dangerous screen in the product — a Flagged account with no pointer — showing
+ * a red line of text and no way to do anything at all.
+ *
+ * `apps/web/src/safety.ts` states the principle these clients were failing:
+ * *"A removal path that is only reachable by typing a URL fragment is, for
+ * legal purposes, not a removal path."* Three of the four clients were in that
+ * position for report, removal, contest and nominate alike.
+ *
+ * THIS IS THE STAGED FIX, and it is deliberately the small half: a HANDOFF to
+ * the web surfaces, not a native reimplementation of them. The fan gets a door;
+ * the door opens in the browser, where the intake forms, their copy law and
+ * their tests already live. Native report/removal intake is the larger, separate
+ * piece of work.
+ *
+ * TWO LINKS ON EVERY VERDICT, no exceptions and no conditions:
+ *   1. `primary` — the door that fits THIS verdict.
+ *   2. `mine` — "Is this listing me?", the removal valve, which the web offers
+ *      on every branch for the reason its own comment gives: somebody arriving
+ *      at their own listing has no idea which verdict Dhwaja is serving about
+ *      them, so gating the removal door on a verdict makes the safety valve
+ *      conditional on the very thing they are complaining about.
+ *
+ * WHAT MUST NOT CHANGE WITHOUT THE OTHERS. `apps/ios/App/ResultView.swift`,
+ * `apps/android/.../ResultView.kt` and `apps/extension/src/popup.ts` are
+ * literal, case-for-case mirrors of the table below (same hashes, same labels),
+ * and `tests/invariants/safety-handoff-parity.test.ts` parses all four and
+ * fails if any one drifts. Nothing in this repository compiles Swift or Kotlin,
+ * so that guard is the only thing that will notice.
+ *
+ * PRIVACY: every hash below is a bare fragment on the app's own origin, and
+ * carries NOTHING about the checked account — no handle, no URL, no hash of
+ * one. The whole point of the k-anonymous check is that the subject never left
+ * the device, so it must not leave through a link either. The web's own safety
+ * bar takes the same care, and the forms ask for the subject again instead.
+ */
+
+export interface SafetyHandoff {
+  /** The primary door for this verdict, as a route hash on the web app. */
+  hash: string;
+  /** Its label. Byte-identical across iOS, Android and the extension. */
+  label: string;
+}
+
+/** "Is this listing me?" — offered on EVERY verdict, on every client. */
+export const HANDOFF_MINE: SafetyHandoff = { hash: "#/remove", label: "Is this listing me? →" };
+
+/**
+ * Per-verdict primary door.
+ *
+ *  - `warning` → report. The fan is looking at an account an operator has
+ *    published a warning about; the report intake is the act that helps the next
+ *    person, and it is free, permanently.
+ *  - `caution` → CONTEST. A caution is machine-served and — per the design
+ *    system — "always contestable" (only the report-derived population ages
+ *    out; `caution.ts:178-186` binds no cutoff on an unproven listing), and
+ *    the person most likely to be
+ *    looking at one is its SUBJECT: a creator whose own unproven listing has
+ *    been cautioned, checking what Dhwaja says about them. This table used to
+ *    send them to "Report this account →", i.e. invited them to report
+ *    themselves, on three of the four clients. The web result card had already
+ *    worked this out and put "Dispute this caution" first; the shared table had
+ *    not, so it was one client's local fix. A caution's primary door is the
+ *    dispute; report belongs on `warning`, where an operator has already looked.
+ *  - `unclaimed` → the request form, `#/nominate`, with the web result card's
+ *    ask chip's words (views.ts). D-1120(7): the phones give each verdict the
+ *    web's doors in the web's order, and the web's unclaimed card shows the
+ *    report chip, the ask chip, the claim chip, the example chip (when
+ *    configured) and the removal valve, in that order (views.ts safetyActions):
+ *    this row is the ask chip, `SAFETY_REPORT` below the report chip (painted first) and `SAFETY_CLAIM` the claim chip. The
+ *    Most Requested board this door opened until R2-I21-Q125 is switched off by
+ *    default (Jason's answer (a); requests.ts REQUESTS_TOP_BOARD_KEY). The
+ *    k-anonymous check returns no passport id for a positive hit, so there is
+ *    nothing to deep-link; neither form needs one.
+ *  - `unknown` → suggest a creator. Dhwaja has no record; the fan can supply
+ *    one, and a person source-checks it.
+ *  - `verified` / `claimed` → Discover. Nothing is wrong; the honest next step
+ *    is the rest of the product.
+ *  - `unsupported` → the safety hub, which names every path we have. Nothing
+ *    was checked, so the door must not be an accusation ("report this") or a
+ *    reassurance ("all good") either.
+ *  - `failed` → TRY AGAIN (I3-0451, D-0920). A check that could not complete
+ *    asserts nothing, and the one act that helps is running it again; the hub
+ *    (a page about reports and removals) answered a question nobody asked.
+ *    `#/check` with no subject is the web app's check form (router.ts parses
+ *    `check` and sends a subject-less fragment home), so the link still carries
+ *    nothing about the checked account.
+ */
+export const SAFETY_HANDOFF: Record<TrustStatus, SafetyHandoff> = {
+  verified: { hash: "#/discover", label: "Open Dhwaja →" },
+  claimed: { hash: "#/discover", label: "Open Dhwaja →" },
+  unclaimed: { hash: "#/nominate", label: "Ask for a creator on Dhwaja →" },
+  warning: { hash: "#/report", label: "Report this account →" },
+  caution: { hash: "#/contest", label: "Dispute this caution →" },
+  unknown: { hash: "#/nominate", label: "Suggest this creator →" },
+  unsupported: { hash: "#/safety", label: "What can I do? →" },
+  failed: { hash: "#/check", label: "Try again →" },
+};
+
+/** The door for a status, fail-closed: an unrecognised status gets the safety
+ * hub (the `unsupported` row) — never an accusation, never a reassurance, and
+ * never "Try again", which would re-run a check this build cannot read. */
+export function safetyHandoff(status: unknown): SafetyHandoff {
+  return (typeof status === "string" ? SAFETY_HANDOFF[status as TrustStatus] : undefined) ?? SAFETY_HANDOFF.unsupported;
+}
+
+/**
+ * THE WARNING'S DISPUTE DOOR (I3-0375, D-0992(7): "a warning verdict gets its own
+ * dispute door on every client"). A third door, offered on `warning` ONLY and in
+ * addition to `primary` and `mine`, never instead of either: the report door helps
+ * the next fan, and the dispute door is for the person the warning is about. It
+ * opens the web removal form with dispute preselected (`apps/web/src/router.ts`
+ * parses `#/remove/dispute` as `{ name: "remove", intent: "contest" }`), the same
+ * door the web result card renders (`apps/web/src/views.ts` disputeWarning).
+ * Like every door here it is a bare fragment and carries nothing about the
+ * checked account. Mirrored by iOS/Android `ResultView` and the extension popup.
+ */
+export const SAFETY_DISPUTE: Partial<Record<TrustStatus, SafetyHandoff>> = {
+  warning: { hash: "#/remove/dispute", label: "Dispute this warning →" },
+};
+
+/** The dispute door for a status, or null — only `warning` has one. */
+export function safetyDispute(status: unknown): SafetyHandoff | null {
+  return (typeof status === "string" && Object.hasOwn(SAFETY_DISPUTE, status) ? SAFETY_DISPUTE[status as TrustStatus] : undefined) ?? null;
+}
+
+/**
+ * THE UNCLAIMED VERDICT'S CLAIM DOOR (D-1120(7): the phones give each verdict the
+ * web's doors, in the web's order). The web result card shows an unclaimed verdict
+ * its ask chip and then its claim chip, the id-free claim page (`apps/web/src/views.ts`
+ * `claim`); the ask chip is `SAFETY_HANDOFF.unclaimed`, and this is the claim chip,
+ * with its words plus the arrow every handoff label carries. Offered on `unclaimed`
+ * ONLY, after the primary door and before "Is this listing me?". A bare fragment,
+ * carrying nothing about the checked account. Mirrored by iOS/Android `ResultView`.
+ */
+export const SAFETY_CLAIM: Partial<Record<TrustStatus, SafetyHandoff>> = {
+  unclaimed: { hash: "#/claim", label: "It's me — claim it instead →" },
+};
+
+/**
+ * THE UNCLAIMED VERDICT'S REPORT DOOR (D-1122(6): "the phones' unclaimed verdict gets #/report first"). The web
+ * result card leads an unclaimed verdict with its report chip, `#/report` "Report an impostor" (`apps/web/src/views.ts`
+ * `report`), before the ask chip; this is that chip, with its words plus the arrow every handoff label carries. On a
+ * phone the unclaimed doors are, in order: this, `SAFETY_HANDOFF.unclaimed`, `SAFETY_CLAIM.unclaimed`, `HANDOFF_MINE`.
+ * Offered on `unclaimed` ONLY in this table (a warning's primary door is already the report intake). A bare
+ * fragment, carrying nothing about the checked account. Mirrored by iOS/Android `ResultView`.
+ */
+export const SAFETY_REPORT: Partial<Record<TrustStatus, SafetyHandoff>> = {
+  unclaimed: { hash: "#/report", label: "Report an impostor →" },
+};
+
+/**
+ * EVERY DOOR THE WEB GIVES EACH VERDICT, IN THE WEB'S ORDER (D-1120(7); D-1122(6)): the in-app doors of the web result
+ * card's safety bar (`apps/web/src/views.ts` `safetyActions`; its two external links, "What does this mean?" and the
+ * Verified example, are not route fragments and are not here), with the web's words plus the arrow every handoff label
+ * carries. The tables above keep their own jobs — `SAFETY_HANDOFF` is each verdict's one primary door, the others its
+ * extra doors — and this is the whole ordered list a client paints to match the web. The valve is last on every
+ * verdict. `apps/mobile-check/test/i38-cprod2-safety-doors.test.ts` renders the web card per verdict and holds this
+ * equal to it. Painted by iOS/Android `ResultView` once they mirror it (I38-CPROD2 hand-off).
+ */
+const WEB_REPORT: SafetyHandoff = { hash: "#/report", label: "Report an impostor →" };
+const WEB_DISPUTE_WARNING: SafetyHandoff = { hash: "#/remove/dispute", label: "Dispute this warning →" };
+const WEB_CLAIM: SafetyHandoff = { hash: "#/claim", label: "It's me — claim it instead →" };
+export const SAFETY_DOORS: Record<TrustStatus, readonly SafetyHandoff[]> = {
+  verified: [WEB_REPORT, HANDOFF_MINE],
+  claimed: [WEB_REPORT, HANDOFF_MINE],
+  unclaimed: [WEB_REPORT, SAFETY_HANDOFF.unclaimed, WEB_CLAIM, HANDOFF_MINE],
+  warning: [WEB_REPORT, WEB_DISPUTE_WARNING, HANDOFF_MINE],
+  caution: [SAFETY_HANDOFF.caution, WEB_REPORT, HANDOFF_MINE],
+  unknown: [WEB_REPORT, SAFETY_HANDOFF.unknown, HANDOFF_MINE],
+  unsupported: [HANDOFF_MINE],
+  failed: [SAFETY_HANDOFF.failed, HANDOFF_MINE],
+};
+
+/** The ordered doors for a status, fail-closed: an unrecognised status gets `unsupported`'s list (the valve alone),
+ * never an accusation, a reassurance or a re-run. */
+export function safetyDoors(status: unknown): readonly SafetyHandoff[] {
+  return (typeof status === "string" && Object.hasOwn(SAFETY_DOORS, status) ? SAFETY_DOORS[status as TrustStatus] : undefined) ?? SAFETY_DOORS.unsupported;
+}
+===== END FILE: apps/mobile-check/src/safety-handoff.ts =====
+
+===== BEGIN FILE: apps/mobile-check/src/url-polyfill.ts =====
+/**
+ * Minimal URL polyfill for the two raw JS engines that host dhwaja-check.js:
+ * iOS JSContext (JavaScriptCore) and the Android androidx.javascriptengine
+ * sandbox. Neither engine exposes Web-platform globals — no `URL`, no `fetch`
+ * — because they're bare ECMAScript isolates, not a DOM/WebView (see
+ * CheckEngine.swift / CheckEngine.kt). @dhwaja/canonical calls `new URL(...)`
+ * unconditionally (index.ts:297,773,872), so on-device this always threw
+ * `ReferenceError: Can't find variable: URL` (iOS) / a JS eval failure
+ * (Android) — caught by `canonicalizeForCheck`'s try/catch and turned into
+ * `{canonical:null}` EVERY time, silently. The mobile check has never
+ * detected a single real profile on-device (A-017).
+ *
+ * Scope: NOT a general WHATWG URL implementation. @dhwaja/canonical only ever
+ * constructs absolute http(s) URLs (`withScheme` guarantees a scheme; the
+ * very next line rejects anything but http/https) and only reads
+ * `.protocol .hostname .port .pathname .search .searchParams`. This covers
+ * exactly that surface. No IDNA mapping of a Unicode HOST (a non-ASCII host is
+ * refused; an `xn--` label IS validated, QUEUE #383 below) and no IPv6-literal
+ * hosts; canonical's own `EMBEDDED_QUAD` / `INTERNAL_TLD` checks already
+ * reject IP-literal and private hosts outright. A non-ASCII PATH is accepted
+ * and percent-encoded the way the real URL encodes it (`percentEncodePath`,
+ * I16 #131IS-01).
+ * Installed ONLY when no native URL exists — Node and every browser keep
+ * their real, fully spec-compliant URL untouched.
+ *
+ * WHATWG PARITY, MEASURED (I3-0016/I3-0084/I3-0170/I3-1375): four divergences
+ * against the real URL global @dhwaja/canonical hashes against on web/
+ * extension, each verified empirically against Node's spec-compliant URL:
+ *  - backslash is a path/authority delimiter for a special scheme (I3-0016,
+ *    critical): `https://evil.com\@instagram.com/x` real-parses to
+ *    hostname "evil.com" (the page a browser actually navigates to), but the
+ *    old authority regex read straight through `\`, landing on hostname
+ *    "instagram.com" — a forged Verified badge on the attacker's own page.
+ *  - a default port (`:443` on https, `:80` on http) is dropped by the real
+ *    URL (`url.port === ""`) but was kept verbatim here, and
+ *    `packages/canonical/src/index.ts:880` trusts `url.port` to already be
+ *    empty for the default — so the SAME subject hashed two different ways.
+ *  - a percent-encoded ASCII host (`insta%67ram.com`) is decoded by the real
+ *    URL before canonical ever sees it; kept encoded here, it hashed as a
+ *    different, unlisted subject (a suppression divergence).
+ *  - dot-segments (`/a/../b`) are removed by the real URL's path parser
+ *    (RFC 3986 §5.2.4 "remove_dot_segments", the algorithm below); left
+ *    alone here, the same profile URL canonicalized to two different paths.
+ * All four are fixed by `preprocessAbsoluteUrl` (backslash + control chars,
+ * run before the grammar match) and by post-processing the matched host/
+ * port/path below — never by widening the regex to accept more inputs.
+ */
+
+function decodeComponent(s: string): string {
+  try {
+    return decodeURIComponent(s.replace(/\+/g, " "));
+  } catch {
+    return s;
+  }
+}
+
+/** Percent-decode WITHOUT the `+` → space rewrite `decodeComponent` applies
+ * for query strings: a literal `+` in a hostname is not form-encoding and
+ * must not become a space (there is no such host in the wild, but silently
+ * mangling one would be worse than leaving it alone). ASCII-safe percent
+ * escapes only, matching this file's declared non-goal of IDNA/exotic
+ * percent-encoding repair; an escape that isn't valid UTF-8 is left as-is,
+ * same fail-open shape as `decodeComponent`. */
+function decodeHostComponent(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    return s;
+  }
+}
+
+const DEFAULT_PORT: Readonly<Record<string, string>> = { "http:": "80", "https:": "443" };
+
+/**
+ * RFC 3986 §5.2.4, the same algorithm the real URL parser's path state runs.
+ * A segment is a dot-segment when it is `.`/`..` with any `.` spelled `%2e`
+ * (either case) — WHATWG's single-dot / double-dot path segment (I16
+ * #131IS-01: `/a/%2e%2e/impostor` is `/impostor` on web). `path` always
+ * starts with `/` here (`MinimalURL` defaults an empty path to `/` first).
+ *
+ * A trailing bare `.` or `..` segment resolves to a trailing `/`, matching
+ * the real URL (`/a/.` → `/a/`, `/a/b/..` → `/a/`) rather than dropping the
+ * slash — verified against Node's URL for every case below.
+ */
+function removeDotSegments(path: string): string {
+  const segs = path.split("/");
+  const out: string[] = [];
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
+    const isLast = i === segs.length - 1;
+    const dots = (seg as string).replace(/%2e/gi, ".");
+    if (dots === ".") {
+      if (isLast) out.push("");
+      continue;
+    }
+    if (dots === "..") {
+      if (out.length > 1) out.pop();
+      if (isLast) out.push("");
+      continue;
+    }
+    out.push(seg as string);
+  }
+  const joined = out.join("/");
+  return joined === "" ? "/" : joined;
+}
+
+/**
+ * WHATWG path percent-encode set, per code point, UTF-8 with uppercase hex —
+ * what the real URL does to a path (`/café` -> `/caf%C3%A9`): C0 controls,
+ * space, `"`, `<`, `>`, backtick, `{`, `}`, and every code point > U+007E. A
+ * lone surrogate encodes as U+FFFD. An existing `%` escape is left alone.
+ * (`#`/`?` never reach here: the grammar ends the path at them.)
+ */
+function percentEncodePath(path: string): string {
+  let out = "";
+  for (const ch of path) {
+    const c = ch.codePointAt(0) as number;
+    if (c > 0x20 && c < 0x7f && !'"<>`{}'.includes(ch)) out += ch;
+    else out += encodeURIComponent(c >= 0xd800 && c <= 0xdfff ? "\ufffd" : ch);
+  }
+  return out;
+}
+
+export class MinimalURLSearchParams {
+  private readonly pairs: [string, string][];
+  constructor(query: string) {
+    const q = query.startsWith("?") ? query.slice(1) : query;
+    this.pairs = q.length === 0
+      ? []
+      : q.split("&").filter((kv) => kv.length > 0).map((kv) => {
+          const i = kv.indexOf("=");
+          const k = i === -1 ? kv : kv.slice(0, i);
+          const v = i === -1 ? "" : kv.slice(i + 1);
+          return [decodeComponent(k), decodeComponent(v)] as [string, string];
+        });
+  }
+  get(key: string): string | null {
+    const hit = this.pairs.find(([k]) => k === key);
+    return hit ? hit[1] : null;
+  }
+  keys(): string[] {
+    return this.pairs.map(([k]) => k);
+  }
+  entries(): [string, string][] {
+    return this.pairs.map(([k, v]) => [k, v]);
+  }
+}
+
+// scheme://[user[:pass]@]host[:port][/path][?query][#hash] — the absolute
+// http(s) form. Deliberately does not accept a bare host with no scheme;
+// canonical's `withScheme` step always supplies one before construction.
+// Safe to match straight through (no `\` handling needed here): every `\`
+// in the authority/path region was already rewritten to `/` by
+// `preprocessAbsoluteUrl` before this ever runs.
+// W3-03 FIX2 item 2a: the userinfo segment ends at the LAST `@` in the
+// authority, not the first. `[^@/?#]*@` could not cross an `@`, so
+// `https://a@b@instagram.com/x` split at the FIRST one and left host
+// `b@instagram.com`; the real URL parser consumes everything up to the last
+// `@` and lands on `instagram.com`, which is the page a browser actually
+// loads. The subject hashed one way on web and another in the app — a
+// suppression/badge divergence of the same class as I3-0016. `[^/?#]*` is
+// greedy and backtracks to the last `@` before any delimiter, so the
+// no-userinfo case still matches the group empty.
+const ABSOLUTE_URL = /^([a-z][a-z0-9+.-]*):\/\/(?:[^/?#]*@)?([^/?#:]*)(?::(\d+))?([^?#]*)(?:\?([^#]*))?(?:#(.*))?$/i;
+
+/**
+ * WHATWG "forbidden domain code point" — the set the real host parser refuses
+ * AFTER percent-decoding. C0 controls, U+007F, space, and
+ * `#%/:<>?@[\]^|`. A `%` survives here only when the escape was invalid and
+ * `decodeURIComponent` left it in place, which the real parser refuses too.
+ */
+// eslint-disable-next-line no-control-regex
+const NON_ASCII = /[^\u0000-\u007f]/;
+const OCTET = "(?:25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)";
+const CANONICAL_DOTTED_QUAD = new RegExp(`^${OCTET}(?:\\.${OCTET}){3}$`);
+
+/** WHATWG URL §3.5 "ends in a number": drop one trailing empty label, then the
+ * last label is all ASCII digits, or `0x`/`0X` followed only by hex digits. */
+function endsInANumber(host: string): boolean {
+  const parts = host.split(".");
+  if (parts.length > 1 && parts[parts.length - 1] === "") parts.pop();
+  const last = parts[parts.length - 1] ?? "";
+  return /^\d+$/.test(last) || /^0x[0-9a-f]*$/i.test(last);
+}
+
+const FORBIDDEN_HOST = /[\u0000-\u001f\u007f %#/:<>?@[\]^|\\]/;
+
+/**
+ * QUEUE #383 (JUDGE-W303-01): IDNA A-label validation, the check `new URL()`
+ * runs on every `xn--` label (UTS46 ToASCII, CheckHyphens=false,
+ * VerifyDnsLength=false). Without it `xn--instagram-abc.com` parsed here and
+ * threw on web — a subject the web never produces. `MinimalURL` refuses an
+ * `xn--` label unless `isValidALabel` holds; a valid A-label is returned as
+ * the lowercased label, same as the real URL's hostname.
+ *
+ * `IDNA_VALID` / `IDNA_MARK` are code-point range tables (base-36 gap,length
+ * pairs) DERIVED from Node 22.23.2's `new URL()` (ada 2.9.2); JS exposes no
+ * IDNA status table. c >= U+0080 is VALID iff an A-label of `c`, `q c`, `x c`
+ * or `KA c` parses; MARK iff only the based forms parse (a label may not start
+ * with one). Code points in the RTL bidi blocks (U+0590-08FF, FB1D-FDFF,
+ * FE70-FEFF, 10800-10FFF, 1E800-1EFFF) are LEFT OUT: the real parser applies a
+ * bidi rule to them that needs Bidi_Class data JS does not expose, so the
+ * device refuses those labels (fails closed; web may accept). U+200C/U+200D
+ * are out too (valid on web only in a ContextJ context — after a virama, or
+ * between joining letters — which needs data JS does not expose), same
+ * direction. The re-derivation
+ * and the whole differential live in test/b27-url-idna-parity.test.ts.
+ */
+const IDNA_VALID =
+  "4h,6,1,0,1,1,1,0,1,1,4,1,3,0,3,0,n,0,7,w,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1" +
+  ",0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,3,0,1,1,1,0,1,0,1,0,3,0,1,0,1,0,1,0,2,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0" +
+  ",1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,2,0,1,0,1,0,1,0,2,0,1,0,2,0,3,1,4,0,2,0,3,2,2,0,2,0,1,0,1,0,2" +
+  ",0,1,1,1,0,2,0,3,0,1,0,2,2,1,6,a,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,1,4,0,3,0,1,0" +
+  ",1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1" +
+  ",6,2,0,2,1,1,0,4,0,1,0,1,0,1,0,1,2o,9,u,6,1,5,2i,2,0,3,8,1,v,1,0,1,0,1,0,1,0,3,2,i,0,r,y,8,0,1,0,1,0,1,0,1,0,1" +
+  ",0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,3,0,2,0,1,0,2,1,1f,1b,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1" +
+  ",0,1,0,1,8,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0" +
+  ",1,0,1,0,2,0,1,0,1,0,1,0,1,0,1,0,1,1,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1" +
+  ",0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0" +
+  ",1,0,1,0,15,19,1,2,2,2,og,2f,8,z,1,7,2,1,2,l,1,6,1,0,3,3,2,8,2,1,2,3,8,0,8,3,2,o,2,2,1,5,4,1,2,l,1,6,1,0,2,0,2" +
+  ",1,2,0,1,4,4,1,2,2,3,0,a,0,9,g,a,2,1,8,1,2,1,l,1,6,1,1,1,4,2,9,1,2,1,2,2,0,f,3,2,b,7,6,1,2,1,7,2,1,2,l,1,6,1,1" +
+  ",1,4,2,8,2,1,2,2,7,2,7,4,2,h,a,1,1,5,3,2,1,3,3,1,1,0,1,1,3,1,3,2,3,b,4,4,3,2,1,3,2,0,6,0,e,k,5,c,1,2,1,m,1,f,2" +
+  ",8,1,2,1,3,7,1,1,2,2,0,2,3,2,9,7,l,1,2,1,m,1,9,1,4,2,8,1,2,1,3,7,1,6,1,1,3,2,9,1,2,c,c,1,2,1,1e,1,2,1,5,4,f,2," +
+  "p,1,2,1,h,3,n,1,8,1,0,2,6,3,0,4,5,1,0,1,7,6,9,2,2,c,1d,1,6,4,s,11,1,1,0,1,4,1,n,1,0,1,b,1,9,2,4,1,0,1,6,1,9,4," +
+  "1,w,b,1,1h,1,3,1,3,1,3,1,3,1,3,1,b,1,2,4,1,1,0,5,6,1,g,1,3,1,3,1,3,1,3,1,3,1,b,1,2,1,e,1,c,11,4f,1c,17,1,2p,2," +
+  "6f,1,3,2,6,1,0,1,3,2,14,1,3,2,w,1,3,2,6,1,0,1,3,2,e,1,1k,1,3,2,1u,2,v,3,p,6,2d,a,hr,1,r,3,2g,7,l,9,n,9,j,c,c,1" +
+  ",2,1,1,c,1f,2,13,2,9,6,9,6,5,1,3,5,9,6,2g,7,16,5,1x,a,u,1,b,4,b,4,0,3,15,2,4,b,17,4,p,6,a,3,1p,2,1s,1,s,2,a,6," +
+  "9,6,d,2,u,1d,24,3,1a,1,37,8,1n,3,e,3,1e,1s,7,8,16,5,17,3,0,b,0,i,0,s,c,1,x,11,1r,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1" +
+  ",0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0" +
+  ",1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1" +
+  ",0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,4,2,1,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0" +
+  ",1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1" +
+  ",0,1,0,1,0,1,0,1,0,1,0,1,0,1,8,8,5,a,7,8,7,8,5,a,7,8,7,8,0,1,0,1,0,1,0,1,0,1,0,1,0,1f,1,4,0,f,0,9,2,3,1,8,2,1," +
+  "3,e,0,p,0,1,4,1,b,3,0,8,2,2,0,2,3,1,0,1,7,3,c,1,6,1t,7,1,n,f,w,j,0,3,0,b,0,2,1,5,1,3,0,1,0,1,0,1,0,4,0,b,0,6,3" +
+  ",5,5,1c,2,1,4,1,1,4,4b,2,0,2,6v,2,6z,p,a,4g,10g,1,2u,3,2s,1,46,2,v,1,2w,1c,1b,1,0,3,1,1,0,1,0,1,0,4,0,1,1,1,5," +
+  "5,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1," +
+  "0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,7,1,0,1,3,1,0,5,18,1,0" +
+  ",5,0,2,1j,8,0,e,n,9,6,1,6,1,6,1,6,1,6,1,6,1,6,1,6,1,3h,y,p,1,3,1,2a,7i,0,1,1e,1,0,3,4,1,2d,2,1,2,1,1,2m,6,16,2" +
+  "o,1,e,1v,c,f,20,7,1b,0,ao,m8c,3,1i,9,9n,l,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1," +
+  "0,1,0,1,0,1,0,1,0,1,i,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,2,2h,8,x,1,0,1,0,1,0,1,0,1,0,1,0" +
+  ",1,2,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1" +
+  ",0,1,0,1,0,1,0,1,0,1,7,1,0,1,0,2,0,1,0,1,0,1,0,1,3,1,0,1,1,1,0,1,2,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,5,0" +
+  ",5,0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,4,0,1,0,6,0,1,0,1,0,1,0,1,0,s,1,2,1e,3,9,6,1j,8,1x,8,b,6,37,b,t,3,25,1,a,4,w," +
+  "1,1i,9,d,2,9,2,2u,o,r,a,5,2,5,2,5,9,6,1,6,1,17,4,8,1,1,2c,19,2,9,6,8mb,c,m,4,1c,6qa,1,1,0,1,1,a,0,1,0,1,1,2,2," +
+  "s6,f,l,1,c9,b,1,p,1,i,1,1,1,e,2,d,y,3e,5,2,4,18,3,2f,1,c,3,0,1b,19,3m,s,3,1c,f,r,4,z,9,t,5,16,5,t,1,10,4,d,2a," +
+  "39,2,9,1a,z,4,13,8,1f,b,0,13,a,1,e,1,6,1,1,1v,8m,9,l,a,7,o,0,1of,25,4,z,9,1p,1,4,d,o,7,9,6,1g,1,h,8,12,9,2n,1," +
+  "j,b,h,1,1a,1q,6,1,0,1,3,1,e,1,a,6,1m,5,9,6,3,1,7,2,1,2,l,1,6,1,1,1,4,1,9,2,1,2,2,2,0,6,0,5,6,2,6,3,4,3v,2j,1,4" +
+  ",u,1z,8,9,4m,1h,2,11,y,1w,b,9,6,c,j,1l,6,9,1i,q,2,e,4,m,55,1n,3o,1e,c,7,2,0,2,7,1,1,1,t,1,1,2,b,9,9,1y,7,2,19," +
+  "2,a,r,1z,8,2a,d,20,7,9,6u,8,1,18,1,d,a,s,3,v,2,l,1,d,21,6,1,1,1,17,3,0,1,1,1,8,8,9,6,5,1,1,1,10,1,1,1,5,7,9,8m" +
+  ",o,7,g,1,14,3,r,2e,0,f,1d,d,pm,2u,32,1,4,b,5f,218,2q,d,tr,g,l,33e,g6,6nt,fs,7,u,1,9,4,28,1,9,6,t,2,5,a,1x,a,9," +
+  "1,6,1,k,5,i,k0,1m,2t,22,4,1k,7,g,1s,4,b,1,e,4qf,8,yd,16,8,6w7,3,1,6,1,1,1,82,f,0,t,2,2,0,e,3,8,az,1s4,2y,5,c,3" +
+  ",8,7,9,2,3,3mo,19,2,m,9,37,1o,6t,a,12,2,1g,7,d,8,1r,6,15,l,1x,3e,j,c,j,c,2e,9,o,w7,i3,f,4,1,e,uo,u,6,5,5x,6,1," +
+  "g,2,6,1,1,1,4,2s,0,34,18,3,d,2,9,4,1,8w,u,h,1l,5,0,cw,15,km,6,1,3,1,1,1,e,1kx,17,4,2r,c,e,2,e,1,e,1,10,l,4,v,0" +
+  ",w,p,3,y,1,s,1k,p,2o,5,4a,rb,4,g,3,c,3,3a,4,2m,6,b,4,0,f,b,4,1j,8,9,6,13,8,t,2,1,26,9f,c,d,2,c,3,8,7,19,1,6,8," +
+  "d,4,8,7,8,7,42,1,1i,tx,wyn,w,37d,6,65,2,4g1,e,5rk,3z3,3t6,5,38f";
+const IDNA_MARK =
+  "lc,1r,2,0,3,8,1,v,7n,6,vq,3,1i,2,1,h,1,6,a,1,t,2,1k,0,1,6,2,1,2,2,9,0,a,1,q,0,2,2,1k,0,1,4,4,1,2,2,3,0,u,1,3,0" +
+  ",b,2,1k,0,1,7,1,2,1,2,k,1,m,5,1,2,1k,0,1,6,2,1,2,2,7,2,a,1,u,0,1n,4,3,2,1,3,9,0,14,4,1l,6,1,2,1,3,7,1,b,1,t,2," +
+  "1k,0,1,6,1,2,1,3,7,1,b,1,s,3,1j,1,1,6,1,2,1,3,9,0,a,1,t,2,1y,0,4,5,1,0,1,7,i,1,1p,0,2,6,c,7,2q,0,2,8,b,5,22,1," +
+  "r,0,1,0,1,0,4,1,1d,1,1,0,5,6,1,2,1,1,5,5,1,3,1,3,1,3,1,3,1,3,1,b,1,2,9,0,2s,j,n,3,4,2,1,2,2,6,3,3,d,b,1,0,a,3," +
+  "jj,2,qa,2,t,2,t,1,u,1,1u,t,9,0,4n,1,y,0,3a,b,4,b,63,4,1l,9,1,s,2,0,1c,g,1r,4,1b,g,12,8,c,2,u,c,1k,d,1c,j,48,2," +
+  "1,k,4,0,6,0,2,2,5i,1l,1,4,k0,w,2da,2,3x,0,2o,v,fe,5,2x,1,n9w,3,1,9,w,1,28,1,7k,0,3,0,4,0,n,4,4,0,2b,1,1e,h,q,h" +
+  ",d,0,12,7,p,c,18,3,1b,d,10,0,1v,d,c,0,8,1,19,2,1e,0,1,2,2,1,5,1,1,0,15,4,5,1,6k,7,1,1,g8i,f,r1,0,6a,0,45,4,2h1" +
+  ",2,1h,e,1k,3,19,a,1x,2,10,d,g,1,18,0,c,2,1c,d,8,3,1,1,2k,b,6,0,4g,b,l,3,1j,1,1,6,2,1,2,2,9,0,a,1,2,6,3,4,5c,h," +
+  "n,0,29,j,6j,6,2,8,r,1,2a,g,2y,c,2t,e,74,e,6t,5,1,1,2,3,1,0,1,1,3x,6,2,6,3,0,s,9,14,6,1,3,8,0,9,a,1a,f,b9,7,1,7" +
+  ",2a,l,1,d,3e,5,3,0,1,1,1,6,1,0,1u,4,1,1,1,4,9n,3,f09,4,1n,6,t4,0,1,1i,7,3,29,0,b,1,f57,1,43q,4,3,5,8,7,2,6,u,3" +
+  ",44,2,1iz,1i,4,1d,8,0,e,0,m,4,1,e,11s,6,1,g,2,6,1,1,1,4,79,6,c5,3";
+function unpackRanges(s: string): number[] {
+  const out: number[] = [];
+  const nums = s.split(",").map((x) => Number.parseInt(x, 36));
+  let prev = -1;
+  for (let i = 0; i + 1 < nums.length; i += 2) {
+    const start = prev + 1 + (nums[i] as number);
+    prev = start + (nums[i + 1] as number);
+    out.push(start, prev);
+  }
+  return out;
+}
+
+let validRanges: number[] | null = null;
+let markRanges: number[] | null = null;
+
+function inRanges(r: number[], c: number): boolean {
+  let lo = 0;
+  let hi = r.length / 2 - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (c < (r[2 * mid] as number)) hi = mid - 1;
+    else if (c > (r[2 * mid + 1] as number)) lo = mid + 1;
+    else return true;
+  }
+  return false;
+}
+
+/** RFC 3492 §6.2 decode of the part after `xn--`; null on any invalid digit,
+ * truncated delta, overflow or code point past U+10FFFF. */
+function punycodeDecode(input: string): number[] | null {
+  const MAXINT = 0x7fffffff;
+  const d = input.lastIndexOf("-");
+  const b = Math.max(d, 0);
+  const out: number[] = [];
+  for (let j = 0; j < b; j++) out.push(input.charCodeAt(j));
+  let n = 128;
+  let i = 0;
+  let bias = 72;
+  for (let pos = d + 1; pos < input.length; ) {
+    const oldi = i;
+    let w = 1;
+    for (let k = 36; ; k += 36) {
+      if (pos >= input.length) return null;
+      const ch = input.charCodeAt(pos++);
+      const digit = ch >= 0x61 && ch <= 0x7a ? ch - 0x61 : ch >= 0x30 && ch <= 0x39 ? ch - 22 : 36;
+      if (digit >= 36 || digit > Math.floor((MAXINT - i) / w)) return null;
+      i += digit * w;
+      const t = k <= bias ? 1 : k >= bias + 26 ? 26 : k - bias;
+      if (digit < t) break;
+      if (w > Math.floor(MAXINT / (36 - t))) return null;
+      w *= 36 - t;
+    }
+    const len = out.length + 1;
+    let delta = oldi === 0 ? Math.floor((i - oldi) / 700) : (i - oldi) >> 1;
+    delta += Math.floor(delta / len);
+    let k = 0;
+    while (delta > 455) {
+      delta = Math.floor(delta / 35);
+      k += 36;
+    }
+    bias = k + Math.floor((36 * delta) / (delta + 38));
+    if (Math.floor(i / len) > MAXINT - n) return null;
+    n += Math.floor(i / len);
+    i %= len;
+    if (n > 0x10ffff) return null;
+    out.splice(i, 0, n);
+    i++;
+  }
+  return out;
+}
+
+/** True iff `label` (lowercased, starting `xn--`) is an A-label `new URL()` accepts. */
+function isValidALabel(label: string): boolean {
+  for (let j = 0; j < label.length; j++) if (label.charCodeAt(j) > 0x7f) return false;
+  const cps = punycodeDecode(label.slice(4));
+  if (cps === null || cps.length === 0) return false;
+  validRanges ??= unpackRanges(IDNA_VALID);
+  markRanges ??= unpackRanges(IDNA_MARK);
+  for (const c of cps) if (c >= 0x80 && !inRanges(validRanges, c)) return false;
+  if (inRanges(markRanges, cps[0] as number)) return false;
+  const u = String.fromCodePoint(...cps);
+  return u.normalize("NFC") === u;
+}
+
+/**
+ * I3-0016: for a special scheme (http/https, the only kind this polyfill
+ * ever sees), the real URL parser treats `\` exactly like `/` everywhere up
+ * to the first `?`/`#` — inside the authority AND the path — because that is
+ * what every real browser's address bar does with it. `evil.com\@insta
+ * gram.com/x` is a page served from evil.com (backslash ends the host) with
+ * path `/@instagram.com/x`; a parser that reads `\` as an ordinary character
+ * lands on hostname `instagram.com` instead — the forged-badge divergence.
+ * Rewriting `\` → `/` ONLY before the first `?`/`#` (verified empirically:
+ * a `\` inside a query or fragment is NOT converted by the real URL) keeps
+ * the existing grammar regex correct with no widening of what it accepts.
+ */
+function preprocessAbsoluteUrl(input: string): string {
+  // WHATWG "remove all ASCII tab or newline" + trim C0-control-or-space —
+  // done before the grammar runs, same as the real parser's first step.
+  // eslint-disable-next-line no-control-regex
+  const noTabNewline = input.replace(/[\t\n\r]/g, "");
+  // eslint-disable-next-line no-control-regex
+  const trimmed = noTabNewline.replace(/^[\u0000- ]+|[\u0000- ]+$/g, "");
+
+  const schemeSep = trimmed.indexOf("://");
+  if (schemeSep === -1) return trimmed;
+  const authorityStart = schemeSep + 3;
+  let cut = trimmed.length;
+  for (let i = authorityStart; i < trimmed.length; i++) {
+    const c = trimmed[i];
+    if (c === "?" || c === "#") {
+      cut = i;
+      break;
+    }
+  }
+  const head = trimmed.slice(0, cut).replace(/\\/g, "/");
+  const tail = trimmed.slice(cut);
+  return head + tail;
+}
+
+export class MinimalURL {
+  readonly protocol: string;
+  readonly hostname: string;
+  readonly port: string;
+  readonly pathname: string;
+  readonly search: string;
+  readonly searchParams: MinimalURLSearchParams;
+  readonly hash: string;
+
+  constructor(input: string) {
+    const m = ABSOLUTE_URL.exec(preprocessAbsoluteUrl(String(input).trim()));
+    // Both the scheme and the host are required for an ABSOLUTE url, and the
+    // repo compiles with `noUncheckedIndexedAccess`, so BOTH are narrowed here
+    // rather than only the host: `m[1]` is the scheme and was previously read
+    // as possibly-undefined one line later.
+    if (!m || !m[1] || !m[2]) throw new TypeError(`invalid URL: ${input}`);
+    const [, scheme, host, port, path, query, hash] = m;
+    this.protocol = `${scheme.toLowerCase()}:`;
+    // W3-03 FIX2 item 2b: FAIL CLOSED ON THE DECODE. The percent-decode that
+    // closed `insta%67ram.com` (I3-0084) runs AFTER the grammar match, so the
+    // grammar's own `[^/?#:]` exclusion no longer holds over the result:
+    // `%40 %2F %3A %09 %00` are forbidden host code points that the real URL
+    // parser REFUSES outright, and this decoded them into a minted host and
+    // returned a subject. Where the two parsers could disagree the polyfill
+    // must refuse, not guess — so the decoded host is re-checked against the
+    // same set the real parser applies, and a violation throws the TypeError
+    // `canonicalizeForCheck`'s catch already turns into `{canonical:null}`.
+    const decodedHost = decodeHostComponent(host);
+    if (FORBIDDEN_HOST.test(decodedHost)) throw new TypeError(`invalid URL: ${input}`);
+    this.hostname = decodedHost.toLowerCase();
+    // QUEUE #383: an `xn--` label must be an A-label the real URL accepts.
+    for (const label of this.hostname.split(".")) {
+      if (label.startsWith("xn--") && !isValidALabel(label)) throw new TypeError(`invalid URL: ${input}`);
+    }
+    // D-0784 / D-0813(4) — the two dangerous-direction divergences B27-URL found.
+    // URL:6: a non-ASCII host. The real parser runs UTS46 (`bücher.ch` ->
+    // `xn--bcher-kva.ch`; `a⒈.com` refused); the device ships no mapping table,
+    // so it would mint the raw Unicode host. Refuse: the safe direction.
+    if (NON_ASCII.test(this.hostname)) throw new TypeError(`invalid URL: ${input}`);
+    // URL:5: a host that "ends in a number" goes down WHATWG's IPv4 path
+    // (`instagram.com.1` refused, `127.1` -> `127.0.0.1`). The device has no
+    // such path; only a dotted quad the real parser serialises unchanged passes.
+    if (endsInANumber(this.hostname) && !CANONICAL_DOTTED_QUAD.test(this.hostname)) throw new TypeError(`invalid URL: ${input}`);
+    const rawPort = port ?? "";
+    this.port = rawPort !== "" && DEFAULT_PORT[this.protocol] === rawPort ? "" : rawPort;
+    this.pathname = removeDotSegments(percentEncodePath(path && path.length > 0 ? path : "/"));
+    this.search = query ? `?${query}` : "";
+    this.searchParams = new MinimalURLSearchParams(this.search);
+    this.hash = hash ? `#${hash}` : "";
+  }
+}
+
+/** Install `MinimalURL` as `globalThis.URL` iff no URL global already exists.
+ * Idempotent; never overwrites a real (Node/browser) URL implementation. */
+export function installURLPolyfillIfMissing(): void {
+  const g = globalThis as unknown as { URL?: unknown };
+  if (typeof g.URL === "undefined") {
+    g.URL = MinimalURL as unknown as typeof globalThis.URL;
+  }
+}
+===== END FILE: apps/mobile-check/src/url-polyfill.ts =====
+
+===== BEGIN FILE: apps/mobile-check/src/verdict-presentation.ts =====
+/* TrustClass/TrustStatus are declared here, not in index.ts (which re-exports them), so this module does not import index.ts back (I13-ARCH, QUEUE #902: the cycle). */
+export type TrustClass = "verified" | "claimed" | "unclaimed";
+/** "warning" is the accusatory class (a reported impersonator). Since D-0707
+ * the registry also mints warning (and caution) DECOYS as bucket padding, so
+ * the class alone proves nothing; a match is trustworthy because the client
+ * matches the entry's FULL hash, and a decoy's hash is random rather than
+ * derived from any real account (clients match on `e.h`, below).
+ *
+ * "failed" (flag 23, 2026-08-14, mirrored from the extension): the check
+ * could not complete — corrupt/thin bucket, unreachable registry, internal
+ * error. DISTINCT from "unknown" ("we looked; no record") so the native UI
+ * renders the fail-closed state ("couldn't check — treat as unverified")
+ * instead of the reassuring "not listed". */
+export type TrustStatus = TrustClass | "warning" | "caution" | "unknown" | "unsupported" | "failed";
+import { EN } from "@dhwaja/i18n";
+
+/**
+ * Verdict presentation — the ONE table the native apps mirror.
+ *
+ * Swift and Kotlin are NOT built in this repo's CI, so a colour/label/icon
+ * mapping that lives only in `FanView.swift` / `FanScreens.kt` can rot silently.
+ * This module is the tested source of truth for that mapping: `apps/ios/App/
+ * Verdict.swift` and `apps/android/.../Verdict.kt` are literal, case-for-case
+ * mirrors of the tables below (same order, same labels, same hexes), so a
+ * reviewer can diff the three files by eye.
+ *
+ * NOTE ON RUNTIME: rows in Collection/Codex arrive over the authenticated REST
+ * API and are rendered by SwiftUI/Compose — the JS bridge is not even loaded on
+ * those screens. So this module is deliberately NOT part of `nativeBridge()`
+ * (see index.ts) and adds nothing to the on-device bundle; it is a specification
+ * with tests, and the natives mirror it.
+ *
+ * Design law it encodes (docs/DESIGN-SYSTEM.md v0.2 §4):
+ *  - a verdict is ALWAYS colour + icon + text label — never colour alone, so it
+ *    survives a greyscale screenshot and a colour-blind reader;
+ *  - each verdict owns exactly one reserved hue; brand magenta/violet is
+ *    identity/action and is NEVER a verdict;
+ *  - precedence is warning (reported) > caution > creator-proven state
+ *    (verified/claimed) > unclaimed;
+ *  - "caution" is machine-served and must read strictly softer than "reported";
+ *  - a `failed` check must never render as "not listed" — it asserts nothing.
+ */
+
+/** Reserved verdict tokens, copied BY VALUE from docs/DESIGN-SYSTEM.md v0.2 §3.
+ * (SVG/native surfaces can't read CSS custom properties — same convention as
+ * `card-render`, `badge.ts` and `seo-page.ts`.) */
+export const TOKEN = {
+  verified: "#18e6a0", // --verified  teal-green — operator-vetted
+  claimed: "#ffb020", // --claimed   amber      — proved control, NOT vetted
+  unclaimed: "#8b93a7", // --unclaimed slate      — listed, no owner yet
+  reported: "#ff3b5c", // --reported  red        — active operator warning
+  caution: "#ff8a3d", // --caution   orange     — machine-served soft signal
+  notlisted: "#838aa6", // --notlisted faint      — no record (#217: was #636a80, sub-AA)
+  muted: "#9aa0b4", // --muted     secondary  — NOT a verdict hue
+} as const;
+
+/** Brand hues. Present so the tests can assert they never leak into a verdict. */
+export const BRAND = { pink: "#ff2d7e", violet: "#a63cff" } as const;
+
+export interface VerdictStyle {
+  /** The mandatory text label. Colour is an accent; this is what carries the
+   * meaning in greyscale. Never empty for a real verdict. */
+  label: string;
+  /** The mandatory icon as a monochrome text glyph — what the Compose mirror
+   * renders (Android pulls no icon artifact, so a glyph cannot fail to build).
+   * Empty ONLY for `unsupported`, which is the absence of a verdict.
+   *
+   * MUST be TEXT-presentation, never an emoji-presentation codepoint (tested):
+   * Compose paints this with `color = style.color`, and Android's colour emoji
+   * font ignores that tint and uses an emoji advance width, so an emoji glyph
+   * would silently drop the verdict's hue and break row alignment. Colour-emoji
+   * surfaces that CAN render them (the HTML table in `seo-page.ts`) are a
+   * separate table and may differ here. */
+  glyph: string;
+  /** The iOS mirror's SF Symbol for the same slot (SwiftUI renders symbols, not
+   * glyphs). Same meaning as `glyph`, platform-idiomatic rendering. */
+  sfSymbol: string;
+  /** The reserved token hex. An accent only — never the sole signal. */
+  color: string;
+}
+
+// --- Collection / Codex row badges -----------------------------------------
+
+/** What a single row badge can say. A row shows exactly ONE badge, so the
+ * highest-precedence state wins (see `rowVerdict`). */
+export type RowVerdict = "reported" | "caution" | "verified" | "claimed" | "unclaimed";
+
+/** Precedence order, strongest first. The native mirrors list their cases in
+ * THIS order so the precedence is legible in the source. */
+export const ROW_ORDER: readonly RowVerdict[] = ["reported", "caution", "verified", "claimed", "unclaimed"];
+
+/** Row labels are short + uppercase (they sit at the end of a dense list row).
+ * Glyphs follow the shipped table in `services/trust-core/src/seo-page.ts` for
+ * the three states it already renders, extended per docs/DESIGN-SYSTEM.md §4.
+ *
+ * `claimed` is `◐` here and, since I3-0090, in `ssr-shell.ts` VERDICTS too (it was
+ * 🔑 there). 🔑 (U+1F511) is emoji-presentation — fine in a
+ * browser, wrong in a tinted Compose `Text`. `◐` keeps the ○ → ◐ → ✓ progression
+ * (nothing proved → control proved → operator-vetted) in one monochrome,
+ * tintable, fixed-width family. iOS is unaffected: it renders the `key.fill`
+ * SF Symbol, which is the design system's "unlocked / key" icon (§4) and IS
+ * monochrome and tintable — the glyph and SF-Symbol columns are allowed to
+ * differ where a platform has a better native form. */
+export const ROW_STYLE: Record<RowVerdict, VerdictStyle> = {
+  reported: { label: "REPORTED", glyph: "⚠", sfSymbol: "exclamationmark.triangle.fill", color: TOKEN.reported },
+  caution: { label: "CAUTION", glyph: "!", sfSymbol: "exclamationmark.circle", color: TOKEN.caution },
+  verified: { label: "VERIFIED", glyph: "✓", sfSymbol: "checkmark.seal.fill", color: TOKEN.verified },
+  claimed: { label: "CLAIMED", glyph: "◐", sfSymbol: "key.fill", color: TOKEN.claimed },
+  unclaimed: { label: "UNCLAIMED", glyph: "○", sfSymbol: "circle", color: TOKEN.unclaimed },
+};
+
+/** States that mean "an active operator warning covers this row". Accepts the
+ * registry's served class name as well as the plain word, so either channel the
+ * server eventually uses lands on the same badge. */
+const REPORTED_STATES: ReadonlySet<string> = new Set(["reported", "warning", "warned"]);
+
+/**
+ * Reduce a row's signals to ONE badge, applying the design-system precedence:
+ * reported > caution > verified/claimed > unclaimed.
+ *
+ * Fail-closed by construction:
+ *  - a state string this build doesn't recognise (registry/server newer than the
+ *    app) falls back to `unclaimed` — the WEAKEST claim, so a row can never
+ *    over-claim; it mirrors the fan web app's `CODEX_STATE[…] ?? unclaimed`.
+ *  - `founding-*` is stripped first: Founding is a MODIFIER, never a verdict
+ *    (docs/DESIGN-SYSTEM.md §4), so `founding-claimed` must not read as verified.
+ */
+export function rowVerdict(input: {
+  /** `undefined`/`null` are explicit here: these fields come off a JSON row and
+   * may simply be absent, and an absent signal must resolve, never throw. */
+  state?: string | null | undefined;
+  warned?: boolean | undefined;
+  caution?: boolean | undefined;
+}): RowVerdict {
+  const state = typeof input.state === "string" ? input.state.trim().toLowerCase() : "";
+  if (input.warned === true || REPORTED_STATES.has(state)) return "reported";
+  if (input.caution === true || state === "caution") return "caution";
+  const base = state.startsWith("founding-") ? state.slice("founding-".length) : state;
+  if (base === "verified") return "verified";
+  if (base === "claimed") return "claimed";
+  return "unclaimed";
+}
+
+/**
+ * I3-0526 (D-1078(13)) — FOUNDING IS A MODIFIER, SHOWN WITH ITS RANK. `rowVerdict` folds `founding-*` into the
+ * base verdict (above); this is the other half: the rank a row shows BESIDE that verdict, or null. The same rule as
+ * the server's `validFoundingRank` (services/trust-core/src/badge.ts) — a `founding-` state and an integer rank in
+ * 1..FOUNDING_CAPACITY — and shown only beside VERIFIED or CLAIMED (docs/DESIGN-SYSTEM.md §4: "layered on
+ * Verified/Claimed"), never beside a REPORTED or CAUTION row. Mirrored by `Founding.rank` (Verdict.swift) and
+ * `foundingRank` (Verdict.kt).
+ */
+export const FOUNDING_CAPACITY = 500; // services/trust-core/src/founding.ts FOUNDING_CAPACITY
+export function foundingRank(input: { state?: string | null | undefined; rank?: unknown; warned?: boolean | undefined; caution?: boolean | undefined }): number | null {
+  const state = typeof input.state === "string" ? input.state.trim().toLowerCase() : "";
+  if (!state.startsWith("founding-")) return null;
+  const rank = input.rank;
+  if (typeof rank !== "number" || !Number.isInteger(rank) || rank < 1 || rank > FOUNDING_CAPACITY) return null;
+  const v = rowVerdict(input);
+  return v === "verified" || v === "claimed" ? rank : null;
+}
+/** The modifier's words — the creator console's approved "Founding Creator #N" (apps/creator-console/src/views.ts). */
+export function foundingLabel(rank: number): string {
+  return `Founding Creator #${rank}`;
+}
+
+// --- The check verdict card (share sheet / extension popup equivalent) -------
+
+/** Case order for the check-result card. The native `titleFor` / `title`
+ * mirrors list their cases in THIS order. */
+export const CHECK_ORDER: readonly TrustStatus[] = ["verified", "claimed", "unclaimed", "warning", "caution", "unknown", "unsupported", "failed"];
+
+/**
+ * The full check vocabulary. `label` is byte-identical to the copy both apps
+ * already ship (ResultView.swift / ResultView.kt) — this table adds the colour
+ * and icon columns those two files were missing, it does not rewrite copy.
+ *
+ * `failed` deliberately does NOT use `--notlisted`: "couldn't check" must never
+ * paint the same as "we looked and there is no record".
+ *
+ * `failed` and `unsupported` SHARE `--muted` — the one colour collision in
+ * either table, and a deliberate one (pinned by test): neither is a verdict, so
+ * neither may own a reserved verdict hue, and they are already distinguished in
+ * all three other channels (label, glyph, SF Symbol).
+ *
+ * `unsupported` is also the one row whose two icon channels differ on purpose:
+ * `glyph` is "" (Compose paints no icon — the absence of a verdict) while iOS
+ * shows the quiet `info.circle`, because a SwiftUI card without a leading symbol
+ * loses its vertical rhythm. Both ResultView files carry the same note.
+ */
+export const CHECK_STYLE: Record<TrustStatus, VerdictStyle> = {
+  verified: { label: EN["check.label_verified"], glyph: "✓", sfSymbol: "checkmark.seal.fill", color: TOKEN.verified },
+  claimed: { label: EN["check.label_claimed"], glyph: "◐", sfSymbol: "key.fill", color: TOKEN.claimed },
+  unclaimed: { label: EN["check.label_unclaimed"], glyph: "○", sfSymbol: "circle", color: TOKEN.unclaimed },
+  warning: { label: EN["check.label_warning"], glyph: "⚠", sfSymbol: "exclamationmark.triangle.fill", color: TOKEN.reported },
+  caution: { label: EN["check.label_caution"], glyph: "!", sfSymbol: "exclamationmark.circle", color: TOKEN.caution },
+  unknown: { label: EN["check.label_unknown"], glyph: "?", sfSymbol: "questionmark.circle", color: TOKEN.notlisted },
+  unsupported: { label: EN["check.label_unsupported"], glyph: "", sfSymbol: "info.circle", color: TOKEN.muted },
+  failed: { label: EN["check.label_failed"], glyph: "↻", sfSymbol: "arrow.clockwise.circle", color: TOKEN.muted },
+};
+
+/**
+ * THE SAME TWO VERDICTS, SAID AT THE LEVEL THEY ARE TRUE AT.
+ *
+ * `verified` and `claimed` are facts about a PASSPORT. The two labels above say
+ * them as facts about the ACCOUNT the fan just checked, and for a very large
+ * population that is not true: with per-account standing off (the default), an
+ * operator/OSINT-seeded handle on a claimed passport is served `claimed` and
+ * nobody has ever confirmed it belongs to that creator. The passport page has
+ * always said so on the row itself ("! not confirmed"); the check could not,
+ * because the entry carried nothing to say it with. It does now — `p` on the
+ * bucket entry — and `checkStyle` picks the sentence.
+ *
+ * The HUE and the GLYPH do not change. The passport really is claimed/verified,
+ * and re-colouring a true verdict would teach a fan that amber sometimes means
+ * something else. What changes is the sentence, which is the channel that was
+ * lying.
+ *
+ * ABSENCE MEANS UNCONFIRMED — a bucket written before the flag existed, or a
+ * registry that stops sending it, lands here. That direction under-claims and
+ * can never over-claim, which is the only way an optional trust field may fail.
+ */
+export const UNCONFIRMED_ORDER: readonly TrustStatus[] = ["verified", "claimed"];
+
+export const UNCONFIRMED_STYLE: Partial<Record<TrustStatus, VerdictStyle>> = {
+  verified: { label: EN["check.label_verified_unconfirmed"], glyph: "✓", sfSymbol: "checkmark.seal.fill", color: TOKEN.verified },
+  claimed: { label: EN["check.label_claimed_unconfirmed"], glyph: "◐", sfSymbol: "key.fill", color: TOKEN.claimed },
+};
+
+/**
+ * The style for a check result, told whether the matched entry carried the
+ * per-account confirmation flag. `confirmed` is only consulted for the two
+ * statuses that have a second form; everything else has one sentence.
+ */
+export function checkStyle(status: TrustStatus, confirmed: boolean): VerdictStyle {
+  return (confirmed ? undefined : UNCONFIRMED_STYLE[status]) ?? CHECK_STYLE[status];
+}
+
+/**
+ * N2 — THE SENTENCE FOR SOMEBODY WHO IS FRIGHTENED.
+ *
+ * The labels above are accurate and they are written in this product's own
+ * vocabulary. "Claimed (identity not verified)" is a precise statement about a
+ * passport's state; it is not an answer to the question a fan actually arrived
+ * with, which is *should I send this person money*. The person reading a verdict
+ * is often already worried — they clicked because something felt wrong — and a
+ * taxonomy term is the wrong register for that moment.
+ *
+ * So every state gains ONE plain sentence, and the labels are deliberately left
+ * alone. Two reasons for that split rather than a rewrite:
+ *
+ *  - the labels are what `verdict-cross-client.test.ts` pins BY VALUE across
+ *    Swift, Kotlin and both TS mirrors, and they appear in the extension badge,
+ *    the share card and the SSR pill. Changing them moves every mirror and
+ *    several fixtures at once, which is a W2 job, not this one;
+ *  - a label and a sentence do different work. The label is the scannable state
+ *    ("Verified"); the sentence is what it MEANS ("This is really them"). A
+ *    surface can render one, the other, or both.
+ *
+ * THIS TABLE IS PARALLEL, NOT A FIELD ON `VerdictStyle`. Adding a fourth
+ * argument to `VerdictStyle` would break the Swift extractor in
+ * `verdict-cross-client.test.ts`, which full-matches
+ * `VerdictStyle(label:symbol:color:)` — i.e. it would require rewriting the only
+ * enforcement iOS has in order to add copy. A separate table gets its own
+ * extractor and its own assertion, and leaves every existing one exactly as
+ * strict as it was.
+ *
+ * RULES THE SENTENCES FOLLOW, and the tests assert them:
+ *  - no Dhwaja vocabulary: no "passport", no "claimed", no "unclaimed", no
+ *    "registry", no "verdict". A word the reader has to learn is a word that
+ *    fails at the moment it is needed;
+ *  - the two states that mean "we did not check" or "we have no record" must
+ *    NOT read as reassurance — `unknown` and `failed` say what they are not;
+ *  - only `warning` gives a money instruction. If every state told a fan what to
+ *    do about money, the one that matters would stop standing out.
+ */
+export const CHECK_PLAIN: Record<TrustStatus, string> = {
+  verified: EN["check.plain_verified"],
+  claimed: EN["check.plain_claimed"],
+  unclaimed: EN["check.plain_unclaimed"],
+  warning: EN["check.plain_warning"],
+  caution: EN["check.plain_caution"],
+  unknown: EN["check.plain_unknown"],
+  unsupported: EN["check.plain_unsupported"],
+  failed: EN["check.plain_failed"],
+};
+
+/**
+ * WHAT THE SUBJECT IS — the four-client half of the character disclosure.
+ *
+ * A passport's subject can be a person, an AI character or a brand character.
+ * Slices 14–16 built that, disclosed it on the passport page, the crawlable page,
+ * the PSA, the share card and the og unfurl, and enforced the accountability rule
+ * behind it over time — and none of it reached the CHECK. The extension and both
+ * mobile apps answered "Verified on Dhwaja" about an AI persona and said nothing
+ * else, on the surface most fans actually use.
+ *
+ * IT IS NOT A VERDICT AND MUST NEVER LOOK LIKE ONE. `TrustStatus` is not widened
+ * (so no guard that enumerates verdicts sees it, and no client grows a ninth
+ * case); the mark takes `TOKEN.muted`, which this file's own comment marks as
+ * "NOT a verdict hue"; and the glyph is `◆`, chosen from outside the verdict set
+ * (✓ ◐ ○ ⚠ ! ? ↻). A verified character is exactly as verified as a verified
+ * person — the kind says what the subject IS, not how far to trust it.
+ *
+ * The label is sentence case where every verdict label is not, which is the same
+ * separation `ssr-shell.ts kindChip` makes on the web.
+ */
+export type SubjectKind = "ai_character" | "brand";
+
+/** Wire → kind. `"a"`/`"b"` are what `RegistryEntry.k` carries (one byte, because
+ * the entry is multiplied by the bucket's padding and again by 16^width).
+ * ANYTHING ELSE IS A PERSON, which is what every entry meant before characters
+ * existed — a client talking to an older or newer registry under-claims. */
+export function kindFromWire(k: unknown): SubjectKind | undefined {
+  return k === "a" ? "ai_character" : k === "b" ? "brand" : undefined;
+}
+
+/**
+ * PER-KIND WARNING WORDING (I3-0122, D-0992(9)). Every served `warning` entry
+ * carries `w`, a one-character KIND CODE (`"i"` impersonation, `"f"` confirmed
+ * fraud); every client maps it to that kind's sentence and falls back to the one
+ * fixed sentence when the entry carries none (a registry built before I23) or a
+ * code this build does not know. The two texts are a literal mirror of
+ * `WARNING_KIND_WORDINGS` in packages/schema/src/index.ts (this package does
+ * not depend on @dhwaja/schema); `test/i23-l04-landing.test.ts` holds this table,
+ * the extension's and both natives' byte-equal to it. Approved there (status
+ * `approved`; Jason, docket I23-Q9a; trust-core migration 0270).
+ */
+export type WarningKindCode = "i" | "f";
+export const WARNING_KIND_WORDINGS: Readonly<Record<WarningKindCode, string>> = {
+  i: "Dhwaja reviewed reports about this account and published a warning that it presents itself as another creator who does not control it.",
+  f: "Dhwaja reviewed evidence about this account and published a warning that it has been used to take money or information from people under false pretences.",
+};
+/** D-0996(1): the kind-neutral safety line every client keeps ABOVE a kind's sentence (mirror of @dhwaja/schema
+ * WARNING_SAFETY_LINE; the natives' WarningWording carries it too). */
+export const WARNING_SAFETY_LINE = "Don't send money.";
+/** The plain lines a served warning shows, top to bottom: the safety line then the kind's sentence, or the fixed
+ * sentence alone when the entry carried no known code. */
+export function warningPlainLines(code: unknown): string[] {
+  const k = warningKindFromWire(code);
+  return k ? [WARNING_SAFETY_LINE, WARNING_KIND_WORDINGS[k]] : [CHECK_PLAIN.warning];
+}
+/** Wire → kind code, strictly: anything but `"i"`/`"f"` is no code (the fallback sentence). */
+export function warningKindFromWire(w: unknown): WarningKindCode | undefined {
+  return w === "i" || w === "f" ? w : undefined;
+}
+/** The kind's sentence for a served warning carrying `code`, or null — and null
+ * means the FALLBACK: the fixed warning label and plain sentence every client
+ * already renders (CHECK_STYLE.warning / CHECK_PLAIN.warning) stand alone, exactly
+ * as before I23. A client never invents a kind it was not sent. */
+export function warningKindSentence(code: unknown): string | null {
+  const k = warningKindFromWire(code);
+  return k ? WARNING_KIND_WORDINGS[k] : null;
+}
+/** I63 K1 (Jason D-1537 I62-Q5, D-1539 I63-Q2; I45-8's words, D-1522): the check heading per served warning kind, read
+ * from the two catalogue keys the web heading uses (apps/web/src/verdict.ts WARNING_KIND_LABEL); both natives mirror it. */
+export const WARNING_KIND_LABEL: Readonly<Record<WarningKindCode, string>> = {
+  i: EN["web.label_warning_impersonation"],
+  f: EN["web.label_warning_confirmed_fraud"],
+};
+/** The heading a check result shows: the kind's label for a warning that carried a known code, else `checkStyle`'s
+ * label. Only the heading moves; the plain lines under it are `warningPlainLines` / `checkPlain`, unchanged. */
+export function checkHeading(status: TrustStatus, confirmed: boolean, warningKind?: unknown): string {
+  const k = status === "warning" ? warningKindFromWire(warningKind) : undefined;
+  return k ? WARNING_KIND_LABEL[k] : checkStyle(status, confirmed).label;
+}
+
+
+/**
+ * TWO NARROWINGS, TWO BOUNDARIES, and conflating them is a silent under-claim.
+ *
+ * `kindFromWire` takes the REGISTRY BYTE (`"a"` / `"b"`) and belongs at the
+ * bucket-parse boundary and nowhere else. Everything downstream — a message
+ * across the extension port, the native bridge's JSON, a stored result — carries
+ * the LONG form, because that is what `CheckResult.kind` is.
+ *
+ * Adversarial review caught the natives calling `fromWire` on the bridge's long
+ * form, which returns nothing: the disclosure would simply never have rendered,
+ * with no error and no failing test, in exactly the direction that produces
+ * silence. `asSubjectKind` is the narrowing for that side.
+ */
+export function asSubjectKind(v: unknown): SubjectKind | undefined {
+  return v === "ai_character" || v === "brand" ? v : undefined;
+}
+
+/**
+ * A LOCAL COPY OF THE SCHEMA'S `DECLARABLE_KINDS`, pinned to it by
+ * `tests/invariants/subject-kind-parity.test.ts` rather than imported.
+ *
+ * `@dhwaja/mobile-check` depends on `@dhwaja/canonical` and nothing else, on
+ * purpose: it is the shared core both native apps embed, and taking a dependency
+ * on `@dhwaja/schema` would drag the ledger's whole event vocabulary into two
+ * mobile bundles to learn two strings. That is the same trade
+ * `@dhwaja/card-render` makes and for the same reason.
+ *
+ * The cost is that this is a copy — and adversarial review found the cost being
+ * paid without the guard: this was the SEVENTH independent re-spelling of the
+ * kind vocabulary, the parity guard iterates it, so a fourth kind in the schema
+ * would have left all four clients rendering it as a person with every test
+ * green. The value-level guard is what closes that, exactly as slice 15 closed
+ * it for the card renderer.
+ */
+export const KIND_ORDER: readonly SubjectKind[] = ["ai_character", "brand"];
+
+export const KIND_STYLE: Record<SubjectKind, { label: string; glyph: string; sfSymbol: string; color: string }> = {
+  // ONE MARK FOR BOTH KINDS, and the LABEL is what distinguishes them — the same
+  // choice `ssr-shell.ts kindChip` makes. Two different icons would imply the two
+  // kinds differ in some way a fan should weigh, and they do not: both say "not a
+  // real person", and neither says anything about trust.
+  ai_character: { label: "AI character", glyph: "◆", sfSymbol: "diamond", color: TOKEN.muted },
+  brand: { label: "Brand character", glyph: "◆", sfSymbol: "diamond", color: TOKEN.muted },
+};
+
+/**
+ * THE SAME FACT, SAID AT THE LEVEL THE CHECK IS TRUE AT — the discipline
+ * `UNCONFIRMED_PLAIN` above keeps, applied to the kind.
+ *
+ * `@dhwaja/i18n`'s `kind.*_plain` ends "The accounts below are run by whoever
+ * operates it", which is written for the PASSPORT PAGE, where a table of accounts
+ * is literally below it. On a check there is no table and no "below": the fan
+ * checked ONE account and is looking at one answer about it. Shipping the
+ * catalogue sentence here would have pointed at a list that does not exist.
+ *
+ * The first clause is byte-identical to the catalogue on purpose — that is the
+ * sentence a fan carries away, and it must not fork between the page they landed
+ * on and the extension they checked with.
+ */
+export const KIND_PLAIN: Record<SubjectKind, string> = {
+  ai_character: "This is an AI character, not a real person. The account you checked is run by whoever operates it.",
+  brand: "This is a brand character, not a real person. The account you checked is run by whoever operates it.",
+};
+
+/**
+ * The plain sentence for the two statuses that have a second, weaker form —
+ * the passport is real, this ACCOUNT is not confirmed to belong to it. Same
+ * split as `UNCONFIRMED_STYLE`, and the same fail-direction: absence lands on
+ * the unconfirmed sentence, which under-claims.
+ */
+export const UNCONFIRMED_PLAIN: Partial<Record<TrustStatus, string>> = {
+  verified: EN["check.plain_verified_unconfirmed"],
+  claimed: EN["check.plain_claimed_unconfirmed"],
+};
+
+/** The plain sentence for a result, told whether the entry carried the
+ * per-account confirmation flag. Mirrors `checkStyle` exactly. */
+export function checkPlain(status: TrustStatus, confirmed: boolean): string {
+  return (confirmed ? undefined : UNCONFIRMED_PLAIN[status]) ?? CHECK_PLAIN[status];
+}
+
+/**
+ * HOW AN ACCOUNT IS PRINTED — one rule, four surfaces.
+ *
+ * A generic Tier-2 `link` is a URL, not a platform. `link · @livejasmin.com/en/chat/RileyMoon`
+ * is two lies in one line: `@…` is how this product spells "a handle on a
+ * platform we model", and `link` is a bucket meaning "somewhere we do not model
+ * yet". The rule was written down and fixed in `services/trust-core/src/passport-view.ts`,
+ * and the SPA's result card, the crawlable `/is/` page and BOTH native result
+ * screens went on printing the fake handle.
+ *
+ * The four clients cannot share a module (two of them are not TypeScript), so
+ * this is the spec copy and `tests/invariants/safety-handoff-parity.test.ts`
+ * holds the Swift, the Kotlin, the SPA and the server's copy to it.
+ *
+ * Returns PLAIN TEXT. Every caller escapes for its own sink.
+ */
+export const LINK_PLATFORM = "link";
+
+export interface AccountDisplay {
+  /** What goes in the platform slot. */
+  platform: string;
+  /** What goes in the identity slot: `@handle`, or a bare URL for a link. */
+  ident: string;
+}
+
+export function accountDisplay(platform: string, handle: string): AccountDisplay {
+  return platform === LINK_PLATFORM ? { platform: "web link", ident: handle } : { platform, ident: `@${handle}` };
+}
+===== END FILE: apps/mobile-check/src/verdict-presentation.ts =====
+
+===== BEGIN FILE: apps/web/build.mjs =====
+import { build } from "esbuild";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+
+/**
+ * Bundle the SPA into a single self-contained module (dist/app.js) plus the
+ * static index.html. The workspace packages (@dhwaja/canonical, card-render)
+ * are inlined — no remote code, no CDN. API_BASE / REGISTRY_BASE are injected
+ * at build time and VALIDATED as plain https URLs first: an unvalidated value
+ * with a quote could break out of the define string, and a non-https or
+ * user-shaped value could point the app at a hostile origin.
+ */
+
+const root = dirname(fileURLToPath(import.meta.url));
+/**
+ * THE CHOKEPOINT. Under a test runner, building into `dist/` is REFUSED
+ * outright — not warned about, not tolerated. `pnpm test` used to run four of
+ * these builds with no env on every invocation, so a real
+ * `OPS_BASE=… node build.mjs` followed by the suite left the deploy artifact
+ * rebuilt from the `dhwaja.example` defaults (exit 0, no warning), and the
+ * console's `connect-src` named a domain we do not own. A test that wants a
+ * build must say where to put it.
+ */
+if (process.env.VITEST && !process.env.BUILD_OUT_DIR) {
+  throw new Error(
+    "refusing to build into dist/ under a test runner: dist/ is the deploy artifact. " +
+      "Set BUILD_OUT_DIR to a temp directory.",
+  );
+}
+
+/**
+ * OUTPUT DIRECTORY. `dist/` is the DEPLOY ARTIFACT — the checklist is
+ * build-then-deploy and `wrangler pages deploy` ships exactly what is in it —
+ * so nothing may write there implicitly. A caller that is not deploying MUST
+ * pass BUILD_OUT_DIR and gets a directory of its own.
+ *
+ * This exists because `pnpm test` used to silently rebuild `dist/` from the
+ * `dhwaja.example` defaults: a real `OPS_BASE=... node build.mjs` followed by
+ * the test suite left the shipped bundle pointed at a domain we do not own,
+ * exit 0, no warning. tests/invariants/build-artifacts.test.ts pins that a
+ * test can never write into an app's dist/ again.
+ */
+const out = process.env.BUILD_OUT_DIR
+  ? resolve(process.env.BUILD_OUT_DIR)
+  : join(root, "dist");
+
+const apiBase = process.env.API_BASE ?? "https://api.dhwaja.example";
+const registryBase = process.env.REGISTRY_BASE ?? "https://registry.dhwaja.example";
+// S84 install-CTA targets (web→extension / web→mobile). Same https validation.
+const extensionUrl = process.env.EXTENSION_URL ?? "https://app.dhwaja.example/extension";
+const appUrl = process.env.APP_URL ?? "https://app.dhwaja.example/mobile";
+// M49: the creator CONSOLE origin. OPTIONAL (absent → the demand page's "Claim
+// your Passport" CTA falls back to the fan passport link). Claiming happens in
+// the console, not the fan app, so when it is configured the CTA links there
+// instead of dead-ending on #/p/:id.
+const consoleUrl = process.env.CONSOLE_URL ?? "";
+const URL_RE = /^https:\/\/[a-z0-9.-]+(:\d+)?(\/[^\s"'`]*)?$/i;
+const BASES = [["API_BASE", apiBase], ["REGISTRY_BASE", registryBase], ["EXTENSION_URL", extensionUrl], ["APP_URL", appUrl]];
+for (const [name, val] of BASES) {
+  if (!URL_RE.test(val)) throw new Error(`${name} must be a plain https URL, got: ${val}`);
+}
+// The console URL is optional but, when given, must pass the same https gate.
+if (consoleUrl && !URL_RE.test(consoleUrl)) throw new Error(`CONSOLE_URL must be a plain https URL, got: ${consoleUrl}`);
+// WEB H7 (I3-0048 b): the "see an example verified creator" chip's target. Optional, like CONSOLE_URL: empty
+// draws no chip (main.ts reads `__EXAMPLE_VERIFIED_URL__`); a set value must pass the same plain-https test.
+const exampleVerifiedUrl = process.env.EXAMPLE_VERIFIED_URL ?? "";
+if (exampleVerifiedUrl && !URL_RE.test(exampleVerifiedUrl)) throw new Error(`EXAMPLE_VERIFIED_URL must be a plain https URL, got: ${exampleVerifiedUrl}`);
+
+/**
+ * THE SECOND CHOKEPOINT: a PLACEHOLDER build may never land in `dist/`.
+ *
+ * `dhwaja.example` is a reserved example domain nobody owns. A bundle built
+ * against it cannot reach the API or the registry, so on a real deploy EVERY
+ * check would fail — and a failed check is the state the fan sees the least
+ * clearly, which is why views.ts had to learn the difference between "no
+ * records" and "we could not read". The measured artifact in `dist/` was exactly
+ * this: built from the defaults, and older than `build.mjs` itself.
+ *
+ * The existing VITEST chokepoint above stops a TEST from overwriting the deploy
+ * artifact. This one stops a developer from filling it with an unusable one:
+ * `node build.mjs` with no env is a perfectly reasonable thing to run, it just
+ * may not produce the thing DEPLOY.md ships. Anywhere else — a preview, a test,
+ * a local sandbox — `BUILD_OUT_DIR` gets its own directory and the defaults are
+ * fine, which is why this is scoped to `dist/`.
+ *
+ * IT RUNS BEFORE `mkdirSync`, DELIBERATELY. This block used to sit 32 lines
+ * AFTER the directory was created, so a refusal left an EMPTY `dist/` behind —
+ * which reds `dist-freshness.test.ts` and, worse, is a directory `wrangler pages
+ * deploy` will happily publish as an empty site (audit v10, B5). The refusal
+ * must write nothing at all.
+ */
+if (!process.env.BUILD_OUT_DIR) {
+  const placeholders = BASES.filter(([, val]) => /(^|\.)dhwaja\.example(\/|$|:)/i.test(val)).map(([name]) => name);
+  if (placeholders.length > 0) {
+    throw new Error(
+      `refusing to build dist/ from the placeholder defaults (${placeholders.join(", ")} still point at dhwaja.example). ` +
+        "dist/ is what `wrangler pages deploy` ships, and a bundle pointed at a domain nobody owns fails every check it makes. " +
+        "Pass the real origins (API_BASE=… REGISTRY_BASE=… EXTENSION_URL=… APP_URL=…), or set BUILD_OUT_DIR to build a throwaway copy.",
+    );
+  }
+}
+// OAuth client ids (optional). Absent → that provider's button doesn't render.
+// Validate the charset so a value can't break out of the define string.
+// VALIDATED ABOVE `mkdirSync`, like every other refusal in this file: a
+// malformed id used to throw after the directory existed, leaving an empty
+// `dist/` behind — the exact publish-an-empty-site state the placeholder
+// refusal was moved up to prevent (audit v10, B5).
+const googleClientId = process.env.GOOGLE_CLIENT_ID ?? "";
+const appleClientId = process.env.APPLE_CLIENT_ID ?? "";
+// I21-Q152 (D-1030): the sign-up bot check's PUBLIC site keys. Empty (the default) = that widget is off and its
+// script is never requested (main.ts); the server keys are trust-core env (bot-check.ts). Same charset rule as the ids.
+const turnstileSiteKey = process.env.TURNSTILE_SITE_KEY ?? "";
+const solvemediaChallengeKey = process.env.SOLVEMEDIA_CHALLENGE_KEY ?? "";
+const ID_RE = /^[A-Za-z0-9._-]*$/;
+for (const [name, val] of [["GOOGLE_CLIENT_ID", googleClientId], ["APPLE_CLIENT_ID", appleClientId], ["TURNSTILE_SITE_KEY", turnstileSiteKey], ["SOLVEMEDIA_CHALLENGE_KEY", solvemediaChallengeKey]]) {
+  if (!ID_RE.test(val)) throw new Error(`${name} has invalid characters: ${val}`);
+}
+// The browser extension's id, so the SPA can hand it the fan's tier for the
+// one-line readout in its popup (see src/extension-bridge.ts). OPTIONAL:
+// absent ⇒ nothing is ever sent and the extension shows no tier line. Chrome
+// ids are 32 characters from a–p; anything else is rejected rather than spliced
+// into the bundle.
+const extensionId = process.env.EXTENSION_ID ?? "";
+if (extensionId !== "" && !/^[a-p]{32}$/.test(extensionId)) throw new Error(`EXTENSION_ID must be 32 characters a-p, got: ${extensionId}`);
+mkdirSync(out, { recursive: true });
+
+await build({
+  entryPoints: { app: join(root, "src/main.ts") },
+  outdir: out,
+  bundle: true,
+  format: "esm",
+  target: "es2022",
+  minify: true,
+  legalComments: "none",
+  define: {
+    __API_BASE__: JSON.stringify(apiBase),
+    __REGISTRY_BASE__: JSON.stringify(registryBase),
+    __EXTENSION_URL__: JSON.stringify(extensionUrl),
+    __APP_URL__: JSON.stringify(appUrl),
+    __CONSOLE_URL__: JSON.stringify(consoleUrl),
+    __EXAMPLE_VERIFIED_URL__: JSON.stringify(exampleVerifiedUrl),
+    __GOOGLE_CLIENT_ID__: JSON.stringify(googleClientId),
+    __APPLE_CLIENT_ID__: JSON.stringify(appleClientId),
+    __EXTENSION_ID__: JSON.stringify(extensionId),
+    __TURNSTILE_SITE_KEY__: JSON.stringify(turnstileSiteKey),
+    __SOLVEMEDIA_CHALLENGE_KEY__: JSON.stringify(solvemediaChallengeKey),
+  },
+});
+
+// The shipped CSP names the exact origins this SPA may talk to — same pattern
+// as apps/admin/agency/creator-console. The checked-in index.html carries
+// `connect-src 'self'` so an un-built or mis-built file fails CLOSED, and the
+// validated API + registry origins are appended here. The sign-in provider
+// origins ride along only when the matching client id is configured, so a
+// deploy without Google/Apple sign-in grants neither.
+const CONNECT_SRC = "connect-src 'self'";
+const htmlIn = readFileSync(join(root, "index.html"), "utf8");
+if (!htmlIn.includes(CONNECT_SRC)) {
+  throw new Error(`index.html must carry "${CONNECT_SRC}" for the API/registry origins to be appended to it`);
+}
+const connectOrigins = [new URL(apiBase).origin, new URL(registryBase).origin];
+if (googleClientId) connectOrigins.push("https://accounts.google.com");
+if (appleClientId) connectOrigins.push("https://appleid.apple.com");
+writeFileSync(join(out, "index.html"), htmlIn.replace(CONNECT_SRC, `${CONNECT_SRC} ${[...new Set(connectOrigins)].join(" ")}`));
+// `frame-ancestors` is IGNORED inside a <meta http-equiv> CSP — the spec makes
+// it header-only, so every browser drops it and the copy in index.html has
+// never protected anything. This app ships as static assets, so the only place
+// a REAL header can come from is a Cloudflare Pages `_headers` file at the root
+// of the output directory. The meta keeps the directives that do work there;
+// this adds the one that does not. Two policies are enforced as an
+// INTERSECTION, so this can only tighten, never loosen, the meta policy.
+// QUEUE #780-C: the Apple association file has no extension, so Pages would
+// serve it as application/octet-stream; iOS requires JSON. Its rule names the
+// exact path the block below writes.
+const AASA_PATH = "/.well-known/apple-app-site-association";
+// apps/web robots (I23-FX-APPS, JN-08 sibling): a non-production copy of the SPA is not indexed — the same reading of
+// DEPLOY_ENV as trust-core's `isProductionDeploy` (discovery-page.ts): production is exactly the literal "production";
+// unset, empty or anything else de-indexes the copy rather than indexing it.
+const production = process.env.DEPLOY_ENV === "production";
+const ROBOTS_HEADER = production ? "" : "  X-Robots-Tag: noindex, nofollow\n";
+const HEADERS_FILE = `/*\n  Content-Security-Policy: frame-ancestors 'none'\n${ROBOTS_HEADER}${AASA_PATH}\n  Content-Type: application/json\n`;
+writeFileSync(join(out, "_headers"), HEADERS_FILE);
+
+/**
+ * I3-1868: NATIVE APP ASSOCIATION FILES. Android and iOS both refuse to open
+ * a link to this domain inside the app, and both refuse a passkey ceremony
+ * bound to this origin (apps/android/README.md, apps/ios/README.md, DEPLOY.md
+ * "3b-bis"), unless the matching `.well-known` file is served here. Neither
+ * file existed anywhere in the build before this: the endpoint 404'd
+ * regardless of what the operator had configured. Both now always exist —
+ * with an EMPTY target list when the identifiers below are unset, never a
+ * missing file, so the endpoint fails closed rather than fails absent — and
+ * are populated once the operator sets them. Values are validated the same
+ * way every other identifier in this file is: reject a malformed one rather
+ * than splice it into a served file unchecked.
+ */
+const ANDROID_PACKAGE_RE = /^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$/;
+const ANDROID_FINGERPRINT_RE = /^[0-9A-F]{2}(:[0-9A-F]{2}){31}$/;
+const APPLE_APP_ID_RE = /^[A-Z0-9]{10}\.[A-Za-z0-9.-]+$/;
+
+const androidPackageName = process.env.ANDROID_PACKAGE_NAME ?? "";
+if (androidPackageName && !ANDROID_PACKAGE_RE.test(androidPackageName)) {
+  throw new Error(`ANDROID_PACKAGE_NAME is not a valid Java package name: ${androidPackageName}`);
+}
+const androidCertFingerprints = (process.env.ANDROID_SHA256_CERT_FINGERPRINTS ?? "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+for (const fp of androidCertFingerprints) {
+  if (!ANDROID_FINGERPRINT_RE.test(fp)) {
+    throw new Error(`ANDROID_SHA256_CERT_FINGERPRINTS entry is not a colon-separated uppercase SHA-256 hex fingerprint: ${fp}`);
+  }
+}
+if (Boolean(androidPackageName) !== (androidCertFingerprints.length > 0)) {
+  throw new Error(
+    "ANDROID_PACKAGE_NAME and ANDROID_SHA256_CERT_FINGERPRINTS must be set together, or neither: " +
+      "an assetlinks.json entry naming a package with no fingerprint (or a fingerprint with no package) " +
+      "cannot be verified by Credential Manager and would ship as dead configuration.",
+  );
+}
+const appleAppId = process.env.APPLE_APP_ID ?? "";
+if (appleAppId && !APPLE_APP_ID_RE.test(appleAppId)) {
+  throw new Error(`APPLE_APP_ID must be "<10-char Apple Team ID>.<bundle id>", got: ${appleAppId}`);
+}
+
+mkdirSync(join(out, ".well-known"), { recursive: true });
+
+const assetlinks =
+  androidPackageName && androidCertFingerprints.length > 0
+    ? [
+        {
+          // handle_all_urls: Android App Links verification (QUEUE #780-A); which
+          // URLs the app claims is the manifest's intent filter, not this file.
+          relation: ["delegate_permission/common.handle_all_urls", "delegate_permission/common.get_login_creds"],
+          target: {
+            namespace: "android_app",
+            package_name: androidPackageName,
+            sha256_cert_fingerprints: androidCertFingerprints,
+          },
+        },
+      ]
+    : [];
+writeFileSync(join(out, ".well-known", "assetlinks.json"), `${JSON.stringify(assetlinks, null, 2)}\n`);
+
+// QUEUE #780-B: applinks claims ONLY the invite link `<origin>/?ref=<10-char
+// code>` (views.ts referralShareUrl). Every other URL on this origin stays on
+// the web. iOS 13+ `components` form; no legacy `paths` key, which cannot
+// match on the query and would have to claim the whole root path.
+const INVITE_COMPONENT = { "/": "/", "?": { ref: "??????????" } };
+const appleAppSiteAssociation = {
+  applinks: { apps: [], details: appleAppId ? [{ appIDs: [appleAppId], components: [INVITE_COMPONENT] }] : [] },
+  webcredentials: { apps: appleAppId ? [appleAppId] : [] },
+};
+writeFileSync(
+  join(out, ...AASA_PATH.split("/").filter(Boolean)),
+  `${JSON.stringify(appleAppSiteAssociation, null, 2)}\n`,
+);
+
+/**
+ * WHAT THIS ARTIFACT IS. `dist/` is gitignored and CI never builds it, so an
+ * artifact on disk carries no provenance at all — the one in `dist/` was stale
+ * AND built from the placeholder defaults, and nothing on it said either.
+ * `build-meta.json` makes both legible: the origins baked in, and when. The
+ * freshness guard (apps/web/test/dist-freshness.test.ts) reads it, and so can a
+ * human standing over a deploy.
+ */
+writeFileSync(
+  join(out, "build-meta.json"),
+  `${JSON.stringify({ api_base: apiBase, registry_base: registryBase, extension_url: extensionUrl, app_url: appUrl, built_at: new Date().toISOString() }, null, 2)}\n`,
+);
+
+// eslint-disable-next-line no-console
+console.log(`built SPA → ${out}/app.js + index.html (API_BASE=${apiBase}, REGISTRY_BASE=${registryBase})`);
+===== END FILE: apps/web/build.mjs =====
+
+===== BEGIN FILE: apps/web/preview/mock.mjs =====
+// A tiny in-memory backend for the SPA preview — implements exactly the routes
+// the app calls, with sample data, so the whole SPA runs offline (no server).
+// Injected as window.fetch before the bundle loads. NOT shipped; dev-only.
+
+export function makeMockFetch() {
+  const ratings = (bar) => {
+    const o = {};
+    ["reach", "momentum", "demand", "collector_base", "archive_depth", "community", "longevity"].forEach((k, i) => { o[k] = { percentile: Math.max(0, (bar - i * 0.6) / 7), bar: Math.max(1, bar - Math.floor(i / 2)) }; });
+    return o;
+  };
+  const PSP = "psp_00000000000000c7";
+  const routes = {
+    [`GET /p/${PSP}/presentation`]: {
+      passport_id: PSP,
+      tabs: {
+        card: { passport_id: PSP, display_name: "Nova Vega", badge: "verified", founding_rank: null, palette_seed: "0000c700", power_ratings: { ratings: ratings(7) } },
+        links: [
+          { platform: "reddit", handle: "novavega", url: "https://reddit.com/u/novavega", status: "active", touched_by: "creator" },
+          { platform: "x", handle: "nova", url: "https://x.com/nova", status: "active", touched_by: "agency" },
+          { platform: "instagram", handle: "nova.vega", url: null, status: "historical", touched_by: "none" },
+        ],
+        archive: {
+          passport_id: PSP,
+          items: [
+            { release_id: "rel_0000000000000001", title: "Aurora Set", edition: "Deluxe", released_at: "2026-01-02T00:00:00Z", item_count: 12, cover_ref: null, fulfillment_url: "https://shop.example.com/a", manifest_hash: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", claimable: true, owned: true },
+            { release_id: "rel_0000000000000002", title: "Nightfall", edition: null, released_at: "2026-03-11T00:00:00Z", item_count: 8, cover_ref: null, fulfillment_url: "https://shop.example.com/b", manifest_hash: "b".repeat(64), claimable: true, owned: false },
+          ],
+          progress: { owned: 1, total: 2 },
+        },
+        tips: [{ type: "btc", value: "bc1qexampleaddressxxxxxxxxxxxxxxxxxxxxxxxx" }, { type: "cashapp", value: "$novavega" }],
+      },
+    },
+    [`GET /p/${PSP}/card/editions`]: { editions: [{ week: "2026-W32", content_hash: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" }, { week: "2026-W31", content_hash: "1b2b0b822cd15d6c15b0f00a089f86d081884c7d659a2feaa0c55ad015a3bf4f" }] },
+    [`GET /p/${PSP}/card/editions/2026-W32`]: { edition_id: `${PSP}@2026-W32`, week: "2026-W32", passport_id: PSP, display_name: "Nova Vega", badge: "verified", founding_rank: null, palette_seed: "0000c700", population: 1204, content_hash: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08", ratings: ratings(7) },
+    [`GET /p/${PSP}/requests`]: { passport_id: PSP, display_name: "Nova Vega", claim_state: "verified", request_count: 0, milestone: null, next_milestone: null },
+    "GET /collectible/acq_0000000000000000000a": { valid: true, release: { release_id: "rel_0000000000000001", title: "Aurora Set", passport_id: PSP, manifest_hash: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08" }, acquired_at: "2026-02-14T00:00:00Z", holder: "novacollector" },
+    "GET /u/novacollector": { handle: "novacollector", display_name: "Nova Collector", bio: "Collecting since day one.", follower_count: 42, following_count: 17, collection_visible: true, featured: [], achievements: [{ achievement_id: "first_verified_acquisition", awarded_at: "2026-02-14" }, { achievement_id: "collector_10", awarded_at: "2026-04-01" }], collection: { total: 2, items: [{ acquisition_id: "acq_0000000000000000000a", release_id: "rel_0000000000000001", title: "Aurora Set", passport_id: PSP, acquired_at: "2026-02-14" }] } },
+    "GET /requests/top": { top: [{ passport_id: "psp_0000000000000a13", display_name: "Rex Solaris", request_count: 512 }, { passport_id: "psp_00000000000004d9", display_name: "Kit Marlow", request_count: 98 }] },
+    "GET /leaderboards": { generated_at: "2026-08-08T00:00:00Z", season: "2026-Q3", categories: { collector: { all_time: [{ handle: "novacollector", display_name: "Nova Collector", score: 44 }, { handle: "deepcuts", display_name: "Deep Cuts", score: 31 }], season: [] }, archive_collector: { all_time: [{ handle: "deepcuts", display_name: "Deep Cuts", score: 12 }], season: [] }, scout: { all_time: [{ handle: "earlybird", display_name: "Early Bird", score: 9 }], season: [] }, supporter: { all_time: [{ handle: "novacollector", display_name: "Nova Collector", score: 20 }], season: [] }, referrer: { all_time: [], season: [] } } },
+    "POST /account/device": { device_id: "dev_preview", session: "cHJldmlldw.c2ln" },
+    "GET /account/saves": { saves: [{ passport_id: PSP, display_name: "Nova Vega" }] },
+    "GET /account/achievements": { achievements: [{ achievement_id: "first_verified_acquisition", awarded_at: "2026-02-14" }, { achievement_id: "collector_10", awarded_at: "2026-04-01" }, { achievement_id: "founding_fan:psp_0000000000000a13", awarded_at: "2026-05-01" }] },
+    "GET /account/credits": { balance: 175, entries: [] },
+    "GET /account/discover": { suggestions: [{ handle: "deepcuts", display_name: "Deep Cuts", overlap: 4 }, { handle: "earlybird", display_name: "Early Bird", overlap: 2 }] },
+    // Audit item #22: `title` and `release_status`. The second row is WITHDRAWN
+    // — it must render the neutral "no longer listed" chip on #/me and appear
+    // in the featured picker as a disabled row, never silently vanish.
+    "GET /account/acquisitions": {
+      acquisitions: [
+        { acquisition_id: "acq_0000000000000000000a", release_id: "rel_0000000000000001", acquired_at: "2026-02-14", title: "Neon Nights EP", release_status: "published" },
+        { acquisition_id: "acq_0000000000000000000b", release_id: "rel_0000000000000002", acquired_at: "2026-03-02", title: "Withdrawn Demo", release_status: "withdrawn" },
+      ],
+    },
+    // The FOUNDER profile: the server WITHHOLDS both counts (null). Since audit
+    // item #24 removed the auto-follow the remaining followers are real, and the
+    // reason the counts stay null is the SIZE ORACLE — the founder is the one
+    // account with an operational reason to follow broadly, so a published
+    // following count is a live lower bound on the user base. The SPA must
+    // render no counts line at all, never "0 followers".
+    "GET /u/dhwaja": { handle: "dhwaja", display_name: "Dhwaja", bio: "Building the thing.", follower_count: null, following_count: null, collection_visible: true, featured: [] },
+    // `GET /public/config` (whose only field was `founder_disclosure`) was
+    // DELETED with audit item #24 — there is no auto-follow left to disclose,
+    // and the join screen now makes no call at all before rendering.
+    "GET /account/profile": {
+      profile: { handle: "novacollector", display_name: "Nova Collector", bio: "Collecting since day one.", visibility: "public" },
+    },
+    "POST /account/profile": { ok: true, profile: { handle: "novacollector", display_name: "Nova Collector", bio: "Collecting since day one.", visibility: "public" } },
+    // Codex with the CURRENT shape of the data: join numbers are allocated on
+    // CLAIM, so the unclaimed majority has none. The unnumbered rows must show
+    // no chip and must sort after the numbered ones, alphabetically.
+    "GET /account/codex": {
+      entries: [
+        { passport_id: PSP, display_name: "Nova Vega", current_state: "verified", first_state: "unclaimed", discovered_early: true, first_source: "check", first_seen_at: "2026-01-04T00:00:00Z", last_seen_at: "2026-08-01T00:00:00Z", encounter_count: 9, saved: true, collected: true, join_no: 12 },
+        { passport_id: "psp_0000000000000a13", display_name: "Rex Solaris", current_state: "claimed", first_state: "unclaimed", discovered_early: false, first_source: "view", first_seen_at: "2026-03-02T00:00:00Z", last_seen_at: "2026-07-20T00:00:00Z", encounter_count: 3, saved: false, collected: false, join_no: 341 },
+        { passport_id: "psp_00000000000004d9", display_name: "Kit Marlow", current_state: "unclaimed", first_state: "unclaimed", discovered_early: false, first_source: "view", first_seen_at: "2026-05-11T00:00:00Z", last_seen_at: "2026-08-02T00:00:00Z", encounter_count: 1, saved: false, collected: false, join_no: null },
+        { passport_id: "psp_00000000000006f1", display_name: "Ada Bloom", current_state: "unclaimed", first_state: "unclaimed", discovered_early: false, first_source: "save", first_seen_at: "2026-06-01T00:00:00Z", last_seen_at: "2026-08-03T00:00:00Z", encounter_count: 2, saved: true, collected: false, join_no: null },
+      ],
+    },
+    "GET /account/codex/stats": { total: 4, verified: 1, claimed: 1, unclaimed: 2, scouted: 1, collected: 1, saved: 2, logging: true },
+    // registry check
+    "GET /v1/info": { v: 2, width: 2 },
+  };
+
+  return async (url, init) => {
+    const u = new URL(url, "https://mock.local");
+    const key = `${(init && init.method) || "GET"} ${u.pathname}`;
+    if (u.pathname.startsWith("/v1/bucket/")) {
+      // Bucket: pretend the checked reddit account is "claimed". Current
+      // protocol only (I3-1729): GET /v1/bucket/:prefix, body {v, entries}
+      // — the retired GET /v1/b/:prefix.json / {e} shape is not served.
+      return jsonResponse({ v: 2, entries: [{ h: "0".repeat(64), c: "claimed" }, { h: "1".repeat(64), c: "verified" }, { h: "2".repeat(64), c: "unclaimed" }, { h: "3".repeat(64), c: "verified" }, { h: "4".repeat(64), c: "claimed" }, { h: "5".repeat(64), c: "unclaimed" }, { h: "6".repeat(64), c: "verified" }, { h: "7".repeat(64), c: "claimed" }] });
+    }
+    if (key in routes) return jsonResponse(routes[key]);
+    return new Response(JSON.stringify({ error: "not_found" }), { status: 404, headers: { "content-type": "application/json" } });
+  };
+}
+
+function jsonResponse(obj) {
+  return new Response(JSON.stringify(obj), { status: 200, headers: { "content-type": "application/json" } });
+}
+===== END FILE: apps/web/preview/mock.mjs =====
+
+===== BEGIN FILE: apps/web/src/a11y.ts =====
+/**
+ * ACCESSIBILITY PRIMITIVES FOR THE FAN SPA.
+ *
+ * Two things live here, both because the same gap recurred across nine flows
+ * and one dialog (S-008 judge rows PS:PS-323, CL:D-05, CL:M-06):
+ *
+ *  1. `trapFocus` — what a container declaring `role="dialog" aria-modal="true"`
+ *     has to do to be one: focus enters it, Tab stays inside it, the page behind
+ *     is `inert`, Escape closes it, and focus goes back to the control that
+ *     opened it. `showRequestModal` (main.ts) declared all of that in markup and
+ *     implemented none of it.
+ *  2. `announce` — ONE page-level polite live region, in the shell, that the
+ *     router and every outcome writer put their sentence into. The app already
+ *     had per-flow `aria-live` spans, but each flow BLANKED its span and then
+ *     wrote the answer into a bare `<div>` — the regions read healthy to a
+ *     counter and announced nothing.
+ *
+ * Nothing here reads a global `document`: every function works off the node it
+ * is handed (`ownerDocument`), so the whole module is testable in a JSDOM realm
+ * that is not the test runner's.
+ */
+
+/** The shell's single live region (views.ts `shell()`). */
+export const LIVE_REGION_SELECTOR = "[data-live-region]";
+
+/**
+ * The nine outcome holders CL:M-06 enumerates — every `<div data-*-out>` a
+ * flow writes its result into after emptying its transient `aria-live` span.
+ * `put()` (main.ts) announces the card it lands in each of these, so the
+ * announcement cannot be forgotten at a new call site of an existing flow.
+ */
+export const OUTCOME_HOLDERS: readonly string[] = [
+  "[data-removal-out]",
+  "[data-verify-out]",
+  "[data-contest-out]",
+  "[data-recovery-out]",
+  "[data-crecovery-status-out]",
+  "[data-nominate-out]",
+  "[data-email-out]",
+  "[data-passkey-out]",
+  "[data-otp-out]",
+];
+
+/**
+ * Write `text` into the page-level live region.
+ *
+ * Returns `true` when the shell's own region took it. When the region is absent
+ * — a shell-less paint, a view rendered outside the router — the outcome is NOT
+ * dropped: a region is created on `<body>` and the text written there, and the
+ * `false` return is the record that the shell regressed (FAMILY-003: no loss
+ * without a record; the record is the return value a caller and a test can both
+ * see, never a silent success).
+ */
+export function announce(doc: Document, text: string): boolean {
+  const t = text.trim();
+  if (!t) return true; // clearing is not an outcome
+  const existing = doc.querySelector<HTMLElement>(LIVE_REGION_SELECTOR);
+  if (existing) {
+    // Re-set: an identical string assigned twice is not re-announced by AT, so
+    // blank first and write on a REAL next tick — not the same synchronous
+    // call, which is what shipped here (I3-1378): both assignments landed in
+    // one turn, so a reader diffing the accessibility tree asynchronously
+    // never observed the intermediate empty state and the repeat announced
+    // nothing. `setTimeout(…, 0)` is the tick; `ownerDocument`'s window (never
+    // the global) keeps this testable in a realm that is not the test runner's.
+    if (existing.textContent === t) {
+      existing.textContent = "";
+      const win = doc.defaultView;
+      const schedule = win ? win.setTimeout.bind(win) : setTimeout;
+      schedule(() => {
+        existing.textContent = t;
+      }, 0);
+      return true;
+    }
+    existing.textContent = t;
+    return true;
+  }
+  const made = doc.createElement("div");
+  made.setAttribute("data-live-region", "");
+  made.setAttribute("role", "status");
+  made.setAttribute("aria-live", "polite");
+  made.setAttribute("data-live-region-fallback", "");
+  made.textContent = t;
+  doc.body.appendChild(made);
+  return false;
+}
+
+const FOCUSABLE = 'a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex="-1"])';
+
+function focusables(holder: HTMLElement): HTMLElement[] {
+  return [...holder.querySelectorAll<HTMLElement>(FOCUSABLE)];
+}
+
+export interface TrapOptions {
+  /** Where focus goes on open. Default: the first focusable in the holder. */
+  initial?: HTMLElement | null;
+  /** Escape was pressed. The caller closes — the trap never removes the DOM. */
+  onEscape?: () => void;
+  /** Where focus returns on `release()`: the control that opened the dialog. */
+  restoreTo?: HTMLElement | null;
+}
+
+/**
+ * Make `holder` the only reachable part of the page until `release()`.
+ *
+ * The main region (`#app-root`) is marked `inert` and `aria-hidden` so AT and
+ * Tab agree with what `aria-modal="true"` already told AT. `release()` is
+ * idempotent — calling it twice must not leave the page inert or steal focus a
+ * second time.
+ */
+export function trapFocus(holder: HTMLElement, opts: TrapOptions = {}): () => void {
+  const doc = holder.ownerDocument;
+  const main = doc.getElementById("app-root");
+  if (main && !main.contains(holder)) {
+    main.setAttribute("inert", "");
+    main.setAttribute("aria-hidden", "true");
+  }
+  const onKeydown = (ev: Event): void => {
+    const e = ev as KeyboardEvent;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      opts.onEscape?.();
+      return;
+    }
+    if (e.key !== "Tab") return;
+    const items = focusables(holder);
+    if (items.length === 0) return;
+    const first = items[0]!;
+    const last = items[items.length - 1]!;
+    const active = doc.activeElement as HTMLElement | null;
+    if (e.shiftKey && (active === first || !holder.contains(active))) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && (active === last || !holder.contains(active))) {
+      e.preventDefault();
+      first.focus();
+    }
+  };
+  holder.addEventListener("keydown", onKeydown);
+  (opts.initial ?? focusables(holder)[0] ?? holder).focus();
+  let released = false;
+  return (): void => {
+    if (released) return;
+    released = true;
+    holder.removeEventListener("keydown", onKeydown);
+    if (main) {
+      main.removeAttribute("inert");
+      main.removeAttribute("aria-hidden");
+    }
+    opts.restoreTo?.focus();
+  };
+}
+===== END FILE: apps/web/src/a11y.ts =====
+
+===== END OF CHUNK 10 OF 75 =====

@@ -1,0 +1,3397 @@
+DHWAJA CODE REVIEW — tsjs — CHUNK 65 OF 73
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (reporter*), services/trust-core/src (reports*), services/trust-core/src (requests*)
+Files in this chunk (3):
+  - services/trust-core/src/reporter-tier.ts
+  - services/trust-core/src/reports.ts
+  - services/trust-core/src/requests-routes.ts
+
+
+===== BEGIN FILE: services/trust-core/src/reporter-tier.ts =====
+/**
+ * Reporter achievement tiers — the flag-7 decision, as pure logic.
+ * (Decision: claude/PRODUCT-FLAG-DECISIONS.md, flag 7.)
+ *
+ * Pinned rules:
+ *  - advances ONLY on operator-PUBLISHED warnings (the caller counts
+ *    distinct published warnings this account reported BEFORE publication —
+ *    this module never sees reports, only that confirmed count)
+ *  - tiers at 1 / 3 / 10 confirmed
+ *  - label is generic ("Reporter · N confirmed") — NEVER a warning id, so
+ *    the badge can't be worked backward to a specific case
+ *  - display is opt-in via the existing public-profile achievement rules
+ *
+ * NOT A REPORTER BAND, and nothing here feeds triage. These are BADGE tiers,
+ * cut on a count of confirmed reports, and they decorate a fan's public
+ * profile. The thing that weights a report in triage is
+ * `fan_report_reporters.earned_band` (reports.ts `fanReporterBand`), which is a
+ * separate 1/10/100 scale. The word "tier" in this file predates the
+ * `tier_band` → `earned_band` rename and means only "badge rung".
+ */
+
+export const REPORTER_TIERS = [1, 3, 10] as const;
+
+/** Stable achievement id per tier (snapshot semantics — never revoked). */
+export function reporterAchievementId(tier: 1 | 3 | 10): string {
+  return `reporter:${tier}`;
+}
+
+/** Generic public label — deliberately contains no case references. */
+export function reporterLabel(tier: 1 | 3 | 10): string {
+  return `Reporter · ${tier} confirmed`;
+}
+===== END FILE: services/trust-core/src/reporter-tier.ts =====
+
+===== BEGIN FILE: services/trust-core/src/reports.ts =====
+import { canonicalAccount, canonicalize, subjectHash, type CanonicalSubject } from "@dhwaja/canonical";
+import { accountProofStanding, freshProofBounds } from "./account-standing.js";
+import { accountNeedsOwnProof } from "./claims.js";
+import { inChunks, type DbLike, type DbStatement } from "./db.js";
+import { consumeRateLimit, RL_DAY_MS } from "./ratelimit.js";
+import { domainKey, LOOKALIKE_PAIRS } from "./domain-match.js";
+import { GATE_MAX_SLACK } from "./domain-gate.js";
+import { isGenericSkeleton } from "./generic-skeletons.js";
+import { FAN_WEIGHT_RAMP_DAYS } from "./fan-quality.js";
+import { itemPurgeHeldSql, purgeItemEvidenceQuietly, type EvidenceStore } from "./evidence.js";
+import { auditActorKind, auditStmt } from "./review.js";
+import { noticeReportOutcome } from "./digest.js";
+import { mintId } from "./ids.js";
+import { reporterLegalHoldSql } from "./legal-holds.js";
+// THE delisting-shield read — one statement, two legs (snapshot ∪ live join).
+// Never re-implement it here: a fourth spelling of "has this subject asked to be
+// removed?" is how the shield and the importer came to disagree in the first
+// place. See seeding.ts `suppressedKeyStmt`.
+import { suppressedKeyStmt } from "./seeding.js";
+import { servingPerAccountStanding } from "./settings.js";
+import { MINT_BATCH_MAX, mintUnsubscribeTokens, unsubscribeUrl } from "./unsubscribe.js";
+import { emailAddressHash, recordEmailSuppressions, retiredSuppressionLookup, suppressedAddressHashes, suppressionKeyOf, templateSendOnce, type TemplateMailerLike } from "./email.js"; import { logError } from "./log.js"; // JA-11 (I24-FX): one line, so no line below moves
+
+/**
+ * S65 — fan reports → automated triage → human warning.
+ * (Plan + locked decisions: docs/FAN-REPORT-TRIAGE-PLAN.md.)
+ *
+ * Reports are queue rows, never trust events; the ledger is touched only when
+ * an escalated item passes the existing governed warning door. The design in
+ * one line: the crowd reports, the machine deduplicates / safety-checks /
+ * scores, the OPERATOR accuses.
+ *
+ * Locked decisions wired here:
+ *  - A signed-in session is REQUIRED (fan or creator; the route enforces it).
+ *  - Priority = reporter band (1 new / 10 trusted / 100 verified creator)
+ *    × log-scaled distinct-reporter count + evidence boosts.
+ *  - The real-link guard runs FIRST: reporting a proven (claimed/verified)
+ *    account auto-dismisses at intake — a brigade against a real creator
+ *    produces no queue item, no counter, nothing.
+ *  - Reporters are notified when their report ends in a PUBLISHED warning
+ *    (and corrected on a retraction) — never on internal states.
+ *
+ * MONEY DOES NOT BUY WEIGHT (invariant repair, 2026-08-14). The fan band used
+ * to come from the billing tier, so a paying fan's report was triaged 10× ahead
+ * of a free fan's on the very path that produces Reported/Caution. That is the
+ * one thing the paywall invariant exists to prevent, queue order or not. The
+ * band is now EARNED, from signals no one can buy: how long the account has
+ * existed, and whether its past reports were upheld by an operator. See
+ * `fanReporterBand`.
+ *
+ * MONEY MAY BUY ATTENTION (product decision, 2026-08-15). On top of the earned
+ * band there is a SECOND, structurally separate signal — `supporterBoost` /
+ * `fan_report_reporters.supporter_boost` — set when the
+ * reporter held a paid supporter entitlement at report time. It has exactly one
+ * consumer: the ORDER of `reportQueue`. It is deliberately kept out of
+ *
+ *   - `priorityOf`         — the earned score the operator reads as a number;
+ *   - the per-reporter cap — abuse control; a bought cap buys VOLUME, and
+ *                            volume is corroboration one step removed;
+ *   - `caution.ts`         — the `MAX(earned_band) >= 10` corroboration gate that
+ *                            can put a Caution label on a person;
+ *   - everything else that decides PUBLICATION.
+ *
+ * The two signals are separate columns, separate names, separate code paths, on
+ * purpose: a future reader must never be able to confuse "how fast an operator
+ * looks at this" with "how much this counts". The route resolves the boost in
+ * its own narrowly-exempted function (`supporterQueueBoost` in index.ts); this
+ * module only ever receives an already-resolved 0 or 1 and never learns why.
+ * Pinned by tests/invariants/paywall.test.ts and
+ * services/trust-core/test/supporter-queue-priority.test.ts.
+ */
+
+export class ReportError extends Error {
+  override name = "ReportError";
+  constructor(
+    message: string,
+    public readonly status: 400 | 401 | 404 | 409 | 429 = 400,
+  ) {
+    super(message);
+  }
+}
+
+/** Locked throttle caps (reports per UTC day, per reporter), keyed by BAND. */
+export const REPORT_CAPS = { new: 5, trusted: 20, verified_creator: 100 } as const;
+
+/**
+ * Reporter bands. The scale is unchanged (1 / 10 / 100) — only what earns a
+ * band changed, and none of it is purchasable:
+ *
+ *  - `new` (1): every account starts here.
+ *  - `trusted` (10): an account that has been around at least
+ *    `REPORTER_TRUST_MIN_AGE_MS` AND has had at least
+ *    `REPORTER_TRUST_MIN_UPHELD` past report end in an operator-PUBLISHED
+ *    warning. Both are required: age alone is farmable by patience, upheld
+ *    reports alone would let a burner account inherit a band the moment its
+ *    first report lands.
+ *  - `claimed_creator` (10): a claimed passport reports at the trusted band.
+ *  - `verified_creator` (100): a verified passport reporting an account the
+ *    machine believes is impersonating THAT passport. See
+ *    `creatorReporterBand` — band 100 is a statement about a SUBJECT, never a
+ *    standing the session carries around. A verified creator reporting an
+ *    unrelated stranger reports at `claimed_creator`, like anyone else.
+ */
+export const REPORTER_BANDS = { new: 1, trusted: 10, claimed_creator: 10, verified_creator: 100 } as const;
+
+/** #132PS-036 (D-0920): automatic re-opens of a soft-closed item (`reopen_count`)
+ * before only an operator can re-open it (`reopenReport`). */
+export const REPORT_AUTO_REOPEN_MAX = 3;
+
+/** #932c: the ONE item-creation failure that is the subject_hash race. */
+const SUBJECT_HASH_RACE_RE = /UNIQUE constraint failed:\s*fan_report_items\.subject_hash/i;
+
+/** RJ550b-W312-R9-3 (D-0920 option c): the most items one queue read loads. */
+export const REPORT_QUEUE_READ_CEILING = 5000;
+
+/** An account must be at least this old before it can hold the trusted band —
+ * the fan-weight ramp (I3-2058, D-0829: was 7 days). */
+export const REPORTER_TRUST_MIN_AGE_MS = FAN_WEIGHT_RAMP_DAYS * 24 * 60 * 60 * 1000;
+/** ...and must have had at least this many reports upheld by an operator (I3-2058: was 1). */
+export const REPORTER_TRUST_MIN_UPHELD = 2;
+/** I3-2058: an upheld item counts toward a reporter only if that reporter was
+ * among the item's first this-many fan reporters, ordered by
+ * `fan_report_reporters.created_at` then `reporter_id` — piling onto a report
+ * that is about to be published earns nothing. `fanReporterBand` applies it. */
+export const REPORTER_UPHELD_EARLY_RANK = 5;
+
+/**
+ * WHICH PUBLICATION OUTCOMES COUNT AS "UPHELD" for the earned band
+ * (`warning_publications.disposition`, migration 0019).
+ *
+ * This list is the whole repair of a defect that made a FALSE ACCUSATION a
+ * permanent reputation asset. `fanReporterBand` used to count any row in
+ * `warning_publications`, a table with no retraction column that is never
+ * deleted from — so one report that an operator published and then RETRACTED AS
+ * WRONG satisfied `REPORTER_TRUST_MIN_UPHELD` forever and promoted the account
+ * to band 10, which is precisely the `MAX(earned_band) >= 10` key to caution.ts's
+ * machine-publication gate. File one confident false report, get it published,
+ * watch it be corrected, keep the credibility. That is fake activity being
+ * useful, which is the one thing this path may not allow.
+ *
+ *  - `active` — still published. Nothing has questioned it.
+ *  - `resolved_threat` — retracted because the accusation was RIGHT and the
+ *    threat is gone. An operator affirmatively said so at retraction time, and
+ *    it is the outcome a good report is supposed to produce. Excluding it would
+ *    mean the best possible ending destroys the reporter's credit and would push
+ *    operators to leave stale warnings standing rather than penalise a reporter
+ *    who did nothing wrong — a perverse incentive on the CORRECTION path, which
+ *    this system deliberately keeps fast and cheap.
+ *
+ * Everything else is excluded, in the fail-safe direction:
+ * `corrected_false_positive` (we were wrong), `duplicate` (the same subject
+ * counted twice is not two confirmations), `target_disappeared` (nothing was
+ * ever confirmed) and `other` — which is also what migration 0019 backfills
+ * every pre-enum retraction to, so no legacy row can smuggle credit through.
+ *
+ * NOTE THE ASYMMETRY WITH THE PUBLIC BADGE, WHICH IS DELIBERATE AND LOCKED.
+ * `social.ts` counts the same joins for the Reporter achievement and does NOT
+ * subtract retractions, because badges are snapshots and a revocable badge would
+ * leak case outcomes through a public profile. That is a decision about what a
+ * PROFILE says. This is a decision about what the machine is allowed to DO with
+ * it. Same query shape, two consumers, and only one of them can publish an
+ * accusation without an operator — so only one of them is retraction-aware.
+ */
+export const REPORTER_UPHELD_DISPOSITIONS = ["active", "resolved_threat"] as const;
+
+/** Most report-outcome emails one publish may fan out to. Each is an outbound
+ * subrequest, and the Workers per-request subrequest budget is the real limit —
+ * past this the notice is truncated LOUDLY (an audit line), not silently. */
+export const REPORT_NOTICE_MAX_RECIPIENTS = 100;
+/** ...and the wall-clock budget for that whole fan-out inside one waitUntil. */
+export const REPORT_NOTICE_BUDGET_MS = 20_000;
+
+// "dead_code" (flag 22, 2026-08-14): a fan bought a creator-code externally
+// and it was already redeemed/expired on arrival — a distinct commerce-scam
+// signal routed through the same triage, not shoehorned into "scam"/"other".
+// "child_safety" (I16-S4-n131D-22a, D-1030 (1): "Add the category and route it above the normal queue"): sorts
+// ahead of every other item in `compareQueueItems`, whatever the reporter's band.
+export const REPORT_CATEGORIES = ["impersonation", "scam", "dead_code", "stolen_content", "child_safety", "other"] as const;
+export type ReportCategory = (typeof REPORT_CATEGORIES)[number];
+
+/**
+ * THE QUESTION THE STAGE 1 SHIELD ANSWERS, and the only question it answers.
+ *
+ * "This account really is that creator" REFUTES an impersonation claim. It is a
+ * non-sequitur to every other category: a verified creator running a `scam`,
+ * reposting `stolen_content`, or holding a `dead_code` link is a report ABOUT A
+ * REAL ACCOUNT, and it is true and irrelevant that the account is really theirs.
+ * The shield returned above the only place `category` is ever consumed (the
+ * reporter-row INSERT), so the category was parsed, validated, and thrown away:
+ * no item row, no counter, no queue entry, and the fan was answered
+ * `real_account`, which reads as "handled". The report never reached a human.
+ *
+ * Read ONCE, at the shield's single gate below, so the two returns inside it can
+ * never disagree about which categories are covered (D-0556).
+ */
+export const SHIELDED_CATEGORIES: readonly ReportCategory[] = ["impersonation"];
+
+/**
+ * The ORDERING-ONLY supporter signal. 0 = none, 1 = the reporter held a paid
+ * supporter entitlement at report time.
+ *
+ * It is a FLAG, never a magnitude, and the item-level aggregate is MAX(): ten
+ * paying reporters nudge an item exactly as far as one, so money cannot be
+ * stacked. It reaches exactly one consumer — `compareQueueItems` — and it never
+ * touches the earned band, the cap, `priorityOf`, or corroboration.
+ */
+export type SupporterQueueBoost = 0 | 1;
+
+export interface Reporter {
+  kind: "fan" | "creator";
+  id: string; // account_id (fan) or passport_id (creator)
+  /**
+   * EARNED band (REPORTER_BANDS), resolved by the route at report time. This is
+   * what a report is WORTH: it drives the daily cap, the priority score, and
+   * caution.ts's corroboration gate. Nothing purchasable may ever feed it.
+   */
+  band: number;
+  /**
+   * PURCHASED queue-order nudge, resolved SEPARATELY by the route (see
+   * `supporterQueueBoost` in index.ts). This is how soon an operator LOOKS at
+   * the report — never how much it counts. Absent/unknown ⇒ no boost.
+   */
+  supporterBoost?: SupporterQueueBoost;
+}
+
+/**
+ * The EARNED band for a fan reporter — the money-free replacement for the
+ * billing-tier lookup the route used to do.
+ *
+ * "Upheld" reuses the repo's already-pinned definition of a confirmed report
+ * (social.ts, flag 7): a DISTINCT operator-published warning reached through
+ * this fan's report item, where the fan's report PREDATES the publication — a
+ * report filed after the accusation was already public confirmed nothing.
+ * Reading `warning_publications` keeps this a derive-from-log read; there is no
+ * score column anyone can write to.
+ *
+ * ...AND the publication must still stand, or have been retracted with an
+ * operator saying the accusation was right (`REPORTER_UPHELD_DISPOSITIONS`,
+ * migration 0019). A publication the operator later corrected as a FALSE
+ * POSITIVE buys nothing, ever again. The filter is on a column of the
+ * PUBLICATION ROW rather than a join back to the mutable `review_queue`, so
+ * what is read here is the fact recorded at retraction time and not the current
+ * state of a queue row anything could edit.
+ *
+ * Fail-safe direction: anything unreadable (missing account row, unparseable
+ * timestamp) yields the `new` band. An error here must lower a reporter's
+ * priority, never raise it.
+ */
+export async function fanReporterBand(db: DbLike, accountId: string, nowMs: number): Promise<number> {
+  const upheld = await db
+    .prepare(
+      // I3-2041 (I22): the publication is reached through the review item's OWN record of which report it
+      // came from (`review_queue.payload.fan_report_item`, written once at escalation), not through
+      // `fan_report_items.review_item_id` — a single pointer a re-escalation overwrites and a rejection
+      // nulls, which took an earlier upheld publication out of the reporter's count. One report item still
+      // counts once, however many publications it reached.
+      `SELECT COUNT(DISTINCT i.item_id) AS n
+         FROM fan_report_reporters fr
+         JOIN fan_report_items i ON i.item_id = fr.item_id
+         JOIN review_queue rq ON rq.item_type = 'report' AND json_extract(rq.payload, '$.fan_report_item') = i.item_id
+         JOIN warning_publications wp ON wp.item_id = rq.item_id
+        WHERE fr.reporter_kind = 'fan' AND fr.reporter_id = ? AND fr.created_at <= wp.published_at
+          AND wp.disposition IN (${REPORTER_UPHELD_DISPOSITIONS.map(() => "?").join(", ")})
+          AND (SELECT COUNT(*) FROM fan_report_reporters e
+                WHERE e.item_id = fr.item_id AND e.reporter_kind = 'fan'
+                  AND (e.created_at < fr.created_at OR (e.created_at = fr.created_at AND e.reporter_id < fr.reporter_id))) < ?`,
+    )
+    .bind(accountId, ...REPORTER_UPHELD_DISPOSITIONS, REPORTER_UPHELD_EARLY_RANK)
+    .first<{ n: number }>();
+  if ((upheld?.n ?? 0) < REPORTER_TRUST_MIN_UPHELD) return REPORTER_BANDS.new;
+  const acct = await db.prepare("SELECT created_at FROM accounts WHERE account_id = ?").bind(accountId).first<{ created_at: string }>();
+  const bornMs = acct ? Date.parse(acct.created_at) : NaN;
+  if (!Number.isFinite(bornMs) || nowMs - bornMs < REPORTER_TRUST_MIN_AGE_MS) return REPORTER_BANDS.new;
+  return REPORTER_BANDS.trusted;
+}
+
+// ---------- the CREATOR band is a fact about the SUBJECT ----------
+
+/** The minimum a canonicalized subject has to look like for the band + evidence
+ * helpers below. `canonicalize()` / `canonicalAccount()` both produce it. */
+export interface SubjectRef {
+  canonical: string;
+  platform: string;
+  id: string;
+  idKind: string;
+}
+
+/**
+ * The machine's answer to "who does this reported subject appear to be
+ * impersonating?", together with the evidence bundle that answer came from.
+ *
+ * Extracted so ONE scan serves both consumers that need it — the creator band
+ * below and the evidence attached at item creation — instead of the same
+ * O(verified accounts) comparison running twice for the same request.
+ */
+export interface Lookalike {
+  suspected_passport_id: string | null;
+  /** Exactly what `fan_report_items.evidence` should hold, or null for "nothing
+   * worth attaching" (which is also the signal that no UPDATE is due). */
+  evidence: Record<string, unknown> | null;
+}
+
+/**
+ * The HOST a subject should be scored against verified brand domains, or null
+ * when the subject is a handle and belongs to the handle scorer instead.
+ *
+ * A `domain` subject IS its host. A `link` subject (M3 Tier-2: a profile URL on
+ * a platform we do not model) carries one: `linkSubjectFromUrl` builds its id as
+ * `host[:port][path][?query]`, so the host is everything before the first `/`,
+ * `?` or `:`. That is READ OFF the norm the canonicalizer built rather than
+ * re-derived from the raw URL — a second copy of an identity rule is how one
+ * page becomes two subjects, and the canonicalizer is deliberately the only
+ * place that decides what a host is.
+ *
+ * Why a link is scored on its host at all: the whole point of the brand scorer
+ * is phishing lookalikes, and a Tier-2 impersonator's page lives on a lookalike
+ * HOST (`paypa1.com/login`). Before link subjects were reportable, `fileReport`
+ * reached that evidence by throwing the page away and reporting the domain —
+ * which is the defect this replaces. Keeping the SUBJECT the page and the SCAN
+ * the host gets both: the item identifies the reported profile, and the operator
+ * still sees "this host resembles PayPal".
+ */
+function brandHostFor(subject: SubjectRef): string | null {
+  if (subject.idKind === "domain") return subject.id;
+  if (subject.platform !== "link") return null;
+  const host = subject.id.split(/[/?:]/, 1)[0] ?? "";
+  return host.length > 0 ? host.toLowerCase() : null;
+}
+
+/** Run the no-network lookalike comparison for one subject. Handle subjects go
+ * through `findLookalike`; DOMAIN and generic-LINK subjects through
+ * `findDomainLookalike` on their host, plus the punycode flag beside a match.
+ * Never throws for a caller that wants a plain answer — the callers here wrap
+ * it, exactly as attach*Evidence always did.
+ *
+ * `domain_punycode` is a TRIAGE signal only, and it is set ONLY beside a
+ * `domain_similarity` match (I3-0304): it says the host that resembles a
+ * verified party is spelled with an `xn--` label, worth +40 in `priorityOf`
+ * (which pays it only beside that match) and a line in the operator's pane. A
+ * host with an `xn--` label that resembles no verified party gets no evidence
+ * at all — an internationalized name is not a signal by itself. It is NOT a publication key —
+ * `caution.ts CAUTION_STRONG_KINDS` requires a resemblance to a NAMED verified
+ * party, so a legitimate creator platform on an internationalized domain can
+ * never be machine-cautioned for its script alone. */
+export async function lookalikeFor(db: DbLike, subject: SubjectRef, nowMs: number): Promise<Lookalike> {
+  const host = brandHostFor(subject);
+  if (host !== null) {
+    const ev = await findDomainLookalike(db, host, nowMs);
+    const punycode = host.split(".").some((l) => l.startsWith("xn--"));
+    if (!ev) return { suspected_passport_id: null, evidence: null };
+    const evidence: Record<string, unknown> = { domain_similarity: ev };
+    if (punycode) evidence.domain_punycode = true;
+    return { suspected_passport_id: ev.suspected_passport_id ?? null, evidence };
+  }
+  const ev = await findLookalike(db, subject.platform, subject.id);
+  return ev ? { suspected_passport_id: ev.suspected_passport_id, evidence: { handle_similarity: ev } } : { suspected_passport_id: null, evidence: null };
+}
+
+/**
+ * THE BAND-100 DECISION, as a pure function of (who is reporting, who the
+ * machine thinks the subject is pretending to be).
+ *
+ * WHAT THIS REPAIRS. `POST /report` used to resolve the creator band from the
+ * SESSION alone — `claim_state === 'verified' ? 100 : 10` — and never looked at
+ * the report TARGET at all. So a verified creator got top reporter credibility
+ * against ANY account in the world, including one that had nothing to do with
+ * them. Band 100 is not a small thing to hand out: it is a 100/day cap instead
+ * of 20, it dominates `priorityOf` (whose own docblock promises that 50k bot
+ * reports never outrank one verified creator's single report), the operator
+ * queue renders it as the words "top band verified creator (100)", and — the
+ * one that has no human in it — it is half of caution.ts's machine-publication
+ * gate, so one verified creator plus any one other account puts a public Caution
+ * on a stranger with no operator ever looking. The comment on `REPORTER_BANDS`
+ * calls 100 "reserved for operator-vetted identities", and that is a statement
+ * about the REPORTER. It was silently being read as a statement about the
+ * report.
+ *
+ * So the band is now relational. `verified_creator` means "the machine believes
+ * this subject is impersonating YOU" — the one situation in which a verified
+ * creator genuinely is the best-informed reporter alive about this account, and
+ * the situation the 100/day cap was written for (a creator under an
+ * impersonation wave). Every other report a creator files is
+ * `claimed_creator` (10): still trusted, still above a new fan, never a
+ * publication key on its own.
+ *
+ * The SESSION still supplies the ceiling — a merely-claimed passport never
+ * reaches 100 whatever the subject looks like — and the caller applies it.
+ */
+export function creatorBandForSuspect(passportId: string, suspectedPassportId: string | null): number {
+  return typeof suspectedPassportId === "string" && suspectedPassportId.length > 0 && suspectedPassportId === passportId
+    ? REPORTER_BANDS.verified_creator
+    : REPORTER_BANDS.claimed_creator;
+}
+
+/**
+ * `creatorBandForSuspect` with the lookup in front of it, so the decision is
+ * callable and testable without the router. The suspected passport comes from
+ * the EXISTING `fan_report_items` row when the subject has already been
+ * reported (that is the machine's standing answer for this subject, computed
+ * once at item creation), and from a fresh lookalike scan when it has not.
+ *
+ * `fileReport` does not call this — it holds the same two inputs already and
+ * calls `creatorBandForSuspect` directly, so filing a report never pays for the
+ * scan twice. This entry point exists for everything else, and the two share
+ * the decision itself rather than a copy of it.
+ */
+export async function creatorReporterBand(db: DbLike, passportId: string, subject: SubjectRef, nowMs: number = Date.now()): Promise<number> {
+  const hash = await subjectHash(subject.canonical);
+  const row = await db.prepare("SELECT suspected_passport_id FROM fan_report_items WHERE subject_hash = ?").bind(hash).first<{ suspected_passport_id: string | null }>();
+  if (row) return creatorBandForSuspect(passportId, row.suspected_passport_id);
+  let found: Lookalike;
+  try {
+    found = await lookalikeFor(db, subject, nowMs);
+  } catch {
+    return REPORTER_BANDS.claimed_creator; // fail DOWN: an unreadable scan never mints a 100
+  }
+  return creatorBandForSuspect(passportId, found.suspected_passport_id);
+}
+
+export interface ReportOutcome {
+  /** D-1067(1): a repeat filing by the same reporter answers `recorded`, as the suppression drop path must (it keeps no
+   * record of the subject, so it cannot tell a repeat). TP-06's `duplicate` answer was that oracle. */
+  result: "recorded" | "real_account";
+  item_id?: string;
+}
+
+/** Per-target daily velocity cap: beyond this many counted reports per day on
+ * ONE item, further reports are accepted (200, no oracle) but not recorded —
+ * a bot farm can't stuff one item's counter, and the log scale + tier bands
+ * bound whatever gets through. */
+export const TARGET_DAILY_CAP = 1000;
+
+const NOTE_MAX = 240;
+/** S6-15 (I59-TEXT): every Unicode Bidi_Control code point (12; not \p{Cf}, which also holds U+200D ZERO WIDTH JOINER). */
+const BIDI_CONTROL_RE = /\p{Bidi_Control}/gu;
+
+/**
+ * Stage 0–3 in one call: canonicalize, real-link guard, throttle, dedup +
+ * count, cheap evidence. The route resolves the session → Reporter first.
+ */
+export async function fileReport(
+  db: DbLike,
+  // REASSIGNED ONCE, on purpose (see the creator-band block below): the band a
+  // creator SESSION arrives with is a ceiling, and the SUBJECT decides whether
+  // it is granted. Rebinding here rather than threading a second variable is
+  // what keeps every downstream consumer — the cap, the stored `earned_band`,
+  // the queue aggregate — reading the one resolved number with no edit at all.
+  reporter: Reporter,
+  input: { url: string; category: string; note?: string },
+  nowMs: number,
+  now: () => string = () => new Date().toISOString(),
+): Promise<ReportOutcome> {
+  // Canonicalize exactly like every check surface — no free-form subjects.
+  let subject: CanonicalSubject;
+  try {
+    subject = canonicalize(String(input.url ?? ""));
+  } catch {
+    throw new ReportError("that link is not a supported profile", 400);
+  }
+  // A known-platform profile is a handle/pid subject and is reported as itself.
+  //
+  // A GENERIC `link` IS NOW REPORTED AS A LINK (audit MEDIUM, 2026-08-26). This
+  // block used to fold `link` in with `url|norm` and re-key BOTH onto
+  // `canonicalAccount("domain", "domain", host)`, discarding the reported page
+  // and leaving a 240-char note as its only trace. Three consequences, all bad:
+  //
+  //   - EVERY impostor on one unmodeled host collapsed onto a SINGLE item. Two
+  //     reporters naming two DIFFERENT scammers on `linktree-ish.example` read
+  //     as two-reporter corroboration of ONE subject — which is precisely the
+  //     input `caution.ts`'s publication gate counts.
+  //   - the machine then compared the WHOLE HOST against verified brand domains,
+  //     so a legitimate platform was a report pair away from an amber caution on
+  //     the entire domain (and every creator hosted on it).
+  //   - the operator got a row whose subject was a platform, with no way to
+  //     reach the profile that was actually reported.
+  //
+  // The canonicalizer already mints a registerable, fan-checkable `link` subject
+  // for exactly this shape, `removal.ts` already treats a link as a first-class
+  // removable subject, and the seed path lists links under the same key — so a
+  // link report needs no new subject kind, only that this function stop throwing
+  // one away. The brand scan is not lost: `lookalikeFor` scores a link on its
+  // HOST (see `brandHostFor`), so `paypa1.com/login` still produces
+  // `domain_similarity` evidence pointing at PayPal — attached to the PAGE.
+  //
+  // `url|norm` (the terminal "not listed" form) still folds to a domain, but
+  // ONLY when the reporter named a BARE ROOT — which is a domain report and
+  // always was. Everything else that lands on `url|norm` is a URL the
+  // canonicalizer refused to treat as an identity — a shortener's opaque
+  // redirect code, an IP/internal host, a CONTENT url on a platform we do model
+  // (`youtube.com/watch?v=…`) — and folding those onto their host is the same
+  // collapse under a different name: `bit.ly/a` and `bit.ly/b` are not two
+  // reports about `bit.ly`. Those are refused, with the same 400 an unsupported
+  // link has always returned.
+  //
+  // Bare-root-ness is READ OFF the canonical the canonicalizer produced rather
+  // than re-decided here: `buildNorm` composes a url|norm id as
+  // `host[:port][path][?query]`, so a root is exactly an id carrying no path and
+  // no query. Re-implementing `hasProfilePath` would be a second copy of an
+  // identity rule, which is how one page becomes two subjects.
+  let isDomain = false;
+  if (subject.platform === "url" || subject.idKind === "norm") {
+    if (subject.id.includes("/") || subject.id.includes("?")) {
+      throw new ReportError("that link is not a supported profile", 400);
+    }
+    const host = domainFromUrl(String(input.url ?? ""));
+    let domSubject = null;
+    if (host) {
+      try {
+        domSubject = canonicalAccount("domain", "domain", host);
+      } catch {
+        domSubject = null;
+      }
+    }
+    if (!domSubject) throw new ReportError("that link is not a supported profile", 400);
+    subject = domSubject;
+    isDomain = true;
+  }
+  const category = REPORT_CATEGORIES.includes(input.category as ReportCategory) ? (input.category as ReportCategory) : null;
+  if (!category) throw new ReportError("unknown category", 400);
+  // Notes are served to the operator console: strip every markup-relevant
+  // char and every bidi control, not just angle brackets, and clamp hard.
+  const note = typeof input.note === "string" ? input.note.replace(/[<>&"'`]/g, "").replace(BIDI_CONTROL_RE, "").slice(0, NOTE_MAX).trim() : null;
+
+  const hash = await subjectHash(subject.canonical);
+
+  // STAGE 1 — real-link guard, before anything is written. A proven account
+  // (claimed or verified passport, ACTIVE row) cannot be reported: friendly
+  // response, no row, no counter. Unclaimed listings are NOT proven → the report
+  // proceeds.
+  //
+  // 'historical' NO LONGER SHIELDS. It used to, on the reasoning that "a
+  // creator's old handle is still theirs" — which is true of the HISTORY and
+  // false of the HANDLE. `historical` is the status an operator correction
+  // (`revoke_account`, `events.ts` correction case / `fold.ts`) gives a row.
+  // The account is no
+  // longer this creator's: the name can be back in the platform's pool, free to
+  // be re-registered by anyone, and re-registered old handles of
+  // known creators are a staple impersonation vector precisely because the
+  // audience remembers them. Shielding it meant the one account most likely to be
+  // an impostor was the one report the product refused to accept — and the shield
+  // fired on the OLD holder's passport, so the impostor was protected by their
+  // victim's own listing. The history stays in the ledger and on the passport
+  // page; it just stops answering "this is really them" about a handle that is
+  // not theirs any more.
+  //
+  // The passport id comes back with it (same statement, same shape, same cost):
+  // the per-account proof read below has to ask about a PAIR, and re-deriving the
+  // owner would be a second statement inside the branch this block is careful
+  // about. `account_key` is `passport_accounts`' primary key, so there is at most
+  // one owner to return.
+  const proven = await db
+    .prepare(
+      `SELECT a.passport_id AS passport_id FROM passport_accounts a JOIN passports p ON p.passport_id = a.passport_id
+       WHERE a.account_key = ? AND a.status = 'active'
+         AND p.retracted = 0 AND p.claim_state IN ('claimed','verified') LIMIT 1`,
+    )
+    .bind(subject.canonical)
+    .first<{ passport_id: string }>();
+
+  // STAGE 1b — THE DELISTING SHIELD. Runs UNCONDITIONALLY (never inside the
+  // `proven` branch) and is deliberately unfiltered by account status and by
+  // retraction, exactly as `nominations.ts` does it: any link at all from this
+  // key to a suppressed passport means that person asked to leave.
+  //
+  // WHAT IT REPAIRS. STAGE 1 shielded on `claim_state IN ('claimed','verified')`
+  // with no suppression filter, so the three states had three signatures:
+  //
+  //   live claimed/verified   /is 200   /report {"result":"real_account"}
+  //   never listed            /is 404   /report {"result":"recorded"}
+  //   SUPPRESSED c/v          /is 404   /report {"result":"real_account"}  <-- unique
+  //
+  // The input is a HANDLE OR URL — precisely what an attacker already has — a
+  // free fan session is the only requirement, and the route carries no per-IP
+  // cap, so a dictionary sweep against the harassment opt-out (the highest-stakes
+  // population in the product) cost nothing (review LAUNCH-BLOCKING 1).
+  //
+  // WHY NOT JUST ADD `request_suppressions` TO THE SHIELD QUERY. Because that
+  // makes a delisted person REPORTABLE: their reports would start being accepted
+  // and counted, `caution.ts` would begin to see them, and a removal request
+  // would end in the product accusing the person who filed it. The shape is
+  // `nominations.ts` fileNomination's instead — CONSTANT WORK, DROP SILENTLY,
+  // RETURN THE NEVER-LISTED ANSWER. See the drop block below.
+  //
+  // IT IS `seeding.ts` `suppressedKeyStmt`, NOT A FOURTH COPY OF THE JOIN. This
+  // shield used to run the LIVE join here, and that join hangs off a pointer
+  // `account_transferred` MOVES: one transfer off the delisted passport made the
+  // shield stop firing, so the person who asked to leave became reportable again
+  // (audit HIGH, 2026-08-26). The shared statement is a UNION over the
+  // `suppressed_account_keys` snapshot and that same live join, so the shield
+  // survives the row moving — and it is still exactly ONE read, which is the
+  // constant-work property `suppression-oracles.test.ts` measures on the wire
+  // rather than in the body.
+  const suppressed = await suppressedKeyStmt(db, subject.canonical).first<{ x: number }>();
+  const drop = suppressed !== null;
+
+  // `!drop` gates the branch and not just its RETURN: the per-account proof
+  // reads below happen only on the `proven` path, so entering it for a
+  // suppressed subject would have spent one to three D1 statements a
+  // never-listed subject never spends — the same oracle, moved off the
+  // response and onto the wire.
+  // The shield is gated on the QUESTION as well as on the answer. A category it
+  // cannot speak to skips the whole branch, which also means such a report spends
+  // exactly the statements a never-listed subject spends — the suppressed and
+  // never-listed paths already skip it, so this adds a third skipper and takes
+  // nothing off the wire that the oracle guard measures.
+  if (proven && !drop && SHIELDED_CATEGORIES.includes(category)) {
+    // An ASSERTED account never shields (mirror of the registry serving gate):
+    //  - a DOMAIN is "real" only once it passed DNS control-proof (S76);
+    //  - a generic LINK is the same case — `events.ts account_added` lets only an
+    //    operator/system LIST one precisely because its control is proven
+    //    separately, so a seeded Tier-2 link must carry its own proof before it
+    //    can silence a report (this is now reachable: link subjects are reported
+    //    as links rather than folded onto their host);
+    //  - a CREATOR/AGENCY-added handle is "real" only once THAT account passed a
+    //    per-account bio-code/OAuth proof — else a creator could self-attest a
+    //    famous handle and have every report against it auto-dismissed.
+    // "Asserted" is the unforgeable actor_kind of the add, NOT the client label
+    // (S101 review HIGH).
+    //
+    // …and with the per-account standing model ON, NOTHING shields at passport
+    // level: every account has to carry its own current proof. The shield is the
+    // strongest thing this route does — it silently refuses a fan's report — and
+    // a shield that fires on an OSINT seed nobody ever confirmed refuses reports
+    // about an account that may not be the creator's at all. A poisoned seed was
+    // one unrelated bio code away from being unreportable. Gated on the same
+    // operator setting as the registry's (`servingPerAccountStanding`) so the two
+    // can never disagree about which accounts are covered.
+    const perAccountProof = await servingPerAccountStanding(db);
+    const needsOwnProof = isDomain || (await accountNeedsOwnProof(db, subject.canonical, perAccountProof));
+    if (!needsOwnProof) return { result: "real_account" };
+    // ONE read, replacing the two inline `EVER` probes — and it asks the two
+    // questions those could not. THE PAIR: the proof must belong to the passport
+    // that holds this row today, so an impostor who acquired the handle does not
+    // inherit the shield the real creator earned (that is the whole handle-
+    // transfer defect, and it landed HERE first: the shield is what makes a
+    // hijacked account unreportable). STILL CURRENT: a proof from years ago says
+    // nothing about who reads the DMs now.
+    //
+    // STATEMENT COUNT. This branch is entered only when `proven` is non-null AND
+    // the subject is not suppressed, which is why `!drop` gates the branch and
+    // not merely its return — a suppressed subject and a never-listed subject
+    // both skip it entirely, so the drop-absorb block below has nothing here to
+    // mirror and the oracle guard's read sequences stay identical. See the note
+    // above `suppressed`.
+    if ((await accountProofStanding(db, proven.passport_id, subject.canonical, nowMs)) === "proven_current") return { result: "real_account" };
+  }
+
+  // STAGE 2a — THE ITEM ROW, READ ONCE AND READ EARLY. It used to be read after
+  // the throttle, which was fine while dedup was its only consumer. It has two
+  // now: the creator band immediately below has to be resolved BEFORE the cap is
+  // computed, because the cap follows the band. Same statement, one extra column
+  // (`suspected_passport_id` — the machine's standing answer about this subject,
+  // written once at item creation), and it is read unconditionally, so the
+  // suppressed and never-listed paths still spend it identically.
+  let item = await db.prepare("SELECT item_id, state, suspected_passport_id FROM fan_report_items WHERE subject_hash = ?").bind(hash).first<{ item_id: string; state: string; suspected_passport_id: string | null }>();
+
+  // The lookalike scan, MEMOIZED. Three places want the machine's opinion about
+  // this subject — the creator band, the evidence attached to a brand-new item,
+  // and the drop path's work mirror — and it is one O(verified accounts) scan,
+  // so it runs at most once per request and only when there is no item row to
+  // read the answer off.
+  let scanned: Lookalike | null = null;
+  const lookalike = async (): Promise<Lookalike> => (scanned ??= await lookalikeFor(db, subject, nowMs));
+
+  // STAGE 2b — THE CREATOR BAND, RESOLVED AGAINST THE SUBJECT (see
+  // `creatorBandForSuspect` for the whole argument). A verified creator session
+  // arrives at band 100; it KEEPS it only for an account the machine believes is
+  // impersonating that same passport, and drops to `claimed_creator` for
+  // everyone else. Nothing here can raise a band — `Math.min` against what the
+  // session already carried is implicit, since 100 is the only value this
+  // branch is entered with and `creatorBandForSuspect` returns 100 or 10.
+  //
+  // Placed before the throttle deliberately: `REPORT_CAPS.verified_creator`
+  // (100/day) exists for a creator drowning in impersonations of THEMSELVES, and
+  // a creator reporting strangers has no claim on it.
+  if (reporter.kind === "creator" && reporter.band >= REPORTER_BANDS.verified_creator) {
+    let suspect: string | null = item ? item.suspected_passport_id : null;
+    if (!item) {
+      try {
+        suspect = (await lookalike()).suspected_passport_id;
+      } catch {
+        suspect = null; // fail DOWN: an unreadable scan never mints a 100
+      }
+    }
+    reporter = { ...reporter, band: creatorBandForSuspect(reporter.id, suspect) };
+  }
+
+  // Reporter throttle (locked caps). Key includes the kind so a person with a
+  // fan AND a creator session gets two small buckets, not one big one.
+  const cap = reporter.band >= REPORTER_BANDS.verified_creator ? REPORT_CAPS.verified_creator : reporter.band >= REPORTER_BANDS.trusted ? REPORT_CAPS.trusted : REPORT_CAPS.new;
+  if (!(await consumeRateLimit(db, `rpt:${reporter.kind}:${reporter.id}`, nowMs, cap))) {
+    throw new ReportError("report limit reached for today", 429);
+  }
+
+  // Per-target velocity cap — accepted-but-uncounted beyond it (no oracle).
+  if (!(await consumeRateLimit(db, `rptvel:${hash}`, nowMs, TARGET_DAILY_CAP))) {
+    return { result: "recorded" };
+  }
+
+  const ts = now();
+  // STAGE 2 — dedup + count. One item per subject hash (read at STAGE 2a above);
+  // the reporter PK makes double-reporting idempotent; distinct_reporters is an
+  // honest recount.
+
+  // ---- SUPPRESSED: CONSTANT WORK, THEN THE NEVER-LISTED ANSWER --------------
+  // Equal response bodies are not enough; the WORK has to match too, or one
+  // request against a named person separates "delisted" from "genuinely
+  // unknown" by latency alone. So every statement the recorded path would spend
+  // from here on is spent — the real reads run for real (the item lookup and the
+  // evidence scan, which branch on facts that are identical for a never-listed
+  // subject), and each WRITE becomes one absorbing upsert against a per-reporter
+  // sink key with a cap it can never reach.
+  //
+  // RESIDUAL, STATED. The absorbing writes are `INSERT rate_limits`, not
+  // `INSERT fan_report_items` / `fan_report_reporters` — equal in count and cost,
+  // distinguishable only to something that can read the statement text, which is
+  // the same trade `nominations.ts absorb` makes. (The old "3 then 2" residual
+  // for a reporter filing the SAME report twice is gone: since I3-1280 the
+  // recorded path always issues its three-statement reporter batch, and the
+  // re-open UPDATE simply matches no row the second time.)
+  if (drop) {
+    // D-1067(1): spent whether or not an item row exists, because the recorded path now spends its creation work on
+    // every filing (a real INSERT for a new item, absorbed writes for an existing one) — gated on `!item`, a subject
+    // reported before its delisting spent less here than a never-listed subject someone else had reported.
+    await absorb(db, reporter, nowMs); // mirrors INSERT fan_report_items
+    // The evidence scan runs FOR REAL — same statement, same inputs, same
+    // decision a never-listed subject's scan would reach — and only its
+    // conditional UPDATE is absorbed.
+    try {
+      // The predicate is `attachEvidence`'s OWN, because it is literally the
+      // same call: `lookalikeFor` decides once whether there is anything worth
+      // attaching (a resemblance to a verified party; since I3-0304 a bare
+      // `xn--` label with no such match attaches nothing), and only the
+      // conditional UPDATE is absorbed. Memoized, so a creator whose band was
+      // already resolved from this scan does not pay for a second one.
+      if ((await lookalike()).evidence !== null) await absorb(db, reporter, nowMs);
+    } catch {
+      /* best-effort, exactly as attachEvidence treats it */
+    }
+    // Mirrors the recorded path's reporter batch, statement for statement (REPORTER_BATCH_WRITES), in ONE atomic
+    // round trip, as there (I3-1280).
+    await absorbBatch(db, reporter, nowMs, REPORTER_BATCH_WRITES);
+    // The never-listed answer, and NO item_id: a case ref for a report that was
+    // never filed would be a second oracle wearing the first one's clothes.
+    return { result: "recorded" };
+  }
+
+  if (!item) {
+    // Dashed UUID shape (pinned by evidence.ts ITEM_ID_RE and apps/web
+    // CASE_REF_RE), but a v4 — this is the case ref a reporter holds, and a
+    // uuid7 would have dated their report to the millisecond inside it.
+    const id = `rpt_${crypto.randomUUID()}`;
+    // Races collapse on the UNIQUE(subject_hash): the loser re-reads.
+    // #932c (I16-W10B): ONLY the subject_hash UNIQUE collision is that race;
+    // any other fault (a D1 outage, a CHECK) propagates to the door's 500
+    // instead of being answered 409 "could not record the report".
+    let created = false;
+    try {
+      await db
+        .prepare("INSERT INTO fan_report_items (item_id, subject_hash, canonical, platform, handle, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .bind(id, hash, subject.canonical, subject.platform, subject.id, ts, ts)
+        .run();
+      item = { item_id: id, state: "open", suspected_passport_id: null };
+      created = true;
+    } catch (e) {
+      if (!SUBJECT_HASH_RACE_RE.test(e instanceof Error ? e.message : String(e))) throw e;
+      item = await db.prepare("SELECT item_id, state, suspected_passport_id FROM fan_report_items WHERE subject_hash = ?").bind(hash).first<{ item_id: string; state: string; suspected_passport_id: string | null }>();
+      if (!item) throw new ReportError("could not record the report", 409);
+    }
+    if (created) {
+      // STAGE 3 — cheap evidence, once per item at creation. `lookalike()` is
+      // memoized, so when a creator's band already forced the scan above this
+      // costs one UPDATE and no second comparison pass. Best-effort inside.
+      await attachEvidence(db, id, lookalike, ts);
+    }
+  } else {
+    // D-1067(1): an item that already exists spends the creation work as absorbed writes — the INSERT and the evidence
+    // UPDATE behind the same scan — because the suppression drop path above, which keeps no record of the subject,
+    // cannot tell a repeat filing from a first one and spends that work every time.
+    await absorb(db, reporter, nowMs);
+    try {
+      if ((await lookalike()).evidence !== null) await absorb(db, reporter, nowMs);
+    } catch {
+      /* best-effort, exactly as attachEvidence treats it */
+    }
+  }
+
+  // `earned_band` stores exactly what its name says: an EARNED reporter band
+  // (account age + upheld-report history, or the creator's claim state), never a
+  // billing tier. It was called `tier_band` until the rename; the billing
+  // meaning had been gone since 2026-08-14 and the stale name was an active
+  // hazard, because a reader who trusted it would wire a paid signal into a
+  // publication gate. `top_band` in the queue query below is its aggregate.
+  //
+  // `supporter_boost` (`0010_reports_caution.sql`, same table) is the SECOND,
+  // ordering-only column and the only place a purchased signal is persisted on
+  // this path. Normalised HERE, once: anything that is not exactly the number 1
+  // becomes 0, so a malformed or partially-resolved caller can only ever fail
+  // toward no boost. It rides the same row purely because the row already keys
+  // (item, reporter) — the two columns are read by different code and never by
+  // each other's consumers.
+  const supporterBoost: SupporterQueueBoost = reporter.supporterBoost === 1 ? 1 : 0;
+  // RE-OPEN on a new distinct reporter (review finding: without this, a
+  // scammer could self-report their own fake, eat one dismissal, and become
+  // permanently unreportable). 'dismissed' and 'retracted' are soft closes —
+  // fresh victims resurface the item (reopen_count tells the operator its
+  // history). 'suppressed' is the explicit terminal state and never re-opens;
+  // 'published'/'escalated' are already in-flight and stay put.
+  //
+  // I3-1280 / I3-1333: the reporter row and the reopen are ONE atomic batch.
+  // As three separate awaits, a fault after the INSERT left the reporter
+  // counted and the case closed, and that reporter's retry hit the unique key
+  // (nothing inserted) and so never reopened it. The reopen runs IMMEDIATELY
+  // after the INSERT and is bound to it with SQLite's `changes()` — the row
+  // count of the most recently completed statement on this connection, i.e.
+  // whether THIS call's INSERT OR IGNORE wrote a row (a timestamp match would
+  // re-open on a same-millisecond duplicate). The RETURNING clauses are not
+  // read since D-1067(1): the answer no longer depends on whether a row landed.
+  await db.batch([
+    // RG-PRIVACY:7 (I16-FXC, D-0931(8)): a reporter's status is that reporter's own. When THIS filing is the one that
+    // re-opens a soft-closed item — the reporter row below will land (new reporter, live account) and the re-open
+    // UPDATE's own predicates hold (soft-closed, under the automatic cap, qualified filer) — every reporter already on
+    // the item is recorded as closed first, so listOwnReports keeps answering 'closed' to them. Ordered BEFORE the
+    // reporter INSERT so the re-open's `changes() = 1` still reads that INSERT.
+    db
+      .prepare(
+        `INSERT OR IGNORE INTO fan_report_reporter_closures (item_id, reporter_kind, reporter_id, closed_at)
+         SELECT r.item_id, r.reporter_kind, r.reporter_id, ? FROM fan_report_reporters r JOIN fan_report_items i ON i.item_id = r.item_id
+          WHERE r.item_id = ? AND i.state IN ('dismissed','retracted') AND i.reopen_count < ?
+            AND NOT (r.reporter_kind = ? AND r.reporter_id = ?)
+            AND ((NOT EXISTS (SELECT 1 FROM fan_report_reporters x WHERE x.item_id = ? AND x.reporter_kind = ? AND x.reporter_id = ?)
+                  AND (? <> 'fan' OR EXISTS (SELECT 1 FROM accounts WHERE account_id = ?))
+                  AND (? = 'child_safety' OR ? <> 'fan' OR EXISTS (SELECT 1 FROM qualified_fan_accounts WHERE account_id = ?)))
+              OR (? = 'child_safety' AND EXISTS (SELECT 1 FROM fan_report_reporters x WHERE x.item_id = ? AND x.reporter_kind = ? AND x.reporter_id = ? AND x.category <> 'child_safety')))`,
+      )
+      .bind(
+        ts, item.item_id, REPORT_AUTO_REOPEN_MAX, reporter.kind, reporter.id,
+        item.item_id, reporter.kind, reporter.id, reporter.kind, reporter.id, category, reporter.kind, reporter.id,
+        category, item.item_id, reporter.kind, reporter.id,
+      ),
+    db
+      // I3-1298 limb 2 (I4-08-R9 hand-off): a FAN reporter row is written only
+      // while its account exists — erasure deletes the account row, so a filing
+      // racing an erasure writes nothing. Creators are a separate model.
+      .prepare(
+        "INSERT OR IGNORE INTO fan_report_reporters (item_id, reporter_kind, reporter_id, earned_band, supporter_boost, category, note, created_at) " +
+          "SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ? <> 'fan' OR EXISTS (SELECT 1 FROM accounts WHERE account_id = ?) RETURNING reporter_id",
+      )
+      .bind(item.item_id, reporter.kind, reporter.id, reporter.band, supporterBoost, category, note, ts, reporter.kind, reporter.id),
+    db
+      // I3-0724 (D-0920 option A): only a QUALIFIED new reporter re-opens — a
+      // creator, or a fan in `qualified_fan_accounts` (the predicate
+      // fan-quality.ts isQualifiedFan and caution.ts I3-0723 use). An
+      // unqualified reporter is still recorded and counted by the INSERT above.
+      // #132PS-036 (D-0920): at most REPORT_AUTO_REOPEN_MAX automatic re-opens;
+      // past it the item stays soft-closed (its reporters still accrue on the
+      // dismissed queue) and only an operator re-opens it (`reopenReport`).
+      .prepare(
+        "UPDATE fan_report_items SET state = 'open', reopen_count = reopen_count + 1, updated_at = ?, closed_at = NULL, tombstoned_at = NULL WHERE item_id = ? AND state IN ('dismissed','retracted') AND changes() = 1" +
+          " AND reopen_count < ? AND (? = 'child_safety' OR ? <> 'fan' OR EXISTS (SELECT 1 FROM qualified_fan_accounts WHERE account_id = ?))",
+      )
+      .bind(ts, item.item_id, REPORT_AUTO_REOPEN_MAX, category, reporter.kind, reporter.id),
+    // D-1059(6) (I30-RG-OPS NEW-child-safety-refile-dropped): the SAME filer's child_safety report raises their existing
+    // row to child_safety instead of being dropped as a duplicate. The new note leads, the old one follows, clamped.
+    db
+      .prepare(
+        "UPDATE fan_report_reporters SET category = 'child_safety', note = CASE WHEN ? IS NULL OR ? = '' THEN note WHEN note IS NULL OR note = '' THEN ? ELSE substr(? || ' | ' || note, 1, ?) END" +
+          " WHERE item_id = ? AND reporter_kind = ? AND reporter_id = ? AND ? = 'child_safety' AND category <> 'child_safety' RETURNING reporter_id",
+      )
+      .bind(note, note, note, note, NOTE_MAX, item.item_id, reporter.kind, reporter.id, category),
+    // D-1059(6): that raise re-opens a soft-closed case like a new child_safety filer would (bound to the raise by changes()).
+    db
+      .prepare(
+        "UPDATE fan_report_items SET state = 'open', reopen_count = reopen_count + 1, updated_at = ?, closed_at = NULL, tombstoned_at = NULL WHERE item_id = ? AND state IN ('dismissed','retracted') AND changes() = 1 AND reopen_count < ?",
+      )
+      .bind(ts, item.item_id, REPORT_AUTO_REOPEN_MAX),
+    // I21-Q91: when THIS filing re-opened a scrubbed tombstone (sweepFanReportTombstones), the live case gets its
+    // subject back from the filing — the re-open is the only way an item leaves a closed state with blank columns
+    // and a filer at hand. A suppressed tombstone is never 'open' here, so it stays blank.
+    db
+      .prepare(
+        "UPDATE fan_report_items SET updated_at = ?, canonical = CASE WHEN state = 'open' AND canonical = '' THEN ? ELSE canonical END," +
+          " platform = CASE WHEN state = 'open' AND platform = '' THEN ? ELSE platform END, handle = CASE WHEN state = 'open' AND handle = '' THEN ? ELSE handle END WHERE item_id = ?",
+      )
+      .bind(ts, subject.canonical, subject.platform, subject.id, item.item_id),
+  ]);
+  // D-1067(1): a repeat filing answers `recorded` like a first one — the drop path cannot answer anything else, so
+  // TP-06's `duplicate` (S-068) was a "did this person ask to be delisted?" oracle. The INSERT OR IGNORE still keeps
+  // one reporter one row; the repeat's note is not added (apps/web no longer offers re-filing as a way to add one).
+  return { result: "recorded", item_id: item.item_id };
+}
+
+/** D-1064(3): the statement count of `fileReport`'s recorded reporter batch (closure marks, INSERT
+ * fan_report_reporters, re-open UPDATE, child_safety raise UPDATE, raise re-open UPDATE, tombstone-subject UPDATE).
+ * The drop path absorbs exactly this many writes; tests/invariants/suppression-oracles.test.ts measures both. */
+const REPORTER_BATCH_WRITES = 6;
+
+/**
+ * One absorbing write, so a DROPPED report costs exactly what a recorded one
+ * costs. It bumps a per-reporter scratch counter in `rate_limits` — the same
+ * single upsert statement the throttle uses, with a cap it can never reach (the
+ * real per-reporter cap already bounds how often this can run). Lifted verbatim
+ * in shape from `nominations.ts absorb`, which solved the same problem first.
+ */
+async function absorb(db: DbLike, reporter: Reporter, nowMs: number): Promise<void> {
+  await consumeRateLimit(db, `rptsink:${reporter.kind}:${reporter.id}`, nowMs, Number.MAX_SAFE_INTEGER);
+}
+
+/** `n` absorbing writes in one `db.batch`, mirroring a batched recorded path.
+ * The same upsert `consumeRateLimit` makes, uncapped, so it never refuses. */
+async function absorbBatch(db: DbLike, reporter: Reporter, nowMs: number, n: number): Promise<void> {
+  const nowIso = new Date(nowMs).toISOString();
+  const cutoffIso = new Date(nowMs - RL_DAY_MS).toISOString();
+  const key = `rptsink:${reporter.kind}:${reporter.id}`;
+  const stmt = () =>
+    db
+      .prepare(
+        `INSERT INTO rate_limits (rl_key, window_start, count) VALUES (?, ?, 1)
+         ON CONFLICT(rl_key) DO UPDATE SET
+           window_start = CASE WHEN rate_limits.window_start < ? THEN ? ELSE rate_limits.window_start END,
+           count        = CASE WHEN rate_limits.window_start < ? THEN 1  ELSE rate_limits.count + 1 END`,
+      )
+      .bind(key, nowIso, cutoffIso, nowIso, cutoffIso);
+  await db.batch(Array.from({ length: n }, stmt));
+}
+
+// ---------- Stage 3: handle-similarity evidence (no network) ----------
+
+/** Normalize a handle for lookalike comparison: lowercase, strip separators,
+ * fold common leet substitutions, drop the classic impersonator suffixes. */
+export function lookalikeNormalize(handle: string): string {
+  let h = handle.toLowerCase().replace(/[._-]/g, "");
+  h = h.replace(/0/g, "o").replace(/1/g, "l").replace(/3/g, "e").replace(/5/g, "s").replace(/7/g, "t");
+  h = h.replace(/(real|official|thereal|backup|new|vip)$/g, "").replace(/^(real|official|thereal)/g, "");
+  return h;
+}
+
+// I3-1104: LOOKALIKE_PAIRS lives in domain-match.ts (I23-L02, TRUST hand-off 8) so the report scan (editDistance) and
+// the creation gate (domain-gate.ts minWindowDistance) share ONE table; re-exported here under its name.
+export { LOOKALIKE_PAIRS };
+
+/** Bounded Damerau–Levenshtein (adjacent transpositions) plus the LOOKALIKE_PAIRS op (cost 1, either direction),
+ * early-exit > max. The extra op reads rows i-1/i-2 only through a cell no cheaper than its neighbour in row i-1,
+ * so the row-minimum early exit stays sound. */
+export function editDistance(a: string, b: string, max = 3): number {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  const dp: number[][] = Array.from({ length: a.length + 1 }, () => new Array<number>(b.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i++) dp[i]![0] = i;
+  for (let j = 0; j <= b.length; j++) dp[0]![j] = j;
+  for (let i = 1; i <= a.length; i++) {
+    let rowMin = Infinity;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      let v = Math.min(dp[i - 1]![j]! + 1, dp[i]![j - 1]! + 1, dp[i - 1]![j - 1]! + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        v = Math.min(v, dp[i - 2]![j - 2]! + 1);
+      }
+      for (const [pair, single] of LOOKALIKE_PAIRS) {
+        // a's two letters <-> b's one, and b's two <-> a's one.
+        if (i > 1 && b[j - 1] === single && a[i - 2] === pair[0] && a[i - 1] === pair[1]) v = Math.min(v, dp[i - 2]![j - 1]! + 1);
+        if (j > 1 && a[i - 1] === single && b[j - 2] === pair[0] && b[j - 1] === pair[1]) v = Math.min(v, dp[i - 1]![j - 2]! + 1);
+      }
+      dp[i]![j] = v;
+      rowMin = Math.min(rowMin, v);
+    }
+    if (rowMin > max) return max + 1; // no cell can shrink below the row min
+  }
+  return dp[a.length]![b.length]!;
+}
+
+export interface HandleEvidence {
+  /**
+   * WHO the machine says this account is pretending to be — or `null` when the
+   * scan found several equally good answers and declines to pick one.
+   *
+   * Read by `creatorBandForSuspect`, the creator-facing protection signal, the
+   * weekly digest, Most Targeted, and the console's `protected_passport_id`
+   * prefill; `face-triage.ts` gates a machine-drafted warning on it. Everything
+   * downstream treats it as an identification.
+   *
+   * A DRAFT OF THIS SLICE WITHHELD IT FOR EVERY `contains` MATCH, and adversarial
+   * review killed that: `thecandyqueen`, `candyqueenxoxo`, `candyqueen2026`,
+   * `candyqueen_official_backup` are all `contains`, all obvious camps, and all
+   * would have become permanently invisible to the creator — `suspected_passport_id`
+   * is never backfilled, so an operator escalating one still left
+   * `underReview()` false and the digest reporting zero. It also dropped the
+   * creator's own reporting band from 100 to 10, letting an impostor choose
+   * which side of the 100/day cap they sat on by padding their handle three
+   * characters. The dangerous consumers were already gated on the stronger kinds
+   * (`caution.ts` publishes only `exact_lookalike`/`homoglyph`), so muting the
+   * pointer cost real protection and bought nothing. BOUNDING the match is the
+   * fix; muting it was not.
+   */
+  suspected_passport_id: string | null;
+  matched_platform: string;
+  matched_handle: string;
+  /**
+   * `exact_lookalike`  identical after normalization — a claim about IDENTITY.
+   * `edit_distance`    a bounded near-miss (a typosquat) — also identity.
+   * `contains`         one handle is the other plus a SHORT pad. The weakest
+   *                    kind — a fan page, a shop and an impostor are lexically
+   *                    identical under it — which is why it is bounded at both
+   *                    ends (`MIN_CONTAINS_MATCH`, `MAX_CONTAINS_AFFIX`) and
+   *                    ranks last.
+   */
+  kind: "exact_lookalike" | "edit_distance" | "contains";
+  distance?: number;
+  same_platform: boolean;
+  /** Two or more DIFFERENT creators tied at the top kind, so the machine
+   * declines to name one. Present only when true. */
+  ambiguous?: true;
+}
+
+/**
+ * The shortest normalized handle that may be matched by CONTAINMENT.
+ *
+ * Below this, containment is noise rather than a lead: a three-character handle
+ * appears inside an enormous share of the internet, in both directions.
+ * `findDomainLookalike` applies the same discipline to brands (whole token,
+ * min 5) with the reason written out — "a prefix/suffix match would over-fire on
+ * ordinary words (purchase⊃chase, pineapple⊃apple)". Handles never got it.
+ */
+export const MIN_CONTAINS_MATCH = 6;
+
+/**
+ * The shortest normalized handle that may be matched by EDIT DISTANCE.
+ *
+ * The gate `findDomainLookalike` already uses, for its stated reason: below four
+ * characters a bounded edit distance stops being a typosquat signal, because
+ * most short strings are within one edit of each other.
+ */
+export const MIN_EDIT_MATCH = 4;
+
+/**
+ * The shortest normalized handle that may be matched EXACTLY.
+ *
+ * The arm that had no floor at all, and the one that mints the strongest kind —
+ * the only one `caution.ts` will publish from. `lookalikeNormalize` deletes
+ * separators, folds five leet digits and strips one affix off EACH end, so a
+ * reported string can be far longer than a creator's handle and still collapse
+ * onto it: with a four-character creator `mont`, the ordinary word `montreal`
+ * normalizes to `mont` and named them. Below five characters a handle is not
+ * distinctive enough to survive that collapse, so it is not matched at all — the
+ * report still files and an operator still sees it; the machine simply declines
+ * to say whose impostor it is.
+ */
+export const MIN_EXACT_MATCH = 5;
+
+/**
+ * The most characters a `contains` match may add.
+ *
+ * Containment used to be unbounded in both directions. The pattern it is for is
+ * the victim's handle plus a short pad — `thecandyqueen`, `candyqueenxoxo`,
+ * `candyqueen2026` — and a bound is what separates that from a long string that
+ * merely happens to carry the handle inside it (`sugarcandyqueenmerchandise`).
+ */
+export const MAX_CONTAINS_AFFIX = 8;
+
+/**
+ * THE DELISTING PREDICATE, ONE COPY, READ BY EVERY ATTRIBUTION DOOR BELOW.
+ *
+ * `request_suppressions` is "this subject is gone" (`passport-view.ts:300`), and
+ * every other reader of the `passport_accounts` family carries it —
+ * `passport-view.ts:286`, `protection.ts:279`, `recognition-public.ts:94`,
+ * `brand-enrolment.ts:285`, `ratings.ts:176`. The two scans below were the
+ * exceptions: they named a delisted creator as the suspected target of a
+ * stranger's report, which put that person's passport back on an operator's
+ * screen, into the warning draft's prefill, and — through `caution.ts` — into a
+ * public caution pointer, on an input any fan session can choose.
+ *
+ * ONE const interpolated at both doors, never re-typed: the two scans must not
+ * be able to drift apart (FAMILY-004 v2 (c)).
+ *
+ * NOT the STAGE 1 shield query (`fileReport` above), which is deliberately
+ * unfiltered here and carries its suppression check separately through
+ * `suppressedKeyStmt` — the reason is written out at its own call site and
+ * adding this predicate there would make a delisted person REPORTABLE.
+ */
+const NOT_DELISTED = "AND NOT EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = p.passport_id)";
+
+/** Compare the reported handle against every VERIFIED creator's active proven
+ * handles (cross-platform: impersonators camp on other platforms too). Runs
+ * once per item at enqueue time, so O(verified accounts) is fine.
+ *
+ * WHAT THIS FUNCTION IS ALLOWED TO CLAIM is the security property. The reported
+ * handle is chosen by whoever filed the report — any fan session, five a day at
+ * the `new` band — so every bound here is a bound on what a stranger can make
+ * the machine say about a creator they do not control. Slice 7's review found
+ * the previous version stamping a pointer from a raw `includes`, which let one
+ * report against any third-party account whose handle merely contained a
+ * victim's land a row naming that victim.
+ */
+export async function findLookalike(db: DbLike, platform: string, handle: string): Promise<HandleEvidence | null> {
+  // Bounded scan (review LOW): O(verified accounts) per NEW item is fine at
+  // launch scale and item creation is session-throttled; the LIMIT is the
+  // backstop, and past it the right move is a precomputed normalized index.
+  const { results } = await db
+    .prepare(
+      `SELECT a.platform, a.id, a.passport_id FROM passport_accounts a
+       JOIN passports p ON p.passport_id = a.passport_id
+       WHERE a.status = 'active' AND p.retracted = 0 AND p.claim_state = 'verified'
+       ${NOT_DELISTED}
+       LIMIT 5000`,
+    )
+    .bind()
+    .all<{ platform: string; id: string; passport_id: string }>();
+  const target = lookalikeNormalize(handle);
+  if (target.length === 0) return null;
+  // WHOSE ACCOUNT IS THIS ALREADY? The same raw-handle test as before — a
+  // NORMALIZED one here would be self-defeating, since a normalized collision is
+  // exactly what this function exists to find — but promoted from "skip this
+  // ROW" to "skip this PASSPORT". The row-level version let a creator's own
+  // second account match their first at `exact_lookalike` and point at
+  // themselves, which `creatorBandForSuspect` reads as band 100.
+  const owners = new Set(
+    results.filter((r) => r.platform === platform && r.id.toLowerCase() === handle.toLowerCase()).map((r) => r.passport_id),
+  );
+  /**
+   * RANKED BY THE STRENGTH OF THE IDENTITY CLAIM, which reverses the previous
+   * order of the bottom two. `contains` used to outrank `edit_distance` on the
+   * intuition that a whole substring is "more" of a match than a near-miss. It
+   * is not: containment is a fact about strings and carries no pointer, so
+   * letting it win meant a creator matched by a bounded typo LOST their pointer
+   * to another creator matched by a coincidental substring.
+   */
+  const rank = { exact_lookalike: 3, edit_distance: 2, contains: 1 } as const;
+  const found: HandleEvidence[] = [];
+  for (const r of results) {
+    // A verified creator's own account never registers as its own lookalike —
+    // ANY of their accounts, not just the one that spells it the same way.
+    if (owners.has(r.passport_id)) continue;
+    const v = lookalikeNormalize(r.id);
+    if (v.length < 3) continue; // too short to compare meaningfully
+    let kind: HandleEvidence["kind"] | null = null;
+    let distance: number | undefined;
+    // EDIT DISTANCE IS TRIED BEFORE CONTAINMENT, and the order is load-bearing.
+    // A one- or two-character pad — `candyqueen0`, `candyqueen_` — is BOTH a
+    // containment and a bounded typosquat, and it is the typosquat reading that
+    // is true: that is an impostor camping the handle, not a fan page. Testing
+    // containment first shadowed every one of those and silently stripped the
+    // pointer from the clearest impersonations in the set.
+    //
+    // What is left to `contains` is therefore exactly the long pad —
+    // `candyqueenfanpage` — which is the case where the machine genuinely
+    // cannot tell an impostor from a fan page, and must not guess.
+    if (v === target) {
+      // FLOORED. Normalization can delete up to sixteen characters, so an exact
+      // match is not evidence that the two strings were ever similar — only that
+      // what survived collapse was equal. A short survivor is not enough to name
+      // somebody on.
+      if (v.length >= MIN_EXACT_MATCH) kind = "exact_lookalike";
+    } else if (v.length >= MIN_EDIT_MATCH && target.length >= MIN_EDIT_MATCH) {
+      const maxD = v.length <= 6 ? 1 : 2; // short handles need tighter bounds
+      const d = editDistance(v, target, maxD);
+      if (d <= maxD) {
+        kind = "edit_distance";
+        distance = d;
+      }
+    }
+    if (kind === null && containsMatch(v, target)) kind = "contains";
+    if (!kind) continue;
+    found.push({
+      suspected_passport_id: r.passport_id,
+      matched_platform: r.platform,
+      matched_handle: r.id,
+      kind,
+      ...(distance !== undefined ? { distance } : {}),
+      same_platform: r.platform === platform,
+    });
+  }
+  if (found.length === 0) return null;
+
+  // STRENGTH = kind, then closeness. Ranking on kind alone made a distance-2
+  // coincidence tie with a distance-1 camp, which an impostor could arrange
+  // deliberately: pick a typo of the victim that also lands within the edit
+  // bound of some other verified handle (they are publicly enumerable) and the
+  // machine refuses to name anybody. Distance is part of the strength.
+  const strength = (f: HandleEvidence): number => rank[f.kind] * 10 - (f.distance ?? 0);
+  const top = Math.max(...found.map(strength));
+  const tied = found.filter((f) => strength(f) === top);
+
+  // AMBIGUOUS ⇒ NO NAME — DECIDED BEFORE THE PLATFORM PREFERENCE, and the order
+  // is the finding. Narrowing to same-platform first let the REPORTER choose
+  // which of two colliding creators got named, simply by which platform's URL
+  // they submitted: the ambiguity was real and the filter hid it.
+  const distinct = new Set(tied.map((f) => f.suspected_passport_id));
+
+  // Same-platform still wins for PRESENTATION within the tie — an impostor on
+  // the platform the report came from is the likelier reading — but it can no
+  // longer decide whether an ambiguity exists.
+  const onPlatform = tied.filter((f) => f.same_platform);
+  const best = (onPlatform.length > 0 ? onPlatform : tied)[0]!;
+
+  if (distinct.size > 1) return { ...best, suspected_passport_id: null, ambiguous: true };
+  return best;
+}
+
+/**
+ * Bounded containment — one normalized handle inside the other.
+ *
+ * Symmetric, because the risk is: `target.includes(v)` lets a stranger pick a
+ * report subject that pads a victim's handle, and `v.includes(target)` lets a
+ * short reported handle hit every creator whose handle contains it. The
+ * previous version had both, unbounded, behind a 3-character floor.
+ *
+ * This bounds the blast radius; it does not and cannot make containment an
+ * identification, which is why the caller refuses to draw a pointer from one.
+ */
+export function containsMatch(a: string, b: string): boolean {
+  const [shorter, longer] = a.length <= b.length ? [a, b] : [b, a];
+  if (shorter.length < MIN_CONTAINS_MATCH) return false;
+  if (longer.length - shorter.length > MAX_CONTAINS_AFFIX) return false;
+  return longer.includes(shorter);
+}
+
+/**
+ * STAGE 3 — write the machine's opinion onto a freshly-created item.
+ *
+ * ONE function for both subject kinds now (it was `attachHandleEvidence` +
+ * `attachDomainEvidence`, identical but for which comparison ran), and it takes
+ * the comparison as a THUNK rather than running it: `fileReport` may already
+ * have paid for the scan while resolving a creator's band, and the memoized
+ * thunk is what makes "at most one scan per request" a property of the code
+ * instead of a comment. `lookalikeFor` decides both the pointer and the bundle
+ * (an `xn--` host gets `domain_punycode` only beside a domain match, and no
+ * evidence without one), so the "is there anything to write?" predicate here is
+ * the single `evidence !== null`.
+ */
+async function attachEvidence(db: DbLike, itemId: string, lookalike: () => Promise<Lookalike>, ts: string): Promise<void> {
+  try {
+    const found = await lookalike();
+    if (found.evidence === null) return;
+    await db
+      .prepare("UPDATE fan_report_items SET suspected_passport_id = ?, evidence = ?, updated_at = ? WHERE item_id = ?")
+      .bind(found.suspected_passport_id, JSON.stringify(found.evidence), ts, itemId)
+      .run();
+  } catch {
+    /* evidence is best-effort — a failure never loses the report */
+  }
+}
+
+// ---------- Stage 3 (Cluster E): domain-lookalike evidence (no network) ----------
+
+export interface DomainEvidence {
+  /** WHO the machine says this host is imitating — or `null` when two or more
+   * DIFFERENT verified brands tied at the top kind and it declines to pick one.
+   * Nullable for the same reason `HandleEvidence.suspected_passport_id` is, and
+   * `caution.ts:371-375` already requires this field to be a string AND to equal
+   * the item column before a caution may publish, so a null pointer cannot lend
+   * its strength to a name something else supplied (F-52 mirrored that coupling
+   * to this arm in advance, noting it had "no reachable writer yet"; this is
+   * that writer). */
+  suspected_passport_id: string | null;
+  matched_domain: string;
+  kind: "homoglyph" | "exact_lookalike" | "edit_distance" | "contains";
+  distance?: number;
+  /** Two or more DIFFERENT brands tied at the top kind. Present only when true. */
+  ambiguous?: true;
+  /**
+   * QUEUE #161 E-19: present (true) only on an `exact_lookalike` whose skeletons
+   * are equal ONLY because the ENROLLED brand's label was leet-folded and the
+   * reported label carried no digit of its own (brand `7eleven`, reported
+   * `televen`). The match, its kind, pointer and priority are unchanged; the
+   * flag keeps it out of `caution.ts`'s machine-caution keys, so it reaches a
+   * fan only through an operator.
+   */
+  leet_coincidence?: true;
+}
+
+/**
+ * Compare a reported host against every VERIFIED brand's DNS-proven domain, using
+ * eTLD+1 registrable labels + confusable skeletons (`domain-match.ts`):
+ *  - "homoglyph"       = the reported registrable label is an IDN/confusable
+ *                        rewrite of the brand's (pаypal.com, Cyrillic а → paypal).
+ *  - "exact_lookalike" = same skeleton, different registrable DOMAIN — a TLD swap
+ *                        (paypal.co) or leet (paypa1.com); NOT a subdomain of the
+ *                        real brand (same registrable domain → skipped).
+ *  - "contains"        = the brand skeleton sits inside the reported host's
+ *                        subdomain skeleton (paypal-login.com, paypal.com.evil.com).
+ *  - "edit_distance"   = a near-miss typosquat (payapl.com).
+ * Only verified + DNS-proven brand domains are matched against, so this can never
+ * point at an unproven listing. O(verified domains) per new item.
+ *
+ * "DNS-PROVEN" NOW MEANS PROVEN BY THIS PASSPORT AND STILL CURRENT. The JOIN used
+ * to match any `used` domain challenge for the account_key, whenever it happened
+ * and whoever filed it — so a brand that let its domain lapse, or whose domain
+ * was picked up by somebody else and re-listed, kept generating "lookalike of
+ * <brand>" evidence that names a passport with no current control of the name it
+ * is being protected under. That evidence is what puts a `suspected_passport_id`
+ * pointer on a report and, downstream, a caution pointing at that creator, so it
+ * has to be as current as the claim it makes. `c.passport_id = a.passport_id` is
+ * the bind; the two bound instants are the freshness test spelled out in
+ * `freshProofBounds`.
+ *
+ * THE `ORDER BY` IS NOT COSMETIC. Past 5000 verified proven domains this LIMIT
+ * truncates, and without an order SQLite is free to truncate a different subset
+ * between runs — so the same host could produce evidence on one call and none on
+ * the next. Ordering does not make truncation safe; it makes it deterministic,
+ * and therefore reproducible from a report. This function is BEST-EFFORT
+ * evidence and stays fail-OPEN at its ceiling (a missed pointer costs a slower
+ * triage, and a human still reads the queue). The self-serve domain-add gate
+ * wanted the opposite error direction and no longer shares this query at all —
+ * see `domain-gate.ts`, which fails CLOSED at its own ceiling.
+ */
+export async function findDomainLookalike(db: DbLike, host: string, nowMs: number = Date.now()): Promise<DomainEvidence | null> {
+  const t = domainKey(host);
+  // I3-0659: the gate's C-012 rule (`domain-gate.ts`): a short residual is kept
+  // when the fold DROPPED something, so `slack` below gets to use it. A fully
+  // dropped label ('') stays out — a human files and reads every report.
+  if (!t || !(t.skeleton.length >= 3 || (t.skeleton.length > 0 && t.dropped > 0))) return null;
+  const { nowIso, provedSince } = freshProofBounds(nowMs);
+  const { results } = await db
+    .prepare(
+      `SELECT DISTINCT a.id AS bhost, a.account_key, a.passport_id
+       FROM passport_accounts a
+       JOIN passports p ON p.passport_id = a.passport_id
+       JOIN claim_challenges c ON c.account_key = a.account_key AND c.platform_key = 'domain' AND c.status = 'used'
+            AND c.passport_id = a.passport_id
+            AND (c.valid_until > ? OR (c.valid_until IS NULL AND COALESCE(c.proved_at, c.created_at) > ?))
+       WHERE a.id_kind = 'domain' AND a.status = 'active' AND p.retracted = 0 AND p.claim_state = 'verified'
+       ${NOT_DELISTED}
+       ORDER BY a.account_key
+       LIMIT 5000`,
+    )
+    .bind(nowIso, provedSince)
+    .all<{ bhost: string; account_key: string; passport_id: string }>();
+  const rank = { homoglyph: 4, exact_lookalike: 3, contains: 2, edit_distance: 1 } as const;
+  const found: DomainEvidence[] = [];
+  // QUEUE #161 E-20: matches found ONLY because `t.dropped` widened the window.
+  // Used only when nothing matched without widening, so a result that fires
+  // today (kind, pointer, ambiguity) is never changed by the widening.
+  const widenedOnly: DomainEvidence[] = [];
+  const slack = Math.min(Math.max(0, t.dropped), GATE_MAX_SLACK);
+  for (const r of results) {
+    const b = domainKey(r.bhost);
+    if (!b || !(b.skeleton.length >= 3 || (b.skeleton.length > 0 && b.dropped > 0))) continue; // I3-0659: same C-012 rule
+    if (b.regDomain === t.regDomain) continue; // same registrable domain = the brand itself or its own subdomain, not a lookalike
+    const bs = b.skeleton;
+    const ts = t.skeleton;
+    let kind: DomainEvidence["kind"] | null = null;
+    let distance: number | undefined;
+    let widened = false;
+    let leetCoincidence = false;
+    if (bs === ts) {
+      kind = t.confusable ? "homoglyph" : "exact_lookalike"; // a homoglyph rewrite is the more deliberate attack
+      // QUEUE #161 E-19: the fold rewrote the BRAND and the reporter's host
+      // wrote no digit — two different real labels, one coincidence.
+      leetCoincidence = kind === "exact_lookalike" && b.leetDigits > 0 && t.leetDigits === 0 && b.regLabel !== t.regLabel;
+    } else if (bs.length >= 5 && !isGenericSkeleton(bs) && t.tokens.includes(bs)) {
+      // The brand skeleton appears as a WHOLE hyphen/dot-separated token of the
+      // reported host (paypal-login, secure.paypal, paypal.com.evil). Exact token
+      // only (min length 5): a prefix/suffix match would over-fire on ordinary
+      // words (purchase⊃chase, pineapple⊃apple); a brand glued with no separator
+      // (paypallogin) is left to the edit_distance / exact kinds. Known gap.
+      // I3-1988: a GENERIC skeleton never earns containment — the same rule as
+      // the gate's containment arm (`domain-gate.ts` `gateMatch`).
+      kind = "contains";
+    } else if (bs.length >= 4) {
+      // Fuzzy typosquat. Gated at >=4 (NOT the contains floor of 5) so 4-char
+      // brands (ebay/uber/visa/meta) keep typo protection; a bounded edit distance
+      // has no substring-flood problem. maxD 1 for short labels, 2 for longer.
+      // QUEUE #161 E-20: plus the code points the fold DELETED from the reported
+      // label, capped — the `domain-gate.ts` slack, on the caution path too.
+      const baseD = bs.length <= 6 ? 1 : 2;
+      const maxD = baseD + slack;
+      const d = editDistance(bs, ts, maxD);
+      if (d <= maxD) {
+        kind = "edit_distance";
+        distance = d;
+        widened = d > baseD;
+      }
+    }
+    if (!kind) continue;
+    const ev: DomainEvidence = {
+      suspected_passport_id: r.passport_id,
+      matched_domain: r.bhost,
+      kind,
+      ...(distance !== undefined ? { distance } : {}),
+      ...(leetCoincidence ? { leet_coincidence: true as const } : {}),
+    };
+    (widened ? widenedOnly : found).push(ev);
+  }
+  if (found.length === 0) found.push(...widenedOnly);
+  if (found.length === 0) return null;
+
+  // AMBIGUOUS => NO NAME. The SAME rule `findLookalike` already applies to the
+  // handle door, and its reason transfers verbatim: the reported host is chosen
+  // by whoever filed the report, so a fold that keeps the first-seen winner lets
+  // the REPORTER decide which of two colliding brands gets named — here by the
+  // `ORDER BY a.account_key` the query needs for deterministic truncation. Two
+  // verified brands whose skeletons both match the reported host is a real tie,
+  // and the honest answer is that the machine cannot tell.
+  //
+  // STRENGTH INCLUDES DISTANCE, exactly as the handle door's does, and it has to:
+  // ranking on `kind` alone would make a distance-2 coincidence TIE with a
+  // distance-1 camp, and under this rule a spurious tie does not just mis-name —
+  // it BLANKS a pointer that was never ambiguous. The strict `>` this replaces
+  // discarded distance entirely, so the first row in account_key order won.
+  const strength = (f: DomainEvidence): number => rank[f.kind] * 10 - (f.distance ?? 0);
+  const top = Math.max(...found.map(strength));
+  const tied = found.filter((f) => strength(f) === top);
+  const best = tied[0]!;
+  if (new Set(tied.map((f) => f.suspected_passport_id)).size > 1) return { ...best, suspected_passport_id: null, ambiguous: true };
+  return best;
+}
+
+/** Extract a bare hostname from a reported link (for a domain report). */
+function domainFromUrl(raw: string): string | null {
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 2048) return null;
+  const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+  try {
+    return new URL(withScheme).hostname;
+  } catch {
+    return null;
+  }
+}
+
+// (The domain branch of the evidence attach lives in `lookalikeFor` above,
+// alongside the handle branch. An `xn--` (punycode/IDN) label is flagged only
+// when `findDomainLookalike` matched the host to a verified party (I3-0304); a
+// bare `xn--` host with no match carries no evidence, because anyone can file
+// reports about any internationalized name and the flag alone used to buy +40.)
+
+// ---------- Stage 5: priority + the operator queue ----------
+
+export interface QueueItem {
+  item_id: string;
+  subject_hash: string;
+  canonical: string;
+  platform: string;
+  handle: string;
+  state: string;
+  /** Reporters who are still a CURRENTLY-ELIGIBLE human signal — deleted
+   * accounts excluded. This is the number the machine counts. */
+  distinct_reporters: number;
+  /**
+   * Reporters on this item whose account has since been ERASED, shown so an
+   * operator sees that the corroboration existed rather than watching it
+   * silently vanish from the count.
+   *
+   * WHY THEY ARE NOT COUNTED. Erasure pseudonymises `reporter_id` to a per-row
+   * `del_<hex>` tombstone precisely so the distinct count survives — which means
+   * one human could delete, re-register, report the same subject again and be
+   * two distinct reporter rows. `caution.ts`'s corroboration gate asks for two
+   * distinct PEOPLE; two rows one person made in sequence is not that. So the
+   * row stays in audit history and stops counting toward anything automatic.
+   */
+  deleted_reporters: number;
+  /** I3-1235 display limb (I23-W1-AUTH H10): evidence items an erasure removed from this item
+   * (`fan_report_items.erased_evidence_count`, migration 0216, written by account_data.ts). The operator is TOLD
+   * "N evidence items removed at erasure" (`erasedEvidenceNote`) rather than shown a quietly thinner file. */
+  erased_evidence: number;
+  erased_evidence_note: string | null;
+  top_band: number;
+  suspected_passport_id: string | null;
+  evidence: Record<string, unknown>;
+  /** The EARNED score: band × log(reporters) + evidence. `priorityOf`, and no
+   * purchased input, ever. This is the number the operator reads. */
+  priority: number;
+  /**
+   * PURCHASED ATTENTION, kept as its own boolean so it can never be mistaken
+   * for the earned signal beside it. True when at least one reporter on this
+   * item held a paid supporter entitlement AT REPORT TIME.
+   *
+   * It affects ORDER only (`compareQueueItems`), and only among items whose
+   * earned priority is already comparable. It is not a credibility signal, it
+   * does not move `priority`, `top_band` or `distinct_reporters`, and nothing
+   * that decides publication reads it. `queueOrderReasons` renders it in words
+   * that say exactly that.
+   */
+  supporter_priority: boolean;
+  /** QUEUE #577: evidence uploads on this item the child-safety scanner
+   * matched (`evidence_scan_events`). Feeds `priorityOf`; a count, never a hash. */
+  scan_matches?: number;
+  /** Times this item was re-opened by fresh reporters after a soft close —
+   * a high count on a dismissed-before item is itself a signal. */
+  reopen_count: number;
+  /** S66 face-stage outcome for this item (pending until the sweep runs). */
+  face_state: string;
+  /** Up to 3 most recent reporter notes (markup-stripped + clamped at intake;
+   * operator evidence, never public). */
+  notes: string[];
+  /** TP-07 (S-068): how many nonempty reporter notes are RETAINED on this item,
+   * which is not the same as how many `notes` above shows. The queue's
+   * three-note preview is also the operator's case-detail evidence surface
+   * (`apps/admin/src/evidence-review.ts:160`) and there is exactly one reader
+   * of the note column in the service, so on an aggregated case later notes
+   * displace earlier context with nothing on screen saying material exists.
+   * The count is what makes the omission visible. */
+  notes_total: number;
+  /** Distinct report categories filed against this item (flag 22, 2026-08-14):
+   * lets triage SEE the commerce-scam signal ("dead_code") instead of the
+   * category being write-only. Enum values only — validated at intake. */
+  categories: string[];
+  /** I16-S4-n131D-22a: at least one report on this item was filed as `child_safety` (erased reporters included —
+   * it is the material, not the corroboration). The first rung of `compareQueueItems`. */
+  child_safety?: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * QUEUE #577 (D-0671): the priority floor for an item the evidence scanner
+ * MATCHED (`evidence_scan_events`, written by `evidence.ts recordScanMatch`).
+ * The largest ORDINARY score is 100 × (1 + log2(1 + 2^53)) + 590 ≈ 5990, so
+ * every matched item sits whole `PRIORITY_COMPARABILITY_STEP` windows above
+ * every ordinary one and no supporter nudge can cross it. The item's STATE is
+ * not touched: `escalated` stays unused (evidence.ts storeEvidence step 4).
+ */
+export const SCAN_MATCH_PRIORITY = 10_000;
+
+/** priority = top band × (1 + log2(1 + distinct reporters)) + boosts.
+ * Log scale: 500 reports beats 5, but 50k bot reports never outranks one
+ * verified creator's single report (1×~16.6 << 100×1). A scanner match adds
+ * `SCAN_MATCH_PRIORITY` (defaulted argument, so the three-input shape of the
+ * earned score is unchanged for every caller that has no match to pass). */
+export function priorityOf(topBand: number, distinctReporters: number, evidence: Record<string, unknown>, scanMatches = 0): number {
+  let boost = 0;
+  // Handle- and domain-lookalike evidence use the same boost scale (a reported
+  // item is one or the other — handle for a profile, domain for a brand host).
+  const sim = (evidence.handle_similarity ?? evidence.domain_similarity) as { kind?: string } | undefined;
+  if (sim?.kind === "homoglyph" || sim?.kind === "exact_lookalike") boost += 50; // a confusable rewrite is at least as severe as a plain lookalike
+  // ORDERED AS `findLookalike` ORDERS THEM. These two used to be the other way
+  // round, on the intuition that a whole substring is "more" of a match than a
+  // near-miss — so the queue ranked a coincidental containment ABOVE a bounded
+  // typosquat, and the matcher and the queue disagreed about the same three
+  // kinds in the same file. A near-miss is a claim about identity; a containment
+  // is a claim about strings.
+  else if (sim?.kind === "edit_distance") boost += 30;
+  else if (sim?.kind === "contains") boost += 20;
+  // I3-0304: the punycode flag pays only beside a DOMAIN match to a verified
+  // party. A stored bare flag (evidence written before the fix) or one beside a
+  // handle match earns nothing.
+  const domainSim = evidence.domain_similarity as { kind?: unknown } | undefined;
+  if (evidence.domain_punycode === true && typeof domainSim?.kind === "string") boost += 40;
+  // S66 face evidence: a high-confidence machine flag pins the item into the
+  // top band alongside verified-creator reports; medium boosts within band.
+  const face = evidence.face as { confidence?: string } | undefined;
+  if (face?.confidence === "high") boost += 500;
+  else if (face?.confidence === "medium") boost += 100;
+  if (scanMatches > 0) boost += SCAN_MATCH_PRIORITY;
+  return topBand * (1 + Math.log2(1 + Math.max(0, distinctReporters))) + boost;
+}
+
+/**
+ * How close two earned priorities must be before they count as COMPARABLE.
+ *
+ * This is the number that makes "ordering is a tiebreak, not a takeover" a
+ * provable property rather than a hope. Items are first ranked by
+ * `floor(priority / STEP)`, so a supporter's report can only ever move within
+ * one such window — it can NEVER pass an item a full step above it. The
+ * displacement money can buy is therefore bounded by this constant, forever.
+ *
+ * 5 is chosen against the real scale: the smallest earned item (base band, one
+ * reporter) scores 2.0 and the smallest TRUSTED item scores 20.0, so a paid
+ * base-band report cannot come within three windows of a trusted one, and no
+ * evidence boost (20 / 30 / 40 / 50 / 100 / 500) fits inside a window either.
+ * Raising it sells more attention; it must never be raised silently.
+ */
+export const PRIORITY_COMPARABILITY_STEP = 5;
+
+/** The coarse window an earned priority falls in. Monotonic in `priority` and
+ * floored at 0, so a negative or absent score cannot invent a window. */
+export function comparabilityBand(priority: number): number {
+  return Math.floor(Math.max(0, Number.isFinite(priority) ? priority : 0) / PRIORITY_COMPARABILITY_STEP);
+}
+
+/**
+ * THE QUEUE SORT. Precedence, highest first — read it as a ladder where money
+ * appears on exactly one rung and cannot reach the one above it:
+ *
+ *   1. comparability window of the EARNED priority, descending.
+ *      Purchased attention CANNOT cross this rung. An item a full
+ *      PRIORITY_COMPARABILITY_STEP above another wins outright, whoever paid.
+ *   2. supporter_priority, descending.  ← the ONLY rung money touches.
+ *      Among comparable items, a supporter's report is looked at first.
+ *   3. exact EARNED priority, descending — the full-precision earned order
+ *      inside the window, so the boost is a nudge, not a reshuffle.
+ *   4. created_at, ascending — the oldest comparable report first.
+ *   5. item_id, ascending — a total order, so the queue is deterministic.
+ *
+ * With no supporter reports anywhere, rungs 1+3 reproduce a plain
+ * priority-descending sort exactly (the window is monotonic in priority), so
+ * turning this feature on changes nothing for a queue nobody paid into.
+ */
+export function compareQueueItems(a: QueueItem, b: QueueItem): number {
+  // 0. I16-S4-n131D-22a: a child-safety report sits above the whole ladder below, whatever its band.
+  const childSafety = Number(b.child_safety === true) - Number(a.child_safety === true);
+  if (childSafety !== 0) return childSafety;
+  const window = comparabilityBand(b.priority) - comparabilityBand(a.priority);
+  if (window !== 0) return window;
+  const supporter = Number(b.supporter_priority) - Number(a.supporter_priority);
+  if (supporter !== 0) return supporter;
+  if (b.priority !== a.priority) return b.priority - a.priority;
+  if (a.created_at !== b.created_at) return a.created_at < b.created_at ? -1 : 1;
+  return a.item_id < b.item_id ? -1 : a.item_id > b.item_id ? 1 : 0;
+}
+
+/** The operator-facing name of an EARNED band — the mock's vocabulary
+ * (71-ops-evidence-review.html), which never describes a payment. */
+export function reporterBandLabel(topBand: number): string {
+  if (topBand >= REPORTER_BANDS.verified_creator) return "verified creator (100)";
+  if (topBand >= REPORTER_BANDS.trusted) return "trusted (10)";
+  return "new (1)";
+}
+
+/**
+ * The one sentence an operator may see about a supporter report. It names WHO
+ * paid (the reporter), what was bought (queue position) and what was not
+ * (credibility), and deliberately borrows none of the earned vocabulary — no
+ * "trusted", "verified", "confirmed", "upheld". An operator must never read
+ * this as a reason to believe the report.
+ *
+ * It used to read "paid supporter — purchased queue position, not credibility"
+ * (reworded 2026-08-15). Two faults, both about MISREADING rather than accuracy:
+ * "supporter" is warm, earned-adjacent vocabulary — in a creator product it
+ * reads as SOMEONE WHO BACKS A CREATOR, i.e. a standing — and the old wording
+ * never named the payer, so on a row whose subject is a creator handle it was
+ * ambiguous between the reporter, the reported account and the impersonated
+ * creator. The sentence now leads with the actor and the verb.
+ */
+export const SUPPORTER_ORDER_LABEL = "the reporter paid — this bought queue position, not credibility";
+
+/**
+ * Why this item sits where it sits, in the order the sort applies. The earned
+ * line always comes first and stays clean; the purchased line is separate,
+ * present only when something was actually purchased, and never merged into the
+ * earned one. The admin UI is free to render these verbatim.
+ */
+export function queueOrderReasons(item: QueueItem): string[] {
+  // The erased-reporter clause rides INSIDE the earned line, not as a line of
+  // its own, and that placement is load-bearing twice over: `fan-reports.ts`
+  // renders reason[0] plainly and every later line as a DISCLOSURE OF A
+  // PURCHASE, so a second line here would read as "somebody paid"; and the
+  // "reasons.length > 1 ⇔ supporter_priority" equivalence is pinned. It is part
+  // of the earned sentence anyway — it explains the count immediately before it.
+  const gone = item.deleted_reporters ?? 0;
+  const erased = gone > 0 ? ` · ${gone} further reporter(s) have since deleted their account and no longer count` : "";
+  // QUEUE #577: a scanner match rides inside reason[0] for the same reason the
+  // erased clause does — a second line would render as a purchase disclosure.
+  const scan = (item.scan_matches ?? 0) > 0 ? ` · child-safety scan matched ${item.scan_matches} upload(s) on this item — sorted ahead of every ordinary report` : "";
+  const out = [`earned priority ${item.priority.toFixed(1)} · top band ${reporterBandLabel(item.top_band)} · ${item.distinct_reporters} distinct reporter(s)${erased}${scan}`];
+  if (item.supporter_priority) out.push(SUPPORTER_ORDER_LABEL);
+  return out;
+}
+
+/**
+ * The QUEUE ITEM AS SERVED to the operator console.
+ *
+ * `supporter_priority` on its own is a bare boolean, and a bare boolean is not
+ * an explanation: an operator reading `true` has been told that something was
+ * bought but not WHAT — and the whole reason purchased queue position is
+ * acceptable is that they can always see that it bought attention and nothing
+ * else. So the API carries the SENTENCES, not just the flag, and the console
+ * renders them verbatim. Any consumer that shows the flag without them is
+ * showing half the fact.
+ */
+export interface QueueItemView extends QueueItem {
+  /**
+   * `queueOrderReasons`, verbatim. Reason [0] is always the EARNED line and is
+   * always present; a purchased line, when there is one, is a SEPARATE entry —
+   * so a client cannot render the two as one sentence without concatenating
+   * them itself, and cannot drop the earned one and keep the purchased one.
+   */
+  order_reasons: string[];
+}
+
+/** Decorate a served page of queue items with their ordering reasons. Kept
+ * beside the sort it explains so a new queue route cannot serve the flag
+ * without the words. */
+export function queueItemViews(items: QueueItem[]): QueueItemView[] {
+  return items.map((item) => ({ ...item, order_reasons: queueOrderReasons(item) }));
+}
+
+/** One served page of the operator queue and the keyset cursor of the page
+ * after it (`null` = nothing after it). I3-1228 (D-0829). */
+export interface QueuePage {
+  items: QueueItem[];
+  next_cursor: string | null;
+  /** RJ550b-W312-R9-3: the state holds MORE than REPORT_QUEUE_READ_CEILING
+   * items, so only the first ceiling (by `sortedQueue`'s SQL pre-order) are
+   * ranked and pageable; a `null` next_cursor then does NOT mean "nothing
+   * after". `oldestOpenReportAt` still reads the whole table. */
+  truncated: boolean;
+}
+
+/** The rungs `compareQueueItems` reads — the window rung is derived from `priority`. */
+type QueueCursor = Pick<QueueItem, "priority" | "supporter_priority" | "created_at" | "item_id" | "child_safety">;
+
+/** Opaque keyset cursor: the LAST served item's sort tuple, base64url JSON. */
+export function encodeQueueCursor(it: QueueCursor): string {
+  return btoa(JSON.stringify([it.priority, it.supporter_priority ? 1 : 0, it.created_at, it.item_id, it.child_safety === true ? 1 : 0]))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+function decodeQueueCursor(raw: string): QueueCursor {
+  try {
+    const b64 = raw.replace(/-/g, "+").replace(/_/g, "/");
+    const v = JSON.parse(atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4))) as unknown;
+    // I16-S4-n131D-22a: a 5th element carries the child-safety rung; a 4-tuple (issued before it) reads as 0.
+    if (Array.isArray(v) && (v.length === 4 || (v.length === 5 && (v[4] === 0 || v[4] === 1))) && typeof v[0] === "number" && Number.isFinite(v[0]) && (v[1] === 0 || v[1] === 1) && typeof v[2] === "string" && typeof v[3] === "string") {
+      return { priority: v[0], supporter_priority: v[1] === 1, created_at: v[2], item_id: v[3], child_safety: v[4] === 1 };
+    }
+  } catch {
+    /* fall through: any undecodable cursor is the same refusal */
+  }
+  throw new ReportError("bad_cursor", 400);
+}
+
+/** The ranked operator queue. Priority is computed at read time from the
+ * stored ingredients (no stored score to race on); the queue is small by
+ * construction (deduped items, operator-paced). Pages through `cursor`
+ * (`reportQueuePage`); the return shape is unchanged for existing callers. */
+/** I3-1235 (I23-W1-AUTH H10): the operator's line for an item whose evidence an erasure removed; null when none was. */
+export function erasedEvidenceNote(count: unknown): string | null {
+  const n = Number(count) || 0;
+  return n > 0 ? `${n} evidence item${n === 1 ? "" : "s"} removed at erasure` : null;
+}
+
+export async function reportQueue(db: DbLike, state = "open", limit = 100, cursor: string | null = null): Promise<QueueItem[]> {
+  return (await reportQueuePage(db, state, limit, cursor)).items;
+}
+
+/**
+ * I3-1228 (D-0829): KEYSET PAGINATION OVER THE UNCHANGED SORT. The safety
+ * bands are not reordered: every item is still ranked by `compareQueueItems`
+ * (window, supporter, priority, created_at, item_id), and a page is the items
+ * STRICTLY after the cursor's tuple in that order — so an item below the first
+ * page is reachable by following `next_cursor` instead of never being shown.
+ */
+/**
+ * I32 (I32-REPORTS hand-off 4, I3-0304 limb 2): the operator's handle search. Trimmed, one leading `@` dropped,
+ * lower-cased, at most 100 characters; empty is no search (`null`). The admin console normalizes the same way
+ * (apps/admin/src/main.ts `fanReportHandleOf`) and trusts a result only when the response echoes this value.
+ */
+export function normalizeQueueHandle(raw: unknown): string | null {
+  const h = String(raw ?? "").trim().replace(/^@/, "").toLowerCase().slice(0, 100);
+  return h === "" ? null : h;
+}
+
+export async function reportQueuePage(db: DbLike, state = "open", limit = 100, cursor: string | null = null, handle: string | null = null): Promise<QueuePage> {
+  const after = cursor === null || cursor === undefined ? null : decodeQueueCursor(cursor);
+  const { items: sorted, truncated } = await sortedQueue(db, state, handle);
+  const rest = after ? sorted.filter((it) => compareQueueItems(after as QueueItem, it) < 0) : sorted;
+  const size = Math.max(1, Math.min(500, limit));
+  const page = rest.slice(0, size);
+  // Operator evidence for the served page only — notes, note totals and
+  // categories — read in CHUNKS, never once per item (`attachQueueDetail`).
+  await attachQueueDetail(db, page);
+  const last = page[page.length - 1];
+  return { items: page, next_cursor: rest.length > page.length && last ? encodeQueueCursor(last) : null, truncated };
+}
+
+/** I3-1228: the created_at of the oldest OPEN report item (null when none), so
+ * a starved low-priority item is visible on the ops overview. */
+export async function oldestOpenReportAt(db: DbLike): Promise<string | null> {
+  const r = await db.prepare("SELECT MIN(created_at) AS t FROM fan_report_items WHERE state = 'open'").first<{ t: string | null }>();
+  return r?.t ?? null;
+}
+
+/** Every item in `state`, ranked — up to REPORT_QUEUE_READ_CEILING of them
+ * (RJ550b-W312-R9-3). The SQL pre-order decides WHICH rows a flood cuts:
+ * child-safety reports first, then scanner matches (both sit above every ordinary item), then the earned
+ * band and reporter count `priorityOf` is built from, then oldest. Private to
+ * the two exports above. */
+async function sortedQueue(db: DbLike, state: string, handle: string | null = null): Promise<{ items: QueueItem[]; truncated: boolean }> {
+  const { results } = await db
+    .prepare(
+      // `top_band` is the EARNED aggregate (MAX of the reporter bands) and feeds
+       // the priority score. `supporter` is the ORDERING-ONLY aggregate and is
+       // deliberately MAX, not SUM: the item either has a paying reporter on it
+       // or it does not, so ten supporters buy exactly what one buys. The two
+       // aggregates travel as separate columns all the way to the operator.
+       //
+       // BOTH EARNED AGGREGATES SKIP ERASED REPORTERS. `reporter_deleted`
+       // (migration 0019) is 1 for a row whose fan account has been deleted and
+       // pseudonymised. Those rows keep the item's history honest for a human
+       // but must not raise the count or the band, because a deleted account and
+       // its re-registered successor are one person filing twice. `deleted_n`
+       // travels beside them so the operator is TOLD, rather than shown a
+       // quietly smaller number.
+       //
+       // `scan_n` (QUEUE #577): scanner matches, read IN this statement for every
+       // row BEFORE the sort — a page-only read could be sliced off by the very
+       // ordering it overrides — and at no extra statement (I3-2130).
+       `SELECT i.*,
+               COALESCE(r.n, 0) AS n,
+               COALESCE(r.deleted_n, 0) AS deleted_n,
+               COALESCE(r.top_band, 0) AS top_band,
+               COALESCE(r.supporter, 0) AS supporter,
+               COALESCE(r.child_safety, 0) AS child_safety,
+               (SELECT COUNT(*) FROM evidence_scan_events s WHERE s.item_id = i.item_id) AS scan_n
+       FROM fan_report_items i
+       LEFT JOIN (SELECT item_id,
+                         SUM(CASE WHEN reporter_deleted = 0 THEN 1 ELSE 0 END) AS n,
+                         SUM(reporter_deleted) AS deleted_n,
+                         MAX(CASE WHEN reporter_deleted = 0 THEN earned_band ELSE 0 END) AS top_band,
+                         MAX(supporter_boost) AS supporter,
+                         MAX(CASE WHEN category = 'child_safety' THEN 1 ELSE 0 END) AS child_safety
+                    FROM fan_report_reporters
+                   WHERE item_id IN (SELECT item_id FROM fan_report_items WHERE state = ?)
+                   GROUP BY item_id) r
+         ON r.item_id = i.item_id
+       WHERE i.state = ? AND (? IS NULL OR lower(i.handle) = ?)
+       ORDER BY child_safety DESC, (scan_n > 0) DESC, top_band DESC, n DESC, i.created_at ASC, i.item_id ASC
+       LIMIT ?`,
+    )
+    // `state` twice: once for the aggregate's own scope above, once for the
+    // outer row filter below. Same value, in SQL-text order. Ceiling + 1 so
+    // the overflow is detectable.
+    // I32: the handle filter is in the WHERE, before the LIMIT, so a search reaches reports past the read ceiling.
+    .bind(state, state, handle, handle, REPORT_QUEUE_READ_CEILING + 1)
+    .all<{
+      item_id: string;
+      subject_hash: string;
+      canonical: string;
+      platform: string;
+      handle: string;
+      state: string;
+      suspected_passport_id: string | null;
+      evidence: string;
+      created_at: string;
+      updated_at: string;
+      n: number;
+      deleted_n: number;
+      top_band: number;
+      supporter: number;
+      child_safety: number;
+      scan_n: number;
+      reopen_count: number;
+      face_state: string;
+      erased_evidence_count?: number | null;
+    }>();
+  const truncated = results.length > REPORT_QUEUE_READ_CEILING;
+  const items: QueueItem[] = [];
+  for (const r of truncated ? results.slice(0, REPORT_QUEUE_READ_CEILING) : results) {
+    const scanN = Number(r.scan_n) || 0;
+    let evidence: Record<string, unknown> = {};
+    try {
+      evidence = JSON.parse(r.evidence) as Record<string, unknown>;
+    } catch {
+      evidence = {};
+    }
+    items.push({
+      item_id: r.item_id,
+      subject_hash: r.subject_hash,
+      canonical: r.canonical,
+      platform: r.platform,
+      handle: r.handle,
+      state: r.state,
+      distinct_reporters: r.n,
+      deleted_reporters: r.deleted_n ?? 0,
+      erased_evidence: Number(r.erased_evidence_count) || 0,
+      erased_evidence_note: erasedEvidenceNote(r.erased_evidence_count),
+      top_band: r.top_band,
+      suspected_passport_id: r.suspected_passport_id,
+      evidence,
+      priority: priorityOf(r.top_band, r.n, evidence, scanN),
+      scan_matches: scanN,
+      // Purchased attention, carried beside the earned score and never folded
+      // into it. Any non-1 value (absent column on a legacy row, NULL from the
+      // LEFT JOIN) reads as false — fail neutral.
+      supporter_priority: r.supporter === 1,
+      reopen_count: r.reopen_count ?? 0,
+      face_state: r.face_state ?? "pending",
+      notes: [],
+      notes_total: 0,
+      categories: [],
+      child_safety: r.child_safety === 1,
+      created_at: r.created_at,
+      updated_at: r.updated_at,
+    });
+  }
+  items.sort(compareQueueItems); // precedence is documented on compareQueueItems
+  return { items, truncated };
+}
+
+/**
+ * Attach reporter notes, note totals and categories to a SERVED PAGE.
+ *
+ * WHAT DID NOT CHANGE, and it is the whole point: the three predicates are the
+ * ones the per-item reads used — same `note IS NOT NULL AND note != ''`, same
+ * `created_at DESC` preview of three, same `DISTINCT category` ascending, same
+ * enum re-validation. Which items an operator sees, in what order, and which
+ * three notes ride on each, are decided exactly where they were decided before.
+ * Only the number of round trips moved.
+ *
+ * The per-item `LIMIT 3` is the one thing that cannot survive as SQL across a
+ * multi-item read, so it becomes a per-item counter in JS on the SAME ordering
+ * key. That key is deliberately NOT given a tie-break: a second key would change
+ * which three notes an operator reads on rows whose `created_at` collide, and
+ * that is a product change, not a round-trip fix.
+ *
+ * CHUNKED BY THE SHARED HELPER. The served page is capped at 500 above, and a
+ * bound-parameter list that long is past what D1 accepts, so the detail columns
+ * are read in `inChunks(...)` chunks: 1 + 3 × ceil(page / IN_CHUNK) statements
+ * instead of the 1 + 3 × page the per-item reads cost (1,501 at the ceiling).
+ * This used to be a LOCAL `QUEUE_DETAIL_CHUNK = 100`, which sat EXACTLY on D1's
+ * 100-parameter ceiling with ZERO headroom: the first caller-side bound
+ * parameter added to one of these three predicates (an `AND created_at > ?`,
+ * say) would have made it 101 and a 500 in production, and the default suite
+ * could never have caught it (better-sqlite3 allows ~32,766). `IN_CHUNK` is 90
+ * precisely to leave that room — see the comment on it in `db.ts`, and pass
+ * `inChunks(ids, n)` if this statement ever grows n extra bindings of its own.
+ *
+ * It is still a ROUND-TRIP control and nothing else. Every chunk runs the same
+ * predicate as every other, so no served value depends on where the boundary
+ * falls; `inChunks` de-duplicates, which is a NO-OP here because `page` carries
+ * one row per `fan_report_items.item_id` (PRIMARY KEY, migration 0010) joined
+ * to a `GROUP BY item_id` aggregate. Control:
+ * `test/w312-regression-w3-12-r9-report-queue.test.ts` — "the statement count
+ * does NOT grow with the served page".
+ */
+/** The operator-note clamp, shared by the queue preview and `reportNotes`. */
+function clampNote(note: unknown): string {
+  return String(note).replace(/[<>&"'`]/g, "").replace(BIDI_CONTROL_RE, "").slice(0, 240);
+}
+
+/**
+ * The FULL note history of one report item (I3-1363, I4-06-R9 hand-off): the
+ * same predicate and order as the queue's three-note preview
+ * (`attachQueueDetail`), with `notes_total` from the same predicate, so
+ * "3 of 9" and this list can never disagree. `limit` is clamped to [1, 500].
+ */
+export async function reportNotes(db: DbLike, itemId: string, limit = 200): Promise<{ notes: string[]; notes_total: number }> {
+  const cap = Math.max(1, Math.min(500, Number.isFinite(limit) ? Math.floor(limit) : 200));
+  const { results } = await db
+    .prepare("SELECT note FROM fan_report_reporters WHERE item_id = ? AND note IS NOT NULL AND note != '' ORDER BY created_at DESC LIMIT ?")
+    .bind(itemId, cap)
+    .all<{ note: string }>();
+  const total = await db
+    .prepare("SELECT COUNT(*) AS n FROM fan_report_reporters WHERE item_id = ? AND note IS NOT NULL AND note != ''")
+    .bind(itemId)
+    .first<{ n: number }>();
+  return { notes: results.map((r) => clampNote(r.note)), notes_total: Number(total?.n ?? 0) };
+}
+
+async function attachQueueDetail(db: DbLike, page: QueueItem[]): Promise<void> {
+  if (page.length === 0) return; // no page, no statement — never an empty IN list
+  const byId = new Map(page.map((it) => [it.item_id, it]));
+  for (const it of page) {
+    it.notes = [];
+    it.notes_total = 0;
+    it.categories = [];
+  }
+  for (const chunk of inChunks(page.map((it) => it.item_id))) {
+    const marks = chunk.map(() => "?").join(",");
+    // Notes preview. `item_id` leads the sort only to group the rows; it cannot
+    // reorder within an item, so `created_at DESC` still decides the three.
+    const { results: noteRows } = await db
+      .prepare(
+        `SELECT item_id, note FROM fan_report_reporters WHERE item_id IN (${marks}) AND note IS NOT NULL AND note != '' ORDER BY item_id ASC, created_at DESC`,
+      )
+      .bind(...chunk)
+      .all<{ item_id: string; note: string }>();
+    for (const n of noteRows) {
+      const it = byId.get(n.item_id);
+      if (!it || it.notes.length >= 3) continue;
+      it.notes.push(clampNote(n.note));
+    }
+    // TP-07: the SAME predicate as the preview above, counted rather than
+    // listed, so "3 of 9" can never disagree with what is shown.
+    const { results: totalRows } = await db
+      .prepare(
+        `SELECT item_id, COUNT(*) AS n FROM fan_report_reporters WHERE item_id IN (${marks}) AND note IS NOT NULL AND note != '' GROUP BY item_id`,
+      )
+      .bind(...chunk)
+      .all<{ item_id: string; n: number }>();
+    for (const t of totalRows) {
+      const it = byId.get(t.item_id);
+      if (it) it.notes_total = Number(t.n ?? 0);
+    }
+    // Distinct categories for the served page only (flag 22). Re-validated
+    // against the enum as defense in depth — the queue serves nothing that
+    // isn't a known category value.
+    const { results: catRows } = await db
+      .prepare(
+        `SELECT DISTINCT item_id, category FROM fan_report_reporters WHERE item_id IN (${marks}) AND category IS NOT NULL ORDER BY item_id ASC, category ASC`,
+      )
+      .bind(...chunk)
+      .all<{ item_id: string; category: string }>();
+    for (const c of catRows) {
+      const it = byId.get(c.item_id);
+      if (it && REPORT_CATEGORIES.includes(c.category as ReportCategory)) it.categories.push(c.category);
+    }
+  }
+}
+
+// ---------- Operator actions ----------
+
+/** I18 #942(a) (D-0946(1), D-0948(1)): the caller's statements (the console's audit row) join the change's batch.
+ * `changeGateStmt` sits DIRECTLY after the change's write: it inserts nothing when that write changed exactly one
+ * row (`changes()`, the passkeys.ts / agency_members.ts idiom) and otherwise violates `audit_log.detail NOT NULL`,
+ * aborting the whole batch — so a joined row never records a change that did not happen, and a failing joined row
+ * rolls the change back. Same shape as agencies.ts `changeGateStmt` (two private copies). */
+function changeGateStmt(db: DbLike): DbStatement {
+  return db.prepare(
+    "INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT 'system:change-gate', 'change-gate', NULL, '', NULL, 'system' WHERE changes() <> 1",
+  );
+}
+const CHANGE_GATE_REFUSED_RE = /NOT NULL constraint failed:\s*audit_log\.detail\b/i;
+function isChangeGateRefusal(e: unknown): boolean {
+  return e instanceof Error && CHANGE_GATE_REFUSED_RE.test(e.message);
+}
+/** `write` (ending in `RETURNING`) then, when given, the gate and `extra`, in ONE batch: the rows the write returned
+ * (0 when the gate refused). */
+async function changeWithJoinedRows(db: DbLike, write: DbStatement, extra: DbStatement[]): Promise<number> {
+  try {
+    const res = (await db.batch(extra.length > 0 ? [write, changeGateStmt(db), ...extra] : [write])) as { results?: unknown[] }[];
+    return res[0]?.results?.length ?? 0;
+  } catch (e) {
+    if (isChangeGateRefusal(e)) return 0;
+    throw e;
+  }
+}
+
+/** Escalate: hand the item to the EXISTING warnings funnel (review_queue
+ * 'report' item), prefilled with the evidence + suspected creator so the
+ * operator's draft can carry the find-the-real-one pointer. */
+export async function escalateReport(
+  db: DbLike,
+  actor: string,
+  itemId: string,
+  now: () => string = () => new Date().toISOString(),
+  audit?: (ctx: { review_item_id: string; ts: string }) => DbStatement[],
+): Promise<{ review_item_id: string }> {
+  const item = await db.prepare("SELECT * FROM fan_report_items WHERE item_id = ?").bind(itemId).first<{ item_id: string; subject_hash: string; state: string; suspected_passport_id: string | null; evidence: string; canonical: string }>();
+  if (!item) throw new ReportError("no such report", 404);
+  if (item.state !== "open") throw new ReportError(`report is not open (state ${item.state})`, 409);
+  // Split exactly as the queue splits it: `distinct_reporters` is the currently
+  // eligible human signal, and reporters who have since erased their account are
+  // carried as their own number so the operator drafting a warning sees that the
+  // corroboration existed and that it no longer counts.
+  const count = await db
+    .prepare("SELECT SUM(CASE WHEN reporter_deleted = 0 THEN 1 ELSE 0 END) AS n, SUM(reporter_deleted) AS gone FROM fan_report_reporters WHERE item_id = ?")
+    .bind(itemId)
+    .first<{ n: number | null; gone: number | null }>();
+  const deleted = count?.gone ?? 0;
+
+  // AUDIT ITEM #76 — enqueue the review item and flip the report IN ONE ATOMIC,
+  // GUARDED BATCH. This used to `enqueue(...)` (creating the review_queue row +
+  // its audit line) and THEN guard only the state flip, so two concurrent
+  // escalates — a double-click, a retry — both enqueued while only one won the
+  // flip, ORPHANING a duplicate review item that sat in the operator queue with
+  // no report pointing at it. Now every write is conditioned on the report still
+  // being `open` at commit time (the same snapshot the flip reads), so the loser
+  // of the race writes NOTHING: no orphan row, no stray audit line.
+  const reviewId = mintId("itm");
+  const ts = now();
+  const payload = {
+    source: "fan_reports",
+    fan_report_item: item.item_id,
+    distinct_reporters: count?.n ?? 0,
+    ...(deleted > 0 ? { deleted_reporters: deleted } : {}),
+    ...(item.suspected_passport_id ? { suspected_passport_id: item.suspected_passport_id } : {}),
+  };
+  const payloadJson = JSON.stringify(payload);
+  const guard = "EXISTS (SELECT 1 FROM fan_report_items WHERE item_id = ? AND state = 'open')";
+  // I18 #942(a) D01 (D-0948(2)): the caller's rows (`audit`, built from this batch's review id) ride THIS batch
+  // behind `changeGateStmt`, so they commit only with the flip, and a failing one rolls the escalation back.
+  const joined = audit ? audit({ review_item_id: reviewId, ts }) : [];
+  const batch = [
+    db
+      .prepare(
+        `INSERT INTO review_queue (item_id, item_type, state, subject, payload, created_at, updated_at, import_batch_id)
+         SELECT ?, 'report', 'open', ?, ?, ?, ?, NULL WHERE ${guard}`,
+      )
+      .bind(reviewId, `sha256:${item.subject_hash}`, payloadJson, ts, ts, itemId),
+    db
+      .prepare(
+        `INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind)
+         SELECT ?, 'enqueue:report', ?, ?, ?, 'operator' WHERE ${guard}`,
+      )
+      .bind(actor, payloadJson.slice(0, 500), ts, reviewId, itemId),
+    db
+      .prepare("UPDATE fan_report_items SET state = 'escalated', review_item_id = ?, updated_at = ? WHERE item_id = ? AND state = 'open'")
+      .bind(reviewId, ts, itemId),
+    ...(joined.length > 0 ? [changeGateStmt(db), ...joined] : []),
+  ];
+  try {
+    await db.batch(batch);
+  } catch (e) {
+    if (isChangeGateRefusal(e)) throw new ReportError("report changed state concurrently", 409);
+    throw e;
+  }
+  // Who won is read back from the row, not from a batch rowcount — D1 batch
+  // results carry no portable `changes`, and the flip is the authority anyway.
+  // Only the batch that found the report `open` set `review_item_id`, and it set
+  // it to ITS reviewId; a loser re-reads a different id (its own guarded writes
+  // all no-op'd) and reports the concurrent close, having orphaned nothing.
+  const after = await db.prepare("SELECT state, review_item_id FROM fan_report_items WHERE item_id = ?").bind(itemId).first<{ state: string; review_item_id: string | null }>();
+  if (!after || after.state !== "escalated" || after.review_item_id !== reviewId) {
+    throw new ReportError("report changed state concurrently", 409);
+  }
+  return { review_item_id: reviewId };
+}
+
+/** Soft close, OPEN items only (review finding: dismissing an escalated item
+ * would diverge from its live review_queue twin — escalated items resolve
+ * through the review flow: publish, or reject → auto-reopen → then dismiss).
+ * A dismissed item RE-OPENS if a new distinct reporter files. */
+export async function dismissReport(
+  db: DbLike,
+  itemId: string,
+  now: () => string = () => new Date().toISOString(),
+  store: EvidenceStore | null = null,
+  extraStatements: DbStatement[] = [],
+): Promise<{ evidenceLeft: number }> {
+  // I21-Q29 (I29-FANERASE H2, D-1030): an open legal hold on the report item refuses the dismissal (and so the
+  // evidence purge below) with 409 `legal_hold`. Asked inside the dismiss UPDATE's own WHERE, so a hold opened at any
+  // point before the batch wins; a refused write then reads the hold (reportItemHeld) to answer 409, not 404. D-1041(4): the
+  // hold asked is itemPurgeHeldSql — the item, an uploader of its evidence, or its passport (the sweep's predicate).
+  const held = () => reportItemHeld(db, itemId);
+  const changed = await changeWithJoinedRows(
+    db,
+    db
+      .prepare(`UPDATE fan_report_items SET state = 'dismissed', updated_at = ?, closed_at = ? WHERE item_id = ? AND state = 'open' AND NOT ${itemPurgeHeldSql("?")} RETURNING item_id`)
+      .bind(...twice(now()), itemId, itemId),
+    extraStatements,
+  );
+  if (changed !== 1) {
+    if (await held()) throw new ReportError("legal_hold", 409);
+    throw new ReportError("no open report to dismiss", 404);
+  }
+  // flag 13 RETENTION: evidence dies with the report. Purged AFTER the state
+  // change lands, so a failed dismissal never destroys the attachments of an
+  // item that is still open. A dismissed item can re-open on a fresh reporter,
+  // but the ORIGINAL reporter's screenshots do not come back — the retention
+  // promise is unconditional, and a re-opened item can be re-evidenced.
+  // NON-THROWING on purpose (adversarial review): the UPDATE above has already
+  // COMMITTED, together with the caller's audit row (`extraStatements`, joined to
+  // the same batch since I18 #942(a)), so a storage fault must not surface as a
+  // 500 for a dismissal that is done and recorded — a logged purge failure an
+  // operator can retry is the right answer.
+  await purgeItemEvidenceQuietly(db, store, itemId);
+  return { evidenceLeft: await evidenceLeftFor(db, itemId) };
+}
+
+/** D-1041(4): the item purge doors' hold predicate. Defined in evidence.ts beside evidencePurgeHeldSql (I29-FX9: the purge
+ * itself asks it, and evidence.ts cannot import this module); re-exported for admin.ts and console.ts. */
+export { itemPurgeHeldSql };
+
+/** I21-Q29 / D-1037(8) / D-1041(4): itemPurgeHeldSql — the read every closing door asks. */
+async function reportItemHeld(db: DbLike, itemId: string): Promise<boolean> {
+  return ((await db.prepare(`SELECT ${itemPurgeHeldSql("?")} AS held`).bind(itemId).first<{ held: number }>())?.held ?? 0) === 1;
+}
+
+/** I3-1349 (I4-05-R4 P4): evidence rows still pointing at bytes after a
+ * terminal close's quiet purge, so the operator route can say so at the moment
+ * (the durable record is `evidence:purge_failed`). -1 when unreadable. */
+async function evidenceLeftFor(db: DbLike, itemId: string): Promise<number> {
+  try {
+    return (await db.prepare("SELECT COUNT(*) AS n FROM report_evidence WHERE item_id = ?").bind(itemId).first<{ n: number }>())?.n ?? -1;
+  } catch {
+    return -1;
+  }
+}
+
+/** The explicit TERMINAL close for nuisance/hostile items — never re-opens,
+ * absorbs future reports silently, and its reporters are never notified.
+ * Deliberately a distinct operator action from dismiss (mirrors the S27
+ * request-suppression pattern), so permanence is always a conscious choice. */
+export async function suppressReport(
+  db: DbLike,
+  itemId: string,
+  on: boolean,
+  now: () => string = () => new Date().toISOString(),
+  store: EvidenceStore | null = null,
+  extraStatements: DbStatement[] = [],
+): Promise<{ evidenceLeft: number }> {
+  // D-1037(8) (I29-JN-05 int-12, RG-ERASE RECORDS-03): the suppress leg purges evidence, so an open legal hold on the
+  // item refuses it with 409 `legal_hold`, asked inside the UPDATE as dismissReport asks it (D-1041(4): itemPurgeHeldSql,
+  // the item, an uploader of its evidence or its passport). Un-suppress purges nothing.
+  const write = on
+    ? db
+        .prepare(`UPDATE fan_report_items SET state = 'suppressed', updated_at = ?, closed_at = ? WHERE item_id = ? AND state IN ('open','dismissed','retracted') AND NOT ${itemPurgeHeldSql("?")} RETURNING item_id`)
+        .bind(...twice(now()), itemId, itemId)
+    : db
+        .prepare("UPDATE fan_report_items SET state = 'open', updated_at = ?, closed_at = NULL, tombstoned_at = NULL WHERE item_id = ? AND state = 'suppressed' RETURNING item_id")
+        .bind(now(), itemId);
+  if ((await changeWithJoinedRows(db, write, extraStatements)) !== 1) {
+    if (on && (await reportItemHeld(db, itemId))) throw new ReportError("legal_hold", 409);
+    throw new ReportError(on ? "no suppressible report" : "not suppressed", 404);
+  }
+  // flag 13 RETENTION: the terminal close destroys the evidence with it. Only
+  // on the SUPPRESS direction — un-suppressing re-opens the case but cannot
+  // resurrect bytes that are already gone. Non-throwing for the same reason as
+  // dismiss: the state change is already committed when this runs.
+  if (on) await purgeItemEvidenceQuietly(db, store, itemId);
+  return { evidenceLeft: await evidenceLeftFor(db, itemId) };
+}
+
+/** #132PS-036 (D-0920): the OPERATOR re-open of a soft-closed item — the only
+ * re-open once REPORT_AUTO_REOPEN_MAX automatic ones are spent. Counts in
+ * `reopen_count` like the automatic one, so the history stays visible. */
+export async function reopenReport(
+  db: DbLike,
+  itemId: string,
+  now: () => string = () => new Date().toISOString(),
+  audit?: { actor: string; detail: string },
+): Promise<void> {
+  // FX-I16-RG-CLIENT:9 (I16-W13S): the operator's audit row commits in the SAME batch as the re-open, bound to the
+  // re-open having happened (the item is 'open' at this batch's instant), so an audit fault rolls the re-open back
+  // and a 404 writes no audit row. The verdict is the UPDATE's own RETURNING rows (batch results carry no `changes`).
+  const ts = now();
+  const [res] = (await db.batch([
+    db
+      .prepare("UPDATE fan_report_items SET state = 'open', reopen_count = reopen_count + 1, updated_at = ?, closed_at = NULL, tombstoned_at = NULL WHERE item_id = ? AND state IN ('dismissed','retracted') RETURNING item_id")
+      .bind(ts, itemId),
+    ...(audit
+      ? [
+          db
+            .prepare(
+              "INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT ?, 'fan_report:reopen', ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM fan_report_items WHERE item_id = ? AND state = 'open' AND updated_at = ?)",
+            )
+            .bind(audit.actor, audit.detail, ts, itemId, auditActorKind(audit.actor), itemId, ts),
+        ]
+      : []),
+  ])) as { results?: unknown[] }[];
+  if ((res?.results?.length ?? 0) !== 1) throw new ReportError("no dismissed or retracted report to re-open", 404);
+}
+
+// ---------- I21-Q91: closed reports become hash tombstones ----------
+
+/** I21-Q91 (I3-0914; D-1030 "(a) delete 180 days after closing, keep a hash tombstone"). */
+export const FAN_REPORT_TOMBSTONE_DAYS = 180;
+/** Items scrubbed per sweep call (one batch each); `more: true` = call again. */
+export const FAN_REPORT_TOMBSTONE_BATCH = 100;
+const CLOSED_STATES_SQL = "('dismissed','retracted','suppressed')";
+/** I21-Q91: one instant bound twice — a closing write's `updated_at` and `closed_at` (0237) are the same moment. */
+const twice = (ts: string): [string, string] => [ts, ts];
+
+/**
+ * I21-Q91 — scrub every report item that has sat in a closed state (dismissed, retracted, suppressed; `closed_at`,
+ * migration 0237) for FAN_REPORT_TOMBSTONE_DAYS: canonical, platform and handle become '', evidence '{}', and its
+ * fan_report_reporters and fan_report_reporter_closures rows are deleted, in ONE batch per item whose every statement
+ * re-asks the predicate (closed, aged, not yet tombstoned, NOT itemPurgeHeldSql: no open hold on the item, an uploader
+ * account of its evidence or the passport it names — D-1045(1)) — a re-open or a hold landing after the read scrubs
+ * nothing. A reporter row whose fan reporter account is under an open hold (`reporterHeld`) is kept by both reporter
+ * deletes, asked per row inside each statement; the late delete takes it once the hold is released. item_id, subject_hash, state, reopen_count and the dates stay: subject_hash UNIQUE
+ * still routes a new filing onto the tombstone, so a suppressed subject keeps absorbing reports and a dismissed one
+ * re-opens as before (fileReport refills the subject on that re-open). A reporter row filed onto an ALREADY scrubbed
+ * closed item (an absorbed or non-re-opening filing) is deleted once it is itself FAN_REPORT_TOMBSTONE_DAYS old.
+ * Not touched: report_evidence (its bytes die at the close, evidence.ts purgeItemEvidenceQuietly; a row left there is
+ * a purge failure the operator retries) and evidence_scan_events. scheduled() step: I29-INT.
+ */
+export async function sweepFanReportTombstones(db: DbLike, nowMs: number = Date.now()): Promise<{ scrubbed: number; late_reporters: number; late_closures: number; more: boolean }> {
+  const cutoff = new Date(nowMs - FAN_REPORT_TOMBSTONE_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  const ts = new Date(nowMs).toISOString();
+  // itemPurgeHeldSql's subquery aliases its own fan_report_items, so the qualified name is the row this statement reads.
+  const due = `state IN ${CLOSED_STATES_SQL} AND closed_at IS NOT NULL AND closed_at <= ? AND tombstoned_at IS NULL AND NOT ${itemPurgeHeldSql("fan_report_items.item_id")}`;
+  // D-1046(2): a reporter row (fan account or creator passport) or closure row whose reporter is held is kept by every delete.
+  const reporterHeld = reporterLegalHoldSql("fan_report_reporters");
+  const closureHeld = reporterLegalHoldSql("fan_report_reporter_closures");
+  const { results } = await db
+    .prepare(`SELECT item_id FROM fan_report_items WHERE ${due} ORDER BY closed_at LIMIT ?`)
+    .bind(cutoff, FAN_REPORT_TOMBSTONE_BATCH)
+    .all<{ item_id: string }>();
+  let scrubbed = 0;
+  for (const { item_id } of results) {
+    const still = `EXISTS (SELECT 1 FROM fan_report_items WHERE item_id = ? AND ${due})`;
+    const [, , upd] = (await db.batch([
+      db.prepare(`DELETE FROM fan_report_reporters WHERE item_id = ? AND NOT ${reporterHeld} AND ${still}`).bind(item_id, item_id, cutoff),
+      db.prepare(`DELETE FROM fan_report_reporter_closures WHERE item_id = ? AND NOT ${closureHeld} AND ${still}`).bind(item_id, item_id, cutoff),
+      db
+        .prepare(`UPDATE fan_report_items SET canonical = '', platform = '', handle = '', evidence = '{}', tombstoned_at = ? WHERE item_id = ? AND ${due} RETURNING item_id`)
+        .bind(ts, item_id, cutoff),
+    ])) as [unknown, unknown, { results?: unknown[] }];
+    scrubbed += upd?.results?.length ?? 0;
+  }
+  const late = (await db
+    .prepare(
+      `DELETE FROM fan_report_reporters WHERE created_at <= ? AND NOT ${reporterHeld} AND item_id IN (SELECT item_id FROM fan_report_items WHERE tombstoned_at IS NOT NULL AND state IN ${CLOSED_STATES_SQL} AND NOT ${itemPurgeHeldSql("fan_report_items.item_id")}) RETURNING item_id`,
+    )
+    .bind(cutoff)
+    .all<{ item_id: string }>()).results.length;
+  // D-1046(2): a closure row kept for a held reporter goes once the hold is released. No age bound: fileReport writes a
+  // closure row only in the batch that re-opens the item (which clears tombstoned_at), so every closure row on a
+  // tombstoned item predates its close and is one the per-item batch kept for a held reporter.
+  const lateClosures = (await db
+    .prepare(
+      `DELETE FROM fan_report_reporter_closures WHERE NOT ${closureHeld} AND item_id IN (SELECT item_id FROM fan_report_items WHERE tombstoned_at IS NOT NULL AND state IN ${CLOSED_STATES_SQL} AND NOT ${itemPurgeHeldSql("fan_report_items.item_id")}) RETURNING item_id`,
+    )
+    .all<{ item_id: string }>()).results.length;
+  return { scrubbed, late_reporters: late, late_closures: lateClosures, more: results.length === FAN_REPORT_TOMBSTONE_BATCH };
+}
+
+// ---------- flag 21 (2026-08-14): the fan's own report status ----------
+
+/** The fan-visible status ladder. Deliberately coarser than the item state
+ * machine: 'dismissed', 'suppressed', AND 'retracted' all present as the SAME
+ * neutral "closed" — a fan must not be able to distinguish an operator
+ * dismissal from a suppression (or probe which terminal state their report
+ * hit). Unknown/future states also fail closed to "closed". */
+export type FanReportStatus = "received" | "reviewing" | "published" | "closed";
+
+export function fanReportStatus(state: string): FanReportStatus {
+  switch (state) {
+    case "open":
+      return "received";
+    case "escalated":
+      return "reviewing"; // in the operator review_queue (incl. queued warnings)
+    case "published":
+      return "published";
+    default:
+      return "closed"; // dismissed / suppressed / retracted / anything unknown
+  }
+}
+
+export interface OwnReport {
+  /** Stable opaque case ref. item_id is `rpt_<uuid v4>` — 122 CSPRNG bits and
+   * NO time field, so it is unguessable, dates nothing, and is served directly
+   * (no derived ref). */
+  case_ref: string;
+  canonical: string; // the target as the fan submitted it (canonical form)
+  platform: string;
+  handle: string;
+  category: string;
+  filed_at: string;
+  status: FanReportStatus;
+}
+
+export const OWN_REPORTS_LIMIT = 50;
+
+/**
+ * The fan's OWN reports, most recent first, bounded. Served fields are ONLY:
+ * the opaque case ref, the target as submitted, the fan's own category, when
+ * they filed, and the coarse status ladder. NEVER operator notes, priorities,
+ * evidence, face-triage state, reporter counts, or anything about other
+ * reporters — this surface must not become a triage oracle.
+ */
+export async function listOwnReports(db: DbLike, accountId: string, kind: "fan" | "creator" = "fan"): Promise<OwnReport[]> {
+  // RG-PRIVACY:7 (I16-FXC, D-0931(8)): a report another filer re-opened stays THIS reporter's 'closed' (its closure
+  // mark is read as the soft-closed state the coarse ladder already maps to 'closed').
+  const { results } = await db
+    .prepare(
+      `SELECT i.item_id AS item_id, i.canonical AS canonical, i.platform AS platform, i.handle AS handle,
+              CASE WHEN c.item_id IS NULL THEN i.state ELSE 'dismissed' END AS state, r.category AS category, r.created_at AS created_at
+         FROM fan_report_reporters r JOIN fan_report_items i ON i.item_id = r.item_id
+         LEFT JOIN fan_report_reporter_closures c ON c.item_id = r.item_id AND c.reporter_kind = r.reporter_kind AND c.reporter_id = r.reporter_id
+        WHERE r.reporter_kind = ? AND r.reporter_id = ?
+        ORDER BY r.created_at DESC, i.item_id DESC LIMIT ?`,
+    )
+    // #114b (I16-W10B): `kind` is the session's principal — a creator reads the
+    // reports their passport filed through the same coarse ladder.
+    .bind(kind, accountId, OWN_REPORTS_LIMIT)
+    .all<{ item_id: string; canonical: string; platform: string; handle: string; state: string; category: string; created_at: string }>();
+  return results.map((r) => ({
+    case_ref: r.item_id,
+    canonical: r.canonical,
+    platform: r.platform,
+    handle: r.handle,
+    // Re-validated against the enum as defense in depth (same as the queue).
+    category: REPORT_CATEGORIES.includes(r.category as ReportCategory) ? r.category : "other",
+    filed_at: r.created_at,
+    status: fanReportStatus(r.state),
+  }));
+}
+
+// ---------- Reporter feedback (locked: YES) ----------
+
+/**
+ * The retraction sentence a reporter reads, per operator disposition.
+ *
+ * Before the disposition existed there was ONE sentence — "the warning ... has
+ * been retracted after review" — for two completely different pieces of news: a
+ * duplicate case being merged (nothing about the reporter or the subject
+ * changed) and an operator concluding the accusation was WRONG (which is the
+ * one a reporter genuinely needs to hear, and the one they must not be able to
+ * read as "you were probably right, we just tidied up").
+ *
+ * WHAT IS DELIBERATELY NOT DONE HERE: this only fires for someone who already
+ * received the PUBLISH notice, so it discloses nothing they were not already
+ * told. It says nothing about internal states, nothing about other reporters,
+ * and nothing that would let a reporter probe a case they were not part of —
+ * `fanReportStatus`'s collapse of every terminal state to "closed" is a
+ * different surface and stays exactly as it is.
+ */
+/**
+ * The publish sentence a reporter reads, per the ACTUAL warning class that
+ * shipped — never a hardcoded one.
+ *
+ * FIXED (S-033/AS-087): every published warning used to tell every fan
+ * reporter the account "has been flagged as an impersonator", even when the
+ * warning that actually published was `confirmed_fraud` or
+ * `historical_fraud_association` (both reach `/ops/warnings/:id/publish` the
+ * same way `impersonation` does — see `console.ts`'s `warning_class` enum
+ * check and `warnings.ts`). A fan who reported a scam or stolen-work account
+ * was told a different, wrong finding.
+ *
+ * D-1073(2) (I31-TERMS-10): `confirmed_fraud` and `historical_fraud_association` are served to nobody
+ * (NOTICE-AND-ACTION.md 3.1), so their reporter notice names no class: it says only that the account was reviewed and
+ * action was taken (wording approved, sheet-2 W65, D-1365). This string is `notifications.summary`, which the inbox
+ * and the alert mail (alerts.ts deliverPendingEmail) both carry.
+ */
+export function publishSummary(platform: string, handle: string, warningClass: string): string {
+  const who = `${platform} @${handle}`;
+  switch (warningClass) {
+    case "confirmed_fraud":
+    case "historical_fraud_association":
+      return `The account you reported (${who}) was reviewed and action was taken. Thank you — your report mattered.`;
+    case "impersonation":
+      return `The account you reported (${who}) has been flagged as an impersonator. Thank you — your report mattered.`;
+    default:
+      // I31 B15: an unknown or future class names no class (the D-1073(2) sentence), never the impersonator one.
+      return `The account you reported (${who}) was reviewed and action was taken. Thank you — your report mattered.`;
+  }
+}
+
+export function retractionSummary(platform: string, handle: string, disposition?: string): string {
+  const who = `${platform} @${handle}`;
+  switch (disposition) {
+    case "corrected_false_positive":
+      return `Correction: after review we concluded the warning on the account you reported (${who}) was wrong, and we have withdrawn it. Reporting it in good faith counts against you in no way.`;
+    case "duplicate":
+      return `Update: the warning on the account you reported (${who}) was a duplicate of another case and has been merged into it. The finding itself has not changed.`;
+    case "resolved_threat":
+      return `Update: the account you reported (${who}) has been dealt with, so the warning is no longer needed and has been withdrawn. Thank you — your report mattered.`;
+    case "target_disappeared":
+      return `Update: the account you reported (${who}) is no longer reachable, so the warning has been withdrawn. Nothing about the report was found to be wrong.`;
+    default:
+      return `Update: the warning on the account you reported (${who}) has been retracted after review.`;
+  }
+}
+
+/**
+ * RETRY BOUNDS for the in-app report-outcome fan-out (Jason, W3-14: of swallow /
+ * cap / retry, "retry").
+ *
+ * Backoff per retry, in order; its LENGTH is the retry count, so three attempts
+ * per step. `NOTIFY_RETRY_BUDGET_MS` is the bound that actually matters: a
+ * per-step count alone is not a bound, because n steps × 2 retries × backoff
+ * grows with the reporter list, and this function is `await`ed on the operator's
+ * publish route (`console.ts:1358`) rather than deferred. The budget is spent
+ * across the WHOLE call, so the worst case this adds to that response is exactly
+ * the budget however wide the fan-out is.
+ *
+ * SET HERE, DERIVED FROM NOTHING DOWNSTREAM — which is the point. A give-up
+ * deadline taken from a provider's own timeout is how one retrigger came to
+ * produce two deliverable copies of unrecallable mail (`alerts.ts:1488`): the
+ * deadline expired while the first request was still live at the provider, and
+ * the "retry" was a second send. Nothing here is tied to any sender's timeout,
+ * and nothing here retries mail at all.
+ */
+const NOTIFY_RETRY_BACKOFF_MS = [25, 100] as const;
+const NOTIFY_RETRY_BUDGET_MS = 500;
+const NOTIFY_MAX_ATTEMPTS = NOTIFY_RETRY_BACKOFF_MS.length + 1;
+
+/**
+ * Retry ONE step of the fan-out.
+ *
+ * THE RETRY IS TRIGGERED BY A REJECTION, NEVER BY A DEADLINE. A second attempt
+ * is only ever reached from the `catch` of an awaited first, so no call is ever
+ * abandoned in flight and re-issued — the structural difference between this
+ * and the shape above. Concurrency is 1 by construction.
+ *
+ * THIS IS SAFE TO REPLAY BECAUSE THE STEP IS, AND FOR NO OTHER REASON. Both
+ * steps it is used on are idempotent at the database: the reporter read is a
+ * read, and the notification write carries `ON CONFLICT(account_id, event_id) DO
+ * NOTHING` against the UNIQUE key `migrations/0004_fan_accounts.sql:144` — "one
+ * notification per (fan, event)". A replay of a write that LANDED and whose
+ * response was lost is therefore a no-op, not a second notice. Do not wrap a
+ * step that lacks such a key; mail has none, and is not wrapped.
+ *
+ * `spend` is the caller's remaining backoff budget, shared across every step of
+ * one fan-out and deducted BEFORE the sleep, so the bound holds without a clock.
+ */
+async function retryFanoutStep<T>(
+  step: () => Promise<T>,
+  sleep: (ms: number) => Promise<void>,
+  spend: { leftMs: number; retries: number },
+): Promise<T> {
+  let last: unknown;
+  for (let attempt = 1; attempt <= NOTIFY_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await step();
+    } catch (e) {
+      last = e;
+      const backoff = NOTIFY_RETRY_BACKOFF_MS[attempt - 1];
+      if (backoff === undefined || backoff > spend.leftMs) break;
+      spend.leftMs -= backoff;
+      spend.retries++;
+      await sleep(backoff);
+    }
+  }
+  throw last;
+}
+
+/**
+ * On warning PUBLISH for a subject that has a fan-report item: notify every
+ * FAN reporter once (idempotent on (account_id, event_id) — the existing
+ * notifications unique key), and flip the item state. Fires ONLY on publish
+ * and retraction — internal states never leak. Creator reporters are skipped
+ * (the notifications table is fan-scoped; creators learn via the roundup).
+ */
+export async function notifyReportersOnWarning(
+  db: DbLike,
+  warnedSubject: string, // "sha256:<hex>" as recorded on the ledger event
+  eventId: string,
+  outcome: "published" | "retracted",
+  now: () => string = () => new Date().toISOString(),
+  /** On a retraction: WHY, from the operator's enum
+   * (`warning_publications.disposition`). A correction and a merge are not the
+   * same news and must not read as the same news. Absent ⇒ the neutral line. */
+  disposition?: string,
+  /**
+   * ME-03 (S-067). RETRACTION IS A CLOSURE, SO IT PURGES LIKE ONE.
+   *
+   * `reportStatusFor` maps 'retracted' to the fan-visible word **closed**, and
+   * the fan was told at upload time — `apps/web/src/report.ts:310`, and again
+   * in `docs/legal/PRIVACY.md:172-173` — that a screenshot "is deleted when
+   * the case closes". `dismissReport` and `suppressReport` have always called
+   * `purgeItemEvidenceQuietly`; the retraction leg, which is the OTHER writer
+   * of a terminal `fan_report_items.state`, did not, so an ordinary successful
+   * withdrawal left the private bytes and their rows behind — and the admin
+   * queue filter omits 'retracted', so they also lost their viewing/purge
+   * entry point. Optional and trailing so every existing caller still
+   * type-checks; a null store keeps the pre-existing behaviour, which is why
+   * the console route below now passes its own.
+   */
+  store: EvidenceStore | null = null,
+  /** Backoff sleeper for the fan-out retry. Trailing and defaulted so every
+   * existing caller is unchanged; tests drive it to observe the schedule
+   * without spending the wall clock. */
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<number> {
+  const m = /^sha256:([0-9a-f]{64})$/.exec(warnedSubject);
+  if (!m) return 0;
+  const item = await db.prepare("SELECT item_id, platform, handle, state FROM fan_report_items WHERE subject_hash = ?").bind(m[1]!).first<{ item_id: string; platform: string; handle: string; state: string }>();
+  if (!item) return 0;
+  // A SUPPRESSED item's reporters are, by operator judgment, likely the
+  // abusers — no notifications, and the terminal state is never clobbered.
+  if (item.state === "suppressed") return 0;
+  const ts = now();
+  let warningClass = "impersonation";
+  if (outcome === "published") {
+    // The class is read from the ledger event itself (S-033/AS-087) — the
+    // one fact both `publishWarning` and every importer path already agree
+    // on — so this needs no new plumbing through any caller.
+    const ev = await db.prepare("SELECT payload FROM trust_events WHERE event_id = ?").bind(eventId).first<{ payload: string }>();
+    if (ev) {
+      try {
+        const p = JSON.parse(ev.payload) as { warning_class?: unknown };
+        if (typeof p.warning_class === "string") warningClass = p.warning_class;
+      } catch {
+        /* malformed/legacy payload — keep the impersonation default */
+      }
+    }
+  }
+  // TP-02 (S-068). MONOTONE EVENT ORDERING: a SUPERSEDED publication's late
+  // feedback must never rewrite authoritative state.
+  //
+  // Delivery is best-effort and uncapped; the moderation decision it reports
+  // is not. If a publication's feedback stalls while a retraction completes,
+  // this call arrives holding the OLD event and would otherwise re-publish an
+  // accusation an operator has already withdrawn — and the same window
+  // overwrites a suppression taken after the read above. The ledger already
+  // totally orders these events (`trust_events.seq`), so the question "is this
+  // still the current decision for this subject?" is answerable here with no
+  // new column and no new plumbing.
+  //
+  // Deliberately worded as "is there a LATER warning event", not "is this the
+  // latest": an `eventId` the ledger does not carry (importer paths, fixtures,
+  // and every existing caller that passes a synthetic id) yields NULL from the
+  // subquery, no row, and the pre-existing behaviour. Only a genuinely
+  // superseded event is refused.
+  const isSuperseded = async (): Promise<boolean> =>
+    (await db
+      .prepare(
+        `SELECT 1 AS x FROM trust_events
+          WHERE subject = ? AND event_type IN ('warning_published','warning_retracted')
+            AND seq > (SELECT seq FROM trust_events WHERE event_id = ?) LIMIT 1`,
+      )
+      .bind(warnedSubject, eventId)
+      .first<{ x: number }>()) !== null;
+  if (await isSuperseded()) return 0;
+  const summary =
+    outcome === "published" ? publishSummary(item.platform, item.handle, warningClass) : retractionSummary(item.platform, item.handle, disposition);
+  // TP-02. THE AUTHORITATIVE FLIP LANDS FIRST, AND IT IS GUARDED.
+  //
+  // It used to sit at the END of an uncapped per-reporter insert loop, inside
+  // a caller-side best-effort `try {} catch {}`. A database error or a worker
+  // interruption anywhere in that loop therefore left the public warning
+  // published while the fan's own report still read `escalated` — or left a
+  // completed retraction reading `published` — with nothing to reconcile it,
+  // because the failure was swallowed. State is not delivery: the item's state
+  // is the fan-visible record of what the operator decided, and every OTHER
+  // writer of this column (`face-triage.ts:304`, `fileReport`, `escalateReport`,
+  // `dismissReport`, `suppressReport` x2, `review.ts:834`, `warnings.ts:580`) carries a state predicate
+  // in its WHERE. This one did not. It does now — `suppressed` is terminal and
+  // an operator's judgment about the reporters, and must not be clobbered by a
+  // delivery that read the row before they made it.
+  //
+  // I3-1361: the supersession test above is repeated INSIDE this statement.
+  // As a separate read it left a window in which a later publish/retraction
+  // could land and then be overwritten by this stale outcome.
+  const flip = await db
+    .prepare(
+      `UPDATE fan_report_items SET state = ?, updated_at = ?, closed_at = CASE WHEN ? = 'retracted' THEN ? END, tombstoned_at = CASE WHEN ? = 'retracted' THEN tombstoned_at END WHERE item_id = ? AND state != 'suppressed'
+          AND NOT EXISTS (SELECT 1 FROM trust_events
+                           WHERE subject = ? AND event_type IN ('warning_published','warning_retracted')
+                             AND seq > (SELECT seq FROM trust_events WHERE event_id = ?))`,
+    )
+    .bind(outcome, ts, outcome, ts, outcome, item.item_id, warnedSubject, eventId)
+    .run();
+  if (flip.changes !== 1) {
+    // Refused because a later decision landed in the window: a DECISION, not a
+    // loss — the same silent 0 as the early supersession return.
+    if (await isSuperseded()) return 0;
+    // FAMILY-003 — NO LOSS WITHOUT A RECORD. Every OTHER zero this function
+    // returns is a DECISION: not a report subject, suppressed, superseded. This
+    // one is a LOSS. The ledger has already recorded the operator's decision and
+    // the accusation is public or withdrawn, but the fan-visible state was not
+    // updated and no reporter was told — the row went `suppressed` or vanished
+    // between the read at the top of this function and this write. Returning the
+    // same `0` as the decisions left a caller unable to tell them apart, and both
+    // call sites (`console.ts:1358`, `:1414`) discard the number anyway, so the
+    // loss had nowhere to appear. It appears here. The return value is unchanged.
+    await recordNoticeLoss(
+      db,
+      "reports:outcome_notify_state_missed",
+      item.item_id,
+      `report-outcome state flip did not land: outcome=${outcome}, event=${eventId}, state at read '${item.state}' — no reporter was notified`,
+      ts,
+    );
+    return 0;
+  }
+  // RETRY (Jason, W3-14). A TRANSIENT fault here used to end the fan-out: it
+  // threw past a caller that swallows, so the mail mirror on the caller's NEXT
+  // statement never ran and the reporters nobody had reached yet were never
+  // reached by either rail. Each step is now retried on rejection, so a fault
+  // that clears leaves every reporter told and the call RESOLVING — and the
+  // resolving is the load-bearing half, because that is what lets the caller
+  // run the mirror.
+  //
+  // WHAT IS RETRIED: the UN-DELIVERED REMAINDER, at the finest grain — one step
+  // is one reporter. A reporter already told is never re-attempted, so a
+  // hundred-reporter fan-out that faults at the ninety-ninth does not redo
+  // ninety-eight writes. But EXACTLY-ONCE DOES NOT REST ON THAT BOOKKEEPING: it
+  // rests on the `(account_id, event_id)` key, which survives a lost response, a
+  // restart and a whole-call replay. That is why replaying the entire fan-out is
+  // also a no-op, and why this is provable by replay rather than by a flag.
+  //
+  // WHAT IS NOT RETRIED: mail. It is irreversible and the mail rail keeps no
+  // per-recipient delivery record, so a resend is a second unrecallable copy of
+  // "someone you reported has been warned". `emailReportersOnWarning` is neither
+  // retried nor re-invoked from here.
+  const spend = { leftMs: NOTIFY_RETRY_BUDGET_MS, retries: 0 };
+  let created = 0;
+  let attempted = 0;
+  // -1 until the reporter list has come back at all, so an exhausted READ is
+  // recorded honestly rather than as "0 eligible". At HEAD this read sat OUTSIDE
+  // the try and a fault in it threw with no row of any kind.
+  let eligible = -1;
+  let more = ""; // "+" once the capped read shows reporters beyond the cap
+  try {
+    // Tombstoned reporters are skipped: `del_<hex>` is nobody's account id, so the
+    // row could only ever have created an unreachable notification.
+    //
+    // I3-0876 — BOUNDED, like both mail twins: at most
+    // `REPORT_NOTICE_MAX_RECIPIENTS` per-reporter steps (cap+1 read, so the
+    // overflow is detectable). The remainder is NOT dropped: it is told by ONE
+    // set-based insert after the loop, idempotent on the same key, so the number
+    // of statements per call no longer grows with the reporter list.
+    const { results: read } = await retryFanoutStep(
+      () =>
+        db
+          .prepare("SELECT reporter_id FROM fan_report_reporters WHERE item_id = ? AND reporter_kind = 'fan' AND reporter_deleted = 0 ORDER BY reporter_id LIMIT ?")
+          .bind(item.item_id, REPORT_NOTICE_MAX_RECIPIENTS + 1)
+          .all<{ reporter_id: string }>(),
+      sleep,
+      spend,
+    );
+    const overflowed = read.length > REPORT_NOTICE_MAX_RECIPIENTS;
+    const results = overflowed ? read.slice(0, REPORT_NOTICE_MAX_RECIPIENTS) : read;
+    eligible = results.length;
+    if (overflowed) more = "+";
+    for (const r of results) {
+      // Before the write, and counting REPORTERS rather than attempts: a retry
+      // must not inflate what the record below tells an operator.
+      attempted++;
+      const res = await retryFanoutStep(
+        () =>
+          db
+            .prepare(
+              "INSERT INTO notifications (account_id, passport_id, event_id, kind, summary, created_at) VALUES (?, '', ?, ?, ?, ?) ON CONFLICT(account_id, event_id) DO NOTHING",
+            )
+            .bind(r.reporter_id, eventId, outcome === "published" ? "report_published" : "report_retracted", summary, ts)
+            .run(),
+        sleep,
+        spend,
+      );
+      if (res.changes === 1) created++;
+    }
+    if (overflowed) {
+      const rest = await retryFanoutStep(
+        () =>
+          db
+            .prepare(
+              "INSERT INTO notifications (account_id, passport_id, event_id, kind, summary, created_at) SELECT reporter_id, '', ?, ?, ?, ? FROM fan_report_reporters WHERE item_id = ? AND reporter_kind = 'fan' AND reporter_deleted = 0 ON CONFLICT(account_id, event_id) DO NOTHING",
+            )
+            .bind(eventId, outcome === "published" ? "report_published" : "report_retracted", summary, ts, item.item_id)
+            .run(),
+        sleep,
+        spend,
+      );
+      created += rest.changes;
+    }
+    // #114b (I16-W10B): the CREATOR reporters' rail. A creator has no
+    // `notifications` row (that table is the fan inbox); the outcome goes to
+    // their digest as one alert per (item, event) — idempotent on
+    // creator_digests UNIQUE(passport_id, kind, period_key), so a re-drive
+    // (`sweepReportOutcomeNotices`) writes nothing twice. Inside this try, so a
+    // fault is recorded below and re-thrown like the fan rail's. Counted apart:
+    // the return value stays the fan count every caller already reads.
+    const { results: creators } = await retryFanoutStep(
+      () =>
+        db
+          .prepare("SELECT reporter_id FROM fan_report_reporters WHERE item_id = ? AND reporter_kind = 'creator' AND reporter_deleted = 0 ORDER BY reporter_id LIMIT ?")
+          .bind(item.item_id, REPORT_NOTICE_MAX_RECIPIENTS + 1)
+          .all<{ reporter_id: string }>(),
+      sleep,
+      spend,
+    );
+    for (const c of creators.slice(0, REPORT_NOTICE_MAX_RECIPIENTS)) {
+      await retryFanoutStep(() => noticeReportOutcome(db, c.reporter_id, item.item_id, eventId, fanReportStatus(outcome) === "published" ? "published" : "closed", now), sleep, spend);
+    }
+    if (creators.length > REPORT_NOTICE_MAX_RECIPIENTS) {
+      // FAMILY-003 v6: the capped read says nothing about the creators beyond
+      // it, so the cut is recorded where an operator looks.
+      await recordNoticeLoss(db, "reports:creator_outcome_notice_truncated", item.item_id, `creator report-outcome notice capped at ${REPORT_NOTICE_MAX_RECIPIENTS}+ (outcome=${outcome}, event=${eventId})`, ts);
+    }
+  } catch (e) {
+    // FAMILY-003 again, and the ONE thing this catch does not do is SWALLOW.
+    //
+    // The state flip above has already committed (TP-02 put it first on purpose),
+    // so a fault here leaves the public warning live, `created` of
+    // `results.length` reporters told in-app — and NOBODY mailed, because both
+    // call sites invoke the mail mirror on the line AFTER this call
+    // (`console.ts:1358` → `:1371`, `:1414` → `:1425`) and wrap the pair in a
+    // best-effort `catch {}`. A throw here therefore skips the delivery helper
+    // entirely and the route still answers `{ ok: true }`. That was invisible:
+    // no row, no counter, no human.
+    //
+    // It is now a row. The error is RETHROWN UNCHANGED, so nothing about when or
+    // whether anything surfaces moves, and the retention call below is still
+    // skipped on this path exactly as it was. Only the record is new.
+    await recordNoticeLoss(
+      db,
+      "reports:outcome_notify_incomplete",
+      item.item_id,
+      // W3-12-R9's counts and words are kept verbatim (its harness asserts both
+      // substrings); the give-up is APPENDED. A silent permanent failure is the
+      // defect this whole item began as, so exhaustion has to read as exhaustion
+      // and not as a first attempt that happened to fail.
+      `report-outcome notify stopped early: ${created} created, ${attempted} attempted, ${eligible < 0 ? "unread" : eligible}${more} eligible (outcome=${outcome}, event=${eventId}) — retried ${spend.retries} time(s), the retry budget of ${NOTIFY_MAX_ATTEMPTS} attempts / ${NOTIFY_RETRY_BUDGET_MS}ms is spent and the mail mirror did not run`,
+      ts,
+    );
+    throw e;
+  }
+  // ME-03 RETENTION, after the state change lands, and non-throwing — the same
+  // ordering and the same contract as `dismissReport`/`suppressReport`: the
+  // flip has already committed, so a storage fault must not surface as a 500
+  // and unwind a retraction the ledger already recorded. Publication is NOT a
+  // closure and keeps its evidence.
+  // D-1037(8) (I29-JN-05 int-12, RG-ERASE RECORDS-03): the purge refuses while an open legal hold names the item. The
+  // flip above stands (the warning is withdrawn on the ledger); the evidence stays, and the audit row is where an
+  // operator finds it to take down (evidence takedown) once the hold is released.
+  // I39-RETRACT (D-1158(3)): a retraction whose effects await a second person's countersign keeps its evidence; the
+  // `warning:retract_pending` audit row is the record, and `countersignRetraction` (warnings.ts) runs this same leg.
+  if (outcome === "retracted" && !(await retractionAwaitsCountersign(db, eventId))) await retractionPurgeLeg(db, store, item.item_id, ts);
+  return created;
+}
+
+/** I39-RETRACT: the retraction's purge leg (legal hold refuses it, D-1037(8)). Moved here unchanged from
+ * `notifyReportersOnWarning` so the countersign runs the same two lines. */
+export async function retractionPurgeLeg(db: DbLike, store: EvidenceStore | null, fanItemId: string, ts: string, createdThrough?: string): Promise<{ held: boolean; purged: number; left: number }> {
+  // I43-DUALCTL (I43S-C-I41-B-CON06, W0-DC-04): `left` counts the item's evidence rows this leg was asked to take (created at
+  // or before `createdThrough` when given) that are still stored after it: every one a hold kept, or whose bytes could not
+  // be deleted. -1 when the count is unreadable.
+  const left = async (): Promise<number> => {
+    try {
+      return (await db.prepare(`SELECT COUNT(*) AS n FROM report_evidence WHERE item_id = ?${createdThrough === undefined ? "" : " AND created_at <= ?"}`).bind(fanItemId, ...(createdThrough === undefined ? [] : [createdThrough])).first<{ n: number }>())?.n ?? -1;
+    } catch {
+      return -1;
+    }
+  };
+  if (await reportItemHeld(db, fanItemId)) {
+    await recordNoticeLoss(db, "evidence:purge_held", fanItemId, "retraction purge refused: an open legal hold names this report item, an uploader of its evidence or its passport; its evidence is kept — take it down once the hold is released", ts);
+    return { held: true, purged: 0, left: await left() };
+  }
+  const purged = await purgeItemEvidenceQuietly(db, store, fanItemId, createdThrough);
+  return { held: false, purged, left: await left() };
+}
+
+/** I39-RETRACT: true while the retraction `eventId` authorised carries a `warning:retract_pending` row (written in
+ * `retractWarning`'s batch) and no `warning:retract_countersign` row. The decision row binds the event to the item. */
+export async function retractionAwaitsCountersign(db: DbLike, eventId: string): Promise<boolean> {
+  const row = await db
+    .prepare(
+      "SELECT 1 AS n FROM review_decisions d JOIN audit_log p ON p.item_id = d.item_id AND p.action = 'warning:retract_pending' " +
+        "WHERE d.event_id = ? AND d.from_state = 'published' AND d.disposition = 'retracted' " +
+        "AND NOT EXISTS (SELECT 1 FROM audit_log c WHERE c.item_id = d.item_id AND c.action = 'warning:retract_countersign') LIMIT 1",
+    )
+    .bind(eventId)
+    .first<{ n: number }>();
+  return row !== null && row !== undefined;
+}
+
+/** I39-RETRACT: the countersign's purge — the fan report item on the warned subject, through `retractionPurgeLeg`.
+ * `null` when no fan report item names the subject (a warning drafted from another source has no report evidence).
+ * I39-FX-OPS: only evidence created at or before `heldThrough` (the retraction's instant) is purged. */
+export async function purgeRetractedReportEvidence(db: DbLike, store: EvidenceStore | null, warnedSubject: string, ts: string, heldThrough: string): Promise<{ held: boolean; purged: number; left: number } | null> {
+  const m = /^sha256:([0-9a-f]{64})$/.exec(warnedSubject);
+  if (!m) return null;
+  const item = await db.prepare("SELECT item_id FROM fan_report_items WHERE subject_hash = ?").bind(m[1]!).first<{ item_id: string }>();
+  if (!item) return null;
+  return retractionPurgeLeg(db, store, item.item_id, ts, heldThrough);
+}
+
+/**
+ * Write down that a report-outcome notice did not fully land.
+ *
+ * Deliberately the SAME instrument the MAIL rail beneath this already uses for
+ * its own truncation (`reports:outcome_mail_truncated`): one actor, one table,
+ * one place an operator looks. Of the two rails that tell a reporter what
+ * happened to their report, only the mail one could be audited — the in-app
+ * rail recorded nothing at all. FAMILY-004(c): the same predicate at every door.
+ *
+ * Best-effort, by the same contract as the mail rail's own audit line: this runs
+ * on paths where the authoritative decision has ALREADY committed, so the record
+ * must never become a new way to fail.
+ *
+ * `actorKind: "system"` because the actor id is literally `system:reports`
+ * (F-31, `review.ts:124`). The mail rail's call below passes no kind and gets
+ * the same `system` from `auditActorKind` (review.ts, OP-09/B27) —
+ * pinned by i16-w10b-reports.test.ts (RJ550b-W312-R9-2).
+ */
+async function recordNoticeLoss(db: DbLike, action: string, itemId: string, detail: string, ts: string): Promise<void> {
+  try {
+    await auditStmt(db, "system:reports", action, itemId, detail, ts, "system").run();
+  } catch {
+    /* the record is best-effort too — it must never fail what it is recording */
+  }
+}
+
+/** I3-1360: at most this many warning events re-driven per scheduled run. */
+export const REPORT_OUTCOME_RECONCILE_MAX = 50;
+/** I3-1360: how far back the re-drive looks. */
+export const REPORT_OUTCOME_RECONCILE_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * I3-1360 (D-0829): THE RE-DRIVE. The publish and retract routes call
+ * `notifyReportersOnWarning` AFTER the ledger event is appended, so a worker
+ * restart between the two left the fan's report on its old state and nobody
+ * told. This scheduled step finds, in the last 7 days, the LATEST warning event
+ * per subject whose fan-report item still sits in the state that event should
+ * have moved it FROM — published <- open | escalated; retracted <- published —
+ * and calls the same function again, bounded to 50 events per run. The notice
+ * is idempotent on `notifications (account_id, event_id)`, so a re-drive of a
+ * notice that did land writes nothing. No outbox table.
+ *
+ * The PRE-STATE predicate is what keeps it from clobbering: a retracted item
+ * that a new report re-opened reads `open`, which is not a retraction's
+ * pre-state, so it is left alone; a suppressed item is never touched.
+ * A fault on one event does not stop the rest; the first is re-thrown at the end.
+ */
+/**
+ * I3-1360 (I22): THE RE-DRIVE ALSO FINDS A FAN-OUT THAT DIED AFTER ITS FLIP.
+ * `notifyReportersOnWarning` commits the state flip before the per-reporter
+ * loop, so a fault mid-loop leaves the item already in the POST-state and the
+ * pre-state predicate alone never selected it again: the reporters not yet
+ * reached were never told (the loss row was the only trace). An item in the
+ * post-state is re-driven while an eligible fan reporter (the loop's own
+ * population: `reporter_kind = 'fan' AND reporter_deleted = 0`) has no
+ * notification for THIS event; the re-drive is exactly-once on
+ * `(account_id, event_id)`, so the reporters already told are untouched.
+ */
+const UNTOLD_FAN_REPORTER = `EXISTS (SELECT 1 FROM fan_report_reporters rr
+                  WHERE rr.item_id = i.item_id AND rr.reporter_kind = 'fan' AND rr.reporter_deleted = 0
+                    AND NOT EXISTS (SELECT 1 FROM notifications n WHERE n.account_id = rr.reporter_id AND n.event_id = e.event_id))`;
+
+export async function sweepReportOutcomeNotices(db: DbLike, nowMs: number = Date.now(), store: EvidenceStore | null = null): Promise<number> {
+  const since = new Date(nowMs - REPORT_OUTCOME_RECONCILE_WINDOW_MS).toISOString();
+  const { results } = await db
+    .prepare(
+      `SELECT e.event_id, e.subject, e.event_type,
+              (SELECT wp.disposition FROM warning_publications wp WHERE wp.item_id = i.review_item_id) AS disposition
+         FROM trust_events e
+         JOIN fan_report_items i ON e.subject = 'sha256:' || i.subject_hash
+        WHERE e.event_type IN ('warning_published','warning_retracted') AND e.created_at >= ?
+          AND ((e.event_type = 'warning_published' AND (i.state IN ('open','escalated') OR (i.state = 'published' AND ${UNTOLD_FAN_REPORTER})))
+            OR (e.event_type = 'warning_retracted' AND (i.state = 'published' OR (i.state = 'retracted' AND ${UNTOLD_FAN_REPORTER}))))
+          AND NOT EXISTS (SELECT 1 FROM trust_events l
+                           WHERE l.subject = e.subject AND l.event_type IN ('warning_published','warning_retracted') AND l.seq > e.seq)
+        ORDER BY e.seq
+        LIMIT ?`,
+    )
+    .bind(since, REPORT_OUTCOME_RECONCILE_MAX)
+    .all<{ event_id: string; subject: string; event_type: string; disposition: string | null }>();
+  const now = () => new Date(nowMs).toISOString();
+  let redriven = 0;
+  let firstFault: unknown = null;
+  for (const r of results) {
+    const outcome = r.event_type === "warning_published" ? "published" : "retracted";
+    try {
+      await notifyReportersOnWarning(db, r.subject, r.event_id, outcome, now, outcome === "retracted" ? (r.disposition ?? undefined) : undefined, store);
+      redriven++;
+    } catch (e) {
+      firstFault ??= e;
+    }
+  }
+  if (firstFault !== null) throw firstFault;
+  return redriven;
+}
+
+/**
+ * flag 21b (2026-08-14): the EMAIL mirror of the publish-outcome notification.
+ * The in-app half already exists (notifyReportersOnWarning → notifications →
+ * GET /account/notifications); this mails the same news via the M2 mailer seam
+ * ('report-outcome' template) to fan reporters who have a VERIFIED fan_email.
+ *
+ * Prefs gate: NONE, and that is a change (orchestrator, W3-03, D-0468). This
+ * rail used to reuse `accounts.email_alerts` — "a fan who turned alert email off
+ * gets no report mail either" — which was reasonable while that column defaulted
+ * to 1, because then a 0 meant somebody had CHOSEN it. W3-03 flipped the default
+ * to 0 to make the commercial channel opt-in, and after that a 0 means "chose
+ * off" OR "never chose" and the column cannot tell them apart. Reusing it here
+ * would silence the outcome of a fan's OWN abuse report unless they had also
+ * opted into marketing, which is not a trade anyone made.
+ *
+ * A report outcome is the transactional result of an action the fan took. That
+ * is the same ground on which `TRANSACTIONAL_KINDS` (alerts.ts) carries the
+ * CAN-SPAM exemption for the other rail; this is the second rail of the same
+ * decision. The verified-email requirement, the recipient cap, the deleted and
+ * kind filters are all unchanged — this widens only to the reporters themselves.
+ * I3-2072 (I23, D-0993(1)): the per-category switch — `accounts.email_report_outcomes` (migration 0217, DEFAULT 1:
+ * transactional, so on unless the fan turned it off) — is honoured in the recipient query below. It silences THIS
+ * mail only; the in-app notice (`notifyReportersOnWarning`) is not gated by it. A coarse marketing toggle is still
+ * not this switch, and must not be reused as if it were.
+ *
+ * Best-effort by contract: every failure (mailer down, template rejected, row
+ * weirdness) is swallowed — a mail problem must NEVER block or fail the
+ * publish. Callers defer this off the response path (waitUntil). Vars carry
+ * only the reported platform/handle (already public in the fan's own report);
+ * the address and vars are never logged (mailer.ts rule).
+ */
+export async function emailReportersOnWarning(
+  db: DbLike,
+  mailer: TemplateMailerLike,
+  warnedSubject: string, // "sha256:<hex>" as recorded on the ledger event
+  nowMs: () => number = () => Date.now(),
+  /** QUEUE #218: the ONE implementation for both outcomes. `retracted` is the
+   * retract route's (`console.ts`); it adds the operator's `disposition` to the
+   * vars so the mail says what actually happened. Cap, budget and truncation
+   * audit are the same code for both. */
+  outcome: "published" | "retracted" = "published",
+  disposition?: string,
+  /** D-0996(3) (I3-2072): THIS Worker's public base (env-config.ts publicBaseUrlFromEnv). When set, each mail carries
+   * a `fan_report_outcomes` one-click token as its List-Unsubscribe header; spending it turns
+   * `accounts.email_report_outcomes` off. Unset (or a mint failure) sends the mail without one, as before. */
+  opts: { oneClickBase?: string | null } = {},
+): Promise<number> {
+  // JA-11 (JN-01, I24-FX): which step a failure aborted, for the outer catch's log line.
+  let step = "recipients";
+  try {
+    const m = /^sha256:([0-9a-f]{64})$/.exec(warnedSubject);
+    if (!m) return 0;
+    const item = await db
+      .prepare("SELECT item_id, platform, handle, state FROM fan_report_items WHERE subject_hash = ?")
+      .bind(m[1]!)
+      .first<{ item_id: string; platform: string; handle: string; state: string }>();
+    if (!item || item.state === "suppressed") return 0; // suppressed reporters are never contacted
+    // BOUNDED FAN-OUT. Each recipient costs one outbound subrequest, and a
+    // widely-reported subject has an unbounded reporter list — so an uncapped
+    // sequential loop exhausts the Workers subrequest budget and the notice
+    // just STOPS partway with nobody the wiser. Ask for cap+1 rows so
+    // truncation is detectable, then say so in the audit log.
+    const { results } = await db
+      .prepare(
+        `SELECT DISTINCT e.address AS address, r.reporter_id AS account_id
+           FROM fan_report_reporters r
+           JOIN fan_email e ON e.account_id = r.reporter_id AND e.verified_at IS NOT NULL
+           JOIN accounts a ON a.account_id = r.reporter_id
+          WHERE r.item_id = ? AND r.reporter_kind = 'fan' AND r.reporter_deleted = 0
+            AND a.email_report_outcomes = 1
+          ORDER BY e.address
+          LIMIT ?`,
+      )
+      .bind(item.item_id, REPORT_NOTICE_MAX_RECIPIENTS + 1)
+      .all<{ address: string; account_id: string }>();
+    const overflowed = results.length > REPORT_NOTICE_MAX_RECIPIENTS;
+    const batch = overflowed ? results.slice(0, REPORT_NOTICE_MAX_RECIPIENTS) : results;
+    // D-0996(3): one-click tokens, minted MINT_BATCH_MAX at a time (unsubscribe.ts: D1's bind ceiling). A failed mint
+    // costs that chunk its header and never the mail.
+    const tokens = new Map<string, string>();
+    if (opts.oneClickBase) {
+      const ids = [...new Set(batch.map((r) => r.account_id))];
+      const at = new Date(nowMs()).toISOString();
+      for (let i = 0; i < ids.length; i += MINT_BATCH_MAX) {
+        try {
+          for (const [k, v] of await mintUnsubscribeTokens(db, "fan_report_outcomes", ids.slice(i, i + MINT_BATCH_MAX), at)) tokens.set(k, v);
+        } catch {
+          /* no header for this chunk */
+        }
+      }
+    }
+    // Second bound: wall-clock. Sends are individually timed out by the mailer
+    // (MAIL_TIMEOUT_MS), but cap × timeout is still far longer than a
+    // waitUntil task should live, so stop at the budget and record it.
+    // JA-11 (I3-0014 a/e, the alerts and digest rails' list): with the mailer's suppression key, an address on
+    // `email_suppressions` is never handed to the provider, and a PERMANENT refusal goes on the list (email.ts helpers,
+    // one read and at most one write). No key (dev/test, or a mailer that carries none) -> no list, as before.
+    const supKey = suppressionKeyOf(mailer);
+    const hashOf = new Map<string, string>();
+    let listed = new Set<string>();
+    if (supKey) {
+      step = "suppression_list_read";
+      for (const r of batch) if (!hashOf.has(r.address)) hashOf.set(r.address, await emailAddressHash(supKey, r.address));
+      listed = await suppressedAddressHashes(db, [...hashOf.values()], retiredSuppressionLookup(mailer, [...hashOf.keys()]));
+    }
+    step = "send";
+    const dead: string[] = [];
+    const deadline = nowMs() + REPORT_NOTICE_BUDGET_MS;
+    let sent = 0;
+    let attempted = 0;
+    let suppressed = 0;
+    for (const r of batch) {
+      if (nowMs() >= deadline) break;
+      const h = hashOf.get(r.address);
+      if (h && listed.has(h)) {
+        suppressed++;
+        continue;
+      }
+      attempted++;
+      try {
+        const vars: Record<string, string> =
+          outcome === "retracted"
+            ? { outcome, platform: item.platform, handle: item.handle, disposition: disposition as string }
+            : { outcome, platform: item.platform, handle: item.handle };
+        const tok = tokens.get(r.account_id);
+        const oneClick = tok ? unsubscribeUrl(opts.oneClickBase, tok) : null;
+        // I23-Q10 (D-1030 (a)): the same URL as the body's one plain link, last line, only when a token was minted
+        // (report-outcome.html/.txt `{{#unsubscribe_url}}`; mailer.ts sanitizeTemplateVar drops a non-https one, and the
+        // body then renders neither the link nor the sentence about it).
+        if (oneClick) vars.unsubscribe_url = oneClick;
+        const got = await templateSendOnce(mailer, "report-outcome", r.address, vars, undefined, oneClick ? { listUnsubscribe: oneClick } : undefined);
+        if (got === "accepted") sent++;
+        else if (got === "permanent" && h) dead.push(h);
+      } catch {
+        /* one bad send never stops the rest */
+      }
+    }
+    if (dead.length > 0) {
+      try {
+        await recordEmailSuppressions(db, dead, new Date(nowMs()).toISOString());
+      } catch {
+        /* best-effort: the next permanent refusal records it */
+      }
+    }
+    if (overflowed || attempted + suppressed < batch.length) {
+      // OBSERVABLE truncation: an operator can see that the notice did not
+      // reach everyone, and roughly how far it got. Counts only — no address.
+      try {
+        await auditStmt(
+          db,
+          "system:reports",
+          "reports:outcome_mail_truncated",
+          item.item_id,
+          `report-outcome mail${outcome === "retracted" ? " (retracted)" : ""} stopped early: ${sent} sent, ${attempted} attempted, ${batch.length}${overflowed ? "+" : ""} eligible (cap ${REPORT_NOTICE_MAX_RECIPIENTS}, budget ${REPORT_NOTICE_BUDGET_MS}ms)`,
+          new Date(nowMs()).toISOString(),
+        ).run();
+      } catch {
+        /* the audit line is best-effort too — it must not fail the publish */
+      }
+    }
+    return sent;
+  } catch (e) {
+    // Never surfaced to the publish path, but never SILENT: a failed suppression-list read (or any other abort) mails
+    // nobody, so it is logged with the step and the error's name — no address, no subject (JA-11, JN-01).
+    logError({ cid: "unknown", hop: "http", msg: "report_outcome_mail_aborted", kind: step, err: e instanceof Error ? e.name : typeof e });
+    return 0;
+  }
+}
+===== END FILE: services/trust-core/src/reports.ts =====
+
+===== BEGIN FILE: services/trust-core/src/requests-routes.ts =====
+import { Hono, type Context } from "hono";
+import { usableFanSecret } from "./analytics-events.js";
+import { d1 } from "./db.js";
+import { archiveDemand, isDemandOptedOut, listOwnRequests, requestArchive, requestCreator, RequestError, setDemandOptOut, unrequestCreator } from "./requests.js";
+import { analyticsPublishArgs, anonBodyLimit, creatorId, fanId, fanIpAllowed, logEncounter, RANKING_WRITES_PER_IP_HOUR, refusal, RATE_LIMIT_MESSAGE , errorBody } from "./route-helpers.js";
+import { listOwnScouts, scoutBudget, scoutCreator, ScoutError } from "./scouts.js";
+import type { Env } from "./env.js";
+import { logError } from "./log.js";
+
+/**
+ * I3-0764 (D-0833(4)) — the fallback for a throw no typed arm above it claimed:
+ * a storage fault, a bug, an outage is ours — logged, answered 500, never a 400
+ * that tells the caller their request was the problem.
+ */
+function serverFault(c: Context<{ Bindings: Env }>, route: string, e: unknown): Response {
+  logError({ cid: crypto.randomUUID(), hop: "http", route, msg: "unexpected route fault", err: e instanceof Error ? e.name : typeof e });
+  return c.json({ error: "internal" }, 500);
+}
+
+
+/**
+ * THE VIRAL CREATOR-REQUEST LOOP (S23) — "list this creator" demand, from the
+ * fan side and the creator side.
+ *
+ * BOUNDARY. Fans request a creator, un-request, read what they have asked for,
+ * and ask an unlisted creator to archive; creators read the resulting demand and
+ * choose whether it is visible. The PUBLIC halves of the same feature
+ * (`/p/:id/requests`, `/p/:id/demand`, `/requests/top`) stay in index.ts with
+ * the rest of the `/p/:id` surface: `tests/invariants/suppression-oracles.ts`
+ * derives its passport-route sweep from index.ts's own text, and those three are
+ * part of the delisting promise it fingerprints.
+ *
+ * Built as an exported factory and mounted with `app.route("/", …)` — the one
+ * shape `tests/invariants/route-static.ts` accepts (see agency-routes.ts).
+ */
+export function makeRequestsRoutes(): Hono<{ Bindings: Env }> {
+  const app = new Hono<{ Bindings: Env }>();
+
+
+  // --- S23 viral creator-request loop ---
+
+  app.post("/account/request-creator", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    // Audit #18/#19 — a request feeds the Most Requested board AND, until it is
+    // frozen at claim, the Founding Fan slot order. This route had no per-IP
+    // ceiling either, which is half of why ten minted accounts could take all ten
+    // permanent slots. Same placement and same subject-independence rule as
+    // /account/collect above.
+    if (!(await fanIpAllowed(c, "reqcr", RANKING_WRITES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { passport_id?: unknown } | null;
+    if (!body || typeof body.passport_id !== "string") return c.json({ error: "passport_id required" }, 400);
+    try {
+      await requestCreator(d1(c.env.TRUST_DB), id, body.passport_id);
+      await logEncounter(c, body.passport_id, "request"); // Codex: requesting is a sighting
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof RequestError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/request-creator", e);
+    }
+  });
+
+  app.post("/account/unrequest-creator", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    const body = (await c.req.json().catch(() => null)) as { passport_id?: unknown } | null;
+    if (!body || typeof body.passport_id !== "string") return c.json({ error: "passport_id required" }, 400);
+    try {
+      await unrequestCreator(d1(c.env.TRUST_DB), id, body.passport_id);
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof RequestError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/unrequest-creator", e);
+    }
+  });
+
+  // --- F6 Scout: the budgeted, numbered act of early support -----------------
+  //
+  // A SECOND VERB, not a rename of the one above. `POST /account/request-creator`
+  // stays free and unbounded-in-the-way-that-matters; this one spends a Scout
+  // from a monthly budget and mints a permanent per-creator ordinal with a
+  // frozen snapshot of what the creator looked like at that moment (#6).
+  //
+  // Scouting an UNCLAIMED passport also records the underlying request. That
+  // happens inside `scoutCreator` rather than here, on purpose: a second caller
+  // of the primitive would otherwise mint an ordinal the demand counter never
+  // hears about, and the two numbers would drift apart with nothing to notice.
+  //
+  // Same per-IP ceiling and the same placement as request-creator: this route
+  // feeds a permanent public ordinal, which is the surface audit #18/#19 added
+  // the ceiling for.
+  app.post("/account/scout", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    // I3-0065 / D-0884(1): this door writes a fan-keyed analytics fact, which
+    // `fanKey` refuses without a usable ANALYTICS_FAN_SECRET; the SAME gate and
+    // words as /account/redeem (credentials-routes.ts), 503 before any work.
+    if (!usableFanSecret(c.env.ANALYTICS_FAN_SECRET)) return c.json({ error: "analytics_unavailable", detail: "scouting is temporarily unavailable" }, 503);
+    if (!(await fanIpAllowed(c, "scout", RANKING_WRITES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const body = (await c.req.json().catch(() => null)) as { passport_id?: unknown } | null;
+    if (!body || typeof body.passport_id !== "string") return c.json({ error: "passport_id required" }, 400);
+    const db = d1(c.env.TRUST_DB);
+    try {
+      const scout = await scoutCreator(db, id, body.passport_id, undefined, c.env.ANALYTICS_FAN_SECRET, ...analyticsPublishArgs(c));
+      await logEncounter(c, body.passport_id, "request"); // Codex: scouting is a sighting
+      return c.json({ ok: true, scout, budget: await scoutBudget(db, id, new Date().toISOString()) });
+    } catch (e) {
+      if (e instanceof ScoutError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/scout", e);
+    }
+  });
+
+  // The fan's own scouts + their remaining budget. Owner-scoped; suppressed
+  // subjects are hidden here exactly as they are in /account/requests.
+  app.get("/account/scouts", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    const db = d1(c.env.TRUST_DB);
+    try {
+      return c.json({ scouts: await listOwnScouts(db, id), budget: await scoutBudget(db, id, new Date().toISOString()) });
+    } catch (e) {
+      if (e instanceof ScoutError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/scouts", e);
+    }
+  });
+
+  app.get("/account/requests", async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    try {
+      return c.json({ requests: await listOwnRequests(d1(c.env.TRUST_DB), id) });
+    } catch (e) {
+      if (e instanceof RequestError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/requests", e);
+    }
+  });
+
+  // Fan asks a claimed creator to catalog their back catalog (note is
+  // creator-visible only).
+  app.post("/account/request-archive", anonBodyLimit, async (c) => {
+    const id = await fanId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    // I3-0219: every sibling authenticated fan write (save, request-creator,
+    // scout, ...) carries fanIpAllowed's per-masked-IP hourly cap; this route
+    // shipped without one, making it the one unthrottled, anonymous-effect
+    // (creator-visible note only) write door into every claimed creator's
+    // archive-request queue.
+    if (!(await fanIpAllowed(c, "reqarch", RANKING_WRITES_PER_IP_HOUR))) return c.json(refusal("rate limit exceeded", RATE_LIMIT_MESSAGE), 429);
+    const raw = await c.req.text();
+    if (raw.length > 4 * 1024) return c.json({ error: "too_large" }, 413);
+    const body = ((): { passport_id?: unknown; note?: unknown } | null => {
+      try {
+        return JSON.parse(raw) as { passport_id?: unknown; note?: unknown };
+      } catch {
+        return null;
+      }
+    })();
+    if (!body || typeof body.passport_id !== "string") return c.json({ error: "passport_id required" }, 400);
+    // AN ABSENT `note` KEY IS NOT A BLANK NOTE (FINDING-0015; Jason 2026-09-05
+    // "3. fix it"). This line used to fold "the client said nothing about the
+    // note" into "the client said the note is empty", and on the repeat path an
+    // empty note is a WITHDRAWAL — so any client re-sending a bare
+    // `{passport_id}` silently retracted whatever the fan had written, with no
+    // act of consent anywhere in the request. `apps/web/src/api.ts:731` omits
+    // the key exactly when the note is empty, so the shipped fan app was that
+    // client.
+    //
+    // Only an explicit string is an instruction about the note. Absent, null, a
+    // number, an object — all of them are "no instruction", which is the
+    // strictly more conservative reading and the only one that cannot destroy
+    // text nobody asked to destroy. `requestArchive` turns `undefined` into `''`
+    // on the INSERT path, so a FIRST request without a note key still stores an
+    // empty note exactly as before; it is the REPEAT path where the two cases
+    // must part company. An explicit `note: ""` is still a withdrawal, and still
+    // a lagged one.
+    const note = typeof body.note === "string" ? body.note : undefined;
+    try {
+      await requestArchive(d1(c.env.TRUST_DB), id, body.passport_id, note);
+      return c.json({ ok: true });
+    } catch (e) {
+      if (e instanceof RequestError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/request-archive", e);
+    }
+  });
+
+  // Creator's own view of archive demand (creator-session gated).
+  //
+  // THE NUMBER IS NOT LIVE AND NOT EXACT, and both halves are the control rather
+  // than a limitation. `archive_requests` is one row per fan, so this count is a
+  // distinct-fan population: served live it let a creator ask one known fan to
+  // act and read either side of it (a +1 three milliseconds apart), and served
+  // unfloored it reported a population of one exactly. `requests.ts
+  // archiveDemand` counts only WHOLE UTC DAYS and k-floors what is left, so two
+  // reads on one day are identical and a sub-floor population is withheld rather
+  // than served as a small integer or as zero. The notes come back day-granular
+  // from the SERVER now — the console used to clamp them for display, which is a
+  // UI restriction standing in for a control (INV-010).
+  //
+  // THE GATE IS UNCHANGED HERE ON PURPOSE. This route is creator-session gated
+  // but not verified-gated, one gate below /account/back-catalog, and whether it
+  // should be is recorded as an open question for the governor — not decided by
+  // the change that floored the number.
+  app.get("/account/archive-demand", async (c) => {
+    const id = await creatorId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    return c.json(await archiveDemand(d1(c.env.TRUST_DB), id, Date.now()));
+  });
+
+  // THE SELF-SERVE DEMAND OPT-OUT (audit item #13). A creator who has claimed
+  // their passport can switch their own public request counter off — and back on —
+  // from their own session, with no ticket and no operator. It is NOT a delisting:
+  // the passport page, the check answer, the card and the badge are untouched; only
+  // /p/:id/requests, /p/:id/demand, /p/:id/demand.svg, the request bar and the Most
+  // Requested board go quiet (see `setDemandOptOut`).
+  //
+  // CREATOR-session gated and self-scoped: `creatorId` returns the caller's OWN
+  // passport id and that is the only id this route will act on, so it cannot be
+  // pointed at anybody else. Pre-claim there is no session to hold — an unclaimed
+  // subject has no account at all — which is why the operator lever exists beside
+  // it (POST /ops/requests/:id/demand-visibility) and why LISTING-POLICY.md says
+  // so in those words rather than claiming self-serve for everyone.
+  //
+  // Deliberately NOT verified-gated. This is a privacy control, not a feature: the
+  // free tier is the whole safety product, and making "stop scoring me" wait on
+  // operator vetting would be the one paywall the paywall invariant exists to
+  // forbid.
+  // THE READ THE SWITCH NEVER HAD. `isDemandOptedOut` has existed since the
+  // opt-out did and the creator console could not call it, so the panel offered
+  // two named buttons and a printed apology — *"This screen does not show which
+  // setting is in force"* — which `docs/legal/LISTING-POLICY.md` then documented
+  // to the public as a limitation. Two clicks a week to discover your own
+  // setting is not a control you can read. Self-scoped exactly like the write
+  // below: the caller's own passport and no other.
+  app.get("/account/demand-visibility", async (c) => {
+    const id = await creatorId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    return c.json({ demand_public: !(await isDemandOptedOut(d1(c.env.TRUST_DB), id)) });
+  });
+
+  app.post("/account/demand-visibility", anonBodyLimit, async (c) => {
+    const id = await creatorId(c);
+    if (!id) return c.json({ error: "unauthorized" }, 401);
+    const body = (await c.req.json().catch(() => null)) as { public?: unknown } | null;
+    if (!body || typeof body.public !== "boolean") return c.json({ error: "public (boolean) required" }, 400);
+    try {
+      // `actor` is the creator's own passport id: "who turned this off" is
+      // answerable later without an operator having been involved at all.
+      await setDemandOptOut(d1(c.env.TRUST_DB), id, id, !body.public);
+      return c.json({ ok: true, demand_public: body.public });
+    } catch (e) {
+      if (e instanceof RequestError) return c.json(errorBody(e), e.status);
+      return serverFault(c, "/account/demand-visibility", e);
+    }
+  });
+
+  return app;
+}
+===== END FILE: services/trust-core/src/requests-routes.ts =====
+
+===== END OF CHUNK 65 OF 73 =====

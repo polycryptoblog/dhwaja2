@@ -1,0 +1,494 @@
+DHWAJA CODE REVIEW — tsjs — CHUNK 73 OF 73
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/test-fidelity, services/trust-core/vitest.fidelity.config.ts
+Files in this chunk (5):
+  - services/trust-core/test-fidelity/i13-every-table-gen.mjs
+  - services/trust-core/test-fidelity/i13-migrate.ts
+  - services/trust-core/test-fidelity/schema.ts
+  - services/trust-core/test-fidelity/vacuity-setup.ts
+  - services/trust-core/vitest.fidelity.config.ts
+
+
+===== BEGIN FILE: services/trust-core/test-fidelity/i13-every-table-gen.mjs =====
+#!/usr/bin/env node
+// I13-D1 (QUEUE #883) — GENERATOR for test-fidelity/i13-every-table-rows.json: one write to EVERY table of
+// both databases (TRUST_DB: migrations/, ANALYTICS_DB: analytics/), replayed on real D1 by
+// i13-every-table.d1.test.ts and on the better-sqlite3 double by test/i13-every-table-rows.test.ts.
+//
+// Run from anywhere: `node services/trust-core/test-fidelity/i13-every-table-gen.mjs`. Re-run it when a
+// migration adds a table — test/i13-every-table-rows.test.ts turns red naming the table until you do.
+//
+// HOW A ROW IS FOUND. On a better-sqlite3 database migrated exactly as the double is, each table (parents
+// before children, by its foreign keys) gets an INSERT naming every non-generated column. Candidate values per
+// column come from the table's own DDL first (IN-lists, `col = literal`, `length(col) = n`, a GLOB/LIKE
+// pattern's simplest match), then from the column's name and type, then generic values, then NULL where the
+// column is nullable; a foreign key takes a value that exists in its parent. A failed INSERT advances only the
+// columns its error names (a CHECK's expression, a UNIQUE's columns) and retries. Every table is written twice
+// where it can be, so a CHECK such as `follower_id <> followee_id` over two keys into one parent can be met. A
+// seeded table whose INSERT cannot be met (a singleton `CHECK (id = 1)`) gets an UPDATE that rewrites every
+// column of its seeded row, which evaluates every CHECK as an INSERT would. Deterministic: same tree, same file.
+import Database from "better-sqlite3";
+import { readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+const here = (rel) => fileURLToPath(new URL(rel, import.meta.url));
+const TS = "2026-01-01T00:00:00.000Z";
+
+// I14-FX3 (I14-TESTS-11, QUEUE #914): this plain-node script cannot import the TypeScript door (test/i14-raw-db.ts, which gives a test's own
+// connection real D1's 50-byte LIKE/GLOB ceiling), so its connection is stock and the ceiling is held STATICALLY instead: after the migrations
+// replay, no GLOB/LIKE pattern literal in the schema may exceed the ceiling. A tripwire for the literals it can read (a pattern built at run
+// time is not seen); the behavioural defender is test/i13-every-table-rows.test.ts, which replays every generated row on the double, whose
+// connection DOES carry the ceiling. test/i14-fx3-gen-ceiling.test.ts holds this function.
+export const D1_PATTERN_MAX_BYTES = 50;
+/** Every `GLOB '…'` / `LIKE '…'` literal in the schema text of `db`, with the table or index that holds it and its byte length. */
+export function patternLiterals(db) {
+  const out = [];
+  for (const { name, sql } of db.prepare("SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL").all())
+    for (const m of sql.matchAll(/\b(?:GLOB|LIKE)\s+'((?:[^']|'')*)'/gi)) out.push({ name, bytes: Buffer.byteLength(m[1].replace(/''/g, "'")) });
+  return out;
+}
+export function assertPatternCeiling(db, label = "database") {
+  const over = patternLiterals(db).filter((p) => p.bytes > D1_PATTERN_MAX_BYTES);
+  if (over.length > 0) throw new Error(`${label}: a LIKE/GLOB pattern over D1's ${D1_PATTERN_MAX_BYTES}-byte ceiling in the schema (${over.map((p) => `${p.name}: ${p.bytes} bytes`).join("; ")}); this generator's connection is stock and would not refuse it`);
+}
+
+export function migrated(dir) {
+  const db = new Database(":memory:");
+  db.pragma("foreign_keys = ON");
+  for (const f of readdirSync(here(dir)).filter((f) => f.endsWith(".sql")).sort()) db.exec(readFileSync(here(`${dir}/${f}`), "utf8"));
+  assertPatternCeiling(db, dir);
+  return db;
+}
+const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+function sample(pat, kind) {
+  let o = "";
+  for (let i = 0; i < pat.length; i++) {
+    const ch = pat[i];
+    if (kind === "GLOB") {
+      if (ch === "*") continue;
+      if (ch === "?") { o += "a"; continue; }
+      if (ch === "[") { const j = pat.indexOf("]", i + 1); const cls = pat.slice(i + 1, j); o += cls[0] === "^" ? "a" : cls[0]; i = j; continue; }
+      o += ch;
+    } else {
+      if (ch === "%") continue;
+      if (ch === "_") { o += "a"; continue; }
+      o += ch;
+    }
+  }
+  return o;
+}
+function pool(col, ddl, alt = false) {
+  const c = esc(col.name);
+  const t = (col.type || "").toUpperCase();
+  const lits = [];
+  for (const m of ddl.matchAll(new RegExp(`\\b${c}\\b\\s+(?:NOT\\s+)?IN\\s*\\(([^)]*)\\)`, "gi")))
+    for (const x of m[1].matchAll(/'((?:[^']|'')*)'|(-?\d+(?:\.\d+)?)/g)) lits.push(x[1] !== undefined ? x[1].replace(/''/g, "'") : Number(x[2]));
+  for (const m of ddl.matchAll(new RegExp(`\\b${c}\\b\\s*(?:=|==)\\s*('(?:[^']|'')*'|-?\\d+)`, "gi")))
+    lits.push(m[1].startsWith("'") ? m[1].slice(1, -1).replace(/''/g, "'") : Number(m[1]));
+  for (const m of ddl.matchAll(new RegExp(`length\\(\\s*${c}\\s*\\)\\s*(?:=|==|BETWEEN)\\s*(\\d+)`, "gi"))) lits.push("a".repeat(Number(m[1])), "0".repeat(Number(m[1])));
+  for (const m of ddl.matchAll(new RegExp(`\\b${c}\\b\\)?\\s+(?:NOT\\s+)?(GLOB|LIKE)\\s+'((?:[^']|'')*)'`, "gi"))) lits.push(sample(m[2], m[1].toUpperCase()));
+  // I39-LAND (0278): an id whose CHECK fixes a prefix AND a length (`substr(col, 1, k) = 'stx_' AND length(col) = 24`)
+  // gets that prefix padded to the length, the same two fills the length candidate uses; pushed after every other DDL literal.
+  for (const m of ddl.matchAll(new RegExp(`substr\\(\\s*${c}\\s*,\\s*1\\s*,\\s*\\d+\\s*\\)\\s*=\\s*'([^']*)'\\s+AND\\s+length\\(\\s*${c}\\s*\\)\\s*=\\s*(\\d+)`, "gi")))
+    if (Number(m[2]) > m[1].length) lits.push(m[1] + "a".repeat(Number(m[2]) - m[1].length), m[1] + "0".repeat(Number(m[2]) - m[1].length));
+  const gen = [];
+  const n = col.name;
+  if (/(_at|_ts)$/.test(n) || /^(created|updated|observed|decided|expires|resolved)/.test(n)) gen.push(TS);
+  if (/_day$|^day$|_date$/.test(n)) gen.push("2026-01-01");
+  if (/_ms$/.test(n) || /INT|REAL|FLOA|DOUB/.test(t)) gen.push(1, 0, 2, 100, 1767225600000);
+  if (/hash|digest|fan_key|_key$/.test(n)) gen.push("a".repeat(64), "0".repeat(64));
+  if (/passport_id$|^psp/.test(n)) gen.push("psp_0000000000000001");
+  if (/account_id$/.test(n)) gen.push("acc_0000000000000001");
+  if (/json|payload|detail|inputs|summary|roster|params|meta/.test(n)) gen.push("{}", "[]");
+  gen.push("US", "2026-01", "x", TS, "2026-01-01", 1, 0, "{}", "[]", "a".repeat(64), "op_0000000000000000000a", "https://example.test/x", "a@example.test", "v1|x|y|z", "0".repeat(64));
+  if (alt) return lits.length ? lits : !col.notnull && !col.pk ? [null, ...gen] : gen;
+  const out = [...lits, ...gen];
+  if (!col.notnull && !col.pk) out.push(null);
+  return out;
+}
+
+// I13-FX9: `_` is LIKE's one-character wildcard, so it is escaped — the same filter as test/i13-every-table-rows.test.ts:22.
+export function solve(db, which) {
+  const tables = db.prepare("SELECT name, sql FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite!_%' ESCAPE '!' AND name NOT LIKE '!_cf!_%' ESCAPE '!' ORDER BY name").all();
+  const fks = Object.fromEntries(tables.map((t) => [t.name, db.prepare("SELECT * FROM pragma_foreign_key_list(?)").all(t.name)]));
+  const done = new Set();
+  const rows = [];
+  const fail = {};
+  const attempt = (t, alt = false) => {
+    const cols = db.prepare("SELECT * FROM pragma_table_xinfo(?)").all(t.name).filter((c) => c.hidden === 0);
+    const fixed = {};
+    for (const f of fks[t.name]) {
+      if (f.table === t.name) continue;
+      const to = f.to ?? "rowid";
+      fixed[f.from] = db.prepare(`SELECT DISTINCT "${to}" AS v FROM "${f.table}" WHERE "${to}" IS NOT NULL ORDER BY 1 LIMIT 4`).pluck().all();
+    }
+    const P = cols.map((c) => (c.name in fixed ? fixed[c.name] : pool(c, t.sql, alt)));
+    const idx = cols.map(() => 0);
+    const sql = `INSERT INTO "${t.name}" (${cols.map((c) => `"${c.name}"`).join(", ")}) VALUES (${cols.map(() => "?").join(", ")})`;
+    let lastErr = "";
+    for (let tries = 0; tries < 3000; tries++) {
+      const bind = cols.map((_, i) => P[i][idx[i] % P[i].length]);
+      db.exec("SAVEPOINT s");
+      try {
+        db.prepare(sql).run(...bind);
+        db.exec("RELEASE s");
+        rows.push({ db: which, table: t.name, sql, bind });
+        return true;
+      } catch (e) {
+        db.exec("ROLLBACK TO s");
+        db.exec("RELEASE s");
+        lastErr = e.message;
+        const named = (re) => cols.map((c, i) => (re(c.name) ? i : -1)).filter((i) => i >= 0 && P[i].length > 1);
+        const chk = e.message.match(/CHECK constraint failed: ([\s\S]*)$/);
+        const uniq = e.message.match(/UNIQUE constraint failed: (.*)$/);
+        let culprits = chk ? named((n) => new RegExp(`\\b${esc(n)}\\b`).test(chk[1])) : uniq ? named((n) => uniq[1].includes(`.${n}`)) : [];
+        if (culprits.length === 0) culprits = cols.map((_, i) => i).filter((i) => P[i].length > 1);
+        let k = 0;
+        while (k < culprits.length) {
+          const i = culprits[k];
+          idx[i]++;
+          if (idx[i] % P[i].length !== 0) break;
+          k++;
+        }
+        if (k === culprits.length) break;
+      }
+    }
+    return lastErr;
+  };
+  const ready = (t) => fks[t.name].every((f) => f.table === t.name || done.has(f.table));
+  for (let pass = 0; pass < 3; pass++) {
+    let progress = true;
+    while (progress) {
+      progress = false;
+      for (const t of tables) {
+        if (done.has(t.name) || !ready(t)) continue;
+        const r = attempt(t);
+        if (r === true) { done.add(t.name); delete fail[t.name]; progress = true; } else fail[t.name] = r;
+      }
+    }
+    if (pass === 0) for (const t of tables) if (done.has(t.name)) attempt(t); // the second row
+  }
+  for (const t of tables) {
+    if (done.has(t.name) || !ready(t)) continue;
+    const r = attempt(t, true);
+    if (r === true) { done.add(t.name); delete fail[t.name]; }
+  }
+  for (const t of tables) {
+    if (done.has(t.name) || db.prepare(`SELECT count(*) FROM "${t.name}"`).pluck().get() === 0) continue;
+    const cols = db.prepare("SELECT name FROM pragma_table_xinfo(?) WHERE hidden = 0").pluck().all(t.name);
+    const sql = `UPDATE "${t.name}" SET ${cols.map((c) => `"${c}" = "${c}"`).join(", ")}`;
+    db.prepare(sql).run();
+    rows.push({ db: which, table: t.name, sql, bind: [] });
+    done.add(t.name);
+    delete fail[t.name];
+  }
+  const missing = tables.filter((t) => !done.has(t.name)).map((t) => `${t.name}: ${fail[t.name] ?? "parent unsolved"}`);
+  if (missing.length) throw new Error(`${which}: no write found for ${missing.length} table(s):\n${missing.join("\n")}`);
+  const wide = rows.filter((r) => r.bind.length > 100);
+  if (wide.length) throw new Error(`D1 caps a statement at 100 bound parameters: ${wide.map((r) => r.table).join(", ")}`);
+  return rows;
+}
+
+// Written only when run as a script, so test/i13-fx9-every-table-gen-filter.test.ts can import `solve`.
+if (process.argv[1] !== undefined && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  const rows = [...solve(migrated("../migrations"), "trust"), ...solve(migrated("../analytics"), "analytics")];
+  writeFileSync(here("./i13-every-table-rows.json"), `${JSON.stringify(rows, null, 1)}\n`);
+  console.log(`wrote ${rows.length} statements over ${new Set(rows.map((r) => `${r.db}.${r.table}`)).size} tables`);
+}
+===== END FILE: services/trust-core/test-fidelity/i13-every-table-gen.mjs =====
+
+===== BEGIN FILE: services/trust-core/test-fidelity/i13-migrate.ts =====
+import type { DbLike } from "../src/db.js";
+import { applyMigrations } from "./schema.js";
+
+/**
+ * I13-D1 — migrate a real D1 to a chosen point, using the SAME statement splitter every fidelity file uses.
+ *
+ * `applyMigrations` (test-fidelity/schema.ts, pinned, not edited here) is run ONCE against a recording DbLike,
+ * which yields the whole ordered statement list without a second splitter. A migration's own statements are
+ * located in that list by exact match against a plain split of its text — valid only for a file with no
+ * trigger body and no `;`/`--` inside a literal, and asserted contiguous, unique and complete, so a file that
+ * breaks that premise fails loudly rather than mis-cutting.
+ */
+let recorded: string[] | null = null;
+export async function allStatements(): Promise<string[]> {
+  if (recorded) return recorded;
+  const out: string[] = [];
+  const recorder = { prepare: (sql: string) => ({ run: async () => (out.push(sql), { success: true }) }) } as unknown as DbLike;
+  await applyMigrations(recorder);
+  recorded = out;
+  return out;
+}
+
+export function plainStatements(fileText: string): string[] {
+  if (/\bCREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER\b/i.test(fileText)) throw new Error("plainStatements: a trigger body cannot be split on `;`");
+  return fileText
+    .split("\n")
+    .map((l) => (l.includes("--") ? l.slice(0, l.indexOf("--")) : l))
+    .join("\n")
+    .split(";")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/** The statements before migration `fileText`, and that migration's own statements. */
+export async function splitAt(fileText: string): Promise<{ before: string[]; own: string[] }> {
+  const all = await allStatements();
+  const own = plainStatements(fileText);
+  const i = all.indexOf(own[0]!);
+  if (i <= 0 || all.lastIndexOf(own[0]!) !== i) throw new Error(`splitAt: the migration's first statement occurs ${i <= 0 ? "nowhere usable" : "twice"} in applyMigrations' list`);
+  const got = all.slice(i, i + own.length);
+  if (JSON.stringify(got) !== JSON.stringify(own)) throw new Error("splitAt: the migration's statements are not contiguous in applyMigrations' list");
+  return { before: all.slice(0, i), own };
+}
+
+export async function run(db: DbLike, statements: string[]): Promise<void> {
+  for (const s of statements) await db.prepare(s).run();
+}
+===== END FILE: services/trust-core/test-fidelity/i13-migrate.ts =====
+
+===== BEGIN FILE: services/trust-core/test-fidelity/schema.ts =====
+import type { DbLike } from "../src/db.js";
+
+/**
+ * Apply the real migrations to a real (miniflare) D1, statement-by-statement.
+ * D1's `exec()` is line-oriented and rejects comment-only lines, so we strip
+ * `--` line comments and split on `;` (our DDL has no triggers and no `--`/`;`
+ * inside string literals), then run each statement through the SAME DbLike the
+ * app code uses. The migration list is imported as raw text at build time via
+ * Vite's `import.meta.glob`, sorted by filename = applied in order.
+ */
+declare module "cloudflare:test" {
+  interface ProvidedEnv {
+    TRUST_DB: D1Database;
+    ANALYTICS_DB: D1Database;
+  }
+}
+
+declare global {
+  interface ImportMeta {
+    glob(pattern: string, opts: { query: string; eager: true; import: string }): Record<string, string>;
+  }
+}
+
+const migrations = import.meta.glob("../migrations/*.sql", { query: "?raw", eager: true, import: "default" }) as Record<string, string>;
+
+export const MIGRATION_COUNT = Object.keys(migrations).length;
+
+/** An open `CREATE TRIGGER` body: fewer `END`s than `BEGIN`s plus `CASE`s
+ * (string literals blanked first). A `CASE … END` inside the body also ends in
+ * the bare word, so "ends with END" alone closes the body early (I3-1839). */
+function triggerOpen(stmt: string): boolean {
+  if (!/^CREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER\b/i.test(stmt)) return false;
+  const bare = stmt.replace(/'(?:[^']|'')*'/g, "''");
+  const n = (re: RegExp) => bare.match(re)?.length ?? 0;
+  return n(/\bEND\b/gi) < n(/\bBEGIN\b/gi) + n(/\bCASE\b/gi);
+}
+
+function statements(sql: string): string[] {
+  const stripped = sql
+    .split("\n")
+    .map((line) => {
+      const i = line.indexOf("--");
+      return i >= 0 ? line.slice(0, i) : line;
+    })
+    .join("\n");
+  // TRIGGER BODIES ARE NOT STATEMENT BOUNDARIES.
+  //
+  // A naive `split(";")` cuts `CREATE TRIGGER … BEGIN … ; … ; END;` into pieces,
+  // and D1 answers the first fragment with `incomplete input: SQLITE_ERROR`. That
+  // is not hypothetical: migration 0024 added eight such triggers, and THIS
+  // ENTIRE FIDELITY SUITE HAS BEEN RED EVER SINCE — every one of its tests
+  // reported as "skipped" because the shared `beforeAll` could not build the
+  // schema. It is not part of `pnpm test`, so nothing said so.
+  //
+  // Which is worth naming, because of what this suite is FOR: it exists to catch
+  // exactly the assumptions the better-sqlite3 double cannot check — driver
+  // message shapes, `meta.changes`, batch rollback on real D1. A suite that
+  // silently stopped running is the same defect class it was built to prevent.
+  //
+  // The rule is SQLite's own: inside a `CREATE TRIGGER`, semicolons belong to the
+  // body until the matching `END`. Accumulate until a fragment ends with `END`,
+  // which is unambiguous here because every trigger in this tree closes that way
+  // and no other statement ends in the bare word.
+  const out: string[] = [];
+  let pending = "";
+  for (const fragment of stripped.split(";")) {
+    pending = pending ? `${pending};${fragment}` : fragment;
+    const trimmed = pending.trim();
+    if (trimmed.length === 0) {
+      pending = "";
+      continue;
+    }
+    // Open trigger body: a BEGIN with no matching END yet.
+    if (triggerOpen(trimmed)) continue;
+    out.push(trimmed);
+    pending = "";
+  }
+  const tail = pending.trim();
+  if (tail.length > 0) out.push(tail);
+  return out;
+}
+
+export async function applyMigrations(db: DbLike): Promise<void> {
+  for (const path of Object.keys(migrations).sort()) {
+    for (const stmt of statements(migrations[path]!)) {
+      await db.prepare(stmt).run();
+    }
+  }
+}
+===== END FILE: services/trust-core/test-fidelity/schema.ts =====
+
+===== BEGIN FILE: services/trust-core/test-fidelity/vacuity-setup.ts =====
+/**
+ * VACUITY TRIPWIRE for the real-D1 fidelity suite (TE-06).
+ *
+ * check-fidelity.mjs's floor reads vitest's JSON `assertionResults` and checks
+ * each case's `status` ("passed"/"failed"/"skipped"/"todo"). A test whose body
+ * runs to completion without ever calling `expect(...)` is reported "passed"
+ * with no assertion behind it — the floor counts it toward `passed` and the
+ * `fidelityMinTests` gate without ever noticing.
+ *
+ * `scripts/invariant-setup.mjs` already has this exact tripwire for the
+ * PROTECTED run (gated on INVARIANT_INCLUDE), but it is not wired into this
+ * suite's config, and it also wraps the single-hasher crypto primitives —
+ * unrelated to fidelity and not something to load under the workerd pool.
+ * This is the same three-line check, standalone, unconditional here: every
+ * fidelity case is already meant to exercise real D1, so unlike the default
+ * `pnpm test` suite there's no legitimate assertion-free smoke test to spare.
+ */
+import { afterEach, expect } from "vitest";
+
+afterEach((ctx) => {
+  const calls = expect.getState().assertionCalls;
+  if (!Number.isFinite(calls) || calls < 1) {
+    throw new Error(
+      `VACUITY [fidelity] violated: "${ctx.task.name}" made no assertions. ` +
+        "check-fidelity.mjs's floor counts reported test status, not assertion " +
+        "count - a case that returns before its first expect() still reads " +
+        "'passed'. Every fidelity case must call expect() at least once.",
+    );
+  }
+});
+===== END FILE: services/trust-core/test-fidelity/vacuity-setup.ts =====
+
+===== BEGIN FILE: services/trust-core/vitest.fidelity.config.ts =====
+import { defineWorkersConfig, defineWorkersProject } from "@cloudflare/vitest-pool-workers/config";
+import http from "node:http";
+
+/**
+ * Real-D1 fidelity suite (run under workerd via `pnpm test:fidelity`), SEPARATE
+ * from the default `pnpm test` (which runs on the better-sqlite3 double under
+ * Node). This re-runs the load-bearing D1 behaviors — batch atomicity, a
+ * UNIQUE-violation rollback, `meta.changes`, and `ON CONFLICT` — against a real
+ * (miniflare-backed) D1, proving the double didn't lie. See docs/D1-FIDELITY.md.
+ *
+ * TWO PROJECTS, ONE CONFIG (I13-FX14, D-0896). `scripts/check-fidelity.mjs`, `gate.mjs --fidelity` and
+ * `pnpm test:fidelity` run this one file, and `vitest run --config` runs every project in it.
+ * - `fidelity`: every real-D1 file, per-test isolated storage (the pool snapshots and restores the D1 files
+ *   around each test through its node-side loopback).
+ * - `fidelity-every-table`: test-fidelity/i13-every-table.d1.test.ts alone, with isolated storage OFF. That
+ *   file migrates a whole database and writes every table; under load (the cloud gate, 2 CPUs, the full suite)
+ *   the pool's restore after its first test died with `Network connection lost` and the 0157 control then saw
+ *   the first test's tables. Without isolation there is no restore to fail, and the control gets its own
+ *   database (`I13_CONTROL_DB`), so it starts empty by construction rather than by a restore.
+ * test/i13-fidelity-every-table-project.test.ts holds this split to its shape.
+ */
+
+/**
+ * I13-FX18 (D-0902, QUEUE #919): the pool pushes a storage frame before each test and pops it after, each a fetch
+ * from workerd to Miniflare's node loopback server (`http.createServer`, Node's default `keepAliveTimeout` of 5 s).
+ * A test that keeps D1 busy for longer than that gets its pop sent down the push's connection after Node has
+ * closed it: `Network connection lost` in `updateStackedStorage`, the frame is never popped, and the next test
+ * sees the last one's tables. Load only decides which test crosses 5 s (0100's control: 0.8 s alone, 6.4 s in the
+ * full suite on 2 CPUs). Every node HTTP server this config's process creates keeps an idle connection for
+ * LOOPBACK_KEEP_ALIVE_MS instead. test/test-fidelity/i13-loopback-keepalive.d1.test.ts goes red without it;
+ * tests/tooling/i13-fidelity-loopback-keepalive.test.ts holds the value and the patch.
+ */
+export const LOOPBACK_KEEP_ALIVE_MS = 300_000;
+const PATCHED = Symbol.for("dhwaja.fidelity.loopbackKeepAlive");
+const httpMod = http as typeof http & { [PATCHED]?: true };
+if (!httpMod[PATCHED]) {
+  httpMod[PATCHED] = true;
+  const createServer = http.createServer;
+  httpMod.createServer = function (this: unknown, ...args: unknown[]) {
+    const server = (createServer as (...a: unknown[]) => http.Server).apply(this, args);
+    if (server.keepAliveTimeout < LOOPBACK_KEEP_ALIVE_MS) server.keepAliveTimeout = LOOPBACK_KEEP_ALIVE_MS;
+    return server;
+  } as typeof http.createServer;
+}
+const EVERY_TABLE = "test-fidelity/i13-every-table.d1.test.ts";
+const shared = {
+  root: import.meta.dirname, // resolve include/imports from services/trust-core, not the repo root
+  // S-075 QUEUE #252 D2: vitest collects test files under dot directories
+  // (a .scratch/**/*.test.ts probe was listed by `vitest list --filesOnly`
+  // under the root config). `include` narrows this suite to `*.d1.test.ts`
+  // under `test-fidelity/`, a shape no scratch/sandbox probe matches, so this
+  // is defense-in-depth, not a behavior change.
+  exclude: ["**/.scratch/**", "**/.stryker-tmp/**", "Claude outputs/**"],
+  // TE-06: every reported "passed" case must have called expect() at least
+  // once - see test-fidelity/vacuity-setup.ts for why.
+  setupFiles: ["test-fidelity/vacuity-setup.ts"],
+  miniflare: { compatibilityDate: "2026-01-01", compatibilityFlags: ["nodejs_compat"] },
+  // I13-FX18: on 2 CPUs every file's beforeAll migrates a real D1 at once, and one (batch-returning's) crossed
+  // vitest's 10 s default hook timeout in a full run; a slow hook is not a fidelity failure.
+  hookTimeout: 60_000,
+};
+
+export default defineWorkersConfig({
+  test: {
+    projects: [
+      defineWorkersProject({
+        root: shared.root,
+        test: {
+          name: "fidelity",
+          hookTimeout: shared.hookTimeout,
+          include: [
+            "test-fidelity/**/*.d1.test.ts",
+            // I4-09-R4 (I3-0390/I3-1939): trust-core's own real-D1 files that live
+            // under `test/` sit in `test/test-fidelity/`, which the root Node suite's
+            // `**/test-fidelity/**` exclude keeps out of `pnpm test`.
+            "test/test-fidelity/**/*.d1.test.ts",
+          ],
+          exclude: [...shared.exclude, EVERY_TABLE],
+          setupFiles: shared.setupFiles,
+          poolOptions: {
+            workers: {
+              miniflare: {
+                ...shared.miniflare,
+                // A real, per-test-isolated D1; migrations are applied in beforeAll.
+                // I3-1939: ANALYTICS_DB too, so the second store's migrations and the
+                // analytics consumer's batch semantics run on real D1 (I3-0390).
+                d1Databases: { TRUST_DB: "dhwaja-fidelity", ANALYTICS_DB: "dhwaja-analytics-fidelity" },
+              },
+            },
+          },
+        },
+      }),
+      defineWorkersProject({
+        root: shared.root,
+        test: {
+          name: "fidelity-every-table",
+          hookTimeout: shared.hookTimeout,
+          include: [EVERY_TABLE],
+          exclude: shared.exclude,
+          setupFiles: shared.setupFiles,
+          poolOptions: {
+            workers: {
+              isolatedStorage: false,
+              miniflare: {
+                ...shared.miniflare,
+                d1Databases: { TRUST_DB: "dhwaja-fidelity", ANALYTICS_DB: "dhwaja-analytics-fidelity", I13_CONTROL_DB: "dhwaja-every-table-control" },
+              },
+            },
+          },
+        },
+      }),
+    ],
+  },
+});
+===== END FILE: services/trust-core/vitest.fidelity.config.ts =====
+
+===== END OF CHUNK 73 OF 73 =====

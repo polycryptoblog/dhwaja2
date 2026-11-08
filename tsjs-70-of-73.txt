@@ -1,0 +1,3250 @@
+DHWAJA CODE REVIEW — tsjs — CHUNK 70 OF 73
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (stripe*), services/trust-core/src (subject*), services/trust-core/src (supporter*), services/trust-core/src (taxonomy*)
+Files in this chunk (4):
+  - services/trust-core/src/stripe.ts
+  - services/trust-core/src/subject-seal.ts
+  - services/trust-core/src/supporter-status.ts
+  - services/trust-core/src/taxonomy.ts
+
+
+===== BEGIN FILE: services/trust-core/src/stripe.ts =====
+/**
+ * Stripe Billing adapter (M7) — the REAL processor behind Fan Premium and
+ * Creator Pro. (Decisions: claude/BILLING-AGENCY-DECISIONS.md flag 17 —
+ * Stripe Billing + Stripe Tax, WEB CHECKOUT ONLY; mobile/extension read
+ * entitlements and never sell.)
+ *
+ * Three responsibilities, all fail-closed:
+ *   1. verifyStripeSignature — the webhook's ONLY authorization. No secret →
+ *      the route 503s; a bad/stale/tampered signature is a 400 before any
+ *      state is read or written.
+ *   2. parseStripeEvent + stripeOutcome — the pure event→intent mapping.
+ *      Applying it (idempotently, atomically) is entitlements-store.ts.
+ *   3. createStripeCheckoutSession / createStripePortalSession — hosted pages.
+ *      NO CARD DATA EVER TOUCHES DHWAJA; we hold a customer id and nothing else.
+ *
+ * --- HMAC vs the single-hasher invariant (invariant #1) -----------------
+ * This file calls `crypto.subtle.importKey` + `crypto.subtle.sign` to compute
+ * an HMAC-SHA256. That is NOT a single-hasher violation and needs NO new
+ * exemption in tests/invariants/single-hasher.test.ts:
+ *   - the guard forbids HASHING primitives — WebCrypto's raw digest call,
+ *     node's createHash factory, imports of node's crypto module — because a second SUBJECT hasher
+ *     would diverge from `@dhwaja/canonical` and break the registry. It does
+ *     not forbid (and must not forbid) keyed MACs.
+ *   - an HMAC over a third-party webhook body is a message-authentication tag
+ *     in Stripe's protocol, verified against Stripe's key. It never produces a
+ *     subject hash, a bucket prefix, or a ledger preimage, and its output is
+ *     never stored or served.
+ *   - the precedent is already in-tree and unexempted: `packages/session`
+ *     signs and verifies session tokens with the same keyed-MAC primitive.
+ *     (billing.ts and creator-billing.ts used to verify processor HMACs this
+ *     way too, since S45/S70; both of those verifiers went with the generic-
+ *     processor web rail in pre-launch item 14, so this module is now the only
+ *     WEBHOOK MAC verifier left.)
+ * Nothing here may ever hash a subject; subject hashing stays in canonical.
+ *
+ * Stripe's scheme (docs: "Check the webhook signatures manually"):
+ *   Stripe-Signature: t=<unix>,v1=<hex hmac>[,v1=<hex>…][,v0=…]
+ *   signed payload   = `${t}.${rawBody}`  (RAW bytes — never re-serialized JSON)
+ */
+
+import { REFUND_OWED_CANCELLED_ACTION } from "./credits.js";
+import { type DbLike, inChunks } from "./db.js";
+import { appOriginFromEnv, consoleOriginFromEnv, publicBaseUrlFromEnv, settingValue } from "./env-config.js";
+import { logError } from "./log.js";
+import { isoWeek, isoWeekEndMs } from "./ratings.js";
+import { openSubject, type SubjectSealKeys, sealKeyList, sealSubject, subjectSealKeys } from "./subject-seal.js";
+
+const encoder = new TextEncoder();
+
+/** Stripe's recommended replay window. A `t` outside ±this is rejected even
+ * when the MAC is valid — a captured-and-held webhook cannot be re-fired later. */
+export const STRIPE_TOLERANCE_SEC = 300;
+
+const placeholder = (v: string | undefined): boolean => !v || String(v).trim() === "" || /TODO/i.test(v);
+
+// ---------------------------------------------------------------------------
+// Signature verification
+// ---------------------------------------------------------------------------
+
+interface SigHeader {
+  t: number;
+  v1: string[];
+}
+
+/** Parse `t=…,v1=…` into its parts, or null when malformed. */
+function parseSigHeader(header: string): SigHeader | null {
+  if (typeof header !== "string" || header.length === 0 || header.length > 4096) return null;
+  let t: number | null = null;
+  const v1: string[] = [];
+  for (const part of header.split(",")) {
+    const eq = part.indexOf("=");
+    if (eq <= 0) continue;
+    const k = part.slice(0, eq).trim();
+    const v = part.slice(eq + 1).trim();
+    if (k === "t") {
+      if (!/^[0-9]{1,15}$/.test(v)) return null;
+      t = Number(v);
+    } else if (k === "v1") {
+      if (/^[0-9a-fA-F]{64}$/.test(v)) v1.push(v.toLowerCase());
+    }
+  }
+  if (t === null || v1.length === 0 || v1.length > 8) return null;
+  return { t, v1 };
+}
+
+/**
+ * Verify a Stripe webhook signature over the RAW body. Fail closed: absent /
+ * short secret, malformed header, stale timestamp, or no matching v1 → false.
+ *
+ * Constant-time: comparison is delegated to `crypto.subtle.verify`, and every
+ * candidate v1 is checked without an early exit, so neither the number of
+ * signatures nor the position of the match is observable through timing.
+ */
+export async function verifyStripeSignature(
+  rawBody: string,
+  header: string,
+  secret: string | undefined,
+  nowMs: number,
+  toleranceSec: number = STRIPE_TOLERANCE_SEC,
+): Promise<boolean> {
+  if (placeholder(secret) || (secret as string).length < 16) return false;
+  const parsed = parseSigHeader(header);
+  if (!parsed) return false;
+  // Stale (or future-dated) timestamps are rejected BEFORE the MAC work.
+  if (Math.abs(Math.floor(nowMs / 1000) - parsed.t) > toleranceSec) return false;
+
+  // Same shape trick push.ts uses — no lib.dom in this build.
+  let key: Awaited<ReturnType<typeof crypto.subtle.importKey>>;
+  try {
+    key = await crypto.subtle.importKey("raw", encoder.encode(secret as string), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  } catch {
+    return false;
+  }
+  const signed = encoder.encode(`${parsed.t}.${rawBody}`) as unknown as ArrayBuffer;
+  let ok = false;
+  for (const hex of parsed.v1) {
+    const sig = new Uint8Array(hex.match(/../g)!.map((h) => parseInt(h, 16))) as unknown as ArrayBuffer;
+    try {
+      // No early break: every candidate costs the same.
+      ok = (await crypto.subtle.verify("HMAC", key, sig, signed)) || ok;
+    } catch {
+      /* malformed candidate — stays false, keeps the loop constant-shaped */
+    }
+  }
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Event parsing + the pure event → intent mapping
+// ---------------------------------------------------------------------------
+
+export interface StripeEvent {
+  id: string;
+  type: string;
+  created: number; // unix seconds
+  object: Record<string, unknown>; // data.object
+}
+
+const EVENT_ID_RE = /^evt_[A-Za-z0-9_-]{1,120}$/;
+const FAN_ID_RE = /^acc_[0-9a-z]{8,32}$/;
+const CREATOR_ID_RE = /^psp_[0-9a-f]{16}$/;
+const STRIPE_ID_RE = /^[A-Za-z0-9_-]{1,255}$/;
+/** A Stripe idempotency key / transfer_group we mint (creator-payout.ts transferIdempotencyKey): header-safe, <= 255. */
+const IDEMPOTENCY_KEY_RE = /^[A-Za-z0-9_:-]{1,255}$/;
+
+/**
+ * The far edge of a believable unix timestamp (seconds), 2100-01-01. Stripe's
+ * `created` is bounded HERE, at parse time, not downstream:
+ * `new Date(ms).toISOString()` THROWS a RangeError beyond ±8.64e15 ms, and a
+ * throw inside applyStripeOutcome aborts the batch — the dedup marker never
+ * lands, the route answers non-2xx, and Stripe redelivers the same poison
+ * event for three days with nothing able to stop it. A `created` we cannot
+ * render is a body we do not understand: reject it here, where rejection is a
+ * clean 400 and not an unbounded retry loop.
+ */
+const MAX_EVENT_CREATED_SEC = 4_102_444_800;
+
+/** Parse + shape-validate a Stripe event body. Unknown/absent fields → null
+ * (fail closed; a body we cannot fully understand is never applied). */
+export function parseStripeEvent(rawBody: string): StripeEvent | null {
+  let obj: Record<string, unknown>;
+  try {
+    obj = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== "object") return null;
+  const id = obj.id;
+  const type = obj.type;
+  const created = obj.created;
+  const data = obj.data as { object?: unknown } | undefined;
+  if (typeof id !== "string" || !EVENT_ID_RE.test(id)) return null;
+  if (typeof type !== "string" || type.length === 0 || type.length > 128) return null;
+  if (typeof created !== "number" || !Number.isInteger(created) || created <= 0 || created > MAX_EVENT_CREATED_SEC) return null;
+  if (!data || typeof data !== "object" || !data.object || typeof data.object !== "object") return null;
+  return { id, type, created, object: data.object as Record<string, unknown> };
+}
+
+/**
+ * What a verified event asks us to do. `ignore` events are still RECORDED
+ * (dedup) so a redelivery is cheap and observable.
+ *
+ * `set` CREATES OR RAISES a grant and is only ever produced by a PAYING
+ * status. `lapse` ENDS one and is UPDATE-ONLY — it can never bring a row into
+ * existence. That split is finding #1's fix (see the grace note on
+ * stripeOutcome). Both name the subscription they are about, because a subject
+ * may hold several (`0008_billing.sql` keys the row on `stripe_subscription_id`).
+ */
+export type StripeOutcome =
+  /** `retry` (#135SC-04): the ignore depends on THIS deployment's price config
+   * (none configured, or a price it does not recognise) — fixable by config,
+   * so the event is NOT dedup-marked and the route answers 5xx; Stripe
+   * redelivers. Absent = permanent (no subject, one-off, malformed). */
+  | { kind: "ignore"; reason: string; retry?: true }
+  | {
+      kind: "set";
+      subjectId: string;
+      subjectKind: "fan" | "creator";
+      tier: "premium" | "pro";
+      paidThroughMs: number;
+      customerId: string | null;
+      subscriptionId: string;
+      /** RJb-T2-AS-013 / #609q: when the subscriber has asked to cancel, the instant the plan ends (the period end
+       * for `cancel_at_period_end`, else `cancel_at`); null when it is set to renew. */
+      cancelAtMs?: number | null;
+    }
+  | {
+      kind: "lapse";
+      subjectId: string;
+      subjectKind: "fan" | "creator";
+      /** paid_through is moved HERE (now) — the 7-day grace starts from it,
+       * but ONLY for a row that already exists, i.e. one that was paid for. */
+      paidThroughMs: number;
+      customerId: string | null;
+      subscriptionId: string;
+    }
+  | {
+      /**
+       * MONEY TAKEN BACK on an ordinary, unexpanded delivery — the shape every
+       * real refund and chargeback arrives in, where the subscription/subject
+       * linkage is simply not in the body. It carries BOTH identities such a
+       * body can have, and entitlements-store resolves them in that order:
+       *
+       *   1. `refs` — the Charge and the PaymentIntent, looked up in
+       *      `billing_payments` (0039), which recorded them against a
+       *      (subject, subscription) when the invoice was paid. This is the
+       *      NARROW path: it names one grant and cannot reach another.
+       *   2. `customerId` — the fallback, applied by REVOKE_BY_CUSTOMER, which
+       *      acts only when the customer has exactly one revocable grant. It
+       *      still serves everything with no recorded linkage: subscriptions
+       *      paid for before 0039, invoices whose payment ids we could not
+       *      read, and any future rail that reaches this outcome.
+       *
+       * `customerId` is NULLABLE because a Dispute carries no customer at all;
+       * `refs` may be empty because a Charge in some deliveries carries no
+       * PaymentIntent. At least one of the two is always present — a body with
+       * neither is `ignore`, since there would be nothing to name.
+       */
+      kind: "revoke";
+      customerId: string | null;
+      /** The Stripe payment ids this reversal is against. Either may be null;
+       * never both (chargeReversal refuses that body). */
+      refs: { chargeId: string | null; paymentIntentId: string | null };
+      /** paid_through moves HERE (now), as for any other lapse. */
+      paidThroughMs: number;
+    }
+  | {
+      kind: "extend";
+      subscriptionId: string;
+      paidThroughMs: number;
+      /** The invoice's customer. An invoice names no Dhwaja subject, so this is
+       * the ONLY thing that binds it to a grant — see the EXTEND statement. */
+      customerId: string;
+      /**
+       * THE LINKAGE TO RECORD (0039): the invoice's own id plus the payment ids
+       * it was settled by. Written by applyStripeOutcome in the SAME batch as
+       * the extend, against the grant that batch resolved — so a linkage can
+       * never exist for money we did not record, nor be missing for money we
+       * did. Null when the body carries no invoice id or no payment id at all
+       * (a $0 trial invoice is the ordinary case); nothing is recorded and a
+       * later reversal falls back to the customer scope.
+       */
+      payment: { invoiceId: string; chargeId: string | null; paymentIntentId: string | null; amountCents: number | null; currency: string | null } | null;
+    };
+
+/** Subscription statuses that MEAN paid. Everything else (past_due, unpaid,
+ * canceled, incomplete, incomplete_expired, paused) stops extending — the
+ * 7-day read-time grace, not a status string, is what softens a blip. */
+const PAYING = new Set(["active", "trialing"]);
+
+/**
+ * The furthest ahead a single billing period may ever reach: ~400 days, which
+ * clears the longest plan we sell (annual) plus a trial and a leap day.
+ *
+ * Stripe's `current_period_end` is a plain number in a JSON body. Nothing
+ * downstream bounded it, so `current_period_end = 8_640_000_000_000` bought a
+ * year-275760 entitlement — permanent Pro from one event. Fail CLOSED above
+ * the ceiling rather than clamping down to it: a period end we cannot believe
+ * means the payload is not what we think it is, and inventing a plausible
+ * grant from an implausible body is exactly the move that turns a parsing bug
+ * into free product. (The signature already gates who can send this; the
+ * ceiling gates what a compromised or mis-versioned sender could achieve.)
+ */
+export const MAX_PAID_AHEAD_MS = 400 * 24 * 60 * 60 * 1000;
+
+function str(v: unknown): string | null {
+  return typeof v === "string" && STRIPE_ID_RE.test(v) ? v : null;
+}
+
+/** Stripe expands `customer`/`subscription` to an object in some payloads. */
+function idOf(v: unknown): string | null {
+  if (typeof v === "string") return str(v);
+  if (v && typeof v === "object") return str((v as { id?: unknown }).id);
+  return null;
+}
+
+/** Subject kind is derived from the ID SHAPE, never from processor metadata.
+ * There is no metadata field an attacker could set to become the other kind.
+ * The TIER is NOT derived from the kind — see tierForPrice. */
+function subjectOf(v: unknown): { subjectId: string; subjectKind: "fan" | "creator" } | null {
+  if (typeof v !== "string") return null;
+  if (FAN_ID_RE.test(v)) return { subjectId: v, subjectKind: "fan" };
+  if (CREATOR_ID_RE.test(v)) return { subjectId: v, subjectKind: "creator" };
+  return null;
+}
+
+/** The configured price ids, per product and interval (StripeConfig.prices). */
+export interface PriceMap {
+  premium: { month?: string | undefined; year?: string | undefined };
+  pro: { month?: string | undefined; year?: string | undefined };
+}
+
+/**
+ * Which product a Stripe price id sells, or null when it is not one of ours.
+ *
+ * The tier used to follow from the subject KIND (creator ⇒ pro), which meant
+ * the grant was never bound to what was actually bought: a Portal plan-switch
+ * onto the $3 fan price, on a `psp_…` creator subject, still granted Pro.
+ * The price is the only thing in the payload that says what was paid for, so
+ * the price is what decides — and a price we do not recognise grants NOTHING
+ * (a mis-set env var must cost a sale, never give away the product).
+ */
+export function tierForPrice(prices: PriceMap, priceId: string): "premium" | "pro" | null {
+  if (priceId === prices.premium.month || priceId === prices.premium.year) return "premium";
+  if (priceId === prices.pro.month || priceId === prices.pro.year) return "pro";
+  return null;
+}
+
+/** Every price id on a subscription's items (`price.id`, or the legacy `plan`
+ * alias for the same object). */
+function priceIdsOf(sub: Record<string, unknown>): string[] {
+  const items = (sub.items as { data?: unknown } | undefined)?.data;
+  if (!Array.isArray(items)) return [];
+  const out: string[] = [];
+  for (const it of items) {
+    const item = it as Record<string, unknown> | undefined;
+    const id = idOf(item?.price) ?? idOf(item?.plan);
+    if (id) out.push(id);
+  }
+  return out;
+}
+
+/** A `metadata` bag off any Stripe object, or an empty one. */
+function metaOf(v: unknown): Record<string, unknown> {
+  if (!v || typeof v !== "object") return {};
+  const m = (v as { metadata?: unknown }).metadata;
+  return m && typeof m === "object" ? (m as Record<string, unknown>) : {};
+}
+
+/** The Charge a `charge.dispute.*` event is about — Stripe sends the Dispute as
+ * `data.object`, and the Charge only when it arrives expanded. */
+function disputedCharge(dispute: Record<string, unknown>): Record<string, unknown> | null {
+  const c = dispute.charge;
+  return c && typeof c === "object" ? (c as Record<string, unknown>) : null;
+}
+
+/**
+ * The payment ids an INVOICE was settled by, or null when it has none we can
+ * store. This is the whole capture side of the chargeback fix: a reversal names
+ * a Charge and/or a PaymentIntent and nothing else, so those ids have to be
+ * written down at the moment we are told which subscription they paid for.
+ *
+ * TWO API DIALECTS, both live. Before 2025-03-31 an Invoice carries `charge`
+ * and `payment_intent` directly. From `basil` (2025-03-31) it carries NEITHER —
+ * along with `subscription`, they were removed; the PaymentIntent moved into
+ * `payments.data[].payment.payment_intent` (the same release that moved the
+ * subscription to `parent.subscription_details`, which this module already
+ * reads). A Stripe account is pinned to one version and we do not choose which,
+ * so read both shapes and store whatever is there: a Dispute names both ids, so
+ * either one alone resolves the reversal.
+ */
+function invoicePayment(
+  inv: Record<string, unknown>,
+): { invoiceId: string; chargeId: string | null; paymentIntentId: string | null; amountCents: number | null; currency: string | null } | null {
+  const invoiceId = idOf(inv.id);
+  if (!invoiceId) return null;
+  let chargeId = idOf(inv.charge);
+  let paymentIntentId = idOf(inv.payment_intent);
+  const payments = (inv.payments as { data?: unknown } | undefined)?.data;
+  if (Array.isArray(payments)) {
+    for (const p of payments) {
+      const pay = (p as Record<string, unknown> | undefined)?.payment;
+      if (!pay || typeof pay !== "object") continue;
+      chargeId = chargeId ?? idOf((pay as Record<string, unknown>).charge);
+      paymentIntentId = paymentIntentId ?? idOf((pay as Record<string, unknown>).payment_intent);
+    }
+  }
+  // Nothing to look a reversal up by ⇒ nothing worth a row. (A $0 trial invoice
+  // is the ordinary case, and there is no money behind it to reverse.)
+  if (!chargeId && !paymentIntentId) return null;
+  // `amount_paid`/`currency` sit on the Invoice itself in BOTH dialects — the
+  // basil move only relocated `subscription`/`charge`/`payment_intent` (Y-04,
+  // 0089_billing_payments_amount.sql). A malformed or absent value is stored
+  // as null rather than coerced, so a bad read is visible, not a false zero.
+  const amountCents = typeof inv.amount_paid === "number" && Number.isSafeInteger(inv.amount_paid) ? inv.amount_paid : null;
+  const currency = typeof inv.currency === "string" && inv.currency.length > 0 ? inv.currency : null;
+  return { invoiceId, chargeId, paymentIntentId, amountCents, currency };
+}
+
+/**
+ * The payment ids a REVERSAL names — the lookup side of the same linkage.
+ *
+ * `charge.refunded` delivers the Charge as `data.object`, so its own `id` is
+ * the charge and `payment_intent` is beside it. `charge.dispute.*` delivers the
+ * Dispute, whose `charge` and `payment_intent` are BARE IDS (and whose body has
+ * no customer at all — the whole reason this path exists). Both are read the
+ * same way, and an expanded Charge, if one ever arrives, is read too.
+ */
+function reversalRefs(obj: Record<string, unknown>, charge: Record<string, unknown> | null): { chargeId: string | null; paymentIntentId: string | null } {
+  return {
+    chargeId: idOf(obj.charge) ?? idOf(charge?.id) ?? null,
+    paymentIntentId: idOf(obj.payment_intent) ?? idOf(charge?.payment_intent) ?? null,
+  };
+}
+
+/**
+ * A REFUND OR A CHARGEBACK, mapped onto the grant the money was paying for.
+ *
+ * THREE PATHS, PREFERRING THE NARROWEST AVAILABLE.
+ *
+ *  1. THE LINKAGE IS IN THE BODY (an expanded invoice). Read it exactly where
+ *     `invoice.payment_succeeded` reads it: the subscription from
+ *     `subscription`/`parent.subscription_details.subscription`, and the
+ *     subject from the subscription metadata Stripe snapshots onto the invoice.
+ *     That gives a `lapse`, scoped to (subject, subscription) — the narrowest
+ *     revocation there is, and the one to take whenever it is available.
+ *  2. THE LINKAGE IS ONE WE RECORDED. Stripe does not expand `charge.invoice`
+ *     (or `dispute.charge`) in webhook deliveries, so path 1 fired on
+ *     essentially no real webhook. What every reversal DOES name is the Charge
+ *     and/or the PaymentIntent, and `0039_subscription_payment_links.sql`
+ *     stores both against the (subject, subscription) they paid for at the
+ *     moment the invoice settles — so the ordinary delivery resolves to one
+ *     grant without Stripe expanding anything. `revoke` carries those ids;
+ *     entitlements-store does the lookup, because this function is pure.
+ *  3. NOTHING BUT THE CUSTOMER. `revoke` also carries the customer when the
+ *     body has one, and REVOKE_BY_CUSTOMER acts on it only when that customer
+ *     has exactly one revocable grant — see that statement for why "exactly
+ *     one" is the whole safety argument. It still serves every payment made
+ *     before 0039 and every invoice whose payment ids we could not read.
+ *
+ * AN EXPANDED INVOICE THAT DOES NOT RESOLVE IS NOT DOWNGRADED. An invoice is
+ * the authoritative statement of what a charge paid for; if it is present and
+ * says "no subscription" (a one-off charge holds no entitlement) or carries a
+ * subject we cannot read, then we have positively read the body and failed to
+ * understand it. That is a different thing from Stripe not telling us, and
+ * acting further on a body we demonstrably misread is the wrong response to it.
+ * The later paths exist for silence, not for confusion.
+ *
+ * SOMETHING TO NAME THE GRANT BY IS REQUIRED, always: a payment id, or a
+ * customer, or (path 1) the invoice itself. A body carrying none of the three
+ * is `ignore` — the same refusal as before, now stated over the identities a
+ * reversal can actually have rather than over the customer alone, which a
+ * Dispute never carries and which therefore refused every chargeback.
+ *
+ * Safety of trusting metadata here: every outcome is UPDATE-ONLY and
+ * shorten-only. A wrong or planted subject costs a revocation that lands on
+ * nothing; no path can create, raise, or extend a grant.
+ */
+function chargeReversal(obj: Record<string, unknown>, charge: Record<string, unknown> | null, nowMs: number, what: string): StripeOutcome {
+  // A Dispute is not a Charge: its `charge` is a bare id in every ordinary
+  // delivery, so accept a customer from the dispute object too when one is
+  // there. (Stripe's Dispute carries none, which is exactly why the payment
+  // ids below had to become the primary way in.)
+  const customerId = idOf(charge?.customer) ?? idOf(obj.customer);
+  const inv = charge?.invoice;
+  if (inv && typeof inv === "object") {
+    // Path 1 is TERMINAL: an expanded invoice decides, and a failure to read it
+    // is not a licence to try something wider.
+    if (!customerId) return { kind: "ignore", reason: `${what} with no customer — nothing to scope the revocation to` };
+    const invoice = inv as Record<string, unknown>;
+    const subscriptionId = idOf(invoice.subscription) ?? idOf((invoice.parent as { subscription_details?: { subscription?: unknown } } | undefined)?.subscription_details?.subscription);
+    if (!subscriptionId) return { kind: "ignore", reason: `${what} against an invoice with no subscription — a one-off charge holds no entitlement` };
+    const subject =
+      subjectOf(metaOf(invoice.subscription_details).dhwaja_subject) ?? subjectOf(metaOf(invoice).dhwaja_subject) ?? subjectOf(metaOf(charge).dhwaja_subject);
+    if (!subject) return { kind: "ignore", reason: `${what} with no dhwaja subject on an expanded invoice` };
+    // paid_through moves to NOW, same as a cancel: the 7-day read-time grace
+    // runs from here. LAPSE only ever shortens, so this can never extend anyone.
+    return { kind: "lapse", ...subject, paidThroughMs: nowMs, customerId, subscriptionId };
+  }
+  // A PAYMENT THAT POSITIVELY BOUGHT SOMETHING ELSE IS NOT THIS RAIL'S TO
+  // REVERSE. `createCreditCheckoutSession` stamps `dhwaja_purpose: "credits"`
+  // on the PaymentIntent, and Stripe copies PaymentIntent metadata onto the
+  // Charge, so a refunded credit bucket says so in its own body. It matters
+  // because the CUSTOMER fallback below cannot tell one of this customer's
+  // charges from another: a fan who buys credits and a fan who subscribes are
+  // the same Stripe customer, so a refunded credit purchase whose grant row is
+  // missing (a lost webhook, or a bucket we refused to grant) would otherwise
+  // end their subscription. The credit rail reverses its own purchases
+  // (refunds.ts); this is only ever a subscription's reversal.
+  if (metaOf(charge).dhwaja_purpose === "credits") {
+    return { kind: "ignore", reason: `${what} of a credit purchase — the credit rail reverses it, not the subscription rail` };
+  }
+  const refs = reversalRefs(obj, charge);
+  if (!refs.chargeId && !refs.paymentIntentId && !customerId) {
+    return { kind: "ignore", reason: `${what} with no payment id and no customer — nothing to scope the revocation to` };
+  }
+  return { kind: "revoke", customerId, refs, paidThroughMs: nowMs };
+}
+
+/**
+ * Was only PART of this charge given back?
+ *
+ * `charge.refunded` fires for a partial refund too — Stripe sends it for any
+ * refund, with `refunded: false` and `amount_refunded < amount`. That matters
+ * now in a way it never did before: while the reversal path could only resolve
+ * an expanded invoice it fired on essentially nothing, and the moment it starts
+ * resolving real deliveries, a $2 goodwill refund on a $99 annual plan would
+ * end the whole grant. Money partly returned is not the purchase reversed.
+ *
+ * ONLY A POSITIVELY-IDENTIFIED PARTIAL REFUND IS SPARED, which is the same
+ * direction every other reversal decision takes: a body that does not carry
+ * readable amounts, or that says the charge is fully refunded, revokes. A
+ * missing or unparseable field must never become the way to keep the product.
+ */
+function isPartialRefund(charge: Record<string, unknown>): boolean {
+  if (charge.refunded === true) return false; // Stripe's own "all of it" flag
+  const amount = charge.amount;
+  const refunded = charge.amount_refunded;
+  if (typeof amount !== "number" || !Number.isFinite(amount) || amount <= 0) return false;
+  if (typeof refunded !== "number" || !Number.isFinite(refunded)) return false;
+  return refunded > 0 && refunded < amount;
+}
+
+/**
+ * Is this dispute money actually taken back? The `warning_*` statuses are
+ * INQUIRIES (retrievals, mostly Amex/Discover): no funds are withdrawn, the
+ * charge stands, and most close with nothing having happened. Revoking on one
+ * would take the product from a paying customer over a question — and nothing
+ * in this module ever restores, so `warning_closed` would not give it back.
+ * An inquiry that does become a chargeback arrives again as a real dispute or
+ * as `charge.dispute.closed (lost)`, which both revoke.
+ *
+ * Anything else — `needs_response`, `under_review`, `lost`, `charge_refunded`,
+ * or a status this code has never heard of — revokes: for a reversal, stopping
+ * is the safe direction, so an unrecognised status must not become a way to
+ * keep the product.
+ */
+function disputeTookTheMoney(dispute: Record<string, unknown>): boolean {
+  const status = typeof dispute.status === "string" ? dispute.status : "";
+  return !status.startsWith("warning_");
+}
+
+/** Period end (unix seconds) from a subscription object. Newer API versions
+ * moved `current_period_end` onto the subscription ITEM; accept both. */
+function periodEndMs(sub: Record<string, unknown>): number | null {
+  const top = sub.current_period_end;
+  if (typeof top === "number" && Number.isFinite(top) && top > 0) return Math.floor(top) * 1000;
+  const items = (sub.items as { data?: unknown } | undefined)?.data;
+  if (Array.isArray(items) && items.length > 0) {
+    const first = items[0] as Record<string, unknown> | undefined;
+    const end = first?.current_period_end;
+    if (typeof end === "number" && Number.isFinite(end) && end > 0) return Math.floor(end) * 1000;
+  }
+  return null;
+}
+
+/**
+ * Map a verified Stripe event to an entitlement intent. PURE.
+ *
+ * Handled:
+ *  - customer.subscription.created/updated/deleted — the state machine. A
+ *    PAYING status at a RECOGNISED price produces `set` (paid_through = the
+ *    period end); anything else produces `lapse`, which moves an EXISTING
+ *    grant's paid_through to now and creates nothing.
+ *  - invoice.payment_succeeded — a renewal we may hear before the subscription
+ *    update; extends FORWARD ONLY, resolved by subscription id AND customer id
+ *    (the invoice carries no Dhwaja subject, so the customer is what binds it),
+ *    and never against a subscription Stripe has already deleted. It is ALSO
+ *    where the payment linkage is recorded (`0039`) — see below.
+ *  - invoice.payment_failed — deliberately NO state change. Dunning is
+ *    Stripe's job; the subscription event that follows is what lapses us.
+ *  - checkout.session.completed — acknowledged and recorded, but grants
+ *    nothing: a checkout session has no period end, and
+ *    customer.subscription.created carries the truth moments later. We never
+ *    grant access from an event that cannot say when access ends.
+ *  - charge.refunded / charge.dispute.created / charge.dispute.closed — MONEY
+ *    REVERSED. See below; this enumeration used to stop at the line above,
+ *    which read as a decision and was in fact an omission.
+ *
+ * --- MONEY TAKEN BACK MUST TAKE THE PRODUCT BACK -------------------------
+ * Refunds and disputes fell to `default: ignore` and wrote only a dedup marker.
+ * Stripe does NOT cancel a subscription when a charge is refunded or disputed,
+ * so no `customer.subscription.*` event follows: after a chargeback on an
+ * annual plan the paid-through date stayed ~10 months out and the raised tier
+ * caps kept running for money that had been taken back. Both store rails
+ * already revoke (Apple on `revocationDate`, Google on a revoked/expired
+ * state); Stripe was the one rail with no reversal path at all.
+ *
+ * A reversal ends a grant — paid_through to now, grace from there — because
+ * that is what this module already means by "this grant ends", and it is
+ * UPDATE-only and shorten-only whichever path it takes, so a reversal can never
+ * conjure or lengthen a grant.
+ *
+ * WHICH GRANT, though, is the whole difficulty, and it took two goes. The first
+ * fix resolved the subscription off `charge.invoice` and produced a `lapse`
+ * scoped to (subject, subscription) — the right shape, and still the preferred
+ * one, but STRIPE DOES NOT EXPAND `charge.invoice` (or `dispute.charge`) IN
+ * WEBHOOK DELIVERIES, and a Charge carries that linkage nowhere else. So on
+ * every real delivery it resolved to `ignore` and revoked nothing: correct,
+ * fail-closed, and inert. What a Charge always does carry is `customer`, and
+ * the entitlement rows carry it too (that is how the EXTEND path scopes
+ * itself), so an unexpanded reversal now produces `revoke` — scoped to the
+ * customer, applied by REVOKE_BY_CUSTOMER in entitlements-store.ts, and acting
+ * only where the customer has exactly ONE revocable grant, because a charge
+ * cannot say which of several subscriptions its money bought and taking the
+ * product from a subscription someone is still paying for would be a worse
+ * defect than the one being closed. The full argument lives on that statement.
+ *
+ * THE THIRD AND LAST GO CLOSED THE CHARGEBACK. The customer-scoped path fixed
+ * refunds and could not fix disputes: Stripe's Dispute names its Charge and its
+ * PaymentIntent as bare ids and carries NO CUSTOMER, so the ordinary chargeback
+ * — money gone, fraud signal strongest — had nothing to scope to and resolved
+ * to `ignore`. The identity it does carry is the payment itself, so that is
+ * what the grant is now indexed by: `0039_subscription_payment_links.sql` adds
+ * `billing_payments`, one row per paid subscription invoice, carrying the
+ * charge id and the PaymentIntent id against the (subject, subscription) they
+ * bought. It is written by applyStripeOutcome in the SAME atomic batch as the
+ * `invoice.payment_succeeded` that paid, so it can never exist for money we did
+ * not record nor be missing for money we did. A reversal then resolves
+ * LOCALLY — `dispute.charge` names a row, the row names one grant — and needs
+ * Stripe to expand nothing.
+ *
+ * This is the CREDIT rail's own fix, applied to this rail: `0038_refunds.sql`
+ * stores the PaymentIntent behind a credit purchase for exactly this reason. It
+ * could put the id in a COLUMN because a credit purchase is one payment; a
+ * subscription is one grant and many payments, and a chargeback lands 30-120
+ * days after its charge (i.e. usually on a renewal), so the faithful analogue
+ * here is a row per payment rather than a column remembering the last one.
+ *
+ * ONE MORE THING THE ROUTE HAD TO GET RIGHT, because it made all of the above
+ * unreachable: the CREDIT rail (S-CW6d, refunds.ts) maps `charge.refunded` and
+ * `charge.dispute.created` too, is asked first, and used to answer 200 for a
+ * payment it did not recognise — so applyStripeOutcome never saw a reversal at
+ * all in production. It now hands an unrecognised payment on (index.ts), and
+ * this mapping refuses one that positively belongs to that rail
+ * (`dhwaja_purpose: "credits"` on the Charge), because the customer fallback
+ * cannot tell one of a fan's charges from another and both rails bill the same
+ * Stripe customer.
+ *
+ * ORDER OF PREFERENCE, narrowest first, all of them UPDATE-only and
+ * shorten-only: an expanded invoice (path 1, and terminal — see chargeReversal)
+ * → the recorded linkage → the customer. The customer scope is KEPT, not
+ * replaced: it still serves every subscription paid for before 0039, every
+ * invoice whose payment ids we could not read, and it is what a `charge.refunded`
+ * falls back to. A reversal that resolves to none of the three revokes nothing
+ * and is recorded as seen — fail closed, and not a retry Stripe cannot satisfy.
+ *
+ * TWO THINGS THAT LOOK LIKE REVERSALS AND ARE NOT, both of which only became
+ * reachable once this path started resolving real deliveries:
+ *   - an INQUIRY — `charge.dispute.created` with a `warning_*` status — has
+ *     taken no money, and since nothing here restores, revoking on one would
+ *     strip a paying customer over a question (disputeTookTheMoney);
+ *   - a PARTIAL refund, which `charge.refunded` also fires for: a $2 goodwill
+ *     refund on a $99 annual is not the purchase reversed (isPartialRefund).
+ * Both fail toward revoking when the body cannot be read, because a missing
+ * field must never become the way to keep the product.
+ *
+ * `charge.dispute.closed` — THE DECISION, written down because "a dispute won
+ * should arguably restore" is the obvious next question. A dispute we LOST is
+ * revoked (idempotent belt-and-braces if `created` could not be resolved). A
+ * dispute we WON restores NOTHING here, deliberately:
+ *   - a Dispute payload carries no period end and no price, so a restore would
+ *     have to invent the shape of a grant out of a body that cannot say when
+ *     access ends — precisely what `checkout.session.completed` is refused for;
+ *   - the subscription at Stripe was never cancelled by the dispute, so it is
+ *     still live and its next `customer.subscription.updated` or renewal
+ *     invoice re-establishes paid_through through the normal, priced paths.
+ *   The residual, named: between winning a dispute and that next subscription
+ *   event, the subject is lapsed and (past the 7-day grace) reads free.
+ *
+ *   PE-04 (S-039): "resend the subscription event from the Stripe Dashboard"
+ *   was written here as the operator remedy, and it is FALSE — a Dashboard
+ *   resend redelivers the identical event id, entitlements-store's dedup is
+ *   keyed on that id alone (`stripe_events.event_id`), and this id was marked
+ *   the moment it first landed (whether it was applied or, like every prior
+ *   redelivery of it, found `duplicate`). A resend of it can only ever hit
+ *   that marker and answer `duplicate` again — it is a structural no-op, not
+ *   a rare miss. Proven in `test/stripe-billing.test.ts`
+ *   ("BREAK/FIXED: the documented dashboard-resend remedy..."). The only
+ *   things that actually clear the residual are the next genuinely NEW event
+ *   id Stripe mints on this subscription — its own `customer.subscription.
+ *   updated` at the next renewal, or an operator edit in the Dashboard that
+ *   provokes one — or a manual admin correction; a bare Resend does neither.
+ *   We would rather under-grant for a stretch than invent an entitlement we
+ *   cannot date.
+ *   RE-EXAMINED when the customer-scoped path went in, and KEPT — the reasoning
+ *   is unchanged and the new path strengthens it: a Dispute still carries no
+ *   period end and no price, and every statement a reversal can now reach is
+ *   UPDATE-only and shorten-only, so "a won dispute restores nothing" is a
+ *   structural property of this module rather than a decision that could be
+ *   quietly reversed by a later edit. The exposure also shrank in the direction
+ *   that matters — a won dispute can only be undoing a revocation we actually
+ *   managed to make, and today a bare chargeback makes none.
+ *
+ * --- why a non-paying status no longer WRITES (finding #1) ---------------
+ * It used to return `set` with paid_through = now for every non-paying status,
+ * including `incomplete` / `incomplete_expired` / `unpaid` / `canceled`. That
+ * CREATED a row at tier pro/premium, and the read path's
+ * `now < paid_through + GRACE_MS` then handed a subscription that never took a
+ * cent the full 7-day grace — repeatably, because after the lapse the
+ * already-subscribed 409 clears and the same failed checkout can be run again.
+ *
+ * The grace exists for a LAPSE AFTER PAYMENT ("a webhook outage or a card blip
+ * must not yank a creator's tools mid-drop"), not for a payment that never
+ * happened. So the row's EXISTENCE is now the ever-paid marker: only a paying
+ * status can bring one into being, and `lapse` is UPDATE-only. That is cleaner
+ * than an `ever_paid` column for this shape — there is exactly one writer, the
+ * flag would be set on precisely the events that already create the row, and
+ * every read (effectiveTier, the grace, the caps) would have to remember to
+ * consult it. Making it structural means no read can forget.
+ *
+ * Residual, named: `trialing` counts as paying, so an unconverted trial gets
+ * its 7 days of grace after the trial ends. That is a deliberate product
+ * choice (we DID grant access), not the never-paid hole.
+ */
+export function stripeOutcome(ev: StripeEvent, nowMs: number, prices: PriceMap | null): StripeOutcome {
+  switch (ev.type) {
+    case "customer.subscription.created":
+    case "customer.subscription.updated":
+    case "customer.subscription.deleted": {
+      const sub = ev.object;
+      const meta = (sub.metadata as Record<string, unknown> | undefined) ?? {};
+      const subject = subjectOf(meta.dhwaja_subject);
+      if (!subject) return { kind: "ignore", reason: "no dhwaja subject in subscription metadata" };
+      // Every write names its subscription (`0008_billing.sql`); an object we
+      // cannot address is one we must not act on.
+      const subscriptionId = idOf(sub.id);
+      if (!subscriptionId) return { kind: "ignore", reason: "subscription without an id" };
+      const customerId = idOf(sub.customer);
+      const status = typeof sub.status === "string" ? sub.status : "";
+      const paying = PAYING.has(status) && ev.type !== "customer.subscription.deleted";
+      // Not paying → END this subscription's grant. No price check: stopping is
+      // always the safe direction, and it must work even unconfigured.
+      if (!paying) return { kind: "lapse", ...subject, paidThroughMs: nowMs, customerId, subscriptionId };
+
+      const end = periodEndMs(sub);
+      if (end === null) return { kind: "ignore", reason: "paying subscription without a period end" };
+      if (end > nowMs + MAX_PAID_AHEAD_MS) return { kind: "ignore", reason: "period end beyond the maximum billing period" };
+
+      // THE TIER IS WHAT WAS BOUGHT, not what the subject kind implies.
+      if (!prices) return { kind: "ignore", reason: "no configured prices — cannot bind a grant to a purchase", retry: true };
+      const ids = priceIdsOf(sub);
+      if (ids.length === 0) return { kind: "ignore", reason: "subscription without a price" };
+      const tiers = new Set(ids.map((id) => tierForPrice(prices, id)));
+      if (tiers.has(null)) return { kind: "ignore", reason: "unrecognised price on the subscription", retry: true };
+      if (tiers.size !== 1) return { kind: "ignore", reason: "mixed price on the subscription" };
+      const tier = [...tiers][0] as "premium" | "pro";
+      // A fan subject can only ever hold Premium, a creator only ever Pro. A
+      // Portal plan-switch across products grants nothing rather than the
+      // wrong thing.
+      if ((subject.subjectKind === "fan") !== (tier === "premium")) return { kind: "ignore", reason: "price does not match the subject kind" };
+
+      // RJb-T2-AS-013 / #609q: a subscriber who pressed cancel is no longer stored like one who did not.
+      const cancelAtMs = sub.cancel_at_period_end === true ? end : typeof sub.cancel_at === "number" && Number.isFinite(sub.cancel_at) && sub.cancel_at > 0 ? Math.floor(sub.cancel_at) * 1000 : null;
+      return { kind: "set", ...subject, tier, paidThroughMs: end, customerId, subscriptionId, cancelAtMs };
+    }
+    case "invoice.payment_succeeded": {
+      const inv = ev.object;
+      const subscriptionId = idOf(inv.subscription) ?? idOf((inv.parent as { subscription_details?: { subscription?: unknown } } | undefined)?.subscription_details?.subscription);
+      if (!subscriptionId) return { kind: "ignore", reason: "invoice without a subscription" };
+      // AN INVOICE NAMES NO DHWAJA SUBJECT, so the customer is the only thing
+      // that can bind it to the grant it is allowed to extend. Without one there
+      // is nothing to scope the write to, and an unscoped extend reached every
+      // row carrying that subscription id — measured: one invoice moved a
+      // SECOND subject's paid_through a month forward. Fail closed; every real
+      // Stripe invoice carries `customer`.
+      const customerId = idOf(inv.customer);
+      if (!customerId) return { kind: "ignore", reason: "invoice without a customer — nothing to scope the extend to" };
+      const lines = (inv.lines as { data?: unknown } | undefined)?.data;
+      let endMs: number | null = null;
+      if (Array.isArray(lines)) {
+        for (const line of lines) {
+          const p = (line as Record<string, unknown> | undefined)?.period as { end?: unknown } | undefined;
+          if (p && typeof p.end === "number" && Number.isFinite(p.end) && p.end > 0) {
+            endMs = Math.max(endMs ?? 0, Math.floor(p.end) * 1000);
+          }
+        }
+      }
+      if (endMs === null) return { kind: "ignore", reason: "invoice without a period end" };
+      if (endMs > nowMs + MAX_PAID_AHEAD_MS) return { kind: "ignore", reason: "period end beyond the maximum billing period" };
+      // …and RECORD WHAT PAID IT. This is the one event that carries the money
+      // and the subscription in the same body, which is why the linkage is
+      // captured here and nowhere else — see the note on this function.
+      return { kind: "extend", subscriptionId, paidThroughMs: endMs, customerId, payment: invoicePayment(inv) };
+    }
+    case "invoice.payment_failed":
+      return { kind: "ignore", reason: "dunning is Stripe's; the subscription event lapses us" };
+    case "checkout.session.completed":
+      return { kind: "ignore", reason: "no period end; customer.subscription.created grants" };
+    // --- money taken back (see the MONEY REVERSED note on this function) ----
+    // Both cases hand chargeReversal the payment ids in the body; the grant
+    // they paid for is looked up in `billing_payments` by entitlements-store.
+    case "charge.refunded":
+      // The event object IS the Charge. A partial refund keeps the purchase.
+      if (isPartialRefund(ev.object)) return { kind: "ignore", reason: "partial refund — the purchase was not reversed" };
+      return chargeReversal(ev.object, ev.object, nowMs, "refund");
+    case "charge.dispute.created":
+      // …and here it is the Dispute, whose Charge arrives only when expanded.
+      if (!disputeTookTheMoney(ev.object)) return { kind: "ignore", reason: "dispute inquiry — no funds withdrawn, nothing to revoke yet" };
+      return chargeReversal(ev.object, disputedCharge(ev.object), nowMs, "dispute");
+    case "charge.dispute.closed": {
+      const status = typeof ev.object.status === "string" ? ev.object.status : "";
+      // LOST is a chargeback that stuck — revoke, in case `dispute.created`
+      // could not be resolved when it arrived. Anything else (won,
+      // warning_closed) restores NOTHING: see the note on this function.
+      if (status !== "lost") return { kind: "ignore", reason: "dispute closed without a loss — nothing is revoked, and nothing is restored" };
+      return chargeReversal(ev.object, disputedCharge(ev.object), nowMs, "dispute");
+    }
+    default:
+      return { kind: "ignore", reason: "unhandled event type" };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Hosted checkout + customer portal (web only)
+// ---------------------------------------------------------------------------
+
+export type BillingInterval = "month" | "year";
+
+export interface StripeConfig {
+  secretKey: string;
+  apiBase: string;
+  /** Price ids, per product and interval. A product with no configured price
+   * cannot be sold (the route 503s) — never a half-priced charge path. This is
+   * also the set a webhook's price is checked against (tierForPrice). */
+  prices: PriceMap;
+  /** Where Stripe returns a fan who completed a SUBSCRIPTION checkout. */
+  successUrl: string;
+  /**
+   * UI-AUDIT F-W1 — where Stripe returns a fan who completed a CREDIT purchase,
+   * and the reason it is a second field rather than the same one.
+   *
+   * `createCreditCheckoutSession` used `cfg.successUrl` — the SUBSCRIPTION
+   * success URL, `?upgraded=1#/me`. So a fan who bought credits was returned to
+   * the account page under the flag that means "a Premium subscription just
+   * completed", and the billing copy answered with *"Confirming your Premium
+   * payment…"* — a spinner waiting on a subscription webhook that was never
+   * coming, because no subscription had been bought. It never resolved. The fan
+   * paid for credits, was told about a Premium payment, and was left on a
+   * permanent loading state with their credits sitting (correctly granted) on a
+   * page they had not been sent to.
+   *
+   * Two purchases, two destinations. This one lands on the wallet with
+   * `?credits=1`, where the balance is what the fan came to see.
+   */
+  creditSuccessUrl: string;
+  cancelUrl: string;
+  portalReturnUrl: string;
+  /**
+   * BF-09 — WHERE A **CREATOR** COMES BACK TO, and why it is a second triple
+   * rather than the same one.
+   *
+   * Every URL above is built from `APP_ORIGIN`, the FAN app. Creator Pro is
+   * bought and managed from the creator console, which is a DIFFERENT ORIGIN
+   * with its own session storage namespace (`apps/creator-console/src/session.ts`),
+   * so a creator who completed a Pro checkout was handed to the fan app's
+   * `#/me` — a surface their console session does not reach, showing a
+   * sign-in/collection screen after a successful purchase. Cancelling landed on
+   * the fan WALLET, and the billing portal on the fan account page.
+   *
+   * Return destinations are therefore chosen by the AUTHENTICATED SUBJECT KIND,
+   * never by a single configured origin. `CONSOLE_ORIGIN` is optional in this
+   * repository (`env-config.ts`), so when it is absent these fall back to the
+   * fan values — the pre-BF-09 behaviour — rather than making the whole billing
+   * config null and 503-ing a creator who could previously at least buy.
+   */
+  consoleSuccessUrl: string;
+  consoleCancelUrl: string;
+  consolePortalReturnUrl: string;
+  /**
+   * #747, D-0855(1): the key the checkout SEALS its subject under —
+   * `SUBJECT_SEAL_KEY`, a server-only secret Stripe never holds (it was
+   * STRIPE_WEBHOOK_SECRET until D-0855, which Stripe issues and can read).
+   * Null when SUBJECT_SEAL_KEY is unusable OR there is no webhook secret →
+   * no checkout is created (createStripeCheckoutSession /
+   * createCreditCheckoutSession answer null): a payment whose webhook could not
+   * attribute it must never be taken.
+   */
+  subjectSealSecret: string | null;
+}
+
+/**
+ * Build the Stripe config from env, or null → every billing route answers 503.
+ * Requires the secret key AND at least one sellable price AND a return URL.
+ */
+/**
+ * I3-1353 (I23-W1-HUB H-3): the configured subscription price ids ALONE — the `price()` reader and the four-id null
+ * check of `stripeConfigFromEnv`, without its secret-key and APP_ORIGIN requirements. A signed webhook maps a price to
+ * a tier with this (index.ts, hub follow-on), so a grant does not wait on STRIPE_SECRET_KEY being set.
+ */
+export function stripePricesFromEnv(env: Record<string, unknown>): StripeConfig["prices"] | null {
+  // I3-0238: a whitespace-only id is unset too — it would otherwise be sent to Stripe as the plan's price.
+  const price = (k: string): string | undefined => {
+    return settingValue(env[k]) ?? undefined; // I62 P12: trimmed; blank or TODO is unset
+  };
+  const prices = {
+    premium: { month: price("STRIPE_PRICE_PREMIUM_MONTH"), year: price("STRIPE_PRICE_PREMIUM_YEAR") },
+    pro: { month: price("STRIPE_PRICE_PRO_MONTH"), year: price("STRIPE_PRICE_PRO_YEAR") },
+  };
+  if (!prices.premium.month && !prices.premium.year && !prices.pro.month && !prices.pro.year) return null;
+  return prices;
+}
+
+export function stripeConfigFromEnv(env: Record<string, unknown>): StripeConfig | null {
+  const secretKey = settingValue(env.STRIPE_SECRET_KEY);
+  if (secretKey === null) return null;
+  const prices = stripePricesFromEnv(env);
+  if (!prices) return null;
+  const origin = appOriginFromEnv(env); // I62 P12: the shared reader (trimmed, TODO unset, an https origin)
+  if (origin === null) return null; // need somewhere to send the user back
+  // BF-09: the CREATOR console's origin, when one is configured. Falls back to
+  // the fan origin so an unconfigured console is exactly the old behaviour and
+  // never a 503 — but a configured one keeps a creator inside the console.
+  // I62 P12: the shared reader; unset or misshapen -> the fan origin below. I62 FX (D-1528(a)): every trailing `/` is
+  // stripped first, as at i62-base; the shared reader alone strips one.
+  const consoleOrigin = consoleOriginFromEnv({ CONSOLE_ORIGIN: settingValue(env.CONSOLE_ORIGIN)?.replace(/\/+$/, "") });
+  const apiBaseRaw = settingValue(env.STRIPE_API_BASE) ?? "https://api.stripe.com"; // I62 P12: trimmed; blank or TODO is unset
+  if (!/^https:\/\//.test(apiBaseRaw)) return null;
+  return {
+    secretKey,
+    apiBase: apiBaseRaw.replace(/\/+$/, ""),
+    prices,
+    // `?upgraded=1` rides the SEARCH string, not the hash: the web app is
+    // hash-routed, so a `#/me?upgraded=1` fragment would fail to route at all.
+    successUrl: `${origin}/?upgraded=1#/me`,
+    // Same search-string-not-hash rule as `successUrl`: the web app is
+    // hash-routed, so a `#/wallet?credits=1` fragment would fail to route.
+    creditSuccessUrl: `${origin}/?credits=1#/wallet`,
+    cancelUrl: `${origin}/#/wallet`,
+    portalReturnUrl: `${origin}/#/me`,
+    // BF-09: the console is hash-routed exactly like the fan app, so the same
+    // search-string-not-hash rule applies to the flag. `#/billing` is the
+    // console's own billing route (`apps/creator-console/src/main.ts`), which
+    // is where a Pro purchase, a cancel and a portal visit all belong.
+    // No console configured → the fan triple verbatim, i.e. exactly the
+    // pre-BF-09 behaviour. `${origin}/#/billing` would be WORSE than the bug:
+    // the fan SPA has no `#/billing` route at all, so an unconfigured
+    // deployment would return a paying creator to a dead hash.
+    consoleSuccessUrl: consoleOrigin ? `${consoleOrigin}/?upgraded=1#/billing` : `${origin}/?upgraded=1#/me`,
+    consoleCancelUrl: consoleOrigin ? `${consoleOrigin}/#/billing` : `${origin}/#/wallet`,
+    consolePortalReturnUrl: consoleOrigin ? `${consoleOrigin}/#/billing` : `${origin}/#/me`,
+    subjectSealSecret: stripeWebhookSecret(env) ? (subjectSealKeys(env)?.current ?? null) : null,
+  };
+}
+
+/** The webhook secret, or null → POST /billing/webhook/stripe answers 503. */
+export function stripeWebhookSecret(env: Record<string, unknown>): string | null {
+  const s = settingValue(env.STRIPE_WEBHOOK_SECRET); // I62 P12: trimmed; blank or TODO is unset
+  return s === null || s.length < 16 ? null : s;
+}
+
+/**
+ * #747 (D-0850(4)): what Stripe is told about WHO is paying. Every checkout
+ * field that used to carry the raw `acc_`/`psp_` id (`client_reference_id`,
+ * each `metadata[dhwaja_subject]`, the idempotency key) carries this token
+ * instead, sealed under SUBJECT_SEAL_KEY (D-0855(1)). DETERMINISTIC per subject (synthetic IV, `sivIv`): the token
+ * is inside both idempotency keys and the bodies they guard, and a key collapses a repeat only when the repeat
+ * mints the same key. The subscription key (`co_`, createStripeCheckoutSession) is reused on a double click; the credit
+ * key (`cc_`, createCreditCheckoutSession) carries the route's per-request nonce, so it is reused only by a re-sent
+ * request with the same nonce, never by a double click. A fresh-IV seal would mint a new key on every repeat.
+ */
+const STRIPE_SEAL_PREFIX = "ssub1.";
+const STRIPE_SEAL_LABEL = "dhwaja/stripe/subject-seal/v1";
+async function sealMac(secret: string, msg: string | ArrayBuffer): Promise<ArrayBuffer> {
+  const mac = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return crypto.subtle.sign("HMAC", mac, typeof msg === "string" ? encoder.encode(msg) : msg);
+}
+/** AES-256-GCM key bytes for the Stripe seal: HMAC-SHA256(SUBJECT_SEAL_KEY, label) — the crypto rail's derivation under Stripe's own label. */
+const stripeSealKey = (secret: string): Promise<ArrayBuffer> => sealMac(secret, STRIPE_SEAL_LABEL);
+export async function sealStripeSubject(subjectId: string, secret: string): Promise<string> {
+  // Synthetic IV: the first 12 bytes of HMAC(HMAC(secret, label#iv), subject).
+  // GCM nonce reuse then only ever re-encrypts the IDENTICAL plaintext, which
+  // reveals equality (the same payer — Stripe's own customer id already says
+  // that) and nothing else.
+  const ivKey = new Uint8Array(await sealMac(secret, `${STRIPE_SEAL_LABEL}#iv`));
+  const mac = await crypto.subtle.importKey("raw", ivKey, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const iv = new Uint8Array(await crypto.subtle.sign("HMAC", mac, encoder.encode(subjectId))).slice(0, 12);
+  return sealSubject(subjectId, await stripeSealKey(secret), STRIPE_SEAL_PREFIX, iv);
+}
+
+/**
+ * The Stripe subscription (and customer) a verified event is ABOUT, when it
+ * names one: a subscription object itself, or a charge / a dispute's expanded
+ * charge whose `invoice` is expanded (the shapes `chargeReversal` reads).
+ */
+function eventSubscriptionRef(obj: Record<string, unknown>): { subscriptionId: string; customerId: string } | null {
+  if (obj.object === "subscription") {
+    const subscriptionId = idOf(obj.id);
+    const customerId = idOf(obj.customer);
+    return subscriptionId && customerId ? { subscriptionId, customerId } : null;
+  }
+  const charge = obj.object === "charge" ? obj : obj.charge && typeof obj.charge === "object" ? (obj.charge as Record<string, unknown>) : null;
+  const inv = charge?.invoice;
+  if (!charge || !inv || typeof inv !== "object") return null;
+  const invoice = inv as Record<string, unknown>;
+  const subscriptionId = idOf(invoice.subscription) ?? idOf((invoice.parent as { subscription_details?: { subscription?: unknown } } | undefined)?.subscription_details?.subscription);
+  const customerId = idOf(charge.customer) ?? idOf(obj.customer) ?? idOf(invoice.customer);
+  return subscriptionId && customerId ? { subscriptionId, customerId } : null;
+}
+
+/**
+ * D-0852(1) fallback: the subject this platform ALREADY attributed the
+ * subscription to (`billing_entitlements`, written by an earlier verified
+ * event). Scoped by subscription AND customer (a customerless row is the
+ * EXTEND_ADOPT shape and counts); answers only when exactly ONE subject holds
+ * that subscription — two subjects can carry one subscription id (PK is
+ * (subject_id, stripe_subscription_id)), and guessing between them is worse
+ * than attributing nothing.
+ */
+const STORED_SUBJECT_FOR_SUBSCRIPTION =
+  "SELECT DISTINCT subject_id FROM billing_entitlements WHERE stripe_subscription_id = ? AND (stripe_customer_id = ? OR stripe_customer_id IS NULL) LIMIT 2";
+
+/**
+ * #747: open every sealed `dhwaja_subject` in a VERIFIED event, anywhere in its
+ * object (a subscription's metadata, an expanded invoice's
+ * `subscription_details`, a charge, a checkout session), so the synchronous
+ * mappers below (`stripeOutcome`, `creditIntentFromEvent`,
+ * `refundIntentFromEvent`) read a plain id exactly as before. A value WITHOUT
+ * the seal prefix is left untouched: the legacy raw `acc_`/`psp_` metadata on
+ * subscriptions created before #747 attributes forever.
+ *
+ * KEYS (D-0855(1)): `sealKeys` is `subjectSealKeys(env)` — SUBJECT_SEAL_KEY, never
+ * a webhook secret — or a bare key. ROTATION (D-0852(1), re-keyed): a sealed
+ * value is tried under `sealKeys.current`, then under each SUBJECT_SEAL_KEY_PREVIOUS
+ * entry (`openedPrevious` counts those). One that no key opens falls back, when
+ * `ctx.db` is given, to the subject already stored for the event's
+ * (subscription, customer) (`fromStore`). `sealKeys` null (no SUBJECT_SEAL_KEY):
+ * no sealed value is attributed at all, not even from the store. Anything
+ * unattributed becomes "" (every mapper then ignores it — fail closed) and is
+ * counted in `unopened` for the caller to log. Returns a copy; the input event
+ * is not mutated.
+ */
+export async function openStripeSubjects(
+  ev: StripeEvent,
+  sealKeys: SubjectSealKeys | string | null,
+  ctx?: { db?: DbLike },
+): Promise<{ event: StripeEvent; unopened: number; openedPrevious: number; fromStore: number }> {
+  let unopened = 0;
+  let openedPrevious = 0;
+  let fromStore = 0;
+  const secrets = sealKeyList(sealKeys);
+  const keys: (ArrayBuffer | undefined)[] = [];
+  // One lookup per event, memoised as a PROMISE so parallel array walks share it.
+  let stored: Promise<string | null> | undefined;
+  const storedSubject = (): Promise<string | null> =>
+    (stored ??= (async () => {
+      const db = ctx?.db;
+      const ref = db ? eventSubscriptionRef(ev.object) : null;
+      if (!db || !ref) return null;
+      const rows = (await db.prepare(STORED_SUBJECT_FOR_SUBSCRIPTION).bind(ref.subscriptionId, ref.customerId).all<{ subject_id: string }>()).results ?? [];
+      const only = rows.length === 1 ? rows[0]!.subject_id : null;
+      return only && (FAN_ID_RE.test(only) || CREATOR_ID_RE.test(only)) ? only : null;
+    })());
+  const open = async (token: string): Promise<string | null> => {
+    for (let i = 0; i < secrets.length; i++) {
+      keys[i] ??= await stripeSealKey(secrets[i]!);
+      const id = await openSubject(token, keys[i]!, STRIPE_SEAL_PREFIX);
+      if (id !== null && (FAN_ID_RE.test(id) || CREATOR_ID_RE.test(id))) {
+        if (i > 0) openedPrevious++;
+        return id;
+      }
+    }
+    return null;
+  };
+  const walk = async (v: unknown, depth: number): Promise<unknown> => {
+    if (depth > 8 || v === null || typeof v !== "object") return v;
+    if (Array.isArray(v)) return Promise.all(v.map((x) => walk(x, depth + 1)));
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(v as Record<string, unknown>)) {
+      if (k === "dhwaja_subject" && typeof x === "string" && x.startsWith(STRIPE_SEAL_PREFIX)) {
+        const id = await open(x);
+        if (id !== null) out[k] = id;
+        else {
+          const fallback = secrets.length > 0 ? await storedSubject() : null;
+          if (fallback !== null) {
+            out[k] = fallback;
+            fromStore++;
+          } else {
+            out[k] = "";
+            unopened++;
+          }
+        }
+      } else out[k] = await walk(x, depth + 1);
+    }
+    return out;
+  };
+  const object = (await walk(ev.object, 0)) as Record<string, unknown>;
+  return { event: { ...ev, object }, unopened, openedPrevious, fromStore };
+}
+
+// ── S-CW6c: Stripe Connect (Standard) — creator payouts ──
+
+export interface ConnectConfig {
+  secretKey: string;
+  apiBase: string;
+  clientId: string; // ca_... — the platform's Connect client id (OAuth)
+  redirectUri: string; // where Stripe returns the creator after authorizing
+}
+
+/**
+ * THE PATH STRIPE REDIRECTS THE CREATOR BACK TO, and the one thing about this
+ * module that has to be true for any of it to work.
+ *
+ * It is a route on THIS worker (`app.get("/connect/oauth/callback")` in
+ * index.ts): Stripe sends the creator's browser here with `?code&state`, the
+ * handler exchanges the code, stores the account PENDING, and only then bounces
+ * the browser on to `CONSOLE_ORIGIN/#/earnings?connected=1` for the passkey
+ * confirm.
+ *
+ * UI-AUDIT F-C1 — it used to be `${consoleOrigin}/connect/return`, and NOTHING
+ * SERVES THAT. The creator console is a hash-router SPA (`/#/earnings`); a path
+ * request to `/connect/return` on its origin reaches no route on any surface in
+ * this repository, and the callback handler that does exist was reachable only
+ * by typing its URL. So the OAuth leg terminated on a 404 with the `code` in the
+ * address bar, `creator_connect` stayed at 'connecting' forever, and NO CREATOR
+ * COULD EVER COMPLETE CONNECT on this build — which is to say every creator
+ * accrued earnings that nothing could pay out. Two console states ("Finish
+ * connecting on Stripe", "One step left") described a flow that could not
+ * advance, and every test passed, because both halves were self-consistent and
+ * nothing compared them. `connect-payout-binding.test.ts` now does: it asks the
+ * real Hono route table whether this path is registered.
+ *
+ * Exported so the guard can name it once rather than restate the string.
+ */
+export const CONNECT_CALLBACK_PATH = "/connect/oauth/callback";
+
+/**
+ * Connect config, or null → every Connect/payout route answers 503 (fail
+ * closed). Needs the secret key, the Connect client id, AND `PUBLIC_BASE_URL`
+ * (this worker's own origin — where the callback route lives).
+ *
+ * `PUBLIC_BASE_URL` is REQUIRED and there is no fallback: a redirect_uri built
+ * from a guess is a redirect_uri Stripe rejects at authorize time, or worse one
+ * that lands the `code` on an origin we do not control. Absent config disables
+ * the feature (503) rather than opening a broken one — invariant 6.
+ */
+export function connectConfigFromEnv(env: Record<string, unknown>): ConnectConfig | null {
+  // I62 P12: every setting here is read trimmed, with a blank or TODO value unset (settingValue and the shared origin reader).
+  const secretKey = settingValue(env.STRIPE_SECRET_KEY);
+  if (secretKey === null) return null;
+  const clientId = settingValue(env.STRIPE_CONNECT_CLIENT_ID);
+  if (clientId === null || !/^ca_[A-Za-z0-9]+$/.test(clientId)) return null;
+  const publicBase = publicBaseUrlFromEnv(env);
+  if (publicBase === null) return null;
+  const apiBaseRaw = settingValue(env.STRIPE_API_BASE) ?? "https://api.stripe.com";
+  if (!/^https:\/\//.test(apiBaseRaw)) return null;
+  return {
+    secretKey,
+    apiBase: apiBaseRaw.replace(/\/+$/, ""),
+    clientId,
+    redirectUri: `${publicBase}${CONNECT_CALLBACK_PATH}`,
+  };
+}
+
+/** The base for Connect OAuth (overridable in tests; real value is Stripe's). */
+function connectOAuthBase(cfg: ConnectConfig): string {
+  // Derived from apiBase so a test can point it at a mock; production apiBase
+  // is api.stripe.com and the OAuth host is connect.stripe.com.
+  return cfg.apiBase.includes("api.stripe.com") ? "https://connect.stripe.com" : cfg.apiBase;
+}
+
+/** The redirect URL that starts a Standard-account OAuth authorization. The
+ * `state` is our single-use binding nonce (stored server-side against the
+ * passport); Stripe echoes it back to the callback. */
+export function connectOAuthUrl(cfg: ConnectConfig, state: string): string {
+  const q = new URLSearchParams({
+    response_type: "code",
+    client_id: cfg.clientId,
+    scope: "read_write",
+    redirect_uri: cfg.redirectUri,
+    state,
+    "stripe_user[business_type]": "individual",
+  });
+  return `${connectOAuthBase(cfg)}/oauth/authorize?${q.toString()}`;
+}
+
+/** Exchange an OAuth `code` for the connected account id (acct_...). Null on
+ * any failure (the route maps that to a clean error, never a fake binding). */
+export async function exchangeConnectCode(cfg: ConnectConfig, code: string, fetchImpl: typeof fetch = fetch): Promise<string | null> {
+  if (!str(code)) return null;
+  // #352b (I17-W2A): the module's deadline idiom (createConnectTransfer) — TRANSFER_TIMEOUT_MS, aborted at it.
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TRANSFER_TIMEOUT_MS);
+  try {
+    const res = await fetchImpl(`${connectOAuthBase(cfg)}/oauth/token`, { redirect: "manual",
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: form({ client_secret: cfg.secretKey, code, grant_type: "authorization_code" }),
+      signal: ctl.signal,
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { stripe_user_id?: unknown };
+    const id = j.stripe_user_id;
+    return typeof id === "string" && /^acct_[A-Za-z0-9]+$/.test(id) ? id : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Hard ceiling on ONE Connect transfer — the same convention and the same
+ * number `push.ts` (`PUSH_TIMEOUT_MS`), `mailer.ts` (`MAIL_TIMEOUT_MS`),
+ * `verify-fetch.ts` and the face-triage fetch in `index.ts` already use.
+ *
+ * WHY IT MATTERS HERE, in the same terms push.ts states for itself: this call
+ * happens in a LOOP inside the cron, serially, once per creator owed money, and
+ * it had no deadline at all while every other outbound call in the codebase
+ * did. With no timeout the ceiling on that loop was whatever the platform
+ * eventually enforced, and `cron-lease.ts` picked its 30-minute TTL on the
+ * STATED ASSUMPTION that a real sweep finishes well inside it. A slow Stripe
+ * therefore pushed the run past the lease TTL BEFORE the first `stillLeased()`
+ * fence, a successor sweep acquired the lease, and both ran `processNewEvents`
+ * — the duplicate push the lease exists to prevent, produced by an unbounded
+ * money call three legs upstream of it.
+ *
+ * Three bounds now stand between a hung Stripe and that: this per-request
+ * deadline (ONE deadline over the whole reconcile-then-send sequence below),
+ * `creator-payout.ts` `PAYOUT_RUN_BUDGET_MS` over the whole run, and the leg's
+ * placement behind the lease re-assert. A timeout is an ordinary transient
+ * failure — it returns null, the payout row stays `pending` with its reserved
+ * amount, and the next tick replays it under the SAME idempotency key. Stripe
+ * honours that key for ~24 h only (I3-1132), so past it what stops a second
+ * transfer is the RECONCILE every send now carries (I3-0028, D-0541, D-0911(1)
+ * — `createConnectTransfer` below). There are deliberately no retries inside
+ * one call.
+ */
+export const TRANSFER_TIMEOUT_MS = 10_000;
+/** QUEUE #352 (D-0434): the operator erasure door's deadline on the Stripe cancel. */
+export const OPS_CANCEL_TIMEOUT_MS = 10_000;
+
+/** #352a (D-0941(2a)): ONE deadline over an operator door's whole Stripe cancel fan-out — one timer, one
+ * abort. Every cancel handed it waits only for what is LEFT of the budget; once it fires, every in-flight
+ * and later cancel is `false`. The door that makes it clears it. */
+export interface OpsCancelDeadline {
+  readonly signal: AbortSignal;
+  readonly expired: Promise<never>;
+  clear(): void;
+}
+export function opsCancelDeadline(ms: number = OPS_CANCEL_TIMEOUT_MS): OpsCancelDeadline {
+  const ctl = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      ctl.abort();
+      reject(new Error("stripe cancel timeout"));
+    }, ms);
+  });
+  expired.catch(() => {}); // observed by each race; never an unhandled rejection
+  return { signal: ctl.signal, expired, clear: () => clearTimeout(timer) };
+}
+
+/** I3-0028 (D-0911(1)): how far back the per-account reconcile lists what Stripe
+ * has sent to the destination. A D1 point-in-time restore reaches back at most
+ * 30 days, so a payout row a restore can lose belongs to a transfer created
+ * inside this window; five days are added for the tick cadence and clock skew. */
+export const RECONCILE_WINDOW_MS = 35 * 24 * 60 * 60 * 1000;
+/** One listing page — Stripe's maximum. A destination with more transfers than
+ * this inside the window is a reconcile that cannot complete: nothing is sent. */
+export const RECONCILE_PAGE = 100;
+/** I3-0028 (D-0976(1), Jason: "allow the extra lookups"): the reconcile lists what Stripe has sent to EVERY
+ * destination the creator has had (the current one first, then `TransferReconcile.destinations`), not only the
+ * current one, so a lost payout sent to an account the creator has since left is still seen. At most this many
+ * listings per send; a creator with more destinations is a reconcile that cannot complete (null, nothing sent). */
+export const MAX_RECONCILE_DESTINATIONS = 5;
+/** I3-0028 c (I22-FX-MONEY, D-0976(1)): a restore rewinds `connect_binding_decisions` with the payout rows, so a lost
+ * payout sent to an account bound after the restore point is in no destination D1 can name. The reconcile therefore
+ * also asks Stripe by `transfer_group` for each of this many ISO weeks ending at the anchor week (the week of
+ * `TransferReconcile.nowMs`, else the week the own key names) — a GET that matches the creator's own key on ANY
+ * connected account. The own key ((A)) and every key the ledger carries are skipped, so a found transfer is one our
+ * ledger does not have: `unrecorded_transfer`, nothing sent. Five weeks span RECONCILE_WINDOW_MS. */
+export const RECONCILE_LOOKBACK_WEEKS = 5;
+/** I22-Q1: at most this many `TransferReconcile.releaseKeys` are asked per send (one GET each, beside the weekly ones). */
+export const RECONCILE_RELEASE_KEYS = 3;
+const RELEASE_KEY_RE = /^release-\d{4}-\d{2}-\d{2}$/;
+const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+/** I3-1119 (I22-FX-MONEY): Stripe codes that refuse a transfer for a condition a later retry can clear — the PLATFORM's
+ * available balance is short (docs.stripe.com/error-codes `balance_insufficient`, a 400 `invalid_request_error`).
+ * Such a refusal is the retryable null, never a `TransferRefusal`: the creator is not told the payout failed. */
+export const TRANSIENT_TRANSFER_CODES: ReadonlySet<string> = new Set(["balance_insufficient"]);
+
+/** A payout our ledger has RESERVED (open) or RECORDED (paid, with Stripe's id)
+ * for one creator, keyed by its transfer idempotency key / `transfer_group`. */
+export interface PayoutLedgerRow {
+  key: string;
+  amountCents: number;
+  transferId: string | null;
+}
+/** What the send must be reconciled against: the creator's key prefix
+ * (`cpk:v1:<passport>:`), the ledger rows, and the listing window's start. */
+export interface TransferReconcile {
+  keyPrefix: string;
+  ledger: readonly PayoutLedgerRow[];
+  sinceMs: number;
+  /** I3-0028 (D-0976(1)): every OTHER destination the creator has had (creator-payout.ts reads them from
+   * `connect_binding_decisions`); the send's own destination is always listed first. Absent = none. */
+  destinations?: readonly string[];
+  /** I3-0028 c (I22-FX-MONEY): the run's clock, the anchor of the RECONCILE_LOOKBACK_WEEKS group lookups. Absent = the
+   * week the own key names (`YYYY-Www`, or `release-YYYY-MM-DD`); a key naming neither, with no clock, looks back nothing. */
+  nowMs?: number;
+  /** I22-Q1 (D-1030: "accept the cost and also look up operator releases"): operator-release periods
+   * (`release-YYYY-MM-DD`, creator-payout.ts RELEASE_PERIOD_PREFIX) the caller names, newest first. The group lookup
+   * asks Stripe for the first RECONCILE_RELEASE_KEYS of them, as for the weekly keys. Absent = none; a malformed entry
+   * is a reconcile that cannot complete (null, nothing sent). */
+  releaseKeys?: readonly string[];
+}
+export type TransferHoldReason = "amount_mismatch" | "destination_mismatch" | "reversed" | "unrecorded_transfer";
+/** The reconcile found Stripe disagreeing with our ledger: NOTHING was sent and
+ * nothing may be recorded paid — the caller holds the payout for an operator. */
+export interface TransferHold {
+  hold: TransferHoldReason;
+  transferId: string;
+  transferGroup: string | null;
+  stripeAmountCents: number;
+  stripeDestination: string;
+}
+/** I3-1119 b (I22): Stripe REFUSED the send with a status no retry can change (400 / 403 / 404 — not 429 or 5xx, which
+ * stay retryable `null`). Nothing was sent; the caller fails the payout at once (creator-payout.ts) instead of
+ * spending its backoff ladder re-asking. */
+export interface TransferRefusal {
+  permanent: true;
+  status: number;
+}
+export const PERMANENT_TRANSFER_STATUSES: ReadonlySet<number> = new Set([400, 403, 404]);
+export function isTransferRefusal(r: unknown): r is TransferRefusal {
+  return typeof r === "object" && r !== null && (r as { permanent?: unknown }).permanent === true;
+}
+export function isTransferHold(r: unknown): r is TransferHold {
+  return typeof r === "object" && r !== null && typeof (r as { hold?: unknown }).hold === "string";
+}
+
+const TRANSFER_ID_RE = /^tr_[A-Za-z0-9]+$/;
+interface SeenTransfer {
+  id: string;
+  group: string | null;
+  amount: number;
+  destination: string;
+  reversed: boolean;
+}
+/** One listed transfer, or null when any field the reconcile compares is unreadable. */
+function seenTransfer(t: unknown): SeenTransfer | null {
+  if (typeof t !== "object" || t === null) return null;
+  const o = t as { id?: unknown; transfer_group?: unknown; amount?: unknown; destination?: unknown; reversed?: unknown; amount_reversed?: unknown };
+  if (typeof o.id !== "string" || !TRANSFER_ID_RE.test(o.id)) return null;
+  if (typeof o.amount !== "number" || !Number.isInteger(o.amount)) return null;
+  if (typeof o.destination !== "string") return null;
+  const group = typeof o.transfer_group === "string" ? o.transfer_group : null;
+  const reversed = o.reversed === true || (typeof o.amount_reversed === "number" && o.amount_reversed > 0);
+  return { id: o.id, group, amount: o.amount, destination: o.destination, reversed };
+}
+const holdOf = (hold: TransferHoldReason, t: SeenTransfer): TransferHold => ({ hold, transferId: t.id, transferGroup: t.group, stripeAmountCents: t.amount, stripeDestination: t.destination });
+/** A transfer Stripe holds for the payout being sent: its id only when the
+ * destination, the reversal state and the amount all equal OURS. */
+function verdictForOwn(t: SeenTransfer, destination: string, amountCents: number): string | TransferHold {
+  if (t.destination !== destination) return holdOf("destination_mismatch", t);
+  if (t.reversed) return holdOf("reversed", t);
+  if (t.amount !== amountCents) return holdOf("amount_mismatch", t);
+  return t.id;
+}
+
+/** The anchor instant of the week lookups: the clock when given, else mid-week of the week the own key's period names. */
+function lookbackAnchorMs(nowMs: number | undefined, period: string): number | null {
+  if (typeof nowMs === "number" && Number.isFinite(nowMs)) return nowMs;
+  if (/^\d{4}-W\d{2}$/.test(period)) return isoWeekEndMs(period) - WEEK_MS / 2;
+  const day = /^release-(\d{4}-\d{2}-\d{2})$/.exec(period);
+  const t = day ? Date.parse(`${day[1]}T12:00:00.000Z`) : Number.NaN;
+  return Number.isFinite(t) ? t : null;
+}
+/** Stripe's `error.code` on a refused request, or "" when the body is not a readable Stripe error. */
+async function refusalCode(res: Response): Promise<string> {
+  try {
+    const j = (await res.json()) as { error?: { code?: unknown } };
+    return typeof j?.error?.code === "string" ? j.error.code : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Transfer `amountCents` (USD) from the platform balance to a connected
+ * account. `idempotencyKey` (derived from passport + payout period — the ISO
+ * week for the weekly run, `release-<UTC day>` for the operator release door;
+ * creator-payout.ts `transferIdempotencyKey`) makes a retry safe INSIDE Stripe's
+ * ~24 h key window, and rides every transfer as its `transfer_group`.
+ *
+ * THE RECONCILE (I3-0028, D-0541, D-0911(1)) is REQUIRED — there is no send
+ * without it, so no door can skip it (the release door's new send once did:
+ * I11-RG-MONEY RGM-P4). Before the POST:
+ *  (A) GET by `transfer_group` = the key. Found -> its id ONLY if its
+ *      destination, reversal state and amount equal ours; otherwise a
+ *      `TransferHold`. Nothing is sent either way, and Stripe's amount is never
+ *      returned as ours.
+ *  (B) Not found -> GET what Stripe has sent to the DESTINATION since
+ *      `reconcile.sinceMs`. Every transfer there in THIS creator's groups
+ *      (`reconcile.keyPrefix`) must be a ledger row (by key): same amount, not
+ *      reversed, and the recorded id when one is recorded. A transfer our ledger
+ *      does not have (a restore lost its row, in any week and at either door —
+ *      RGM-P4/P5), a different amount or a reversal is a `TransferHold`.
+ *  (C) Consistent -> POST.
+ * An unreadable answer, a listing with `has_more`, a failed GET or the deadline
+ * is null: the reconcile did not complete, nothing was sent, the row stays
+ * pending. So a not-found send costs THREE subrequests, a found one ONE
+ * (creator-payout.ts `PAYOUT_DISPATCH_SUBREQUESTS`).
+ */
+export async function createConnectTransfer(
+  cfg: ConnectConfig,
+  args: { destination: string; amountCents: number; idempotencyKey: string; reconcile: TransferReconcile },
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | TransferHold | TransferRefusal | null> {
+  if (!/^acct_[A-Za-z0-9]+$/.test(args.destination)) return null;
+  if (!Number.isInteger(args.amountCents) || args.amountCents <= 0) return null;
+  // NEW (I4-16-R4, found under I3-1132): the key is `transferIdempotencyKey`'s
+  // `cpk:v1:<psp>:<period>`, and `str()`'s STRIPE_ID_RE has no `:` — so every
+  // production payout was refused here, before any network call, and replayed
+  // forever. The key is our own opaque header value, validated as one.
+  if (!IDEMPOTENCY_KEY_RE.test(args.idempotencyKey)) return null;
+  const rec = args.reconcile;
+  if (!rec || !Array.isArray(rec.ledger) || !Number.isFinite(rec.sinceMs) || typeof rec.keyPrefix !== "string" || rec.keyPrefix.length === 0 || !args.idempotencyKey.startsWith(rec.keyPrefix)) return null;
+  // Aborting is what makes the deadline real — without the AbortController the
+  // request keeps running and keeps holding the invocation open after we have
+  // stopped waiting for it (push.ts `fetchWithDeadline`, same shape).
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TRANSFER_TIMEOUT_MS);
+  const transfersUrl = `${cfg.apiBase}/v1/transfers`;
+  const auth = { authorization: `Bearer ${cfg.secretKey}` };
+  try {
+    // (A) the payout's own group.
+    const q = new URLSearchParams({ transfer_group: args.idempotencyKey, limit: "1" });
+    const found = await fetchImpl(`${transfersUrl}?${q.toString()}`, { redirect: "manual", method: "GET", headers: auth, signal: ctl.signal });
+    if (!found.ok) return null;
+    const list = (await found.json()) as { data?: unknown };
+    if (!Array.isArray(list.data)) return null;
+    // JA-02 (D-0881(2)): ONLY an empty list is "not found". Stripe filters by
+    // `transfer_group` server-side, so a non-empty list with no readable entry in
+    // the requested group is an answer we cannot read: a failure, nothing sent.
+    if (list.data.length > 0) {
+      const hit = list.data.map(seenTransfer).find((t) => t !== null && t.group === args.idempotencyKey);
+      if (!hit) return null;
+      return verdictForOwn(hit, args.destination, args.amountCents);
+    }
+    // (B) what Stripe has sent to EVERY destination this creator has had (I3-0028, D-0976(1)), against our ledger.
+    // Six destinations (I22-FX-MONEY): more than MAX_RECONCILE_DESTINATIONS is no longer a refusal (a creator who had six
+    // accounts was never paid again). The send's own account and the most recent others (the caller orders them newest
+    // first) are listed; a lost payout to any older account is still found by the week lookups below.
+    const dests = [...new Set([args.destination, ...(rec.destinations ?? [])])];
+    if (!dests.every((d) => typeof d === "string" && /^acct_[A-Za-z0-9]+$/.test(d))) return null;
+    const listed: unknown[] = [];
+    for (const dest of dests.slice(0, MAX_RECONCILE_DESTINATIONS)) {
+      const aq = new URLSearchParams({ destination: dest, "created[gte]": String(Math.floor(rec.sinceMs / 1000)), limit: String(RECONCILE_PAGE) });
+      const acct = await fetchImpl(`${transfersUrl}?${aq.toString()}`, { redirect: "manual", method: "GET", headers: auth, signal: ctl.signal });
+      if (!acct.ok) return null;
+      const sent = (await acct.json()) as { data?: unknown; has_more?: unknown };
+      if (!Array.isArray(sent.data) || sent.has_more === true) return null;
+      listed.push(...sent.data);
+    }
+    const byKey = new Map(rec.ledger.map((r) => [r.key, r]));
+    const byId = new Map(rec.ledger.filter((r) => r.transferId !== null).map((r) => [r.transferId as string, r]));
+    for (const raw of listed) {
+      const t = seenTransfer(raw);
+      if (!t) return null;
+      if (t.group === args.idempotencyKey) return verdictForOwn(t, args.destination, args.amountCents);
+      const row = t.group !== null && t.group.startsWith(rec.keyPrefix) ? byKey.get(t.group) : byId.get(t.id);
+      if (!row) {
+        if (t.group !== null && t.group.startsWith(rec.keyPrefix)) return holdOf("unrecorded_transfer", t);
+        continue; // another creator's group at a shared destination, or a pre-group transfer we never recorded
+      }
+      if (row.transferId !== null && row.transferId !== t.id) return holdOf("unrecorded_transfer", t);
+      if (t.reversed) return holdOf("reversed", t);
+      if (t.amount !== row.amountCents) return holdOf("amount_mismatch", t);
+    }
+    // (B2) I3-0028 c: the creator's recent weekly keys, asked of Stripe on ANY account (RECONCILE_LOOKBACK_WEEKS),
+    // then (I22-Q1) the operator-release keys the caller names (RECONCILE_RELEASE_KEYS).
+    const releases = rec.releaseKeys ?? [];
+    if (!releases.every((p) => typeof p === "string" && RELEASE_KEY_RE.test(p))) return null;
+    const groupKeys: string[] = [];
+    const anchorMs = lookbackAnchorMs(rec.nowMs, args.idempotencyKey.slice(rec.keyPrefix.length));
+    for (let k = 0; anchorMs !== null && k < RECONCILE_LOOKBACK_WEEKS; k++) groupKeys.push(rec.keyPrefix + isoWeek(anchorMs - k * WEEK_MS));
+    for (const period of releases.slice(0, RECONCILE_RELEASE_KEYS)) groupKeys.push(rec.keyPrefix + period);
+    for (const key of groupKeys) {
+      if (key === args.idempotencyKey || byKey.has(key)) continue;
+      const gq = new URLSearchParams({ transfer_group: key, limit: "1" });
+      const g = await fetchImpl(`${transfersUrl}?${gq.toString()}`, { redirect: "manual", method: "GET", headers: auth, signal: ctl.signal });
+      if (!g.ok) return null;
+      const gl = (await g.json()) as { data?: unknown };
+      if (!Array.isArray(gl.data)) return null;
+      if (gl.data.length === 0) continue;
+      const lost = gl.data.map(seenTransfer).find((t) => t !== null && t.group === key);
+      if (!lost) return null; // JA-02: a non-empty answer we cannot read is a failure, nothing sent
+      return holdOf("unrecorded_transfer", lost);
+    }
+    // (C) consistent: send.
+    const res = await fetchImpl(transfersUrl, { redirect: "manual",
+      method: "POST",
+      headers: {
+        ...auth,
+        "content-type": "application/x-www-form-urlencoded",
+        "idempotency-key": args.idempotencyKey,
+      },
+      body: form({ amount: String(args.amountCents), currency: "usd", destination: args.destination, transfer_group: args.idempotencyKey }),
+      signal: ctl.signal,
+    });
+    if (!res.ok) {
+      if (TRANSIENT_TRANSFER_CODES.has(await refusalCode(res))) return null; // I3-1119: retryable, not a failure
+      return PERMANENT_TRANSFER_STATUSES.has(res.status) ? { permanent: true, status: res.status } : null;
+    }
+    const j = (await res.json()) as { id?: unknown };
+    return typeof j.id === "string" && TRANSFER_ID_RE.test(j.id) ? j.id : null;
+  } catch {
+    return null; // including the abort — a timeout is an ordinary retryable failure
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The price id for a product+interval, or null (→ 503, never a guess).
+ * D-0884(6) / I3-0238: null for EVERY plan while two configured price ids are
+ * the same — `tierForPrice` would resolve the shared id to the first plan, so
+ * the webhook could grant a product other than the one sold (the health row,
+ * admin.ts `stripe_prices`, refuses the same configuration). */
+export function priceFor(cfg: StripeConfig, tier: "premium" | "pro", interval: BillingInterval): string | null {
+  const set = [cfg.prices.premium.month, cfg.prices.premium.year, cfg.prices.pro.month, cfg.prices.pro.year].filter((id): id is string => !!id);
+  if (new Set(set).size !== set.length) return null;
+  return cfg.prices[tier][interval] ?? null;
+}
+
+function form(fields: Record<string, string>): string {
+  return Object.entries(fields)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join("&");
+}
+
+/** Only an https:// URL from the processor is ever handed to a client — a
+ * compromised/odd response can never redirect a user to `javascript:`. */
+function httpsUrl(v: unknown): string | null {
+  return typeof v === "string" && /^https:\/\//.test(v) && v.length <= 2048 ? v : null;
+}
+
+export interface CheckoutRequest {
+  subjectId: string;
+  subjectKind: "fan" | "creator";
+  tier: "premium" | "pro";
+  interval: BillingInterval;
+  /** Reuse an existing Stripe customer when we already know one. */
+  customerId?: string | null;
+}
+
+/**
+ * Create a hosted Checkout Session. Returns the https redirect URL, or null on
+ * ANY failure (the route maps that to 502 — never a silent success).
+ *
+ * The subject id rides in BOTH `client_reference_id` and the SUBSCRIPTION's
+ * metadata, because the subscription is what later webhooks carry. Stripe Tax
+ * is enabled per the flag-17 decision (`automatic_tax[enabled]=true`), with
+ * address collection so it can actually compute.
+ */
+export interface CheckoutSession {
+  /** The https Checkout URL to hand the client. */
+  url: string;
+  /**
+   * BF-06 — THE INTERVAL THIS URL ACTUALLY BUYS, which is not always the one
+   * that was asked for. See the idempotency block below: a subject who already
+   * has an in-flight checkout open on the other interval is handed THAT session
+   * back (which is what the key exists to do), so the caller must be able to
+   * tell the client what it is about to pay for rather than guess from its own
+   * request.
+   */
+  interval: BillingInterval;
+  /** True when this is the earlier, differently-priced session replayed. */
+  replayed: boolean;
+}
+
+export async function createStripeCheckoutSession(cfg: StripeConfig, req: CheckoutRequest, fetchImpl: typeof fetch = fetch): Promise<CheckoutSession | null> {
+  const priceId = priceFor(cfg, req.tier, req.interval);
+  if (!priceId) return null;
+  // Defense in depth: a fan subject can only buy premium, a creator only pro.
+  if ((req.subjectKind === "fan") !== (req.tier === "premium")) return null;
+  // #747: Stripe is handed the SEALED subject, never the raw id.
+  if (!cfg.subjectSealSecret) return null;
+  let sealed: string;
+  try {
+    sealed = await sealStripeSubject(req.subjectId, cfg.subjectSealSecret);
+  } catch {
+    return null;
+  }
+  const fields: Record<string, string> = {
+    mode: "subscription",
+    "line_items[0][price]": priceId,
+    "line_items[0][quantity]": "1",
+    client_reference_id: sealed,
+    "subscription_data[metadata][dhwaja_subject]": sealed,
+    "metadata[dhwaja_subject]": sealed,
+    "automatic_tax[enabled]": "true",
+    "tax_id_collection[enabled]": "true",
+    billing_address_collection: "required",
+    // BF-09: by SUBJECT KIND, not by one configured origin. A creator
+    // completing Pro checkout returns to the console's billing screen.
+    success_url: req.subjectKind === "creator" ? cfg.consoleSuccessUrl : cfg.successUrl,
+    cancel_url: req.subjectKind === "creator" ? cfg.consoleCancelUrl : cfg.cancelUrl,
+  };
+  if (req.customerId) {
+    fields.customer = req.customerId;
+    fields["customer_update[address]"] = "auto";
+  }
+  const key = `co_${sealed}_${req.customerId ?? "new"}`;
+  // #352b (I17-W2A): ONE TRANSFER_TIMEOUT_MS deadline over both `post` legs (the replay is the same sequence).
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TRANSFER_TIMEOUT_MS);
+  const post = async (f: Record<string, string>): Promise<Response> =>
+    fetchImpl(`${cfg.apiBase}/v1/checkout/sessions`, { redirect: "manual",
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${cfg.secretKey}`,
+        "content-type": "application/x-www-form-urlencoded",
+        // Idempotent create: a double-clicked upgrade button re-uses the session.
+        //
+        // The key is deliberately INTERVAL-INDEPENDENT. Keyed per interval, two
+        // concurrent calls (`month` in one tab, `year` in another) were two
+        // different keys, so Stripe created two sessions, the subject completed
+        // both, and they were charged twice for the same product. One subject +
+        // one customer state = one in-flight checkout, whichever interval won
+        // the race. Trade, stated: inside Stripe's 24h key window a subject who
+        // opened a monthly checkout and then asks for annual is handed the
+        // monthly session back. They are never BLOCKED from buying, and after
+        // the first period they change plan in the Portal — which is strictly
+        // better than a double charge.
+        //
+        // `customerId` is in the key because it is the only other thing that
+        // varies the body: when a customer id lands between two attempts the
+        // body changes, and Stripe rejects a re-used key whose body differs.
+        // Keyed on it, that becomes a fresh session instead of a hard 502 for
+        // the rest of the 24h window.
+        "idempotency-key": key,
+      },
+      body: form(f),
+      signal: ctl.signal,
+    });
+
+  try {
+    const res = await post(fields);
+    if (res.ok) {
+      const j = (await res.json()) as { url?: unknown };
+      const url = httpsUrl(j.url);
+      return url ? { url, interval: req.interval, replayed: false } : null;
+    }
+    // BF-06 — THE RECOVERY LEG, and why the comment above was a promise the
+    // code could not keep.
+    //
+    // The key is interval-independent ON PURPOSE (see above). The BODY is not:
+    // `line_items[0][price]` is the whole point of the interval. Stripe's
+    // idempotency contract rejects a live key whose parameters changed — it
+    // does NOT hand back the first response — so "handed the monthly session
+    // back" was inverted in practice: the second request 400'd, this helper
+    // mapped it to `null`, and the route answered 502 `checkout_unavailable`
+    // for the remaining 24h of the key window. A subject who opened a monthly
+    // checkout and then clicked "annual" could not buy at all.
+    //
+    // The fix delivers what the comment says instead of abandoning the guard.
+    // Under this key there is exactly ONE other body we could have sent — the
+    // other interval's price — so re-issuing the ORIGINAL request replays the
+    // ORIGINAL response, which is Stripe's documented behaviour for a matching
+    // key+body. That returns the session already open, opens no second one, and
+    // keeps the key doing the only job it was ever there for.
+    //
+    // NARROW ON PURPOSE, three ways: only on an `idempotency_error` (a 500, a
+    // network fault or any other 4xx is still a hard `null`, so an outage can
+    // never be dressed as a replay); only once (no loop); and it reports
+    // `interval` + `replayed` so the caller tells the subject which plan the
+    // session they are being sent to actually buys, rather than assuming its
+    // own request won.
+    // https://docs.stripe.com/api/idempotent_requests
+    if (res.status !== 400) return null;
+    const err = (await res.json().catch(() => null)) as { error?: { type?: unknown; code?: unknown } } | null;
+    const t = err?.error?.type;
+    const code = err?.error?.code;
+    if (t !== "idempotency_error" && code !== "idempotency_key_in_use") return null;
+    const other: BillingInterval = req.interval === "month" ? "year" : "month";
+    const otherPrice = priceFor(cfg, req.tier, other);
+    if (!otherPrice) return null;
+    const replay = await post({ ...fields, "line_items[0][price]": otherPrice });
+    if (!replay.ok) return null;
+    const rj = (await replay.json()) as { url?: unknown };
+    const rurl = httpsUrl(rj.url);
+    return rurl ? { url: rurl, interval: other, replayed: true } : null;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * S-CW6a: create a ONE-TIME (mode: payment) Checkout Session that buys a bucket
+ * of credits. Unlike the subscription checkout, the price is COMPUTED
+ * server-side from the credit bucket (inline `price_data`), never a client
+ * amount and never a pre-configured price id — so the fan cannot pick what they
+ * pay. The bucket count rides in metadata so the webhook grants exactly what
+ * was bought; Stripe signs the event, and we set the metadata, so trusting it
+ * back is safe (the webhook still re-validates the bucket). Stripe Tax is on.
+ * I21-Q55 (D-1030): the price is TAX-INCLUSIVE unless `req.taxBehavior` says
+ * "exclusive" (the caller reads `creditCheckoutTaxBehavior`, ops_settings
+ * `credit_checkout_tax_behavior`), so the fan pays the bucket price shown and
+ * the tax is inside it.
+ * Returns the redirect URL and the session id (I3-1691: stored on the pending
+ * row so `sweepCreditCheckoutPending` can retrieve it; null when Stripe's answer
+ * carries no well-formed id), or null on any failure (route → 502).
+ */
+/** I21-Q55 (D-1030): ops_settings key and default for whether a credit price includes tax. */
+export const CREDIT_CHECKOUT_TAX_BEHAVIOR_KEY = "credit_checkout_tax_behavior";
+export type CreditTaxBehavior = "inclusive" | "exclusive";
+export const CREDIT_CHECKOUT_TAX_BEHAVIOR_DEFAULT: CreditTaxBehavior = "inclusive";
+/** The setting: exactly "exclusive" is exclusive; anything else, or no row, is the default (inclusive). */
+export async function creditCheckoutTaxBehavior(db: DbLike): Promise<CreditTaxBehavior> {
+  const row = await db.prepare("SELECT value FROM ops_settings WHERE key = ?").bind(CREDIT_CHECKOUT_TAX_BEHAVIOR_KEY).first<{ value: string }>();
+  return row?.value === "exclusive" ? "exclusive" : CREDIT_CHECKOUT_TAX_BEHAVIOR_DEFAULT;
+}
+
+export async function createCreditCheckoutSession(
+  cfg: StripeConfig,
+  req: { subjectId: string; credits: number; unitAmountCents: number; customerId?: string | null; nonce: string; taxBehavior?: CreditTaxBehavior },
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ url: string; id: string | null } | null> {
+  if (!str(req.subjectId)) return null;
+  if (!Number.isInteger(req.credits) || req.credits <= 0) return null;
+  if (!Number.isInteger(req.unitAmountCents) || req.unitAmountCents <= 0) return null;
+  // The nonce is what makes this key per-ATTEMPT rather than per-day (F-W4). A
+  // caller that forgets it gets no session rather than a silently un-repeatable
+  // one — the failure is loud instead of a purchase that cannot be made twice.
+  if (!/^[0-9a-f]{8,64}$/.test(req.nonce)) return null;
+  // #747: Stripe is handed the SEALED subject, never the raw id.
+  if (!cfg.subjectSealSecret) return null;
+  let sealed: string;
+  try {
+    sealed = await sealStripeSubject(req.subjectId, cfg.subjectSealSecret);
+  } catch {
+    return null;
+  }
+  const fields: Record<string, string> = {
+    mode: "payment",
+    // Review F2: card only. Async methods (ACH/SEPA/iDEAL) fire
+    // checkout.session.completed with payment_status "unpaid" and settle later
+    // via a DIFFERENT event (async_payment_succeeded) our mapper ignores — the
+    // fan would pay and never be credited. Cards are synchronous (always "paid"
+    // at completion), so pin them for the one-time credit purchase.
+    "payment_method_types[0]": "card",
+    "line_items[0][price_data][currency]": "usd",
+    "line_items[0][price_data][unit_amount]": String(req.unitAmountCents),
+    // I21-Q55: inclusive unless the setting says exclusive.
+    "line_items[0][price_data][tax_behavior]": req.taxBehavior === "exclusive" ? "exclusive" : "inclusive",
+    "line_items[0][price_data][product_data][name]": `${req.credits} Creator War credits`,
+    "line_items[0][quantity]": "1",
+    client_reference_id: sealed,
+    "payment_intent_data[metadata][dhwaja_subject]": sealed,
+    "payment_intent_data[metadata][dhwaja_purpose]": "credits",
+    "payment_intent_data[metadata][dhwaja_credits]": String(req.credits),
+    "payment_intent_data[metadata][dhwaja_nonce]": req.nonce,
+    "metadata[dhwaja_subject]": sealed,
+    "metadata[dhwaja_purpose]": "credits",
+    "metadata[dhwaja_credits]": String(req.credits),
+    // I3-1691: the attempt's nonce, so the grant resolves THIS attempt's pending row.
+    "metadata[dhwaja_nonce]": req.nonce,
+    "automatic_tax[enabled]": "true",
+    billing_address_collection: "required",
+    // A CREDIT purchase, so the fan comes back to the WALLET (F-W1) — not to the
+    // account page under the flag that means a subscription completed.
+    success_url: cfg.creditSuccessUrl,
+    cancel_url: cfg.cancelUrl,
+  };
+  if (req.customerId) {
+    fields.customer = req.customerId;
+    fields["customer_update[address]"] = "auto";
+  }
+  // #352b (I17-W2A): the module's deadline idiom — TRANSFER_TIMEOUT_MS, aborted at it.
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TRANSFER_TIMEOUT_MS);
+  try {
+    const res = await fetchImpl(`${cfg.apiBase}/v1/checkout/sessions`, { redirect: "manual",
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${cfg.secretKey}`,
+        "content-type": "application/x-www-form-urlencoded",
+        // UI-AUDIT F-W4 — WHAT THIS KEY MAY AND MAY NOT DEDUPLICATE.
+        //
+        // It was `cc_<subject>_<credits>_<customer>` and nothing else. A Stripe
+        // idempotency key is honoured for 24 HOURS, and credits are a CONSUMABLE
+        // a fan is meant to buy again — so the second 1000-credit purchase of
+        // the day did not open a second session, it replayed the first one, and
+        // the fan was handed back a Checkout URL for a session they had already
+        // completed. Buying the same bucket twice in a day was impossible, and
+        // the failure looked like a broken button rather than a refusal.
+        //
+        // A subscription can borrow a stable key because subscribing twice is
+        // not a thing a fan means to do; a credit bucket cannot. The nonce is
+        // per attempt: the checkout route mints a fresh one for every request
+        // (index.ts), so this key collapses only a re-sent request that carries
+        // the same nonce, never a double-click, which is two requests with two
+        // nonces. The second click of a double-click is answered before this
+        // call, by recordOpenCheckoutWithinLimit's reuse arm (fan-spend-limits.ts,
+        // D-1158(2)): while the first click's card row is still open inside
+        // checkout_reuse_window_minutes, it gets that session's URL (200), or 409
+        // checkout_in_progress while that session has no URL yet.
+        "idempotency-key": `cc_${sealed}_${req.credits}_${req.nonce}`,
+      },
+      body: form(fields),
+      signal: ctl.signal,
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { url?: unknown; id?: unknown };
+    const url = httpsUrl(j.url);
+    if (!url) return null;
+    return { url, id: typeof j.id === "string" && STRIPE_ID_RE.test(j.id) ? j.id : null };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export interface CreditPurchaseIntent {
+  subjectId: string;
+  credits: number;
+  externalTxnId: string;
+  grossCents: number;
+  /** The PaymentIntent behind the session — stored so a later refund/dispute
+   * (which carries the PI, never the session id) maps back to this purchase. */
+  paymentRef: string;
+  /** I3-1691: the checkout attempt's nonce (`metadata.dhwaja_nonce`), when the
+   * session carries one — the key of its `credit_checkout_pending` row. */
+  nonce?: string;
+  /** I3-1213 (I16-W06C H-1213-stripe): the session's ISO currency (lowercase, 3
+   * letters) as Stripe reported it, or null when absent/malformed. */
+  currency: string | null;
+}
+
+/**
+ * S-CW6a: map a verified event to a CREDIT grant intent, or null if it is not a
+ * completed, paid credit checkout. PURE — the webhook does the granting. Only
+ * `checkout.session.completed` with `mode: payment`, `payment_status: paid`,
+ * and our `dhwaja_purpose: credits` metadata qualifies; everything else (a
+ * subscription event, an unpaid session, a foreign session) returns null and
+ * flows to the subscription path or is ignored. The external id is the session
+ * id (stable, unique) — the grant is idempotent on it.
+ */
+export function creditIntentFromEvent(ev: StripeEvent): CreditPurchaseIntent | null {
+  if (ev.type !== "checkout.session.completed") return null;
+  const s = ev.object;
+  if (s.mode !== "payment") return null;
+  if (s.payment_status !== "paid") return null;
+  const meta = (s.metadata as Record<string, unknown> | undefined) ?? {};
+  if (meta.dhwaja_purpose !== "credits") return null;
+  const subjectId = typeof meta.dhwaja_subject === "string" ? meta.dhwaja_subject : "";
+  if (!FAN_ID_RE.test(subjectId)) return null;
+  const credits = typeof meta.dhwaja_credits === "string" ? Number(meta.dhwaja_credits) : NaN;
+  if (!Number.isInteger(credits) || credits <= 0) return null;
+  const sessionId = typeof s.id === "string" && STRIPE_ID_RE.test(s.id) ? s.id : "";
+  if (!sessionId) return null;
+  const grossCents = typeof s.amount_total === "number" && Number.isInteger(s.amount_total) && s.amount_total >= 0 ? s.amount_total : 0;
+  const paymentRef = typeof s.payment_intent === "string" && STRIPE_ID_RE.test(s.payment_intent) ? s.payment_intent : "";
+  const nonce = typeof meta.dhwaja_nonce === "string" && /^[0-9a-f]{8,64}$/.test(meta.dhwaja_nonce) ? meta.dhwaja_nonce : "";
+  const currency = typeof s.currency === "string" && /^[a-z]{3}$/.test(s.currency) ? s.currency : null;
+  return nonce ? { subjectId, credits, externalTxnId: sessionId, grossCents, paymentRef, nonce, currency } : { subjectId, credits, externalTxnId: sessionId, grossCents, paymentRef, currency };
+}
+
+/** I3-1691: read a Checkout Session's state for a reconcile sweep. null on any
+ * failure or on a malformed id — the caller treats null as "unknown", never "unpaid".
+ * D-0843(1) (I4-RG-MONEY-06): bounded by TRANSFER_TIMEOUT_MS, the payout transfer
+ * path's deadline, and aborted at it — a hung Stripe is "unknown", not a held lease. */
+export async function retrieveCheckoutSession(
+  cfg: StripeConfig,
+  sessionId: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<{ status: string; paymentStatus: string } | null> {
+  if (!STRIPE_ID_RE.test(sessionId)) return null;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TRANSFER_TIMEOUT_MS);
+  try {
+    const res = await fetchImpl(`${cfg.apiBase}/v1/checkout/sessions/${encodeURIComponent(sessionId)}`, { redirect: "manual",
+      method: "GET",
+      headers: { authorization: `Bearer ${cfg.secretKey}` },
+      signal: ctl.signal,
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { status?: unknown; payment_status?: unknown };
+    if (typeof j.status !== "string" || typeof j.payment_status !== "string") return null;
+    return { status: j.status, paymentStatus: j.payment_status };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** I3-1691: a Checkout Session lives 24 h; an attempt still `open` past this age
+ * is one the webhook never resolved, and the sweep asks Stripe what became of it. */
+export const CREDIT_CHECKOUT_RECONCILE_AFTER_MS = 25 * 60 * 60 * 1000;
+export const CREDIT_CHECKOUT_RECONCILE_BATCH = 50;
+/** D-0843(1): wall clock for one sweep, checked BEFORE each Stripe call (the
+ * payout run's PAYOUT_RUN_BUDGET_MS shape), so the worst overshoot is one
+ * TRANSFER_TIMEOUT_MS, never BATCH x it. */
+export const CREDIT_CHECKOUT_RECONCILE_BUDGET_MS = 20_000;
+
+/**
+ * I3-1691 — RECONCILE credit checkout attempts the webhook never resolved
+ * (`credit_checkout_pending.session_id`, 0142; wired in index.ts `scheduled()`).
+ * Per open stripe row older than CREDIT_CHECKOUT_RECONCILE_AFTER_MS, never-checked then least
+ * recently checked first (D-0844(6): every row asked is stamped `last_checked_at`):
+ *  - Stripe says `expired` -> the row is `expired` (guarded `state = 'open'`, so a
+ *    grant that lands meanwhile is never overwritten): nothing can be paid on it.
+ *  - `complete` + `paid` -> D-0843(1): if this session's grant is on record
+ *    (`credit_purchases` rail 'stripe', external_txn_id = the session id, the key the
+ *    webhook grants under) the row is `granted`; otherwise it is PAID BUT UNGRANTED and
+ *    moves OUT of the open set to `reconciled` = awaiting operator review (counted on the
+ *    ops overview). Never granted or refunded here: that call is QUEUED for Jason. Both
+ *    writes are guarded `state = 'open'` and on the purchase row's (non-)existence.
+ *  - anything else, or null (Stripe unreachable/malformed/timed out) -> unknown; state untouched.
+ *  - I59 S6-26: no session id (the attempt row landed, its session id never did) -> `expired` through the same
+ *    guarded UPDATE, with no Stripe call: Stripe's default 24 h session life ends before this 25 h cutoff.
+ */
+export async function sweepCreditCheckoutPending(
+  db: DbLike,
+  cfg: StripeConfig,
+  nowMs: number,
+  fetchImpl: typeof fetch = fetch,
+  clock: () => number = Date.now,
+): Promise<{ checked: number; expired: number; paid_ungranted: number; granted: number }> {
+  const cutoff = new Date(nowMs - CREDIT_CHECKOUT_RECONCILE_AFTER_MS).toISOString();
+  const { results } = await db
+    .prepare(
+      // D-0844(6): never-asked rows first, then least recently asked, so the
+      // oldest BATCH rows Stripe will not answer cannot pin the sweep forever.
+      "SELECT nonce, session_id FROM credit_checkout_pending INDEXED BY idx_credit_checkout_pending_check WHERE state = 'open' AND rail = 'stripe' AND created_at <= ? ORDER BY last_checked_at IS NOT NULL, last_checked_at ASC, created_at ASC LIMIT ?",
+    )
+    .bind(cutoff, CREDIT_CHECKOUT_RECONCILE_BATCH)
+    .all<{ nonce: string; session_id: string | null }>();
+  const out = { checked: 0, expired: 0, paid_ungranted: 0, granted: 0 };
+  const deadline = clock() + CREDIT_CHECKOUT_RECONCILE_BUDGET_MS;
+  for (const row of results) {
+    if (clock() >= deadline) break;
+    const s = row.session_id === null ? null : await retrieveCheckoutSession(cfg, row.session_id, fetchImpl);
+    out.checked++;
+    await db.prepare("UPDATE credit_checkout_pending SET last_checked_at = ? WHERE nonce = ?").bind(new Date(nowMs).toISOString(), row.nonce).run();
+    if (row.session_id === null || s?.status === "expired") {
+      const r = await db
+        .prepare("UPDATE credit_checkout_pending SET state = 'expired', resolved_at = ? WHERE nonce = ? AND state = 'open'")
+        .bind(new Date(nowMs).toISOString(), row.nonce)
+        .run();
+      out.expired += r.changes ?? 0;
+    } else if (s?.status === "complete" && s.paymentStatus === "paid") {
+      const at = new Date(nowMs).toISOString();
+      const onRecord = "EXISTS (SELECT 1 FROM credit_purchases WHERE rail = 'stripe' AND external_txn_id = ?)";
+      const g = await db
+        .prepare(`UPDATE credit_checkout_pending SET state = 'granted', resolved_at = ? WHERE nonce = ? AND state = 'open' AND ${onRecord}`)
+        .bind(at, row.nonce, row.session_id)
+        .run();
+      out.granted += g.changes ?? 0;
+      if (!(g.changes ?? 0)) {
+        const r = await db
+          .prepare(`UPDATE credit_checkout_pending SET state = 'reconciled', resolved_at = ? WHERE nonce = ? AND state = 'open' AND NOT ${onRecord}`)
+          .bind(at, row.nonce, row.session_id)
+          .run();
+        out.paid_ungranted += r.changes ?? 0;
+      }
+    }
+  }
+  return out;
+}
+
+export interface RefundIntent {
+  /** The PaymentIntent the refund/dispute is against — the map key to the purchase. */
+  paymentRef: string;
+  /** D-0744/D-0753/D-0755: `dispute_open` (any dispute's open or funds
+   * withdrawal) freezes, `dispute_won` unfreezes, `dispute` (a LOSS only)
+   * reverses and bans. `refund` is unchanged. */
+  kind: "refund" | "dispute" | "dispute_open" | "dispute_won";
+  eventId: string;
+  /** D-0745: `dispute.amount` on a `dispute` (lost) intent, when a positive integer — the
+   * numerator of the proportional take-back (refunds.ts `clawFor`). */
+  disputedCents?: number;
+  /** RG-634-02: Stripe's dispute id on a freeze/unfreeze intent — the key the
+   * freeze is held under, so a second dispute on the purchase freezes again. */
+  disputeId?: string;
+  /** Review F4: a PARTIAL refund of a fixed-bucket credit purchase is not a shape
+   * we issue. The caller does NOT claw on it (clawing a full bucket for part of
+   * the money is wrong) — it surfaces it for manual review instead of silently
+   * dropping it. Never set for a dispute. */
+  partial?: boolean;
+}
+
+/**
+ * S-CW6d: map a verified event to a credit REVERSAL intent, or null if it is not
+ * a refund/dispute we act on. PURE — the webhook does the reversing, which is a
+ * no-op if the PaymentIntent is not a credit purchase (a subscription
+ * refund/dispute simply finds no credit_purchases row and is ignored).
+ *
+ * - `charge.refunded` only when the charge is FULLY refunded (`refunded: true`).
+ *   A partial refund of a fixed-bucket credit purchase is not a shape we issue;
+ *   it is left for an operator rather than clawing a whole bucket for part of it.
+ * - `charge.dispute.created` (D-0753), inquiry or real chargeback alike ->
+ *   `dispute_open`: the D-0744 freeze, keyed by the dispute id. Nothing is
+ *   reversed and nobody is banned while the dispute is open.
+ * - `charge.dispute.funds_withdrawn` (D-0755) -> `dispute_open` too: Stripe
+ *   withdraws a chargeback's funds AT OPEN and an inquiry's on escalation, and
+ *   neither is a decision. Same dispute key, so it keeps the created freeze.
+ * - `charge.dispute.closed` `won` / `warning_closed` -> `dispute_won`: unfreeze.
+ * - `charge.dispute.closed` `lost` -> `dispute`: release the freeze, take back
+ *   in proportion to `dispute.amount` (D-0745) and ban (D-0743 lift rule).
+ *   Any other closed status: null.
+ * Subscriptions are NOT this function's: `stripeOutcome` still revokes on a
+ * real chargeback's open (D-0755).
+ */
+export function refundIntentFromEvent(ev: StripeEvent): RefundIntent | null {
+  if (ev.type === "charge.refunded") {
+    const c = ev.object;
+    const pi = typeof c.payment_intent === "string" && STRIPE_ID_RE.test(c.payment_intent) ? c.payment_intent : "";
+    if (!pi) return null;
+    // A PARTIAL refund (`refunded` not yet true, but money went back) is flagged
+    // for manual review, never auto-clawed — a fixed-bucket credit purchase is
+    // not something we partial-refund, so a partial is an anomaly to surface.
+    if (c.refunded !== true) {
+      const amt = typeof c.amount_refunded === "number" ? c.amount_refunded : 0;
+      return amt > 0 ? { paymentRef: pi, kind: "refund", eventId: ev.id, partial: true } : null;
+    }
+    return { paymentRef: pi, kind: "refund", eventId: ev.id };
+  }
+  if (ev.type !== "charge.dispute.created" && ev.type !== "charge.dispute.funds_withdrawn" && ev.type !== "charge.dispute.closed") return null;
+  const d = ev.object;
+  const pi = typeof d.payment_intent === "string" && STRIPE_ID_RE.test(d.payment_intent) ? d.payment_intent : "";
+  if (!pi) return null;
+  // The LOST dispute's reversal intent, carrying `dispute.amount` when it is a positive integer.
+  const amt = d.amount;
+  const reverse: RefundIntent =
+    typeof amt === "number" && Number.isInteger(amt) && amt > 0 ? { paymentRef: pi, kind: "dispute", eventId: ev.id, disputedCents: amt } : { paymentRef: pi, kind: "dispute", eventId: ev.id };
+  const did = typeof d.id === "string" && STRIPE_ID_RE.test(d.id) ? { disputeId: d.id } : {};
+  // D-0753/D-0755: an open dispute and its funds withdrawal FREEZE, whatever
+  // the status. A PI that is no credit purchase answers `unknown` in
+  // reverseGrant and falls through to the subscription reducer.
+  if (ev.type === "charge.dispute.created" || ev.type === "charge.dispute.funds_withdrawn") return { paymentRef: pi, kind: "dispute_open", eventId: ev.id, ...did };
+  // charge.dispute.closed. QUEUE #598: "lost" is the predicate stripeOutcome's
+  // closed branch applies; a purchase already reversed is a `duplicate`.
+  if (d.status === "won" || d.status === "warning_closed") return { paymentRef: pi, kind: "dispute_won", eventId: ev.id, ...did };
+  return d.status === "lost" ? reverse : null;
+}
+
+/** Create a Customer Portal session (manage / cancel / update card). Null on
+ * any failure. Dhwaja renders no billing UI of its own — this is the whole
+ * management surface. */
+export async function createStripePortalSession(cfg: StripeConfig, customerId: string, subjectKind: "fan" | "creator" = "fan", fetchImpl: typeof fetch = fetch): Promise<string | null> {
+  if (!str(customerId)) return null;
+  // #352b (I17-W2A): the module's deadline idiom — TRANSFER_TIMEOUT_MS, aborted at it.
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TRANSFER_TIMEOUT_MS);
+  try {
+    const res = await fetchImpl(`${cfg.apiBase}/v1/billing_portal/sessions`, { redirect: "manual",
+      method: "POST",
+      headers: { authorization: `Bearer ${cfg.secretKey}`, "content-type": "application/x-www-form-urlencoded" },
+      // BF-09: a creator returns to the CONSOLE's billing screen, not the fan
+      // account page their console session cannot even open.
+      body: form({ customer: customerId, return_url: subjectKind === "creator" ? cfg.consolePortalReturnUrl : cfg.portalReturnUrl }),
+      signal: ctl.signal,
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { url?: unknown };
+    return httpsUrl(j.url);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * H3: cancel a subscription at Stripe IMMEDIATELY — used when a fan erases their
+ * account so the CARD STOPS BEING CHARGED, not just the local entitlement
+ * removed. Best-effort and fail-soft: returns true on a clean cancel (or if
+ * Stripe reports it already gone / not found), false on any other failure so the
+ * caller can audit the residual. Erasure never blocks on this — the resurrection
+ * guard in entitlements-store already stops a late webhook re-creating the row.
+ */
+export async function cancelStripeSubscription(
+  cfg: StripeConfig,
+  subscriptionId: string,
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs?: number | OpsCancelDeadline,
+): Promise<boolean> {
+  if (!str(subscriptionId) || !/^sub_[A-Za-z0-9]+$/.test(subscriptionId)) return false;
+  // QUEUE #352 (D-0434): `timeoutMs` is passed by the OPERATOR erasure door only
+  // (account_data.ts `eraseAccountWithSubscriptions`); the fan path passes none
+  // and its request is byte-identical to before. The race is what bounds the
+  // wait even if a fetch ignores the signal; the abort is what stops the request
+  // (same shape as `createConnectTransfer` above). A timeout is `false`.
+  // #352a: a shared `OpsCancelDeadline` is the door's ONE budget — not cleared here, and once spent no
+  // request is sent; a number is a private deadline for this one call, cleared below.
+  const own = typeof timeoutMs === "number" ? opsCancelDeadline(timeoutMs) : null;
+  const dl = own ?? (typeof timeoutMs === "object" ? timeoutMs : null);
+  try {
+    if (dl?.signal.aborted) return false;
+    const call = fetchImpl(`${cfg.apiBase}/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, { redirect: "manual",
+      method: "DELETE",
+      headers: { authorization: `Bearer ${cfg.secretKey}` },
+      ...(dl ? { signal: dl.signal } : {}),
+    });
+    const res = dl ? await Promise.race([call, dl.expired]) : await call;
+    // 200 = cancelled now; 404 = already gone (resubscribe made a new id, or it
+    // was cancelled already) — both are the desired end state.
+    return res.ok || res.status === 404;
+  } catch {
+    return false;
+  } finally {
+    own?.clear();
+  }
+}
+
+/** I21-Q49 (D-1030): delete a Stripe CUSTOMER at erasure, after the subscription cancels succeed (the caller is
+ * account_data.ts `eraseAccountWithSubscriptions`, I30-PRIVACY). Modelled on `cancelStripeSubscription`: true on a
+ * 2xx or a 404 (already gone); false on a refusal, a 5xx, a throw or the TRANSFER_TIMEOUT_MS deadline. No request is
+ * sent for an id that is not a `cus_` id (an empty id included). */
+export async function deleteStripeCustomer(cfg: StripeConfig, customerId: string, fetchImpl: typeof fetch = fetch): Promise<boolean> {
+  if (!/^cus_[A-Za-z0-9]+$/.test(customerId)) return false;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TRANSFER_TIMEOUT_MS);
+  try {
+    const res = await fetchImpl(`${cfg.apiBase}/v1/customers/${encodeURIComponent(customerId)}`, {
+      redirect: "manual",
+      method: "DELETE",
+      headers: { authorization: `Bearer ${cfg.secretKey}` },
+      signal: ctl.signal,
+    });
+    return res.ok || res.status === 404;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** I21-Q37 (D-1030): set a subscription to END AT ITS PERIOD END (`cancel_at_period_end=true`) — the fan keeps what
+ * they paid for and is not charged again. Used after a store subscription grant (entitlements-store.ts
+ * cancelWebSubscriptionAfterStoreGrant). true only on a 2xx; false on a malformed id, a refusal, a throw or the deadline. */
+export async function setStripeCancelAtPeriodEnd(cfg: StripeConfig, subscriptionId: string, fetchImpl: typeof fetch = fetch): Promise<boolean> {
+  if (!/^sub_[A-Za-z0-9]+$/.test(subscriptionId)) return false;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TRANSFER_TIMEOUT_MS);
+  try {
+    const res = await fetchImpl(`${cfg.apiBase}/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      redirect: "manual",
+      method: "POST",
+      headers: { authorization: `Bearer ${cfg.secretKey}`, "content-type": "application/x-www-form-urlencoded" },
+      body: form({ cancel_at_period_end: "true" }),
+      signal: ctl.signal,
+    });
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** POST /v1/subscriptions/:id `pause_collection[behavior]=void` (pause: no invoice is collected) or `pause_collection=`
+ * (unset: resume), under `dl` when given (the door's one OpsCancelDeadline), else TRANSFER_TIMEOUT_MS. true only on a 2xx. */
+async function setSubscriptionCollectionPaused(cfg: StripeConfig, subscriptionId: string, paused: boolean, fetchImpl: typeof fetch, dl?: OpsCancelDeadline): Promise<boolean> {
+  if (!/^sub_[A-Za-z0-9]+$/.test(subscriptionId)) return false;
+  const deadline = dl ?? opsCancelDeadline(TRANSFER_TIMEOUT_MS);
+  try {
+    if (deadline.signal.aborted) return false;
+    const call = fetchImpl(`${cfg.apiBase}/v1/subscriptions/${encodeURIComponent(subscriptionId)}`, {
+      redirect: "manual",
+      method: "POST",
+      headers: { authorization: `Bearer ${cfg.secretKey}`, "content-type": "application/x-www-form-urlencoded" },
+      body: paused ? form({ "pause_collection[behavior]": "void" }) : form({ pause_collection: "" }),
+      signal: deadline.signal,
+    });
+    const res = await Promise.race([call, deadline.expired]);
+    return res.ok;
+  } catch {
+    return false;
+  } finally {
+    if (!dl) deadline.clear();
+  }
+}
+
+/** I25-Q3 (D-1030: "pause billing on suspension, cancel on termination"): pause collection on a subscription. */
+export async function pauseStripeSubscription(cfg: StripeConfig, subscriptionId: string, fetchImpl: typeof fetch = fetch, dl?: OpsCancelDeadline): Promise<boolean> {
+  return setSubscriptionCollectionPaused(cfg, subscriptionId, true, fetchImpl, dl);
+}
+
+/** I25-Q3: resume collection on a subscription `pauseStripeSubscription` paused (on a lift or an overturned appeal). */
+export async function resumeStripeSubscription(cfg: StripeConfig, subscriptionId: string, fetchImpl: typeof fetch = fetch, dl?: OpsCancelDeadline): Promise<boolean> {
+  return setSubscriptionCollectionPaused(cfg, subscriptionId, false, fetchImpl, dl);
+}
+
+/**
+ * I4-Q7 (D-1030: "Dedupe them and refund automatically"): refund a Stripe credit settlement that was refused on a
+ * freeze (`credit_settlement_refusals`, 0120). `externalTxnId` is the Checkout Session id the credit rail keys on
+ * (creditIntentFromEvent), so its PaymentIntent is read from the session, then POST /v1/refunds with
+ * Idempotency-Key = `externalTxnId` (a redelivered or re-run refund is the same refund at Stripe).
+ * I39-FX-MONEY (D-1164): the answer says whether a refund can exist. `refunded`: the POST answered ok, or
+ * `charge_already_refunded`. `not_sent`: no refund request was issued (an id that is not a session, a session GET that
+ * failed, answered not ok or carried no PaymentIntent). `refused`: the POST answered a 4xx other than 409 and 429, which
+ * creates no refund. `unknown`: anything else once the POST was issued (a 5xx, 409, 429, a timeout or network fault).
+ */
+export type StripeRefundOutcome = "refunded" | "not_sent" | "refused" | "unknown";
+export async function createStripeRefund(cfg: StripeConfig, externalTxnId: string, fetchImpl: typeof fetch = fetch): Promise<StripeRefundOutcome> {
+  if (!/^cs_[A-Za-z0-9_]{1,250}$/.test(externalTxnId)) return "not_sent";
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TRANSFER_TIMEOUT_MS);
+  const auth = { authorization: `Bearer ${cfg.secretKey}` };
+  let sent = false;
+  try {
+    const s = await fetchImpl(`${cfg.apiBase}/v1/checkout/sessions/${encodeURIComponent(externalTxnId)}`, { redirect: "manual", method: "GET", headers: auth, signal: ctl.signal });
+    if (!s.ok) return "not_sent";
+    const pi = ((await s.json()) as { payment_intent?: unknown }).payment_intent;
+    if (typeof pi !== "string" || !/^pi_[A-Za-z0-9_]+$/.test(pi)) return "not_sent";
+    sent = true;
+    const res = await fetchImpl(`${cfg.apiBase}/v1/refunds`, {
+      redirect: "manual",
+      method: "POST",
+      headers: { ...auth, "content-type": "application/x-www-form-urlencoded", "idempotency-key": externalTxnId },
+      body: form({ payment_intent: pi }),
+      signal: ctl.signal,
+    });
+    if (res.ok) return "refunded";
+    if ((await refusalCode(res)) === "charge_already_refunded") return "refunded";
+    return res.status >= 400 && res.status < 500 && res.status !== 409 && res.status !== 429 ? "refused" : "unknown";
+  } catch {
+    return sent ? "unknown" : "not_sent";
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** I4-Q7: rows refunded per call, fewest failures then oldest first (two Stripe subrequests each); the next tick takes the rest. */
+export const REFUND_OWED_BATCH = 10;
+/** D-1037(5) (RGM-05): failed refund attempts per row before the payer PARKS it — the row stays `refund_owed` for an
+ * operator (console settlement-refusals list) and is never asked again. Each failure is one REFUND_OWED_FAILED_ACTION
+ * audit row (item_id = the settlement id), and those rows are the count. */
+export const REFUND_OWED_MAX_ATTEMPTS = 5;
+export const REFUND_OWED_FAILED_ACTION = "credit:refund_owed_failed";
+/** I39-FX-MONEY (D-1164): the audit row written in the same batch as a released claim (item_id = the settlement id;
+ * detail = the createStripeRefund outcome, `not_sent` or `refused`). */
+export const REFUND_OWED_RELEASED_ACTION = "credit:refund_owed_released";
+/** I38-REFUNDSIG: the audit row a successful payer refund writes in the same batch as its status change (item_id = the
+ * settlement id; detail = the new status, rail, gross_cents, credits, and the credit purchase when one exists). */
+export const REFUND_OWED_REFUNDED_ACTION = "credit:refund_owed_refunded";
+/** OPEN-ROWS B2 (D-1064(11), D-1070(2)): the rails whose `refund_owed` rows refundOwedStripe refunds by itself. Its
+ * SELECT and UPDATE bind these, and settlement-refusals.ts `by_hand` reads the same constant, so a rail added here is
+ * paid and labelled together. */
+export const PAYER_REFUND_RAILS: readonly ("stripe" | "apple" | "google" | "crypto")[] = ["stripe"];
+
+/**
+ * I4-Q7: refund every `refund_owed` settlement on the STRIPE rail (createStripeRefund) and mark it `refunded`
+ * (resolved_at = now), guarded on it still being `refund_owed`. A Stripe failure leaves the row owed, logs and writes one
+ * REFUND_OWED_FAILED_ACTION audit row; a row with REFUND_OWED_MAX_ATTEMPTS of them is parked (not selected), and rows are
+ * taken fewest failures first, so rows Stripe keeps refusing never starve a newer one (D-1037(5)). Apple, Google and
+ * crypto rows are never selected: those refunds stay manual. Cron (scheduled()).
+ *
+ * I39-CREDITS (D-1158 answer 1; W0 amendment 1): before the POST the row is CLAIMED (`refund_claimed_at`, 0275) in a
+ * committed conditional write, and the POST runs only when that write matched the row (still `refund_owed` after the
+ * cancel below ran in the same batch). grantCredits cancels only an owed row that is NOT
+ * claimed, so the claim and the cancel are the only exits from "owed and unclaimed" and exclude each other inside D1.
+ * An unclaimed owed row whose settlement already has a purchase is cancelled here instead (same batch, one
+ * REFUND_OWED_CANCELLED_ACTION row) and never POSTed. The claim of a row read unclaimed binds `refund_claimed_at IS NULL`
+ * and the retry of a claimed row binds the claim time it read, so two runs cannot both claim one row.
+ * I39-FX-MONEY (D-1164): when this attempt made the claim and createStripeRefund answers `not_sent` or `refused` (no
+ * refund was created), the claim is released in one batch (`refund_claimed_at = NULL` guarded on this claim time and
+ * `refund_owed`, then one REFUND_OWED_RELEASED_ACTION row gated on changes()), so a later grant can cancel the row. An
+ * `unknown` answer, or a claim an earlier attempt made, stays owed and claimed and is retried with the same
+ * Idempotency-Key until Stripe answers or the row parks. Every failed attempt still writes one REFUND_OWED_FAILED_ACTION row.
+ *
+ * I31-FX-TCMONEY (fidelity-suite every-IN-builder census): both `rail IN (...)` statements loop over
+ * `inChunks(PAYER_REFUND_RAILS, 2)` (each binds 2 values beside the list). The read takes up to `limit` rows per chunk and
+ * keeps the `limit` with the fewest failures, oldest first, across all chunks: the one ORDER BY the single statement had.
+ */
+export async function refundOwedStripe(
+  db: DbLike,
+  cfg: StripeConfig,
+  fetchImpl: typeof fetch = fetch,
+  now: () => string = () => new Date().toISOString(),
+  limit: number = REFUND_OWED_BATCH,
+): Promise<{ refunded: number; failed: number }> {
+  const owed: { external_txn_id: string; failures: number; at: string; refund_claimed_at: string | null }[] = [];
+  for (const chunk of inChunks(PAYER_REFUND_RAILS, 2)) {
+    const { results: part } = await db
+      .prepare(
+        `SELECT external_txn_id, failures, at, refund_claimed_at FROM (SELECT external_txn_id, at, refund_claimed_at, (SELECT COUNT(*) FROM audit_log a WHERE a.item_id = credit_settlement_refusals.external_txn_id AND a.action = '${REFUND_OWED_FAILED_ACTION}') AS failures
+           FROM credit_settlement_refusals WHERE rail IN (${chunk.map(() => "?").join(", ")}) AND status = 'refund_owed') WHERE failures < ? ORDER BY failures, at LIMIT ?`,
+      )
+      .bind(...chunk, REFUND_OWED_MAX_ATTEMPTS, limit)
+      .all<{ external_txn_id: string; failures: number; at: string; refund_claimed_at: string | null }>();
+    owed.push(...part);
+  }
+  const results = owed.sort((a, b) => a.failures - b.failures || (a.at < b.at ? -1 : a.at > b.at ? 1 : 0)).slice(0, limit);
+  const out = { refunded: 0, failed: 0 };
+  for (const { external_txn_id, failures, refund_claimed_at: readClaim } of results) {
+    let claimed = 0;
+    const claimAt = now();
+    for (const chunk of inChunks(PAYER_REFUND_RAILS, 2)) {
+      const ph = chunk.map(() => "?").join(", ");
+      const purchased = "EXISTS (SELECT 1 FROM credit_purchases p WHERE p.rail = credit_settlement_refusals.rail AND p.external_txn_id = credit_settlement_refusals.external_txn_id)";
+      // the cancel first (an unclaimed owed row whose settlement already has a purchase), its audit row gated on
+      // changes() directly after it, then the claim: every row still owed after the cancel is claimed or unpurchased.
+      const [, , c] = (await db.batch([
+        db
+          .prepare(
+            `UPDATE credit_settlement_refusals SET status = 'credited_after_lift', refund_cancelled_at = ?, resolved_at = ? WHERE external_txn_id = ? AND rail IN (${ph}) AND status = 'refund_owed' AND refund_claimed_at IS NULL AND ${purchased}`,
+          )
+          .bind(claimAt, claimAt, external_txn_id, ...chunk),
+        db
+          .prepare(
+            "INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT 'system:refund_owed', ?, s.status || ' rail=' || s.rail || ' gross_cents=' || s.gross_cents || ' credits=' || s.credits || COALESCE(' purchase=' || (SELECT p.purchase_id FROM credit_purchases p WHERE p.rail = s.rail AND p.external_txn_id = s.external_txn_id), ''), ?, s.external_txn_id, 'system' FROM credit_settlement_refusals s WHERE s.external_txn_id = ? AND changes() = 1",
+          )
+          .bind(REFUND_OWED_CANCELLED_ACTION, claimAt, external_txn_id),
+        db
+          .prepare(`UPDATE credit_settlement_refusals SET refund_claimed_at = COALESCE(refund_claimed_at, ?) WHERE external_txn_id = ? AND rail IN (${ph}) AND status = 'refund_owed' AND refund_claimed_at IS ?`)
+          .bind(claimAt, external_txn_id, ...chunk, readClaim),
+      ])) as { meta?: { changes?: number } }[];
+      claimed += c?.meta?.changes ?? 0;
+    }
+    if (claimed === 0) continue;
+    const outcome = await createStripeRefund(cfg, external_txn_id, fetchImpl);
+    if (outcome === "refunded") {
+      const resolvedAt = now();
+      for (const chunk of inChunks(PAYER_REFUND_RAILS, 2)) {
+        // I38-REFUNDSIG: a settlement that also has a credit_purchases row (granted after a lift) is marked
+        // credited_after_lift instead of refunded; the audit row is written only when this UPDATE changed the row.
+        const [r] = (await db.batch([
+          db
+            .prepare(
+              `UPDATE credit_settlement_refusals SET status = CASE WHEN EXISTS (SELECT 1 FROM credit_purchases p WHERE p.rail = credit_settlement_refusals.rail AND p.external_txn_id = credit_settlement_refusals.external_txn_id) THEN 'credited_after_lift' ELSE 'refunded' END, resolved_at = ? WHERE external_txn_id = ? AND rail IN (${chunk.map(() => "?").join(", ")}) AND status = 'refund_owed'`,
+            )
+            .bind(resolvedAt, external_txn_id, ...chunk),
+          db
+            .prepare(
+              "INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT 'system:refund_owed', ?, s.status || ' rail=' || s.rail || ' gross_cents=' || s.gross_cents || ' credits=' || s.credits || COALESCE(' purchase=' || (SELECT p.purchase_id FROM credit_purchases p WHERE p.rail = s.rail AND p.external_txn_id = s.external_txn_id), ''), ?, s.external_txn_id, 'system' FROM credit_settlement_refusals s WHERE s.external_txn_id = ? AND changes() = 1",
+            )
+            .bind(REFUND_OWED_REFUNDED_ACTION, resolvedAt, external_txn_id),
+        ])) as { meta?: { changes?: number } }[];
+        out.refunded += r?.meta?.changes ?? 0;
+      }
+    } else {
+      out.failed += 1;
+      const n = failures + 1;
+      const parked = n >= REFUND_OWED_MAX_ATTEMPTS;
+      logError({ cid: crypto.randomUUID(), hop: "cron", msg: parked ? "credit settlement refund parked for an operator; the row stays refund_owed" : "credit settlement refund failed; the row stays refund_owed", err: "stripe_refund_failed" });
+      if (readClaim === null && (outcome === "not_sent" || outcome === "refused")) {
+        try {
+          for (const chunk of inChunks(PAYER_REFUND_RAILS, 2)) {
+            await db.batch([
+              db
+                .prepare(`UPDATE credit_settlement_refusals SET refund_claimed_at = NULL WHERE external_txn_id = ? AND rail IN (${chunk.map(() => "?").join(", ")}) AND status = 'refund_owed' AND refund_claimed_at = ?`)
+                .bind(external_txn_id, ...chunk, claimAt),
+              db
+                .prepare("INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT 'system:refund_owed', ?, ?, ?, ?, 'system' WHERE changes() = 1")
+                .bind(REFUND_OWED_RELEASED_ACTION, outcome, now(), external_txn_id),
+            ]);
+          }
+        } catch {
+          // an unwritable release leaves the row claimed (retried next tick with the same Idempotency-Key)
+        }
+      }
+      try {
+        await db
+          .prepare("INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) VALUES ('system:refund_owed', ?, ?, ?, ?, 'system')")
+          .bind(REFUND_OWED_FAILED_ACTION, `${parked ? "parked" : "failed"} attempt=${n}`, now(), external_txn_id)
+          .run();
+      } catch {
+        // an unwritable count row leaves the row as it was (asked again next tick); the failure is already logged
+      }
+    }
+  }
+  return out;
+}
+
+/** I21-Q52 / I21-Q66 (D-1030: completed Connect onboarding before any transfer; US dollars only at launch): what
+ * Stripe says of a connected account, or null on a malformed id, a failed or unreadable answer, or the deadline. */
+export interface ConnectAccountState {
+  details_submitted: boolean;
+  payouts_enabled: boolean;
+  default_currency: string | null;
+}
+
+/** I21-Q52 / I21-Q66: GET /v1/accounts/<id> (I29-PAYOUT gates a transfer on it). */
+export async function getConnectAccount(cfg: ConnectConfig, accountId: string, fetchImpl: typeof fetch = fetch): Promise<ConnectAccountState | null> {
+  if (!/^acct_[A-Za-z0-9]+$/.test(accountId)) return null;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), TRANSFER_TIMEOUT_MS);
+  try {
+    const res = await fetchImpl(`${cfg.apiBase}/v1/accounts/${encodeURIComponent(accountId)}`, {
+      redirect: "manual",
+      method: "GET",
+      headers: { authorization: `Bearer ${cfg.secretKey}` },
+      signal: ctl.signal,
+    });
+    if (!res.ok) return null;
+    const j = (await res.json()) as { details_submitted?: unknown; payouts_enabled?: unknown; default_currency?: unknown };
+    if (typeof j.details_submitted !== "boolean" || typeof j.payouts_enabled !== "boolean") return null;
+    const cur = typeof j.default_currency === "string" && /^[a-z]{3}$/.test(j.default_currency) ? j.default_currency : null;
+    return { details_submitted: j.details_submitted, payouts_enabled: j.payouts_enabled, default_currency: cur };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+===== END FILE: services/trust-core/src/stripe.ts =====
+
+===== BEGIN FILE: services/trust-core/src/subject-seal.ts =====
+/**
+ * The SUBJECT SEAL shared by the payment rails (I3-1037 crypto rail; #747
+ * Stripe). A rail that must hand a processor something to name the payer by
+ * hands it an opaque AES-256-GCM token instead of the raw account id, and opens
+ * it again when the processor's signed webhook echoes it back.
+ *
+ * Token: `prefix` + base64url(iv(12) || ciphertext+tag).
+ *
+ * THE KEY (D-0855(1), I5-FX4-SEAL): `SUBJECT_SEAL_KEY`, a server-only secret
+ * no processor holds (`subjectSealKeys`). It was the rail's own webhook secret
+ * until D-0855 — a secret the processor issues and can read, so the seal hid
+ * nothing from the one party it is shown to. Each rail derives its AES key
+ * bytes itself as HMAC-SHA256(SUBJECT_SEAL_KEY, <its own label>) — in its own
+ * file, which is where the single-hasher guard's KEYED_MAC_ORIGINS names the
+ * keyed MAC (`scripts/invariant-setup.mjs`). This module makes no MAC and no
+ * digest; it never hashes a subject.
+ *
+ * `openSubject` returns the PLAINTEXT or null; the caller decides which id
+ * shapes it accepts (the crypto rail `acc_` only, Stripe `acc_`/`psp_`).
+ */
+
+type KeyBytes = ArrayBuffer | Uint8Array;
+
+const b64u = (b: Uint8Array): string => btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64u = (s: string): Uint8Array | null => {
+  if (!/^[A-Za-z0-9_-]+$/.test(s)) return null;
+  try {
+    return Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+  } catch {
+    return null;
+  }
+};
+
+async function aesKey(keyBytes: KeyBytes): Promise<Awaited<ReturnType<typeof crypto.subtle.importKey>>> {
+  // D-1061(6): typed for the DOM lib too (apps/web compiles this file, I30 0ae7c56/be3f275); the bytes are ArrayBuffer-backed.
+  return crypto.subtle.importKey("raw", keyBytes as ArrayBuffer | Uint8Array<ArrayBuffer>, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+}
+
+/** Seal `id` under `keyBytes`. A fresh random IV unless the caller gives one (a synthetic IV makes the token deterministic). */
+export async function sealSubject(id: string, keyBytes: KeyBytes, prefix: string, iv: Uint8Array = crypto.getRandomValues(new Uint8Array(12))): Promise<string> {
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv as Uint8Array<ArrayBuffer> }, await aesKey(keyBytes), new TextEncoder().encode(id)));
+  const out = new Uint8Array(iv.length + ct.length);
+  out.set(iv);
+  out.set(ct, iv.length);
+  return prefix + b64u(out);
+}
+
+/** Open a sealed subject: its plaintext, or null unless it carries `prefix` and authenticates under `keyBytes`. */
+export async function openSubject(token: string, keyBytes: KeyBytes, prefix: string): Promise<string | null> {
+  if (typeof token !== "string" || !token.startsWith(prefix) || token.length > 256) return null;
+  const bytes = unb64u(token.slice(prefix.length));
+  if (!bytes || bytes.length <= 12 + 16) return null;
+  try {
+    const pt = await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12) }, await aesKey(keyBytes), bytes.slice(12));
+    return new TextDecoder().decode(pt);
+  } catch {
+    return null;
+  }
+}
+
+/** D-0855(1): the floor on `SUBJECT_SEAL_KEY` (and each PREVIOUS entry), in UTF-8 bytes. */
+export const SUBJECT_SEAL_KEY_MIN_BYTES = 32;
+
+/** The seal keys: `current` seals and opens; each `previous` entry only ever OPENS (rotation). */
+export interface SubjectSealKeys {
+  current: string;
+  previous: string[];
+}
+
+const usableSealKey = (v: unknown): v is string =>
+  typeof v === "string" && v.trim() === v && !/TODO|CHANGEME|PLACEHOLDER/i.test(v) && new TextEncoder().encode(v).length >= SUBJECT_SEAL_KEY_MIN_BYTES;
+
+/**
+ * `SUBJECT_SEAL_KEY` (required; null when absent, a placeholder, or under
+ * SUBJECT_SEAL_KEY_MIN_BYTES → no checkout is created and no sealed subject is
+ * attributed) and the optional comma-separated `SUBJECT_SEAL_KEY_PREVIOUS`
+ * (entries trimmed; unusable ones, duplicates and the current key dropped;
+ * order kept).
+ */
+export function subjectSealKeys(env: Record<string, unknown> | undefined): SubjectSealKeys | null {
+  const current = env?.SUBJECT_SEAL_KEY;
+  if (!usableSealKey(current)) return null;
+  const previous: string[] = [];
+  const raw = env?.SUBJECT_SEAL_KEY_PREVIOUS;
+  if (typeof raw === "string") {
+    for (const part of raw.split(",")) {
+      const k = part.trim();
+      if (usableSealKey(k) && k !== current && !previous.includes(k)) previous.push(k);
+    }
+  }
+  return { current, previous };
+}
+
+/** The opener list for a rail: a bare key string is `[key]`; null is `[]` (nothing opens). */
+export function sealKeyList(keys: SubjectSealKeys | string | null | undefined): string[] {
+  if (keys === null || keys === undefined) return [];
+  return typeof keys === "string" ? [keys] : [keys.current, ...keys.previous];
+}
+===== END FILE: services/trust-core/src/subject-seal.ts =====
+
+===== BEGIN FILE: services/trust-core/src/supporter-status.ts =====
+import type { DbLike } from "./db.js";
+
+/**
+ * Active-supporter status (DIRECTION.md Cluster D) — a CREATOR-FACING, derive-
+ * from-log signal, never a fan-facing badge. It is computed on demand from the
+ * reverse-code log (claims + redemptions), so there is no stored state to keep
+ * in sync and no new ledger event type / fold column.
+ *
+ * Per (fan, creator), within a rolling recency window (the "decays if quiet"):
+ *   - 'core'   — the fan claimed a code the creator later MARKED REDEEMED (a
+ *                real conversion — a supporter actually bought) recently.
+ *   - 'active' — the fan claimed a code recently (engaged; conversion unconfirmed).
+ *   - 'none'   — no recent activity (aged out of the window, or never a supporter).
+ *
+ * Redemption recency is measured by `redeemed_at` (when the creator confirmed the
+ * conversion), claim recency by `claimed_at`. A conversion counts as 'core' even
+ * if the underlying claim itself is old — converting is the stronger signal.
+ *
+ * Uses ONLY the attributable channel: reverse_code_claims ties an account to a
+ * code, and that code's redeemed_at is the conversion. A code handed out
+ * off-platform and redeemed WITHOUT a Dhwaja claim isn't attributable to any
+ * account, so it never counts toward a fan's status (correct — we don't know who).
+ */
+
+export const SUPPORTER_TIERS = ["active", "core"] as const;
+export type SupporterTier = (typeof SUPPORTER_TIERS)[number];
+export type SupporterStatus = "none" | SupporterTier;
+
+/** How long activity keeps a fan "active" before it decays to none. */
+export const ACTIVE_WINDOW_DAYS = 90;
+const DAY_MS = 86_400_000;
+
+/**
+ * Sybil resistance (anti-inflation): a claim counts toward a supporter tier ONLY
+ * if the claiming account is CURRENTLY at least this old. A fresh throwaway fleet
+ * (each account saves + claims for free) therefore contributes nothing until every
+ * account has aged a week — killing instant fake "supporter" social proof and, via
+ * the same `supporterTier`, stopping a fresh Sybil from unlocking a
+ * `min_supporter_tier`-gated pool. Age is measured AT NOW, not at claim time, so a
+ * real new fan's claim starts counting once their account is established — it is
+ * never permanently penalized (de-weight, never deny; the code is still dispensed).
+ * NOTE: with a per-account (not per-IP) claim throttle this raises the cost of
+ * inflation but does not stop a patient attacker who ages accounts — an accepted,
+ * documented limit.
+ */
+export const SUPPORTER_MIN_ACCOUNT_AGE_DAYS = 7;
+
+const RANK: Record<SupporterStatus, number> = { none: 0, active: 1, core: 2 };
+
+/** Does an actual status satisfy a required minimum tier? (ordinal compare) */
+export function meetsTier(actual: SupporterStatus, required: SupporterTier): boolean {
+  return RANK[actual] >= RANK[required];
+}
+
+function cutoffIso(nowMs: number): string {
+  return new Date(nowMs - ACTIVE_WINDOW_DAYS * DAY_MS).toISOString();
+}
+
+/** The account must have been created on or before this instant to count. A row
+ * whose `created_at` is NULL or in the future fails the `<=` and so does NOT count
+ * (fail-safe: an unknown-age account is treated as too new, never as established). */
+function ageCutoffIso(nowMs: number): string {
+  return new Date(nowMs - SUPPORTER_MIN_ACCOUNT_AGE_DAYS * DAY_MS).toISOString();
+}
+
+/**
+ * A fan's active-supporter tier for one creator, as of `nowMs`. Read-only,
+ * derived. 'core' (recent conversion) is checked first, then 'active' (recent
+ * claim); neither → 'none'.
+ *
+ * CO-07 — CONVERSION ATTRIBUTION IS EXPLICIT: `c.redeemed_at >= k.claimed_at`.
+ * The join is claim→code→redemption, and without that predicate ANY redemption
+ * inside the window counted for whoever ended up holding the claim on that
+ * code — including one the creator had already fulfilled BEFORE this fan was
+ * ever allocated it. That is not a hypothetical ordering: it is exactly what
+ * the unguarded allocator above could produce, and `core` standing is an input
+ * to further eligibility gates (`min_supporter_tier`), so a misattributed
+ * conversion bought real access. A legitimate conversion is always at or after
+ * the claim it converts, so the predicate costs nothing correct. Applied to the
+ * aggregate `active`/`core` counts too, so the creator's supporter numbers and
+ * the per-fan tier answer the same question.
+ */
+export async function supporterTier(db: DbLike, accountId: string, passportId: string, nowMs: number): Promise<SupporterStatus> {
+  const cutoff = cutoffIso(nowMs);
+  const ageCutoff = ageCutoffIso(nowMs);
+  // Sybil gate everywhere: JOIN accounts + require created_at <= ageCutoff, so a
+  // too-new (or unknown-age) account's claim never reaches a tier.
+  // A recent CONVERSION: a claim by this fan on this creator whose code the
+  // creator marked redeemed within the window. Strongest signal → 'core'.
+  const converted = await db
+    .prepare(
+      `SELECT 1 AS x
+         FROM reverse_code_claims k
+         JOIN reverse_code_pools p ON p.pool_id = k.pool_id
+         JOIN reverse_codes c ON c.code_id = k.code_id
+         JOIN accounts a ON a.account_id = k.account_id
+        WHERE k.account_id = ? AND p.passport_id = ?
+          AND c.redeemed_at IS NOT NULL AND c.redeemed_at >= ?
+          AND c.redeemed_at >= k.claimed_at
+          AND a.created_at <= ?
+        LIMIT 1`,
+    )
+    .bind(accountId, passportId, cutoff, ageCutoff)
+    .first();
+  if (converted) return "core";
+  // A recent CLAIM (engagement, conversion unconfirmed) → 'active'.
+  const claimed = await db
+    .prepare(
+      `SELECT 1 AS x
+         FROM reverse_code_claims k
+         JOIN reverse_code_pools p ON p.pool_id = k.pool_id
+         JOIN accounts a ON a.account_id = k.account_id
+        WHERE k.account_id = ? AND p.passport_id = ? AND k.claimed_at >= ?
+          AND a.created_at <= ?
+        LIMIT 1`,
+    )
+    .bind(accountId, passportId, cutoff, ageCutoff)
+    .first();
+  return claimed ? "active" : "none";
+}
+
+/** The three served counts, outermost first: core ⊆ active ⊆ total_supporters. */
+export const SUPPORTER_COUNTS = ["total_supporters", "active", "core"] as const;
+export type SupporterCount = (typeof SUPPORTER_COUNTS)[number];
+
+/**
+ * I23 (I3-0816 a, D-0993(1)): the platform floor these creator-private counts are
+ * held to (INV-004: creator-private counts are k-floored) — `intelligence.ts`
+ * `K_ANONYMITY_FLOOR`, restated here because importing it pulls the
+ * intelligence module's graph into the claim path; `test/i23-supporter-stats-floor.test.ts`
+ * asserts the two are equal.
+ */
+export const SUPPORTER_STATS_FLOOR = 5;
+
+export interface SupporterStats {
+  total_supporters: number | null; // distinct accounts that have EVER claimed a code from this creator; null = withheld
+  active: number | null; // distinct accounts with any activity in the window (superset of core); null = withheld
+  core: number | null; // distinct accounts with a recent conversion (subset of active); null = withheld
+  window_days: number; // the decay window, so the numbers are self-describing
+  withheld: SupporterCount[]; // the counts served as null, in SUPPORTER_COUNTS order
+}
+
+/**
+ * I23 (I3-0816 a): the floor, applied to a NESTED chain. A count below the floor is
+ * withheld; then, because the reader can subtract nested counts it holds, a served
+ * inner count whose gap to the nearest served outer one is 0 < gap < floor goes
+ * too (total 7, active 5 would name 2 lapsed supporters). Repeated to a fixed point;
+ * the choice reads the values' order only through the chain, never a raw count.
+ */
+export function floorSupporterCounts(raw: Readonly<Record<SupporterCount, number>>, floor: number = SUPPORTER_STATS_FLOOR): Pick<SupporterStats, SupporterCount | "withheld"> {
+  const served = new Set<SupporterCount>(SUPPORTER_COUNTS.filter((k) => raw[k] >= floor));
+  for (let changed = true; changed; ) {
+    changed = false;
+    const chain = SUPPORTER_COUNTS.filter((k) => served.has(k));
+    for (let i = 1; i < chain.length; i++) {
+      const gap = raw[chain[i - 1] as SupporterCount] - raw[chain[i] as SupporterCount];
+      if (gap > 0 && gap < floor) {
+        served.delete(chain[i] as SupporterCount);
+        changed = true;
+        break;
+      }
+    }
+  }
+  const v = (k: SupporterCount): number | null => (served.has(k) ? raw[k] : null);
+  return { total_supporters: v("total_supporters"), active: v("active"), core: v("core"), withheld: SUPPORTER_COUNTS.filter((k) => !served.has(k)) };
+}
+
+/**
+ * Creator-facing AGGREGATE stats — counts only, never fan identities (privacy
+ * stance: like intelligence.ts, no per-fan roster). `active` counts any account
+ * with a claim OR a conversion in the window, so active >= core always holds. I23 (I3-0816 a): every count is floored (`floorSupporterCounts`); a withheld one is null and named in `withheld`.
+ * I24 (I3-0816 a, JN-03): the counts are taken AS OF the start of the current UTC day (`asOf`), so every read within
+ * one day returns the same numbers and two reads cannot be differenced to see one supporter lapse, join, age in or
+ * convert; a change shows at the next day boundary. D-1004(6) (I24-FX, JN-03): `total_supporters` also holds across an
+ * ERASURE within the day — a fan the day's count included and who was erased today is still counted, from the claim
+ * tombstone erasure writes (account_data.ts, migration 0080), until the next day. `active` and `core` across an erasure
+ * stay Jason's (D-1003(4)).
+ */
+export async function supporterStats(db: DbLike, passportId: string, nowMs: number): Promise<SupporterStats> {
+  const asOf = Math.floor(nowMs / DAY_MS) * DAY_MS;
+  return { ...floorSupporterCounts(await supporterDaySnapshot(db, passportId, asOf, nowMs)), window_days: ACTIVE_WINDOW_DAYS };
+}
+
+/**
+ * I24-Q1 (D-1030, Jason: "(a) yes, keep snapshots 90 days"): the day's three unfloored counts are STORED by the first
+ * read of the UTC day (`supporter_day_snapshots`, 0246) and every later read that day serves the stored row, so an
+ * erasure during the day moves neither `active` nor `core` (the live JOIN on accounts no longer sees an erased fan).
+ * INSERT OR IGNORE then read: two concurrent first reads compute the same as-of-day counts and the row that lands is
+ * the one both serve.
+ */
+async function supporterDaySnapshot(db: DbLike, passportId: string, asOf: number, nowMs: number): Promise<Record<SupporterCount, number>> {
+  const day = new Date(asOf).toISOString().slice(0, 10);
+  const read = () =>
+    db
+      .prepare("SELECT total_supporters, active, core FROM supporter_day_snapshots WHERE passport_id = ? AND day = ?")
+      .bind(passportId, day)
+      .first<Record<SupporterCount, number>>();
+  const pick = (r: Record<SupporterCount, number>) => ({ total_supporters: r.total_supporters, active: r.active, core: r.core });
+  // A skip-read (ADR-0003 §11): it saves the three counts; the INSERT OR IGNORE and the re-read below decide.
+  const stored = await read();
+  if (stored) return pick(stored);
+  const raw = await supporterCountsRaw(db, passportId, asOf);
+  await db
+    .prepare("INSERT OR IGNORE INTO supporter_day_snapshots (passport_id, day, total_supporters, active, core, created_at) VALUES (?, ?, ?, ?, ?, ?)")
+    .bind(passportId, day, raw.total_supporters, raw.active, raw.core, new Date(nowMs).toISOString())
+    .run();
+  const landed = await read();
+  if (!landed) throw new Error("supporter_day_snapshots: the day's row did not land");
+  return pick(landed);
+}
+
+/** I24-Q1: supporter day snapshots are kept this many days. */
+export const SUPPORTER_SNAPSHOT_RETENTION_DAYS = 90;
+
+/** I24-Q1: delete snapshots of days more than 90 days before `nowMs`'s UTC day (a `scheduled()` step, wired by
+ * I29-INT). One statement; the population is one row per creator read per day, so 90 days bound it. */
+export async function pruneSupporterSnapshots(db: DbLike, nowMs: number = Date.now()): Promise<number> {
+  const cutoffDay = new Date(Math.floor(nowMs / DAY_MS) * DAY_MS - SUPPORTER_SNAPSHOT_RETENTION_DAYS * DAY_MS).toISOString().slice(0, 10);
+  return (await db.prepare("DELETE FROM supporter_day_snapshots WHERE day < ?").bind(cutoffDay).run()).changes;
+}
+
+/**
+ * The three UNFLOORED counts `supporterStats` floors. NEVER SERVED: its only
+ * production caller is `supporterStats` above (I23, I3-0816 a); tests read it to
+ * pin the counting rules (window, Sybil age gate, distinctness) apart from the floor.
+ */
+export async function supporterCountsRaw(db: DbLike, passportId: string, nowMs: number): Promise<Record<SupporterCount, number>> {
+  const cutoff = cutoffIso(nowMs);
+  const ageCutoff = ageCutoffIso(nowMs);
+  // I24 (I3-0816 a): counted AS OF `nowMs` — a claim or redemption recorded after it is not yet counted.
+  const asOf = new Date(nowMs).toISOString();
+  // Every count JOINs accounts + requires created_at <= ageCutoff (Sybil gate), so
+  // a fresh throwaway fleet inflates none of total/active/core until it ages in.
+  const total = await db
+    .prepare(
+      `SELECT COUNT(DISTINCT k.account_id) AS n
+         FROM reverse_code_claims k
+         JOIN reverse_code_pools p ON p.pool_id = k.pool_id
+         JOIN accounts a ON a.account_id = k.account_id
+        WHERE p.passport_id = ? AND a.created_at <= ? AND k.claimed_at <= ?`,
+    )
+    .bind(passportId, ageCutoff, asOf)
+    .first<{ n: number }>();
+  const active = await db
+    .prepare(
+      `SELECT COUNT(DISTINCT k.account_id) AS n
+         FROM reverse_code_claims k
+         JOIN reverse_code_pools p ON p.pool_id = k.pool_id
+         JOIN accounts a ON a.account_id = k.account_id
+         LEFT JOIN reverse_codes c ON c.code_id = k.code_id
+        WHERE p.passport_id = ? AND a.created_at <= ? AND k.claimed_at <= ?
+          AND (k.claimed_at >= ? OR (c.redeemed_at IS NOT NULL AND c.redeemed_at >= ? AND c.redeemed_at <= ? AND c.redeemed_at >= k.claimed_at))`,
+    )
+    .bind(passportId, ageCutoff, asOf, cutoff, cutoff, asOf)
+    .first<{ n: number }>();
+  const core = await db
+    .prepare(
+      `SELECT COUNT(DISTINCT k.account_id) AS n
+         FROM reverse_code_claims k
+         JOIN reverse_code_pools p ON p.pool_id = k.pool_id
+         JOIN reverse_codes c ON c.code_id = k.code_id
+         JOIN accounts a ON a.account_id = k.account_id
+        WHERE p.passport_id = ? AND c.redeemed_at IS NOT NULL AND c.redeemed_at >= ? AND c.redeemed_at <= ?
+          AND c.redeemed_at >= k.claimed_at
+          AND a.created_at <= ?`,
+    )
+    .bind(passportId, cutoff, asOf, ageCutoff)
+    .first<{ n: number }>();
+  // D-1004(6): fans this read would have counted (`created_day` < the read's day: the live predicate's first day, folded
+  // at erasure) who were erased on or after that day — the live JOIN on accounts no longer sees them (analytics-read.ts
+  // supporters_total reads the same rows the same way). The two halves never overlap: erasure re-keys the claim.
+  const day = asOf.slice(0, 10);
+  const tomb = await db
+    .prepare("SELECT COUNT(*) AS n FROM reverse_code_claim_tombstones WHERE passport_id = ? AND created_day < ? AND erased_day >= ?")
+    .bind(passportId, day, day)
+    .first<{ n: number }>();
+  return { total_supporters: (total?.n ?? 0) + (tomb?.n ?? 0), active: active?.n ?? 0, core: core?.n ?? 0 };
+}
+===== END FILE: services/trust-core/src/supporter-status.ts =====
+
+===== BEGIN FILE: services/trust-core/src/taxonomy.ts =====
+import type { DbLike, DbStatement } from "./db.js";
+
+/**
+ * S80 — creator taxonomy + profile metadata.
+ *
+ * A small VERSIONED vocabulary of top-level creator categories, plus optional
+ * secondary tags, language, and region. Creator-self-set (operator can
+ * override); stored in the non-ledger `passport_profile` table. The vocabulary
+ * is a pinned server-side constant so categories can be added/renamed without a
+ * migration — clients read it from `GET /taxonomy` and never hardcode the list.
+ */
+
+export const TAXONOMY_VERSION = "2026-08-11";
+
+/** Top-level categories (the controlled set). Extend by appending — never
+ * repurpose an existing key, or historical assignments would silently shift. */
+export const CATEGORIES = [
+  "music",
+  "streaming_gaming",
+  "art_illustration",
+  "writing",
+  "video_film",
+  "podcast",
+  "photography",
+  "fashion_beauty",
+  "fitness_health",
+  "education",
+  "comedy",
+  "news_commentary",
+  "tech",
+  "food_cooking",
+  "adult",
+  "brand_business",
+  "other",
+] as const;
+
+export type Category = (typeof CATEGORIES)[number];
+
+/** Human labels for display (clients may localize; these are the defaults). */
+export const CATEGORY_LABELS: Record<Category, string> = {
+  music: "Music",
+  streaming_gaming: "Streaming/Gaming",
+  art_illustration: "Art/Illustration",
+  writing: "Writing",
+  video_film: "Video/Film",
+  podcast: "Podcast",
+  photography: "Photography",
+  fashion_beauty: "Fashion/Beauty",
+  fitness_health: "Fitness/Health",
+  education: "Education",
+  comedy: "Comedy",
+  news_commentary: "News/Commentary",
+  tech: "Tech",
+  food_cooking: "Food/Cooking",
+  adult: "Adult",
+  brand_business: "Brand/Business",
+  other: "Other",
+};
+
+/**
+ * CONSENT-GATED categories (M5). Publishing one of these ABOUT SOMEONE WHO HAS
+ * NOT CLAIMED their listing is an outing vector, not a discovery aid: the label
+ * is reachable from the handle alone (`/is/:platform/:handle` → passport id →
+ * `/p/:id/profile-meta`), so a seeded, non-consenting creator would be tagged
+ * in public BY US. Operator-only bookkeeping (a required source note) removes
+ * exactly zero public exposure, so the rule has to be a REFUSAL, not a paper
+ * trail.
+ *
+ * The stance, the same consent-by-claim principle M4 applied to indexability:
+ * we will LIST an adult creator so a fan can check whether an account is really
+ * them — that is the protective function, and it needs no label — but we will
+ * not publish the label that outs them until they claim and set it themselves.
+ */
+export const CONSENT_REQUIRED_CATEGORIES: ReadonlySet<Category> = new Set<Category>(["adult"]);
+
+export const MAX_SECONDARY = 3;
+const CATEGORY_SET: ReadonlySet<string> = new Set(CATEGORIES);
+/** BCP-47-shaped language tag: a 2-3 letter primary subtag (ISO 639-1 or
+ * 639-2/3, so `pcm`, `ceb`, `hil`, `ilo` are valid), an optional 4-letter
+ * script subtag (`Hans`, `Hant`, `Latn`), an optional region subtag (2
+ * letters or 3 digits) — covers `pt-BR` and `zh-Hans` that a bare 639-1 code
+ * cannot. Exported so a read-side consumer (e.g. rankings.ts, which
+ * currently keeps its OWN copy of the old 2-letter-only regex — F-53) can
+ * import this instead of re-deriving the rule and drifting from it again. */
+export const LANGUAGE_TAG_RE = /^([a-z]{2,3})(?:-([a-z]{4}))?(?:-([a-z]{2}|\d{3}))?$/i;
+
+/** Validate + normalize a BCP-47-shaped tag (see `LANGUAGE_TAG_RE`). Returns
+ * `null` on no match; canonicalizes casing (primary lower, script Title,
+ * region upper / digits as-is) on match. */
+export function normalizeLanguageTag(input: string): string | null {
+  const m = LANGUAGE_TAG_RE.exec(input);
+  if (!m) return null;
+  const primary = m[1]!.toLowerCase();
+  const script = m[2] ? m[2][0]!.toUpperCase() + m[2].slice(1).toLowerCase() : null;
+  const region = m[3] ? (/^\d{3}$/.test(m[3]) ? m[3] : m[3].toUpperCase()) : null;
+  return [primary, script, region].filter((x): x is string => x !== null).join("-");
+}
+const REGION_RE = /^[A-Z]{2}$/; // ISO 3166-1 alpha-2
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+
+export function isCategory(x: unknown): x is Category {
+  return typeof x === "string" && CATEGORY_SET.has(x);
+}
+
+export class TaxonomyError extends Error {
+  override name = "TaxonomyError";
+  constructor(message: string, public readonly status: 400 | 404 = 400) {
+    super(message);
+  }
+}
+
+export interface ProfileMeta {
+  primary_category: Category | null;
+  secondary: Category[];
+  language: string | null;
+  region: string | null;
+  updated_by: string | null;
+  updated_at: string | null;
+}
+
+export interface ProfileMetaInput {
+  primary_category?: unknown;
+  secondary?: unknown;
+  language?: unknown;
+  region?: unknown;
+}
+
+/** The vocabulary payload clients render from (never hardcoded client-side). */
+export function taxonomyVocabulary(): { version: string; categories: { key: Category; label: string }[]; max_secondary: number } {
+  return {
+    version: TAXONOMY_VERSION,
+    categories: CATEGORIES.map((k) => ({ key: k, label: CATEGORY_LABELS[k] })),
+    max_secondary: MAX_SECONDARY,
+  };
+}
+
+/** Validate + normalize a metadata input. Every field is optional; a field set
+ * to null/empty clears it. Fail-closed on any out-of-vocabulary value. */
+function validate(input: ProfileMetaInput): { primary: Category | null; secondary: Category[]; language: string | null; region: string | null } {
+  const i = (input ?? {}) as ProfileMetaInput;
+
+  let primary: Category | null = null;
+  if (i.primary_category !== undefined && i.primary_category !== null && i.primary_category !== "") {
+    if (!isCategory(i.primary_category)) throw new TaxonomyError("unknown primary_category");
+    primary = i.primary_category;
+  }
+
+  let secondary: Category[] = [];
+  if (i.secondary !== undefined && i.secondary !== null) {
+    if (!Array.isArray(i.secondary)) throw new TaxonomyError("secondary must be an array");
+    if (i.secondary.length > MAX_SECONDARY) throw new TaxonomyError(`at most ${MAX_SECONDARY} secondary categories`);
+    for (const s of i.secondary) {
+      if (!isCategory(s)) throw new TaxonomyError(`unknown secondary category: ${String(s)}`);
+      if (s === primary) throw new TaxonomyError("a secondary category cannot repeat the primary");
+      if (secondary.includes(s)) throw new TaxonomyError(`duplicate secondary category: ${s}`);
+      secondary.push(s);
+    }
+  }
+
+  let language: string | null = null;
+  if (i.language !== undefined && i.language !== null && i.language !== "") {
+    const normalized = normalizeLanguageTag(String(i.language));
+    if (normalized === null) throw new TaxonomyError("language must be a BCP-47 tag with an ISO 639-1/639-3 primary subtag (e.g. en, pcm, pt-BR, zh-Hans)");
+    language = normalized;
+  }
+
+  let region: string | null = null;
+  if (i.region !== undefined && i.region !== null && i.region !== "") {
+    const r = String(i.region).toUpperCase();
+    if (!REGION_RE.test(r)) throw new TaxonomyError("region must be an ISO 3166-1 alpha-2 code (e.g. US)");
+    region = r;
+  }
+
+  return { primary, secondary, language, region };
+}
+
+/**
+ * Read a passport's metadata (public — it's discovery-facing). Returns an
+ * empty shape (not null) so callers don't branch, but `updated_at` is null when
+ * unset.
+ *
+ * A SUPPRESSED passport reads back as that same EMPTY shape — the exact answer a
+ * passport id that never existed gets (measured gap; `removal.ts`: "SUPPRESSION
+ * IS INDISTINGUISHABLE FROM NEVER-LISTED"). `GET /p/:id/profile-meta` answers
+ * 200 with the all-null meta for a stranger's id, so 404-ing a suppressed
+ * subject would BUILD the "did this person ask to be delisted?" oracle instead
+ * of removing it; the never-listed answer for THIS route is the null meta. The
+ * facets are coarse (category / language / region) — the mildest leak in the
+ * sweep — but they are still the delisted person's self-description, and the
+ * has-facets-vs-not split alone answers "is there a real listing behind this id".
+ *
+ * WHY IN THE READER AND NOT THE ROUTE. Gating the public route alone would
+ * leave the table one accessor away from being re-exposed, so the gate rides the
+ * READ: both callers (`GET /p/:id/profile-meta` and `GET /account/profile-meta`)
+ * and every future SERVED one inherit it. The consequence is deliberate and
+ * named: a suppressed creator's OWN `/account/profile-meta` also reads empty.
+ * The row itself is untouched and `setProfileMeta` still works, so lifting the
+ * suppression restores the facets exactly.
+ *
+ * THIS IS NO LONGER THE ONLY READ PROJECTION, and the sentence that said so was
+ * true until slice 22 and is corrected here rather than left to mislead.
+ * `storedProfileMeta` (below) is a SECOND accessor, deliberately ungated on both
+ * axes, and it exists because an operator override form populated from THIS
+ * function would show "no category" over a stored one and clear it on save. It
+ * is reachable only from `GET /ops/creators/:id` — an Access-gated operator
+ * dossier that already carries payout tags, per-account proof standing and the
+ * bound operator id. The rule the old sentence was protecting still holds and is
+ * restated so the next accessor has to face it: **anything SERVED to a fan, a
+ * creator or an unauthenticated caller reads through `getProfileMeta`.** A third
+ * accessor that is not operator-gated is a bug.
+ *
+ * The gate rides the SAME statement as the read (`NOT EXISTS`), so a suppressed
+ * subject costs neither an extra round trip nor a different one — the facets are
+ * never read out of the database, and the statement count does not distinguish.
+ *
+ * THE CONSENT GATE IS ENFORCED HERE TOO, AT READ TIME, AND THAT IS THE POINT.
+ * `setProfileMeta` refuses to WRITE a consent-gated category onto an unclaimed
+ * listing, and the seed importer refuses the same. Neither of them can hold the
+ * line, because a passport can BECOME unclaimed after the label was legitimately
+ * set: `correction / downgrade_claim` returns a claimed passport to `unclaimed`
+ * and leaves `passport_profile` alone, so `/p/:id/profile-meta` served
+ * `primary_category:"adult"` on an unclaimed listing — the exact publication
+ * LISTING-POLICY.md §4.3 says cannot happen "at all", and the refusal
+ * PRIVACY.md §1.3 leans on as its Art. 9 answer (review HIGH 1).
+ *
+ * WHY READ-TIME AND NOT A FOLD EFFECT. Three reasons, in order of weight:
+ *   1. COVERAGE. `downgrade_claim` is one way into `unclaimed`, not the only
+ *      one, and the next one will be written by someone who has not read this
+ *      file. A write-time effect covers the paths that existed when it was
+ *      written; the reader covers every path there will ever be. Same argument
+ *      the suppression gate above makes for living in the reader.
+ *   2. THE LEDGER. `passport_profile` is NOT part of the fold — `fold.ts`
+ *      reproduces `passports` and `passport_accounts` and nothing else. A
+ *      correction-time side effect on this table would therefore be a state
+ *      change that the second reducer cannot reproduce and the determinism
+ *      guard cannot see: divergence with nothing watching it. Corrections
+ *      SUPERSEDE state; they do not reach sideways into non-fold tables.
+ *   3. IT IS NOT AN ERASURE. The label is not wrong, it is unpublishable while
+ *      unclaimed. Clearing the row would destroy the creator's own data over a
+ *      state change that may itself be corrected, and a re-claim would come
+ *      back blank. Left in place, re-claiming restores the category exactly —
+ *      the same "the row itself is untouched" property suppression already has.
+ * The write-time gate STAYS: it fails the operator/creator loudly at the moment
+ * of the mistake instead of silently swallowing a label that will never show.
+ *
+ * The claim state is read on the SAME statement (a join), so this costs no extra
+ * round trip either. No `passports` row → the empty shape, fail closed. A
+ * RETRACTED passport (`p.retracted = 0` in the WHERE) answers that same empty
+ * shape, like every other /p/:id reader (I3-0305).
+ */
+export async function getProfileMeta(db: DbLike, passportId: string): Promise<ProfileMeta> {
+  const empty: ProfileMeta = { primary_category: null, secondary: [], language: null, region: null, updated_by: null, updated_at: null };
+  if (!PSP_RE.test(passportId)) return empty;
+  const row = await db
+    .prepare(
+      `SELECT pp.primary_category, pp.secondary, pp.language, pp.region, pp.updated_by, pp.updated_at, p.claim_state
+         FROM passport_profile pp
+         JOIN passports p ON p.passport_id = pp.passport_id
+        WHERE pp.passport_id = ?
+          AND p.retracted = 0
+          AND NOT EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = pp.passport_id)`,
+    )
+    .bind(passportId)
+    .first<{ primary_category: string | null; secondary: string; language: string | null; region: string | null; updated_by: string; updated_at: string; claim_state: string }>();
+  if (!row) return empty;
+  let secondary: Category[] = [];
+  try {
+    const parsed = JSON.parse(row.secondary) as unknown[];
+    if (Array.isArray(parsed)) secondary = parsed.filter(isCategory);
+  } catch {
+    /* malformed → empty, never throw on a read */
+  }
+  let primary = isCategory(row.primary_category) ? row.primary_category : null;
+  // Consent-by-claim: an unclaimed listing publishes no consent-gated label,
+  // however the label got there. Fail closed on an unrecognised state.
+  if (row.claim_state !== "claimed" && row.claim_state !== "verified") {
+    if (primary !== null && CONSENT_REQUIRED_CATEGORIES.has(primary)) primary = null;
+    secondary = secondary.filter((c) => !CONSENT_REQUIRED_CATEGORIES.has(c));
+  }
+  return {
+    primary_category: primary,
+    secondary,
+    language: row.language,
+    region: row.region,
+    updated_by: row.updated_by,
+    updated_at: row.updated_at,
+  };
+}
+
+/**
+ * SLICE 22 — THE STORED ROW, FOR THE OPERATOR DOSSIER. Not a variant of
+ * `getProfileMeta`; the opposite of it in the two ways that matter.
+ *
+ * `getProfileMeta` is the PUBLIC read and it deliberately lies by omission twice:
+ * it MASKS a consent-gated category on an unclaimed listing (a stored `adult`
+ * reads back as `null`), and it returns nothing at all for a suppressed
+ * passport. Both are right for a fan and wrong for an operator, and using it to
+ * populate an override form would be a console that lies to the person using it:
+ * the operator sees "no category", sets one, and silently clears a stored label
+ * they were never shown. That is exactly the failure shape
+ * `apps/admin/test/operator-truthfulness.test.ts` exists to catch.
+ *
+ * So this returns the row as STORED — no masking, no suppression filter — plus
+ * `withheld_from_public`, which is the answer to "why does their public page
+ * show no category?" without the operator having to know the consent rule.
+ *
+ * WHAT IT DOES ADD, stated rather than waved away: `GET /ops/creators/:id` is a
+ * `support`-role read, and it now carries a consent-gated label for an unclaimed
+ * listing and the facets of a delisted subject — neither of which any `/ops`
+ * route previously exposed. That is defensible on a dossier already carrying
+ * payout tags and the bound operator id, and it is the smallest reach that lets
+ * the override form tell the truth; it is not "no new reach", which is what an
+ * earlier draft of this comment claimed.
+ *
+ * BOTH REASONS THE PUBLIC READ WITHHOLDS ARE REPORTED. `getProfileMeta` hides on
+ * two independent grounds — consent-by-claim AND suppression — and reporting
+ * only the first left the operator's own question ("why is their public page
+ * blank?") answered wrongly for a delisted creator: `withheld_from_public` came
+ * back empty while the public read was returning nothing at all.
+ */
+export interface StoredProfileMeta extends ProfileMeta {
+  /** Stored categories the PUBLIC read withholds for this listing right now
+   * because of CONSENT-BY-CLAIM. Empty once the listing is claimed or verified,
+   * and empty when the reason is suppression instead — see the flag below. */
+  withheld_from_public: Category[];
+  /**
+   * The OTHER reason the public read returns nothing: this passport is
+   * suppressed, so `getProfileMeta` withholds the whole row whatever it holds
+   * and whatever the claim state is. Independent of the array above — a
+   * delisted CLAIMED creator has an empty array and a true flag.
+   */
+  public_read_suppressed: boolean;
+}
+
+export async function storedProfileMeta(db: DbLike, passportId: string): Promise<StoredProfileMeta> {
+  const empty: StoredProfileMeta = { primary_category: null, secondary: [], language: null, region: null, updated_by: null, updated_at: null, withheld_from_public: [], public_read_suppressed: false };
+  if (!PSP_RE.test(passportId)) return empty;
+  // SLICE 24 — THE DRIVING TABLE IS `passports`, NOT `passport_profile`, AND
+  // THE JOIN IS A LEFT JOIN.
+  //
+  // This read used to be `FROM passport_profile pp JOIN passports p`, which
+  // silently made every field here — INCLUDING the suppression flag — depend on
+  // the creator having discovery metadata. A passport with no `passport_profile`
+  // row (every seeded listing nobody has categorised, which is most of them) fell
+  // to `empty`, and `empty.public_read_suppressed` is hardcoded `false`. So the
+  // operator dossier reported a DELISTED creator as not delisted, for exactly
+  // the population most likely to have asked to be delisted, with nothing
+  // anywhere reporting the miss.
+  //
+  // Suppression is a fact about the PASSPORT and has no relationship to its
+  // metadata, so the statement now says so. The metadata columns come back NULL
+  // for a passport with no profile row, which is what "no metadata" means and
+  // what the callers below already handle.
+  const row = await db
+    .prepare(
+      `SELECT pp.primary_category AS primary_category, pp.secondary AS secondary, pp.language AS language, pp.region AS region,
+              pp.updated_by AS updated_by, pp.updated_at AS updated_at, p.claim_state AS claim_state,
+              EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = p.passport_id) AS suppressed
+         FROM passports p LEFT JOIN passport_profile pp ON pp.passport_id = p.passport_id
+        WHERE p.passport_id = ?`,
+    )
+    .bind(passportId)
+    .first<{ primary_category: string | null; secondary: string | null; language: string | null; region: string | null; updated_by: string | null; updated_at: string | null; claim_state: string; suppressed: number }>();
+  if (!row) return empty; // no such passport at all — not "a passport with nothing set"
+  let secondary: Category[] = [];
+  try {
+    // `null` when there is no profile row; `JSON.parse(null)` yields `null`
+    // rather than throwing, and the Array check below rejects it. Belt and
+    // braces, because a read must never throw.
+    const parsed = JSON.parse(row.secondary ?? "[]") as unknown[];
+    if (Array.isArray(parsed)) secondary = parsed.filter(isCategory);
+  } catch {
+    /* malformed → empty, never throw on a read — same stance as the public read */
+  }
+  const primary = isCategory(row.primary_category) ? row.primary_category : null;
+  // The SAME predicate the public read applies, evaluated here to REPORT rather
+  // than to hide. Fail closed on an unrecognised state, exactly as it does.
+  const consentGated = row.claim_state !== "claimed" && row.claim_state !== "verified";
+  const withheld = consentGated ? [primary, ...secondary].filter((c): c is Category => c !== null && CONSENT_REQUIRED_CATEGORIES.has(c)) : [];
+  return {
+    primary_category: primary,
+    secondary,
+    language: row.language,
+    region: row.region,
+    updated_by: row.updated_by,
+    updated_at: row.updated_at,
+    withheld_from_public: withheld,
+    public_read_suppressed: row.suppressed === 1,
+  };
+}
+
+/**
+ * Set a passport's metadata (creator-self-set or operator override). The
+ * passport must exist and be live. `updatedBy` is the audit stamp ('creator'
+ * or an opaque operator actor id, `op_<hex>` — operators.ts resolves the staff
+ * email to it, and the email never reaches this column). Upsert — a null/empty
+ * field clears it.
+ */
+export async function setProfileMeta(
+  db: DbLike,
+  passportId: string,
+  input: ProfileMetaInput,
+  updatedBy: string,
+  now: () => string = () => new Date().toISOString(),
+  audit?: (meta: ProfileMeta) => DbStatement[],
+): Promise<ProfileMeta> {
+  if (!PSP_RE.test(passportId)) throw new TaxonomyError("bad passport id");
+  const live = await db.prepare("SELECT claim_state FROM passports WHERE passport_id = ? AND retracted = 0").bind(passportId).first<{ claim_state: string }>();
+  if (!live) throw new TaxonomyError("no such passport", 404);
+  const { primary, secondary, language, region } = validate(input);
+
+  // CONSENT GATE (M5). Enforced HERE, at the chokepoint every setProfileMeta
+  // writer goes through — creator self-set and operator override; the seed
+  // importer's raw write carries the same refusal (seeding.ts
+  // seedMetadataStmts) rather than routing through this function. An
+  // import-time-only check would be bypassable in two steps: import
+  // with no category, then POST /ops/creators/:id/profile-meta. A claimed
+  // creator setting this on their own passport is the consent we require, so
+  // this never fires on the path that matters.
+  if (live.claim_state === "unclaimed") {
+    const offending = [primary, ...secondary].find((c) => c !== null && CONSENT_REQUIRED_CATEGORIES.has(c));
+    if (offending) {
+      throw new TaxonomyError(`the '${offending}' category cannot be published for an unclaimed listing — the creator may set it themselves after claiming`);
+    }
+  }
+  const ts = now();
+  const meta: ProfileMeta = { primary_category: primary, secondary, language, region, updated_by: updatedBy.slice(0, 128), updated_at: ts };
+  // QUEUE #942(a) (D15): the caller's statements, built from the validated `meta` (the console's
+  // `creator:profile_meta` row names `primary_category`), ride the upsert's batch. Unconditional: the upsert writes.
+  const upsert = db
+    .prepare(
+      `INSERT INTO passport_profile (passport_id, primary_category, secondary, language, region, updated_by, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(passport_id) DO UPDATE SET
+         primary_category = excluded.primary_category,
+         secondary = excluded.secondary,
+         language = excluded.language,
+         region = excluded.region,
+         updated_by = excluded.updated_by,
+         updated_at = excluded.updated_at`,
+    )
+    .bind(passportId, primary, JSON.stringify(secondary), language, region, updatedBy.slice(0, 128), ts);
+  await db.batch([upsert, ...(audit?.(meta) ?? [])]);
+  return meta;
+}
+===== END FILE: services/trust-core/src/taxonomy.ts =====
+
+===== END OF CHUNK 70 OF 73 =====

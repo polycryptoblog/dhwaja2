@@ -1,0 +1,3291 @@
+DHWAJA CODE REVIEW — tsjs — CHUNK 58 OF 73
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (oidc*), services/trust-core/src (operator*), services/trust-core/src (operators*), services/trust-core/src (otp*), services/trust-core/src (packs*)
+Files in this chunk (5):
+  - services/trust-core/src/oidc.ts
+  - services/trust-core/src/operator-alarm.ts
+  - services/trust-core/src/operators.ts
+  - services/trust-core/src/otp-policy.ts
+  - services/trust-core/src/packs.ts
+
+
+===== BEGIN FILE: services/trust-core/src/oidc.ts =====
+import { verifyRs256, b64urlToBytes, b64urlToString, type Jwk } from "./auth.js";
+import { mintId, randomHex } from "./ids.js";
+import type { DbLike } from "./db.js";
+import { closureNotice } from "./closures.js";
+import { noopMailer, type Mailer } from "./mailer.js";
+import { FROZEN_CLOSURE_STATES_SQL } from "./credits.js";
+
+/**
+ * Social sign-in (OpenID Connect) for FAN accounts — Google + Apple.
+ *
+ * The whole trust hinges on verifying the provider's SIGNED ID token before we
+ * believe any identity: RS256 signature against the provider JWKS (matched by
+ * kid), issuer, audience (our client id), expiry, and — when the client sent a
+ * nonce — a matching nonce (binds the token to this sign-in, blocks replay).
+ * The algorithm is PINNED to RS256 (blocks "none" / alg-confusion). Missing
+ * config → the provider is DISABLED (fail closed), never open.
+ *
+ * Sign-in is find-or-create keyed by the provider's STABLE `sub` (not email —
+ * email can change, and Apple may omit it on later logins).
+ */
+
+export type OidcProvider = "google" | "apple";
+
+export interface OidcProviderConfig {
+  iss: string[]; // acceptable issuers
+  aud: string[]; // accepted client/service ids — web and native each mint their
+  // own audience for the SAME provider (Apple: web Services ID vs. native bundle
+  // id; Google similarly needs the iOS SDK's server-client id alongside the web
+  // id) — the token's audience must match one of these
+  jwksUrl: string;
+}
+
+export interface OidcClaims {
+  sub: string;
+  email: string | null;
+  email_verified: boolean;
+}
+
+export class OidcError extends Error {
+  override name = "OidcError";
+  constructor(message: string, public readonly status: 400 | 401 | 503 = 401) {
+    super(message);
+  }
+}
+
+/** Provider config from env. `aud` (the operator's client id) is required — its
+ * absence disables the provider (fail closed). Issuers + JWKS are constants. */
+export function providerConfig(provider: OidcProvider, env: Record<string, unknown>): OidcProviderConfig | null {
+  const s = (k: string) => (typeof env[k] === "string" ? (env[k] as string).trim() : "");
+  const placeholder = (v: string) => v === "" || /TODO/i.test(v);
+  // Extra accepted audiences (comma-separated), for the SAME provider's other
+  // client surface: Apple's native bundle id alongside the web Services ID, or
+  // Google's iOS server-client id alongside the web client id (DX-17). Blank
+  // entries are dropped; a placeholder/blank primary still fails closed.
+  const extras = (k: string) =>
+    s(k)
+      .split(",")
+      .map((v) => v.trim())
+      .filter((v) => v !== "" && !placeholder(v));
+  if (provider === "google") {
+    const aud = s("GOOGLE_OAUTH_CLIENT_ID");
+    if (placeholder(aud)) return null;
+    return { iss: ["https://accounts.google.com", "accounts.google.com"], aud: [aud, ...extras("GOOGLE_OAUTH_EXTRA_CLIENT_IDS")], jwksUrl: "https://www.googleapis.com/oauth2/v3/certs" };
+  }
+  if (provider === "apple") {
+    const aud = s("APPLE_OAUTH_CLIENT_ID");
+    if (placeholder(aud)) return null;
+    return { iss: ["https://appleid.apple.com"], aud: [aud, ...extras("APPLE_OAUTH_EXTRA_CLIENT_IDS")], jwksUrl: "https://appleid.apple.com/auth/keys" };
+  }
+  return null;
+}
+
+const SKEW = 60;
+/** I3-1778 a: the oldest (by `iat`) ID token a sign-in door accepts — the token is minted for this sign-in. */
+export const OIDC_MAX_TOKEN_AGE_SECONDS = 600;
+/** I3-1332 a (D-0993(1)): how recently the matched identity's provider must have attested its email for an automatic
+ * cross-provider link (oauth_identities.email_verified_at, migration 0216). */
+export const OIDC_LINK_ATTESTATION_MAX_DAYS = 180;
+
+/** I3-0161 c (I22-W1-AUTH): the OIDC sign-up's account INSERT binds `email_alerts = 0` itself (see accounts.ts
+ * ACCOUNT_INSERT_SQL) — promo mail is opt-in whatever default the deployed table carries. */
+export const OIDC_ACCOUNT_INSERT_SQL = "INSERT INTO accounts (account_id, tier, email, email_alerts, session_epoch, created_at) VALUES (?, 'free', ?, 0, 0, ?)";
+interface JwtHeader {
+  alg?: string;
+  kid?: string;
+}
+
+/**
+ * Verify a provider ID token against config + JWKS. Pure (no network — the
+ * caller supplies the fetched/cached keys). Returns validated claims or throws
+ * OidcError. Claims are only read AFTER the signature is proven.
+ */
+export async function verifyIdToken(token: string, cfg: OidcProviderConfig, jwks: readonly Jwk[], nowSec: number, expectedNonce?: string): Promise<OidcClaims> {
+  if (jwks.length === 0) throw new OidcError("no signing keys", 503);
+  const parts = typeof token === "string" ? token.split(".") : [];
+  if (parts.length !== 3) throw new OidcError("malformed token");
+  const [h, p, sig] = parts as [string, string, string];
+  if (![h, p, sig].every((seg) => /^[A-Za-z0-9_-]+$/.test(seg))) throw new OidcError("malformed token");
+  let header: JwtHeader;
+  let claims: Record<string, unknown>;
+  try {
+    header = JSON.parse(b64urlToString(h)) as JwtHeader;
+    claims = JSON.parse(b64urlToString(p)) as Record<string, unknown>;
+  } catch {
+    throw new OidcError("malformed token");
+  }
+  // Client-controlled JSON: valid JSON that is not an object (`null`, a number,
+  // a string, a bare array) parses without throwing, so any bare property
+  // access below would be a plain TypeError, not the typed refusal the route
+  // maps to 4xx. Reject the shape explicitly before touching either payload.
+  if (header === null || typeof header !== "object" || claims === null || typeof claims !== "object") throw new OidcError("malformed token");
+  if (header.alg !== "RS256") throw new OidcError("unexpected alg"); // block "none" / alg-confusion
+  if (!header.kid) throw new OidcError("no kid");
+  const jwk = jwks.find((k) => k.kid === header.kid);
+  if (!jwk) throw new OidcError("unknown kid");
+  // b64urlToBytes(sig) decodes client-controlled base64url and can throw
+  // synchronously (e.g. a segment length ≡ 1 mod 4) BEFORE verifyRs256 is
+  // even called, which is before there is a promise for `.catch` to attach to
+  // -- that sync throw used to escape as a plain DOMException. Wrap the whole
+  // decode-and-verify so any failure (sync or async) becomes the same typed
+  // "bad signature" refusal.
+  let ok = false;
+  try {
+    ok = await verifyRs256(jwk, `${h}.${p}`, b64urlToBytes(sig));
+  } catch {
+    ok = false;
+  }
+  if (!ok) throw new OidcError("bad signature");
+
+  if (typeof claims.iss !== "string" || !cfg.iss.includes(claims.iss)) throw new OidcError("bad iss");
+  const auds = Array.isArray(claims.aud) ? claims.aud : typeof claims.aud === "string" ? [claims.aud] : [];
+  if (!auds.some((a) => cfg.aud.includes(a as string))) throw new OidcError("bad aud");
+  if (!Number.isFinite(claims.exp as number) || (claims.exp as number) + SKEW < nowSec) throw new OidcError("expired");
+  if (typeof claims.iat === "number" && (!Number.isFinite(claims.iat) || claims.iat - SKEW > nowSec)) throw new OidcError("issued in the future");
+  // I3-1778 a (I22-W1-AUTH): a token is accepted only within OIDC_MAX_TOKEN_AGE_SECONDS of its issue, so a stolen
+  // token nobody has used is not good until the provider's own `exp`. `iat` is therefore required.
+  if (typeof claims.iat !== "number" || !Number.isFinite(claims.iat)) throw new OidcError("no iat");
+  if (nowSec - claims.iat > OIDC_MAX_TOKEN_AGE_SECONDS + SKEW) throw new OidcError("too old");
+  if (expectedNonce !== undefined && claims.nonce !== expectedNonce) throw new OidcError("nonce mismatch");
+  if (typeof claims.sub !== "string" || claims.sub.length === 0 || claims.sub.length > 255) throw new OidcError("no sub");
+
+  const email = typeof claims.email === "string" && claims.email.length <= 320 ? claims.email.toLowerCase() : null;
+  // Google: boolean; Apple: boolean or "true"/"false" string.
+  const email_verified = claims.email_verified === true || claims.email_verified === "true";
+  return { sub: claims.sub, email, email_verified };
+}
+
+export interface SignInResult {
+  account_id: string;
+  created: boolean;
+  /** True when this NEW identity attached to a pre-existing account via a
+   * cross-provider verified-email match (rather than creating a fresh one). */
+  linked: boolean;
+  session_epoch: number;
+}
+
+/**
+ * Find-or-create the fan account for a verified (provider, sub). Idempotent per
+ * identity; refreshes the stored email when the provider sent one (Apple omits
+ * it on later logins, so we never clobber a known email with null). Handles a
+ * concurrent first-sign-in via the (provider, sub) primary key.
+ *
+ * Cross-provider LINKING: a brand-new identity presenting a provider-VERIFIED
+ * email that matches an existing VERIFIED identity attaches to that same
+ * account (so Google-you and Apple-you become one). Gated strictly on
+ * email_verified on BOTH sides, and only ACROSS providers (Google↔Apple).
+ *
+ * Why the constraints: an unverified email can never link, and same-provider
+ * linking is refused. The residual risk email carries is provider EMAIL
+ * REASSIGNMENT (e.g. a Google Workspace address handed to a new employee):
+ * refusing same-provider matches closes the common case (a reassigned Google
+ * address minting a second Google sub that links to the prior owner), while
+ * still supporting the intended "same person, Google then Apple" flow. It is
+ * not a total guarantee against a reassigned address used across two different
+ * providers; a fully email-agnostic explicit-link flow is the stronger design
+ * if that ever matters.
+ */
+export async function signInWithOidc(
+  db: DbLike,
+  provider: OidcProvider,
+  claims: OidcClaims,
+  now: () => string = () => new Date().toISOString(),
+  mailer: Mailer = noopMailer,
+  defer?: (p: Promise<unknown>) => void,
+  env?: Record<string, unknown> | null,
+): Promise<SignInResult> {
+  const existing = await oidcIdentityAccount(db, provider, claims.sub);
+  const ts = now();
+  if (existing !== null) return resolveExisting(db, existing, provider, claims, env, ts);
+
+  const verified = claims.email !== null && claims.email_verified ? 1 : 0;
+
+  // Link path: this sub is new, but a verified email matches an existing
+  // verified identity on a DIFFERENT provider → attach to that account instead
+  // of minting a duplicate. Same-provider matches are refused (reassigned-email
+  // defense, see the doc comment above).
+  if (verified === 1) {
+    // I3-1332 a (D-0993(1) census pick): only an attestation SEEN within OIDC_LINK_ATTESTATION_MAX_DAYS links. An older
+    // one may belong to a mailbox the provider has since recycled; it falls through to a separate account (the owner
+    // can link explicitly later). NULL (never attested since 0216's backfill) never links.
+    const linkFloor = new Date(Date.parse(ts) - OIDC_LINK_ATTESTATION_MAX_DAYS * 86_400_000).toISOString();
+    const match = await db
+      .prepare("SELECT account_id FROM oauth_identities WHERE email = ? AND email_verified = 1 AND provider != ? AND email_verified_at >= ? LIMIT 1")
+      .bind(claims.email, provider, linkFloor)
+      .first<{ account_id: string }>();
+    if (match) {
+      // I3-0207: the link arm is a proof-of-control door too. A closed account
+      // takes no new identity and mints no session here, exactly as
+      // `resolveExisting` refuses it (same error, same epoch rule).
+      await refuseIfClosed(db, match.account_id, env);
+      try {
+        await db.prepare("INSERT INTO oauth_identities (provider, sub, account_id, email, email_verified, created_at, email_verified_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(provider, claims.sub, match.account_id, claims.email, verified, ts, ts).run();
+      } catch (e) {
+        if (e instanceof Error && /UNIQUE|constraint/i.test(e.message)) {
+          const race = await oidcIdentityAccount(db, provider, claims.sub);
+          if (race !== null) return resolveExisting(db, race, provider, claims, env, ts);
+        }
+        throw e;
+      }
+      // D-0706 (QUEUE #180): the account just gained a new way in — its owner is told.
+      await notifyProviderLinked(db, mailer, match.account_id, provider, claims.sub, ts, defer);
+      const acct = await db.prepare("SELECT session_epoch FROM accounts WHERE account_id = ?").bind(match.account_id).first<{ session_epoch: number }>();
+      return { account_id: match.account_id, created: false, linked: true, session_epoch: acct?.session_epoch ?? 0 };
+    }
+  }
+
+  const accountId = mintId("acc");
+  try {
+    await db.batch([
+      db.prepare(OIDC_ACCOUNT_INSERT_SQL).bind(accountId, claims.email, ts),
+      db.prepare("INSERT INTO oauth_identities (provider, sub, account_id, email, email_verified, created_at, email_verified_at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(provider, claims.sub, accountId, claims.email, verified, ts, verified === 1 ? ts : null),
+    ]);
+  } catch (e) {
+    // Lost a concurrent first-sign-in race → the (provider, sub) PK rejected this
+    // insert. Resolve to whoever won; never mint a second account for one sub.
+    if (e instanceof Error && /UNIQUE|constraint/i.test(e.message)) {
+      const race = await oidcIdentityAccount(db, provider, claims.sub);
+      if (race !== null) return resolveExisting(db, race, provider, claims, env, ts);
+    }
+    throw e;
+  }
+  return { account_id: accountId, created: true, linked: false, session_epoch: 0 };
+}
+
+/**
+ * The account a provider identity (provider, sub) belongs to, else null — THE one spelling of that read (I30-WEB H10):
+ * signInWithOidc's first statement and its two race re-reads, and fan-account-routes.ts's sign-up bot-check gate
+ * (a new identity is a sign-up). test/i30-reg4a.test.ts holds every other src file to not spelling it.
+ */
+export async function oidcIdentityAccount(db: DbLike, provider: string, sub: string): Promise<string | null> {
+  const row = await db.prepare("SELECT account_id FROM oauth_identities WHERE provider = ? AND sub = ?").bind(provider, sub).first<{ account_id: string }>();
+  return row?.account_id ?? null;
+}
+
+/**
+ * D-0706 (QUEUE #180) — the link notice. Sent to the addresses the account held
+ * BEFORE this link (a proven `fan_email`, and the verified emails of its OTHER
+ * identities), never only to the address the new identity asserted: that is the
+ * one an attacker holding a second provider account supplies. Undeliverable —
+ * mailer refused, disabled (the `noopMailer` default), or no address at all —
+ * writes an operator audit line carrying the account id and no address, the
+ * fan-auth.ts `fanOtpSignIn` was-this-you idiom. Never throws into sign-in.
+ */
+async function notifyProviderLinked(db: DbLike, mailer: Mailer, accountId: string, provider: OidcProvider, sub: string, ts: string, defer?: (p: Promise<unknown>) => void): Promise<void> {
+  const notice = (async () => {
+    const at = new Date(ts);
+    const whenUtc = Number.isNaN(at.getTime()) ? ts : at.toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+    const vars = { provider: provider === "google" ? "Google" : "Apple", when_utc: whenUtc };
+    const rows = await db
+      .prepare(
+        "SELECT address FROM fan_email WHERE account_id = ? AND verified_at IS NOT NULL " +
+          "UNION SELECT email AS address FROM oauth_identities WHERE account_id = ? AND email_verified = 1 AND email IS NOT NULL AND NOT (provider = ? AND sub = ?) LIMIT 5",
+      )
+      .bind(accountId, accountId, provider, sub)
+      .all<{ address: string }>();
+    const to = [...new Set((rows.results ?? []).map((r) => r.address))];
+    const delivered = await Promise.all(to.map((a) => mailer.send("fan-provider-linked", a, vars).catch(() => false)));
+    if (to.length === 0 || delivered.includes(false)) {
+      await db
+        .prepare(
+          "INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) " +
+            "SELECT 'system:oidc', 'oidc:link_notice_undeliverable', ?, ?, " +
+            "CASE WHEN EXISTS (SELECT 1 FROM accounts WHERE account_id = ?) THEN ? ELSE 'del_' || lower(hex(randomblob(16))) END, 'operator'",
+        )
+        .bind(`a ${vars.provider} sign-in was linked to this account but the owner notice could not be sent to ${to.length === 0 ? "any address (none on file)" : "at least one address"}`, ts, accountId, accountId)
+        .run();
+    }
+  })().catch(() => {});
+  if (defer) defer(notice);
+  else await notice;
+}
+
+async function resolveExisting(db: DbLike, accountId: string, provider: OidcProvider, claims: OidcClaims, env: Record<string, unknown> | null | undefined, nowIso: string): Promise<SignInResult> {
+  // F18 / #32 — THE THIRD PROOF-OF-CONTROL DOOR, AND IT WAS SILENT.
+  //
+  // The passkey and OTP finish paths tell a closed account the ground and the
+  // appeal address; this one did not, and it is the primary consumer door. A
+  // review drove it: the provider's id token verifies, a session is minted from
+  // the raw epoch, the fan is shown "signed in" — and every subsequent request
+  // 401s, because `currentSessionEpoch` folds the closure into null. Exactly the
+  // failure the OTP path's own comment says it fixed, left standing here.
+  //
+  // BEFORE the email write below, and that matters: a terminated account was
+  // still having `accounts.email` rewritten by a login it could not use.
+  //
+  // Thrown rather than returned so the route cannot forget to check a flag —
+  // `SignInResult` has no shape for "you may not".
+  await refuseIfClosed(db, accountId, env);
+  if (claims.email) {
+    // Keep email_verified in step with the current attestation so the linking
+    // index reflects what the provider asserts on this login.
+    const verified = claims.email_verified ? 1 : 0;
+    await db.batch([
+      // I3-1332 a: a verified sign-in re-stamps the attestation instant; an unverified one clears it.
+      db.prepare("UPDATE oauth_identities SET email = ?, email_verified = ?, email_verified_at = ? WHERE provider = ? AND sub = ?").bind(claims.email, verified, verified === 1 ? nowIso : null, provider, claims.sub),
+      // I3-1931: only a provider-VERIFIED address becomes the account's alert
+      // address; an unverified one is recorded on the identity row alone.
+      ...(verified === 1
+        ? [
+            // I3-1284 (1): the one-click `fan_alerts` tokens are keyed on the
+            // account, not an address, so when this write moves the mailbox
+            // alerts go to (no verified `fan_email`, which wins in alerts.ts
+            // ALERT_ADDRESS_SQL) the old mailbox's tokens are retired in the
+            // same batch — fan-auth.ts's F-12 swap rule, on this door.
+            db
+              .prepare(
+                "DELETE FROM unsubscribe_tokens WHERE stream IN ('fan_alerts', 'fan_report_outcomes', 'fan_newsletter') AND subject_id = ? " +
+                  "AND EXISTS (SELECT 1 FROM accounts WHERE account_id = ? AND email IS NOT NULL AND email <> ?) " +
+                  "AND NOT EXISTS (SELECT 1 FROM fan_email WHERE account_id = ? AND verified_at IS NOT NULL)",
+              )
+              .bind(accountId, accountId, claims.email, accountId),
+            db.prepare("UPDATE accounts SET email = ? WHERE account_id = ?").bind(claims.email, accountId),
+          ]
+        : []),
+    ]);
+  }
+  const acct = await db.prepare("SELECT session_epoch FROM accounts WHERE account_id = ?").bind(accountId).first<{ session_epoch: number }>();
+  return { account_id: accountId, created: false, linked: false, session_epoch: acct?.session_epoch ?? 0 };
+}
+
+/** The closure refusal every proof-of-control door in this file asks before any
+ * write (F18 / #32; I3-0207 for the link arm). Throws; never returns a flag. */
+async function refuseIfClosed(db: DbLike, accountId: string, env?: Record<string, unknown> | null): Promise<void> {
+  // D-1074(1): the notice is closures.ts `closureNotice`, the one the passkey and one-time-code doors give
+  // (fan-auth.ts explainNullEpoch): it carries `account_id`, and a terminated account gets no `appeal_deadline`.
+  // Null for no row or a `lifted` one.
+  const notice = await closureNotice(db, accountId, env);
+  if (notice) {
+    // QUEUE #417: the RAW epoch rides along (never in the payload) so the route
+    // can mint the data-rights-scoped session; null only if the row is gone.
+    // D-0810(1): never under `account_compromise` (fan-auth.ts explainNullEpoch).
+    const epoch = notice.category === "account_compromise" ? null : await accountSessionEpoch(db, accountId);
+    throw new OidcAccountClosedError(notice as unknown as Record<string, string>, epoch === null ? undefined : { accountId, epoch });
+  }
+}
+
+/** Logout-everywhere: bump the account's session epoch so every previously
+ * issued session (which carries the older epoch) fails verification. */
+export async function bumpSessionEpoch(db: DbLike, accountId: string): Promise<number> {
+  await db.prepare("UPDATE accounts SET session_epoch = session_epoch + 1 WHERE account_id = ?").bind(accountId).run();
+  const acct = await db.prepare("SELECT session_epoch FROM accounts WHERE account_id = ?").bind(accountId).first<{ session_epoch: number }>();
+  return acct?.session_epoch ?? 0;
+}
+
+/** I3-1778 (D-1080(5)): how long an issued sign-in nonce stays spendable — the same window as the ID token max-age
+ * `verifyIdToken` enforces (`OIDC_MAX_TOKEN_AGE_SECONDS`). */
+export const OIDC_NONCE_TTL_MS = OIDC_MAX_TOKEN_AGE_SECONDS * 1000;
+
+/** The one door an issued nonce may be spent at: the fan sign-in or the agency login. */
+export type NonceDoor = "fan" | "agency";
+
+/** I3-1778: both OIDC doors' answer for a nonce it will not spend — never issued, issued for the other door,
+ * expired, or already spent; one statement does not tell them apart, so neither does the answer. */
+export const NONCE_REFUSED = "nonce not issued, expired or already used";
+
+/**
+ * I3-1778 (D-1080(5)): ISSUE a sign-in nonce. 32 CSPRNG bytes (`randomHex`), stored with the door that may spend it
+ * and an expiry `OIDC_NONCE_TTL_MS` after `nowMs`. The client hands this value to the provider, and the door accepts
+ * only a value this function wrote — the client no longer chooses its own nonce.
+ */
+export async function issueNonce(db: DbLike, door: NonceDoor, nowMs: number = Date.now()): Promise<{ nonce: string; expiresAt: string }> {
+  const nonce = randomHex(32);
+  const expiresAt = new Date(nowMs + OIDC_NONCE_TTL_MS).toISOString();
+  await db.prepare("INSERT INTO oauth_nonces (nonce, created_at, purpose, expires_at) VALUES (?, ?, ?, ?)").bind(nonce, new Date(nowMs).toISOString(), door, expiresAt).run();
+  return { nonce, expiresAt };
+}
+
+/**
+ * Spend an ISSUED nonce, once (I3-1778). One conditional UPDATE: the row must have been issued for THIS door, be
+ * unexpired at `nowMs`, and be unspent; `true` only when this call stamped it. A value the server never issued, one
+ * issued for the other door, an expired one, and a replay all change no row, and concurrent spends race on the one
+ * row, so exactly one wins. A row from before 0271 has no `expires_at` and can never be spent. Bounded length guards
+ * the bind.
+ */
+export async function consumeNonce(db: DbLike, nonce: string, door: NonceDoor, nowMs: number = Date.now()): Promise<boolean> {
+  if (typeof nonce !== "string" || nonce.length === 0 || nonce.length > 200) return false;
+  const now = new Date(nowMs).toISOString();
+  try {
+    const r = await db.prepare("UPDATE oauth_nonces SET consumed_at = ? WHERE nonce = ? AND purpose = ? AND consumed_at IS NULL AND expires_at > ?").bind(now, nonce, door, now).run();
+    return r.changes === 1;
+  } catch {
+    return false;
+  }
+}
+
+/** Prune nonces ISSUED before `before` (RFC3339; `created_at` is the issue instant since 0271). The window must
+ * exceed `OIDC_NONCE_TTL_MS`, so no prune removes a nonce that is still spendable. */
+export async function pruneNonces(db: DbLike, before: string): Promise<void> {
+  await db.prepare("DELETE FROM oauth_nonces WHERE created_at < ?").bind(before).run();
+}
+
+/** The account's current session epoch (for the fan-auth freshness check), or
+ * null if the account no longer exists (deleted → every session is dead). */
+/** The OAuth sign-in door's closed-account answer. Its own class, because the
+ * route maps `OidcError` to a uniform refusal and this one carries a payload
+ * the person is owed. */
+export class OidcAccountClosedError extends Error {
+  override name = "OidcAccountClosedError";
+  readonly status = 403 as const;
+  /** QUEUE #417: see `fan-auth.ts AccountClosedError.subject`. */
+  constructor(
+    readonly payload: Record<string, string>,
+    readonly subject?: { accountId: string; epoch: number },
+  ) {
+    super("account_closed");
+  }
+}
+
+export async function currentSessionEpoch(db: DbLike, accountId: string): Promise<number | null> {
+  // F18 / #32: A CLOSED ACCOUNT HAS NO LIVE SESSION, and this is the one place
+  // that has to say so.
+  //
+  // `fanCaller` already reads this fold to answer "account deleted, or signed
+  // out everywhere", and every one of the ~55 `if (!id) return 401` sites in
+  // the service inherits its answer. Putting the freeze here rather than at the
+  // routes means it covers the collecting and claiming surfaces as well as the
+  // money ones, and that no route can be added later that forgets it —
+  // `accountBanned`, the chargeback money gate, needed eight call sites and an
+  // invariant to keep them together.
+  //
+  // ONE STATEMENT, not two. A second round trip for suspended accounts only
+  // would be a timing difference between a closed account and a live one, on
+  // the path every authenticated request takes — the oracle class this repo
+  // instruments for. The LEFT JOIN costs a primary-key probe either way.
+  //
+  // NULL — the same answer a deleted account gives — so the wire answer is the
+  // indistinguishable `401 unauthorized` a bare token holder already gets. The
+  // person is told at the door where they PROVE control instead: see
+  // `closures.ts closureNotice` and the sign-in finish paths.
+  const acct = await db
+    .prepare(
+      `SELECT a.session_epoch AS session_epoch
+         FROM accounts a
+        WHERE a.account_id = ?
+          AND NOT EXISTS (SELECT 1 FROM account_closures c
+                           WHERE c.account_id = a.account_id AND c.state IN ${FROZEN_CLOSURE_STATES_SQL})`,
+    )
+    .bind(accountId)
+    .first<{ session_epoch: number }>();
+  return acct ? acct.session_epoch : null;
+}
+
+/**
+ * The account's session epoch WITHOUT the closure fold — null ONLY when the
+ * account row is gone.
+ *
+ * `currentSessionEpoch` above is the answer for every SERVICE door, and it stays
+ * exactly as it is: a closed account has no live session. This one exists for
+ * the two doors where the right survives the end of the service — the
+ * data-subject rights, `GET /account/export` (access/portability) and
+ * `POST /account/delete` (erasure). Closing an account and thereby locking the
+ * person out of their own erasure has the two backwards.
+ *
+ * WHAT IS STILL ENFORCED, and it is everything but the closure clause: a
+ * deleted account is still null (the row is the whole predicate), the caller's
+ * epoch is still compared against this one by `fanCallerWith`, so
+ * logout-everywhere and a revoked token still refuse, and the token must still
+ * verify and be of kind `fan`. The ONLY relaxation is the
+ * `account_closures` EXISTS clause.
+ *
+ * Same single primary-key probe, so the two doors cost no extra round trip and
+ * introduce no timing difference against a live account.
+ */
+export async function accountSessionEpoch(db: DbLike, accountId: string): Promise<number | null> {
+  const acct = await db
+    .prepare("SELECT session_epoch FROM accounts WHERE account_id = ?")
+    .bind(accountId)
+    .first<{ session_epoch: number }>();
+  return acct ? acct.session_epoch : null;
+}
+===== END FILE: services/trust-core/src/oidc.ts =====
+
+===== BEGIN FILE: services/trust-core/src/operator-alarm.ts =====
+/**
+ * services/trust-core/src/operator-alarm.ts
+ *
+ * I21-Q27 (Jason: "(a) operator email plus a free outside uptime monitor") — THE OPERATOR ALARM. Every alarm in this
+ * service was a log line that reached an operator only if someone was tailing the log. `logError` (log.ts) now hands
+ * each line to `noteOperatorAlarm`: a line whose `marker` or `msg` is on OPERATOR_ALARM_MARKERS is buffered in this
+ * isolate, and `flushOperatorAlarms` (called by the worker's handlers off the response path) mails every operator
+ * once per marker per UTC hour.
+ *
+ * - Dedupe: the hour is CLAIMED in `rate_limits` (`operator-alarm:<marker>:<YYYY-MM-DDTHH>`, ON CONFLICT DO NOTHING;
+ *   the alerts.ts alertExplainRefusals pattern, pruned by ratelimit.ts pruneRateLimits), so every isolate shares one
+ *   mail per marker per hour. No mail accepted: the claim is released and the marker re-queued; one hour's claim key
+ *   is sent on at most OPERATOR_ALARM_MAX_ATTEMPTS times in an isolate (`book`). No operator address: nothing is
+ *   claimed and the buffer is kept.
+ * - Rails: the http EmailSender (email.ts httpEmailFromEnv) first; when it does not accept, the Postmark mailer
+ *   (mailer.ts, its POSTMARK_STREAM security stream) under OPERATOR_ALARM_TEMPLATE.
+ * - The mail names the marker, the hour and a line count, never a field of the line (`detail` can carry a digest).
+ * - Never throws: noteOperatorAlarm runs inside logError on request paths, and flushOperatorAlarms catches everything.
+ * - Imports no module that imports log.ts (log.ts imports this file; email.ts and mailer.ts import log.ts), so the
+ *   mail shapes below are declared here: email.ts's EmailSender is assignable to AlarmSender.
+ */
+import type { DbLike } from "./db.js";
+
+/** The fields of email.ts EmailMessage this file sets. */
+export interface AlarmMail {
+  to: string;
+  subject: string;
+  text: string;
+  html?: string;
+}
+export type AlarmSender = (msg: AlarmMail) => Promise<boolean>;
+
+/**
+ * The markers that mail an operator. The census (test/i34-w2alarm-operator-alarm.test.ts) reads every `*_MARKER`
+ * constant and every `marker: "..."` literal in services/trust-core/src and fails on one that is in neither this list
+ * nor OPERATOR_ALARM_UNPAGED, and on a name here that no source line emits.
+ */
+export const OPERATOR_ALARM_MARKERS: readonly string[] = Object.freeze([
+  // ledger tamper (DEPLOY.md section 3f): msg values, written by index.ts's integrity legs
+  "ledger_tamper_detected",
+  "ledger_chain_corrupt",
+  "ledger_witness_mismatch",
+  "seal_anchor_mismatch",
+  "checkpoint_object_unverifiable",
+  // a stuck payout: Stripe paid it and the row was not flipped (creator-payout.ts)
+  "PAYOUT_FLIP_MISSED",
+  // a child-safety scan match (I21-Q65, evidence.ts SCAN_MATCH_MARKER)
+  "SCAN_MATCH",
+  // deadlines and lost records
+  "DSR_DEADLINE",
+  "ANALYTICS_DLQ_UNRECORDED",
+  "ANALYTICS_DLQ_INCOMPLETE_UNRECORDED",
+  "ANALYTICS_OUTBOX_DEAD",
+  "ANALYTICS_QUEUE_KEYLESS",
+  "ANALYTICS_ERASURE_SHELVED",
+  "ANALYTICS_FAN_SECRET_CHANGED",
+  "CREATOR_CLOSURE_NOTICE_DEAD",
+  // I54 (INV-082; P31 a, P30 a): a promised notice that was not delivered and is not owed again
+  "CREATOR_CLOSURE_NOTICE_UNDELIVERED",
+  "WARNING_SUBJECT_NOTICE_TRUNCATED",
+  // I54 (P30 a, I54-SCOUT-22A correction 3, promote-generic): EVERY exhausted mail retry (alerts.ts, all kinds) pages
+  "email_delivery_retry_exhausted",
+  "MAILER_CONFIG_ERROR",
+  "AI_REFUSAL_RATE_HIGH",
+  "frozen_purge_lap_over_threshold",
+  // a cron job's lease renewal was refused or threw mid-run (cron-lease.ts CRON_LEASE_LOST_MARKER, I38-TICK)
+  "CRON_LEASE_LOST",
+  // gate markers: a money or pack gate refused because its configuration is wrong (index.ts, packs.ts)
+  "iap_credit_gate_misconfigured",
+  "pack_gate_misconfigured",
+  // money drift: a conservation identity over the money tables failed (money-reconcile.ts, the money tail; I53, D-1383(3))
+  "money_reconcile_drift",
+  // a likeness job still generating past its staleness bound (likeness.ts pruneLikenessPrompts; I56, D-1433(2))
+  "LIKENESS_JOB_STALE",
+]);
+
+/** Marker-shaped names the census finds that do not mail anyone, each with its reason. */
+export const OPERATOR_ALARM_UNPAGED: Readonly<Record<string, string>> = Object.freeze({
+  ANALYTICS_TICK: "the analytics tick's per-tick summary line",
+  ANALYTICS_BUILD_SWEEP: "the analytics pre-build sweep's per-tick report",
+  AI_REPLY_REJECTED: "one refused explainer reply; AI_REFUSAL_RATE_HIGH is the platform-wide alarm",
+  AI_NO_ANSWER: "one explainer reply with no answer",
+  "rankings/topfans-legacy-purge.done": "an R2 object key, not a log line",
+  "internal/registry-gens/": "an R2 key prefix, not a log line",
+  verify_chain_full: "a sweep_cursor id, not a log line",
+});
+
+export const OPERATOR_ALARM_WINDOW_MS = 60 * 60 * 1000;
+export const OPERATOR_ALARM_PREFIX = "operator-alarm:";
+export const OPERATOR_ALARM_MAX_ATTEMPTS = 3;
+/** The Postmark fallback's template name (its alias and body are mailer.ts's and ops/email/templates/'s). */
+export const OPERATOR_ALARM_TEMPLATE = "ops-alarm";
+
+const ALARM: ReadonlySet<string> = new Set(OPERATOR_ALARM_MARKERS);
+interface Pending {
+  first: number;
+  count: number;
+  attempts: number;
+}
+const pending = new Map<string, Pending>();
+/**
+ * I34-FX2-ALARM (NEW-ALARM-SELFFEED, I34-RG-W2M N1, I34-JN-14 probe B): what this isolate did with each hour's claim key.
+ * `tries` counts the sends made on the key: a key tried OPERATOR_ALARM_MAX_ATTEMPTS times is dropped without a claim, so an
+ * alarm whose own failed mail logs its marker again (MAILER_CONFIG_ERROR on a refusing rail, email.ts httpEmailFromEnv; the
+ * fresh line has the same hour key) stops. `held`: the release DELETE threw, so the claim row is still this isolate's, and
+ * the next flush sends on it without claiming again. Keys older than two hours are forgotten.
+ */
+interface ClaimBook {
+  tries: number;
+  held: boolean;
+  hour: number;
+}
+const book = new Map<string, ClaimBook>();
+
+/** logError's hook: buffer a listed marker. Never throws (the line is already written). */
+export function noteOperatorAlarm(f: { marker?: unknown; msg?: unknown }, nowMs: number = Date.now()): void {
+  try {
+    const name = typeof f.marker === "string" && ALARM.has(f.marker) ? f.marker : typeof f.msg === "string" && ALARM.has(f.msg) ? f.msg : null;
+    if (name === null) return;
+    const a = pending.get(name);
+    if (a) a.count++;
+    else pending.set(name, { first: nowMs, count: 1, attempts: 0 });
+  } catch {
+    // a hostile getter on the fields: nothing is buffered, the caller is not disturbed
+  }
+}
+
+/** What this isolate holds unsent (tests and the ops read). */
+export function pendingOperatorAlarms(): { marker: string; count: number }[] {
+  return [...pending.entries()].map(([marker, a]) => ({ marker, count: a.count }));
+}
+/** The claim keys this isolate remembers (tests and the ops read). */
+export function operatorAlarmClaimKeys(): string[] {
+  return [...book.keys()];
+}
+/** Tests only: drop the buffer and the claim book. */
+export function resetOperatorAlarms(): void {
+  pending.clear();
+  book.clear();
+}
+
+/**
+ * I34-FX2-ALARM (I34-RG-W2M TC:16): `ctx` with every promise handed to its waitUntil recorded, so the alarm flush can wait
+ * for the work a handler deferred (a marker that work logs lands after the handler returns). `settled` also waits for
+ * promises handed over while it waits; it never rejects.
+ */
+export interface DeferredWork<C> {
+  ctx: C;
+  handed(): number;
+  settled(): Promise<void>;
+}
+export function trackWaitUntil<C extends { waitUntil(p: Promise<unknown>): void }>(ctx: C): DeferredWork<C> {
+  const seen: Promise<unknown>[] = [];
+  const waitUntil = (p: Promise<unknown>): void => {
+    seen.push(Promise.resolve(p).then(
+      () => undefined,
+      () => undefined,
+    ));
+    ctx.waitUntil(p);
+  };
+  const tracked = new Proxy(ctx, {
+    get(target, prop) {
+      if (prop === "waitUntil") return waitUntil;
+      const v: unknown = Reflect.get(target, prop);
+      return typeof v === "function" ? (v as (...a: unknown[]) => unknown).bind(target) : v;
+    },
+  });
+  return {
+    ctx: tracked,
+    handed: () => seen.length,
+    settled: async () => {
+      for (let i = 0; i < seen.length; i++) await seen[i];
+    },
+  };
+}
+
+export interface OperatorAlarmRails {
+  /** email.ts httpEmailFromEnv: tried first. */
+  send?: AlarmSender | null;
+  /** mailer.ts mailerFromEnv: the fallback, under OPERATOR_ALARM_TEMPLATE. */
+  mailer?: { send(template: string, to: string, vars: Record<string, string>): Promise<boolean> } | null;
+  /** The html frame operator mail wears (email.ts wrapHtml(textToHtml(text), "")); absent: text only. */
+  html?: (text: string) => string;
+}
+export interface OperatorAlarmFlush {
+  claimed: number;
+  mailed: number;
+  released: number;
+  dropped: number;
+  kept: number;
+}
+
+const hourOf = (ms: number): number => Math.floor(ms / OPERATOR_ALARM_WINDOW_MS) * OPERATOR_ALARM_WINDOW_MS;
+
+/** The operator mail for one marker (DRAFT copy, REPORT.md ## JASON). */
+export function operatorAlarmText(marker: string, sinceIso: string, count: number): { subject: string; text: string } {
+  return {
+    subject: `Dhwaja alarm: ${marker}`,
+    text: [
+      `The trust-core worker logged the alarm marker ${marker} ${count} time(s) in one worker instance since ${sinceIso} (UTC). Each marker is mailed at most once an hour, so later lines this hour send no mail.`,
+      "",
+      `Read the lines: pnpm exec wrangler tail -c services/trust-core/wrangler.jsonc --env <environment> --search "${marker}"`,
+      `What it means and what to do: DEPLOY.md, "Operator alarm email", the row for ${marker}.`,
+    ].join("\n"),
+  };
+}
+
+function requeue(marker: string, a: Pending, out: OperatorAlarmFlush): void {
+  if (a.attempts + 1 >= OPERATOR_ALARM_MAX_ATTEMPTS) {
+    out.dropped++;
+    return;
+  }
+  const now = pending.get(marker);
+  pending.set(marker, { first: a.first, count: a.count + (now?.count ?? 0), attempts: a.attempts + 1 });
+}
+
+/**
+ * Mail every buffered marker to every operator, once per marker per hour. Resolves; never rejects.
+ */
+export async function flushOperatorAlarms(db: DbLike, rails: OperatorAlarmRails, operatorEmails: readonly string[]): Promise<OperatorAlarmFlush> {
+  const out: OperatorAlarmFlush = { claimed: 0, mailed: 0, released: 0, dropped: 0, kept: 0 };
+  try {
+    if (pending.size === 0) return out;
+    const to = [...new Set(operatorEmails.map((e) => String(e).trim().toLowerCase()).filter((e) => e.length > 0))];
+    if (to.length === 0) {
+      out.kept = pending.size;
+      return out;
+    }
+    const batch = [...pending.entries()];
+    pending.clear();
+    const forget = hourOf(Date.now()) - 2 * OPERATOR_ALARM_WINDOW_MS;
+    for (const [k, b] of book) if (b.hour < forget) book.delete(k);
+    for (const [marker, a] of batch) {
+      const hourMs = hourOf(a.first);
+      const hour = new Date(hourMs).toISOString();
+      const key = `${OPERATOR_ALARM_PREFIX}${marker}:${hour.slice(0, 13)}`;
+      const b = book.get(key) ?? { tries: 0, held: false, hour: hourMs };
+      if (b.tries >= OPERATOR_ALARM_MAX_ATTEMPTS) {
+        out.dropped++; // tried the limit this hour in this isolate: no claim, no mail
+        continue;
+      }
+      try {
+        if (!b.held) {
+          const won = await db.prepare("INSERT INTO rate_limits (rl_key, window_start, count) VALUES (?, ?, 1) ON CONFLICT(rl_key) DO NOTHING").bind(key, hour).run();
+          if ((won.changes ?? 0) === 0) continue; // another flush mailed this marker this hour
+        }
+        out.claimed++;
+        b.tries++;
+        book.set(key, b);
+        const { subject, text } = operatorAlarmText(marker, new Date(a.first).toISOString(), a.count);
+        const vars = { marker, since_utc: new Date(a.first).toISOString(), count: String(a.count) };
+        let accepted = 0;
+        for (const addr of to) {
+          const msg: AlarmMail = { to: addr, subject, text, ...(rails.html ? { html: rails.html(text) } : {}) };
+          let ok = rails.send ? await rails.send(msg).catch(() => false) : false;
+          if (!ok && rails.mailer) ok = await rails.mailer.send(OPERATOR_ALARM_TEMPLATE, addr, vars).catch(() => false);
+          if (ok) accepted++;
+        }
+        if (accepted > 0) {
+          b.held = false;
+          out.mailed += accepted;
+          continue;
+        }
+        try {
+          await db.prepare("DELETE FROM rate_limits WHERE rl_key = ?").bind(key).run();
+          b.held = false;
+          out.released++;
+        } catch {
+          b.held = true; // the claim row is still ours: the next flush sends on it without claiming
+        }
+        requeue(marker, a, out);
+      } catch {
+        requeue(marker, a, out);
+      }
+    }
+  } catch {
+    // never into the caller
+  }
+  return out;
+}
+===== END FILE: services/trust-core/src/operator-alarm.ts =====
+
+===== BEGIN FILE: services/trust-core/src/operators.ts =====
+import { hasUnsafeDisplayText } from "@dhwaja/schema";
+import { inChunks, type DbLike, type DbStatement } from "./db.js";
+import { mintId } from "./ids.js";
+import { auditActorKind } from "./review.js";
+
+/**
+ * Operator identity: the opaque `op_<hex>` that stands in for a staff email
+ * everywhere an operator's action is RECORDED.
+ *
+ * Why this exists. Every operator write lands in `trust_events.actor_id`, which
+ * is line 6 of the hashed preimage of an append-only, checkpoint-anchored chain,
+ * and in the `audit_log` / `pending_actions` / `passport_profile` audit columns
+ * beside it. The old value was `op:<email>`. `proof.ts` redacts it from the
+ * public read, but redaction on the way out is not removal at rest: the address
+ * survived in every export, backup and subpoena, and every published warning
+ * permanently named the human who published it — in front of exactly the people
+ * warnings are published about.
+ *
+ * The mapping lives in one ordinary, mutable table (`operator_identities`, `0002_operations.sql`) so:
+ *   - the console can still show a human name (`operatorLabels`), and
+ *   - an operator whose email changes KEEPS their id (`setOperatorEmail`),
+ *     which is the whole point of an opaque identifier: the ledger's actor is
+ *     durable, the personal data beside it is correctable and erasable.
+ *
+ * FAIL CLOSED. There is no fallback id. An email that is missing, malformed, or
+ * that we cannot durably map throws — the caller (the console's auth middleware)
+ * turns that into a 503 and the route never runs. A blank or shared actor id
+ * would be worse than an email: it would silently de-attribute the ledger.
+ */
+
+export class OperatorIdentityError extends Error {
+  override name = "OperatorIdentityError";
+}
+
+/** The actor_id shape this module mints. 20 hex = 80 CSPRNG bits, no clock. */
+export const OPERATOR_ACTOR_RE = /^op_[0-9a-f]{20}$/;
+
+/**
+ * Conservative address check. This is not RFC 5322 — the address has ALREADY
+ * passed the Access allowlist (`auth.ts`), so the job here is only to refuse
+ * the empty/junk/oversized values that would otherwise mint a garbage row.
+ */
+const EMAIL_RE = /^[^\s@,;<>"]{1,64}@[^\s@,;<>"]{1,185}\.[A-Za-z]{2,24}$/;
+
+function normalize(email: unknown): string {
+  if (typeof email !== "string") throw new OperatorIdentityError("operator email missing");
+  const e = email.trim().toLowerCase();
+  if (e.length === 0 || e.length > 254 || !EMAIL_RE.test(e)) {
+    // Never echo the value back — this string reaches logs.
+    throw new OperatorIdentityError("operator email is not a usable identity");
+  }
+  return e;
+}
+
+/**
+ * THE CANONICAL FORM OF AN ADDRESS — what a machine can tell about aliasing.
+ *
+ * `normalize` above is the LOOKUP key and must never change: it is what every
+ * existing `operator_identities` row is stored under, and changing it would
+ * orphan those rows and split a live operator's ledger attribution in two. This
+ * is a second, stricter form, used only to decide whether a NEWLY SEEN address
+ * belongs to a person already on record.
+ *
+ * WHAT IT FOLDS, and only where the provider actually defines it that way:
+ *   - plus-addressing (`jbrown+ops@` → `jbrown@`) on every host, because no
+ *     mail provider treats `+` as significant and several document it;
+ *   - dots in the local part, on the Gmail family ONLY (`j.brown@gmail.com` is
+ *     the same mailbox as `jbrown@gmail.com`; on most other hosts it is not,
+ *     and folding it everywhere would merge two genuinely different people).
+ *   - `googlemail.com` → `gmail.com`, the same mailbox under a second name.
+ *
+ * WHAT IT DELIBERATELY DOES NOT FOLD: anything requiring a guess. A work
+ * address and a personal one share no canonical form and no algorithm can know
+ * they are one human — that is what `POST /ops/operators/link` is for. This
+ * function's job is the aliasing that is a FACT about mail delivery, not the
+ * aliasing that is a fact about a person.
+ *
+ * It is used ONLY to widen who counts as the same person, never to narrow it,
+ * so a false positive here costs a second signature and a false negative costs
+ * nothing that was not already the case.
+ */
+const GMAIL_HOSTS = new Set(["gmail.com", "googlemail.com"]);
+
+export function canonicalizeEmail(normalized: string): string {
+  const at = normalized.lastIndexOf("@");
+  if (at <= 0) return normalized;
+  let local = normalized.slice(0, at);
+  const host = normalized.slice(at + 1);
+  const plus = local.indexOf("+");
+  if (plus > 0) local = local.slice(0, plus);
+  if (GMAIL_HOSTS.has(host)) return `${local.replace(/\./g, "")}@gmail.com`;
+  return `${local}@${host}`;
+}
+
+/**
+ * The PERSON behind an `op_` id — what every "two distinct operators" gate
+ * actually has to compare.
+ *
+ * Falls back to the id itself, which is both the pre-slice behaviour and the
+ * fail-safe direction FOR A NARROWING CHECK (a self-unlink refusal, a
+ * self-link-widening refusal): a missing or unlinked row can only ever make
+ * THAT KIND of gate STRICTER by one, never open it.
+ *
+ * IT IS NOT STRICTER FOR A QUORUM COUNT (docket #65). `distinctPersonCount`
+ * and `withDualControl` ask a different question — how many humans are
+ * present, not whether two ids are the same one — and there the default is
+ * PERMISSIVE: two allowlisted addresses that have simply never been linked
+ * already count as two distinct persons, with no unlink call, no collusion,
+ * and no action by anyone. `POST /ops/operators/link`'s docblock frames the
+ * residual as "two operators who unlink EACH OTHER" (collusion); the actual,
+ * weaker residual is one human holding two never-linked addresses on
+ * OPERATOR_EMAILS, which is the DEFAULT state of any address pair nobody has
+ * reviewed, not an attack a full seat has to execute. Closing it needs a
+ * decision this module does not own (verify identity at allowlist time, or
+ * accept the gap as a deployment-hygiene requirement) — see VERDICTS.md,
+ * docket #65.
+ */
+export async function personOf(db: DbLike, opId: string): Promise<string> {
+  const row = await db.prepare("SELECT person_id FROM operator_identities WHERE op_id = ?").bind(opId).first<{ person_id: string | null }>();
+  return row?.person_id ?? opId;
+}
+
+/**
+ * Are these two `op_` ids the same human, as far as anything on record says?
+ *
+ * ONE QUERY, and it answers `true` when it cannot tell them apart — because every
+ * caller is asking "may this person be the second signature", and the safe
+ * answer to "I do not know" is no.
+ */
+export async function samePerson(db: DbLike, a: string, b: string): Promise<boolean> {
+  if (a === b) return true;
+  const [pa, pb] = await Promise.all([personOf(db, a), personOf(db, b)]);
+  return pa === pb;
+}
+
+/**
+ * Every `op_` id that currently resolves to the same person as `opId`.
+ *
+ * The membership question three separate fixes need to ask, in one place:
+ * which ids move when a person is joined or split, and whose banked
+ * dual-control sign-offs are therefore about to be worth a different number.
+ */
+async function personMembers(db: DbLike, person: string): Promise<string[]> {
+  const { results } = await db
+    .prepare("SELECT op_id FROM operator_identities WHERE COALESCE(person_id, op_id) = ? ORDER BY created_at, op_id")
+    .bind(person)
+    .all<{ op_id: string }>();
+  return results.map((r) => r.op_id).filter((id) => OPERATOR_ACTOR_RE.test(id));
+}
+
+/**
+ * How many distinct humans this deployment has on record.
+ *
+ * The number every governance gate is really asking about, and the one thing
+ * `effectiveApprovals` structurally cannot see: it reads `OPERATOR_EMAILS`,
+ * deliberately, so that an operator who has not yet signed in does not halve the
+ * requirement. But a deployment can be reduced below its threshold by LINKING —
+ * two allowlisted addresses declared one human — and env has no view of that. So
+ * the posture read pairs the env count with this one, and reports `satisfiable`.
+ *
+ * Without it a wrong link is silent: on a two-operator deployment the two ids
+ * become one person, neither of them can unlink (rail 1 refuses a self-split),
+ * every dual-controlled route and the whole warnings pipeline stall, and
+ * `GET /ops/settings` answers `clamped: false` — healthy. The recovery is real
+ * but it has to be findable: add a third operator address, and that operator can
+ * unlink the pair.
+ *
+ * THE OPPOSITE FAILURE IS NOT SILENT EITHER, AND IT IS THE MORE LIKELY ONE
+ * (docket #65). A wrong NON-link — two allowlisted addresses that are one
+ * human and were never told to `link` — costs nothing to reach: it is the
+ * state every address pair starts in and stays in until an operator who
+ * happens to know they are the same person calls the door. No unlink, no
+ * collusion between two humans, and no code path treats this as anomalous:
+ * `operatorAnomalies` reports `split_mailbox` only for addresses that
+ * canonicalize the same way, never for a work/personal pair a human would
+ * have to recognize. This function's count is the correct upper bound on
+ * distinct addresses; it is not, and cannot by itself be, an assurance that
+ * the humans behind them are that many.
+ */
+export async function distinctPersonCount(db: DbLike): Promise<number> {
+  const row = await db
+    .prepare("SELECT COUNT(DISTINCT COALESCE(person_id, op_id)) AS n FROM operator_identities")
+    .bind()
+    .first<{ n: number }>();
+  return row?.n ?? 0;
+}
+
+/**
+ * A SIGN-OFF IS ONLY WORTH WHAT IT WAS WORTH WHEN IT WAS CAST.
+ *
+ * `pending_actions` banks one row per `op_` id and `withDualControl` recounts
+ * DISTINCT PERSONS at approval time, so a person mapping that changes between
+ * two signatures silently revalues signatures already given. Splitting a person
+ * is the dangerous direction — two rows that counted as one signature become
+ * two, and one human executes an account transfer alone — but a join revalues
+ * downward just as silently. So any change to the mapping discards the sign-offs
+ * of every id it touched: the operators re-sign under the mapping that now holds.
+ * Dropping a valid signature costs a click; keeping an invalid one costs the gate.
+ */
+function discardSignOffs(db: DbLike, opIds: readonly string[]): DbStatement[] {
+  return inChunks(opIds).map((chunk) =>
+    db.prepare(`DELETE FROM pending_actions WHERE requested_by IN (${chunk.map(() => "?").join(",")})`).bind(...chunk),
+  );
+}
+
+/**
+ * Record that two `op_` ids are one human.
+ *
+ * DIRECTIONALLY SAFE, and that is why it is an ordinary operator action rather
+ * than a break-glass one: linking can only ever REMOVE a valid second signature,
+ * never add one. The worst an abusive link achieves is denying a publish, which
+ * is visible, audited and reversible by unlinking — where the thing it prevents
+ * (one human signing twice) is invisible and permanent.
+ *
+ * The absorbing side keeps its `person_id`, so the person a deployment has been
+ * attributing actions to does not move under it.
+ *
+ * `extra` rides in the SAME batch as the mutation, so the audit line describing
+ * a change to who counts as a second person cannot fail while the change lands.
+ */
+export async function linkOperators(
+  db: DbLike,
+  keepOpId: string,
+  mergeOpId: string,
+  now: () => string = () => new Date().toISOString(),
+  extra: readonly DbStatement[] = [],
+): Promise<string> {
+  if (!OPERATOR_ACTOR_RE.test(keepOpId) || !OPERATOR_ACTOR_RE.test(mergeOpId)) {
+    throw new OperatorIdentityError("both ids must be operator ids");
+  }
+  if (keepOpId === mergeOpId) throw new OperatorIdentityError("an operator is already themselves");
+  const keep = await db.prepare("SELECT person_id FROM operator_identities WHERE op_id = ?").bind(keepOpId).first<{ person_id: string | null }>();
+  const merge = await db.prepare("SELECT person_id FROM operator_identities WHERE op_id = ?").bind(mergeOpId).first<{ person_id: string | null }>();
+  if (!keep || !merge) throw new OperatorIdentityError("no such operator");
+  const person = keep.person_id ?? keepOpId;
+  const from = merge.person_id ?? mergeOpId;
+  if (person === from) return person;
+  const touched = [...(await personMembers(db, from)), ...(await personMembers(db, person))];
+  const ts = now();
+  // Move EVERY id that shared the merged side's person, not just the named one,
+  // so a three-address human converges rather than splitting into two persons.
+  // COALESCE, because a row minted in the window between 0054 being applied and
+  // the new Worker going live carries a NULL `person_id`, and `NULL = ?` matches
+  // nothing — which used to make this UPDATE a no-op that still answered `ok`.
+  await db.batch([
+    db
+      .prepare("UPDATE operator_identities SET person_id = ?, updated_at = ? WHERE COALESCE(person_id, op_id) = ?")
+      .bind(person, ts, from),
+    ...discardSignOffs(db, touched),
+    ...extra,
+  ]);
+  // The write is the control, so read it back rather than trusting it.
+  if ((await personOf(db, mergeOpId)) !== person) throw new OperatorIdentityError("the link did not take");
+  return person;
+}
+
+/**
+ * Undo a link — detach `opId` from whatever person it is in.
+ *
+ * NOT "same door, opposite direction". `linkOperators` can only ever tighten a
+ * gate; this loosens one, and that asymmetry is the whole of its design:
+ *
+ *   - A CANONICAL KINSHIP CANNOT BE OVERRULED. If another id shares this row's
+ *     `canonical_email`, the two are the same MAILBOX — a fact about mail
+ *     delivery, not an operator's judgement about a human — and no amount of
+ *     operator authority makes them two people. Refusing here is what stops a
+ *     single full operator from splitting their own alias pair and handing
+ *     themselves back the second signature the slice took away.
+ *   - THE ANCHOR CASE IS NOT A NO-OP. The person id is one member's `op_id`, so
+ *     detaching THAT member used to write the value already there and report
+ *     success while the group stayed joined. The remaining members are re-seated
+ *     on the next id instead, so "detach this id" means the same thing whichever
+ *     member is named.
+ *   - Banked sign-offs of every member are discarded; see `discardSignOffs`.
+ *
+ * The caller must ALSO refuse an operator unlinking their own person; that check
+ * needs the request's actor and lives at the route.
+ */
+export async function unlinkOperator(
+  db: DbLike,
+  opId: string,
+  now: () => string = () => new Date().toISOString(),
+  extra: readonly DbStatement[] = [],
+): Promise<void> {
+  if (!OPERATOR_ACTOR_RE.test(opId)) throw new OperatorIdentityError("not an operator id");
+  const row = await db
+    .prepare("SELECT op_id, email, person_id, canonical_email FROM operator_identities WHERE op_id = ?")
+    .bind(opId)
+    .first<{ op_id: string; email: string | null; person_id: string | null; canonical_email: string | null }>();
+  if (!row) throw new OperatorIdentityError("no such operator");
+  // DERIVED FROM THE ADDRESS, NOT FROM THE CACHED COLUMN. `canonical_email` is
+  // only ever filled by a code path that mints or repairs, so an earlier version
+  // that read the column alone silently skipped this rail for any row still
+  // carrying NULL — which is every row on a deployment that upgraded and has not
+  // minted since. The rail is about a fact concerning mail delivery; it must be
+  // computed from the address every time.
+  const canonical = row.canonical_email ?? (typeof row.email === "string" ? canonicalizeEmail(row.email) : null);
+  if (canonical) {
+    const { results: siblings } = await db
+      .prepare("SELECT op_id, email, canonical_email FROM operator_identities WHERE op_id <> ?")
+      .bind(opId)
+      .all<{ op_id: string; email: string | null; canonical_email: string | null }>();
+    const kin = siblings.find(
+      (k) => (k.canonical_email ?? (typeof k.email === "string" ? canonicalizeEmail(k.email) : null)) === canonical,
+    );
+    if (kin) throw new OperatorIdentityError("these ids are one mailbox, not an operator judgement — they cannot be split");
+  }
+  const person = row.person_id ?? opId;
+  const ts = now();
+  const members = await personMembers(db, person);
+  // A NO-OP UNLINK MUST NOT BE A WEAPON. `discardSignOffs` is a safety rail when
+  // the mapping changes; run unconditionally it became a lever: any full seat
+  // could call unlink on an already-unlinked operator, change nothing, and empty
+  // that operator's banked sign-offs — repeatably, invisibly (the person graph is
+  // byte-identical afterwards), and only through the API, since the console never
+  // renders the button for a one-member person. Refusing is the honest answer:
+  // there is nothing here to undo.
+  if (members.length <= 1) throw new OperatorIdentityError("this operator is already their own person");
+  const stmts: DbStatement[] = [];
+  if (person === opId) {
+    const next = members.find((id) => id !== opId);
+    if (next) {
+      stmts.push(
+        db
+          .prepare("UPDATE operator_identities SET person_id = ?, updated_at = ? WHERE COALESCE(person_id, op_id) = ? AND op_id <> ?")
+          .bind(next, ts, person, opId),
+      );
+    }
+  }
+  stmts.push(db.prepare("UPDATE operator_identities SET person_id = ?, updated_at = ? WHERE op_id = ?").bind(opId, ts, opId));
+  await db.batch([...stmts, ...discardSignOffs(db, members), ...extra]);
+}
+
+export interface OperatorPersonRow {
+  op_id: string;
+  label: string;
+  person_id: string;
+  /** True when another row shares this row's mailbox — a fact, not a judgement. */
+  shares_mailbox: boolean;
+  /** #135E-26: present (true) only for a revoked id — absent otherwise, so the row shape is unchanged for live ones. */
+  revoked?: true;
+}
+
+/**
+ * The person graph, readable.
+ *
+ * Adversarial review's sharpest structural point about slice 29 was that
+ * NOTHING read `person_id` back: the two gates consumed it and one route wrote
+ * it, so an operator could neither see which ids the system considered one human
+ * nor verify that a link or an unlink had done what they asked. Three separate
+ * defects were only findable because they were invisible. This is the read.
+ *
+ * `canonical_email` itself is deliberately NOT returned — it is a derived form of
+ * a staff address and the label already carries the address. What callers need is
+ * the BOOLEAN: whether this row is joined to another by a fact about mail
+ * delivery, which is exactly the join `unlinkOperator` refuses to break.
+ */
+/**
+ * THE RECONCILIATION READ (sitting 0, 2026-09-03). Three states the person
+ * graph can be in that nothing asked about, each silent and each one that the
+ * slice-29 review found only by probing:
+ *
+ *  - `split_mailbox`: rows sharing a canonical form under DIFFERENT persons —
+ *    one human the gates count as two. Should be impossible after
+ *    `reconcileMailbox`, so a hit means the repair did not reach a row (the
+ *    login-path repair fix was exactly this shape once).
+ *  - `uncanonical`: `canonical_email IS NULL` — the derived rails compute it, but
+ *    a NULL here says the row was minted or repaired by a path that did not fill
+ *    the cache, and the cache is what `idx_operator_canonical` serves.
+ *  - `dangling_person`: `person_id` names an `op_id` with no row — an anchor
+ *    that was deleted or never existed. `COALESCE(person_id, op_id)` hides it;
+ *    the gate would count that person, but nobody can link or unlink through an
+ *    anchor that is not there.
+ *
+ * READ-ONLY. The repair for each is a human decision through the existing
+ * link/unlink door; auto-repairing a person graph from a background read is how
+ * two of the slice-29 findings happened. Canonical forms are NOT returned
+ * (same rule as `OperatorPersonRow`) — the affected `op_` ids are.
+ */
+export interface OperatorAnomaly {
+  kind: "split_mailbox" | "uncanonical" | "dangling_person";
+  op_ids: string[];
+  /** True when the 200-id cap cut this list — the roster rule: a partial list
+   * never renders as a whole one. */
+  truncated: boolean;
+}
+
+export async function operatorAnomalies(db: DbLike): Promise<OperatorAnomaly[]> {
+  const CAP = 200;
+  const out: OperatorAnomaly[] = [];
+  const split = await db
+    .prepare(
+      `SELECT canonical_email AS k, group_concat(op_id, ' ') AS ids
+         FROM operator_identities
+        WHERE canonical_email IS NOT NULL
+        GROUP BY canonical_email
+       HAVING COUNT(DISTINCT COALESCE(person_id, op_id)) > 1
+        ORDER BY canonical_email
+        LIMIT ${CAP + 1}`,
+    )
+    .bind()
+    .all<{ k: string; ids: string }>();
+  const splitTruncated = split.results.length > CAP;
+  const splitIds = split.results
+    .slice(0, CAP)
+    .flatMap((r) => r.ids.split(" "))
+    .filter((id) => OPERATOR_ACTOR_RE.test(id))
+    .sort();
+  if (splitIds.length > 0) out.push({ kind: "split_mailbox", op_ids: [...new Set(splitIds)], truncated: splitTruncated });
+  const uncanonical = await db
+    .prepare(`SELECT op_id FROM operator_identities WHERE canonical_email IS NULL ORDER BY op_id LIMIT ${CAP + 1}`)
+    .bind()
+    .all<{ op_id: string }>();
+  const un = uncanonical.results.slice(0, CAP).map((r) => r.op_id).filter((id) => OPERATOR_ACTOR_RE.test(id));
+  if (un.length > 0) out.push({ kind: "uncanonical", op_ids: un, truncated: uncanonical.results.length > CAP });
+  const dangling = await db
+    .prepare(
+      `SELECT a.op_id FROM operator_identities a
+        WHERE a.person_id IS NOT NULL
+          AND a.person_id <> a.op_id
+          AND NOT EXISTS (SELECT 1 FROM operator_identities b WHERE b.op_id = a.person_id)
+        ORDER BY a.op_id LIMIT ${CAP + 1}`,
+    )
+    .bind()
+    .all<{ op_id: string }>();
+  const dg = dangling.results.slice(0, CAP).map((r) => r.op_id).filter((id) => OPERATOR_ACTOR_RE.test(id));
+  if (dg.length > 0) out.push({ kind: "dangling_person", op_ids: dg, truncated: dangling.results.length > CAP });
+  return out;
+}
+
+export async function operatorPersons(db: DbLike): Promise<{ operators: OperatorPersonRow[]; truncated: boolean; anomalies: OperatorAnomaly[] }> {
+  const CAP = 200;
+  const { results } = await db
+    .prepare(
+      `SELECT op_id, email, display_name, canonical_email, COALESCE(person_id, op_id) AS person_id
+         FROM operator_identities
+        ORDER BY COALESCE(person_id, op_id), created_at, op_id
+        LIMIT ${CAP + 1}`,
+    )
+    .bind()
+    .all<{ op_id: string; email: string | null; display_name: string | null; canonical_email: string | null; person_id: string }>();
+  const truncated = results.length > CAP;
+  const rows = results.slice(0, CAP).filter((r) => OPERATOR_ACTOR_RE.test(r.op_id));
+  // Derived, not read: `canonical_email` is a cache only the mint and repair
+  // paths fill, and a rail that reads the cache is a rail that is off whenever
+  // the cache is cold. Same reason `unlinkOperator` computes it too.
+  const canonicalOf = (r: { email: string | null; canonical_email: string | null }): string | null =>
+    r.canonical_email ?? (typeof r.email === "string" ? canonicalizeEmail(r.email) : null);
+  const counts = new Map<string, number>();
+  for (const r of rows) {
+    const k = canonicalOf(r);
+    if (k) counts.set(k, (counts.get(k) ?? 0) + 1);
+  }
+  const anomalies = await operatorAnomalies(db);
+  const revoked = await revokedOperatorIds(db);
+  return {
+    // A truncated roster rendered as a whole one is a governance screen lying by
+    // omission, so the flag rides with the rows rather than being inferred.
+    truncated,
+    anomalies,
+    operators: rows.map((r) => ({
+      op_id: r.op_id,
+      label: r.display_name || r.email || r.op_id,
+      person_id: r.person_id,
+      shares_mailbox: (counts.get(canonicalOf(r) ?? "\u0000") ?? 0) > 1,
+      ...(revoked.has(r.op_id) ? { revoked: true as const } : {}),
+    })),
+  };
+}
+
+/**
+ * Repair the rows migration 0054 could not fill, AND fold the mailboxes that
+ * repair just made visible.
+ *
+ * Filling the column is only half of it: two legacy rows for one mailbox both
+ * get a `canonical_email` and are still two persons, which is worse than before
+ * — `shares_mailbox` then reports "same mailbox" beside a pair the gates count
+ * as two people. So every canonical form the repair touched is reconciled in the
+ * same pass.
+ */
+async function healLegacyRows(db: DbLike, ts: string): Promise<void> {
+  const repaired = await repairCanonicalEmails(db, ts);
+  for (const canonical of repaired) await reconcileMailbox(db, canonical, ts);
+}
+
+/**
+ * Fill in `canonical_email` for rows that predate migration 0054.
+ *
+ * One statement per row rather than a single SQL expression, because the rule
+ * lives in `canonicalizeEmail` and must live in exactly one place. Guarded by
+ * `canonical_email IS NULL` so it is idempotent and cannot overwrite a value a
+ * concurrent request just wrote.
+ */
+async function repairCanonicalEmails(db: DbLike, ts: string): Promise<string[]> {
+  // BOUNDED. This runs inside the console's auth middleware, so an unbounded
+  // batch here is an unbounded batch on the request path that decides whether an
+  // operator gets in at all. 100 rows a call, guarded and idempotent, drains a
+  // realistic table in one and any table in a few.
+  const { results } = await db
+    .prepare("SELECT op_id, email FROM operator_identities WHERE canonical_email IS NULL LIMIT 100")
+    .all<{ op_id: string; email: string }>();
+  if (results.length === 0) return [];
+  const filled = results.map((r) => ({ opId: r.op_id, canonical: canonicalizeEmail(typeof r.email === "string" ? r.email : "") }));
+  await db.batch(
+    filled.map((r) =>
+      db
+        .prepare("UPDATE operator_identities SET canonical_email = ?, updated_at = ? WHERE op_id = ? AND canonical_email IS NULL")
+        .bind(r.canonical, ts, r.opId),
+    ),
+  );
+  return [...new Set(filled.map((r) => r.canonical))];
+}
+
+/**
+ * RECONCILE ONE MAILBOX. Every row sharing this canonical form is one human, so
+ * every one of them ends on the same person — the oldest row's.
+ *
+ * It is not enough to point the row just written at the winner. Two aliases
+ * minted CONCURRENTLY each saw an empty kin lookup and each became their own
+ * person, and that split is permanent on its own (a later login returns at the
+ * `email` hit and never re-folds). So the sweep runs over the whole mailbox, and
+ * a third sibling arriving later repairs a split that predates it.
+ *
+ * There is no legitimate state this can trample: `unlinkOperator` refuses to
+ * split a shared mailbox, so two rows on one canonical form holding different
+ * persons is always the race, never a decision. Deterministic
+ * (`created_at, op_id`; the timestamps come from one clock, so ties are
+ * ordinary), idempotent, and a no-op in the overwhelmingly common case.
+ */
+async function reconcileMailbox(db: DbLike, canonical: string, ts: string): Promise<void> {
+  const { results } = await db
+    .prepare("SELECT op_id, person_id FROM operator_identities WHERE canonical_email = ? ORDER BY created_at, op_id")
+    .bind(canonical)
+    .all<{ op_id: string; person_id: string | null }>();
+  if (results.length < 2) return;
+  const first = results[0];
+  if (!first) return;
+  const winner = first.person_id ?? first.op_id;
+  const strays = [...new Set(results.map((r) => r.person_id ?? r.op_id))].filter((pid) => pid !== winner);
+  if (strays.length === 0) return;
+  // THE UNIT IS THE PERSON, NOT THE MAILBOX ROW — and this was argued the other
+  // way first, wrongly. A reviewer read this sweep moving whole person groups as
+  // "a mailbox sweep absorbing an operator who was never on that mailbox", and a
+  // narrower version scoped to `canonical_email` was written and tested. It
+  // STRANDS: if id B sits on this mailbox and an operator has declared B and C
+  // one human, moving B alone leaves C pointing at a person id nobody holds any
+  // more — a partitioned person, a worse defect than the one it was meant to fix.
+  // The slice-29 suite caught it on the first run.
+  //
+  // The narrow version was also wrong on the merits. A LINK IS A DECLARATION that
+  // two ids are one human, not an accident of grouping. If B shares a mailbox
+  // with A (a fact about mail delivery) and an operator has declared B and C one
+  // human (a judgement), then A, B and C are one human by transitivity. Carrying
+  // the whole group is the correct reading of both statements; severing C would
+  // silently overrule the operator who made the declaration.
+  //
+  // A genuinely unrelated person — one nobody has linked to anything on this
+  // mailbox — holds their own person id, is not among `strays`, and is untouched.
+  // That is the absorption the reviewer was right to look for, and it does not
+  // occur.
+  await db.batch(
+    strays.map((pid) =>
+      db.prepare("UPDATE operator_identities SET person_id = ?, updated_at = ? WHERE COALESCE(person_id, op_id) = ?").bind(winner, ts, pid),
+    ),
+  );
+}
+
+/**
+ * The stable `op_` id for an operator, minting one on first sight.
+ *
+ * Minting here (rather than requiring a pre-seeded row) is safe because the
+ * caller only reaches this after `verifyAccessJwt` matched the email against
+ * the OPERATOR_EMAILS allowlist: an unknown address cannot get this far. It is
+ * also the only design in which onboarding an operator needs no manual database
+ * step, which is what makes "fail closed" affordable in practice.
+ */
+export async function operatorActorId(
+  db: DbLike,
+  email: unknown,
+  now: () => string = () => new Date().toISOString(),
+): Promise<string> {
+  const e = normalize(email);
+  const found = await db
+    .prepare("SELECT op_id, canonical_email FROM operator_identities WHERE email = ?")
+    .bind(e)
+    .first<{ op_id: string; canonical_email: string | null }>();
+  if (found?.op_id) {
+    // THE REPAIR CANNOT LIVE BELOW THIS RETURN, which is the branch almost every
+    // request takes. An earlier version put it on the mint path only, and the
+    // consequence was exact: on a deployment that UPGRADED to 0054, two aliases
+    // of one mailbox that had BOTH already logged in kept their pre-migration
+    // rows forever — nothing ever minted, so nothing ever repaired, so they
+    // stayed two persons and one human could publish an accusation alone. That
+    // is not an edge case, it is the deployment the slice was written for: those
+    // rows exist precisely BECAUSE the human logged in with each address.
+    //
+    // Guarded on a NULL column, so it costs one extra column on a query already
+    // being made and does nothing at all once the population has drained.
+    if (found.canonical_email === null) await healLegacyRows(db, now());
+    return assertUsable(found.op_id);
+  }
+
+  const opId = mintId("op");
+  const ts = now();
+  // 0054 ADDED `canonical_email`; IT COULD NOT FILL IT IN. Every row that
+  // existed before the migration carries NULL, and `NULL = ?` matches nothing —
+  // so on any deployment that UPGRADED rather than started fresh, the kin lookup
+  // below saw none of the operators already on record and the fold applied to
+  // nobody. That is the half of the fix that mattered, silently inert on exactly
+  // the deployments that have been running longest, and invisible in tests
+  // because every test database is built from empty.
+  //
+  // Repairing here rather than in SQL keeps ONE implementation of the canonical
+  // form: re-deriving `canonicalizeEmail`'s rules in a migration would be a
+  // second copy of a rule that must not drift, the same argument that gives this
+  // repository one hasher. The table is bounded by OPERATOR_EMAILS (tens of
+  // rows), this runs only on the mint path, and the NULL population drains to
+  // zero the first time any new address is seen.
+  await healLegacyRows(db, ts);
+  // A NEW ADDRESS THAT IS AN OLD PERSON. If this address canonicalizes onto one
+  // already on record, the new id joins that person rather than becoming a
+  // second one — so a Gmail dot-variant or a plus-address cannot be its own
+  // "second operator". The id itself is still new and still random: the ledger
+  // keeps attributing to the address that acted.
+  //
+  // `op_id` breaks the `created_at` tie: the timestamps are ISO milliseconds
+  // taken from one clock, so ties are ordinary, and an unordered pick would let
+  // the same input join different persons on two deployments.
+  const canonical = canonicalizeEmail(e);
+  const kin = await db
+    .prepare("SELECT person_id, op_id FROM operator_identities WHERE canonical_email = ? ORDER BY created_at, op_id LIMIT 1")
+    .bind(canonical)
+    .first<{ person_id: string | null; op_id: string }>();
+  const person = kin ? (kin.person_id ?? kin.op_id) : opId;
+  try {
+    // I3-0261 b (I22-W1-AUTH H1, landed by I22-L02): an OPERATOR_EMAILS grant that mints an identity on first
+    // request leaves an audit row, in the SAME atomic batch as the mint and gated on it (`changes() = 1`), so a
+    // lost first-sight race (the UNIQUE(email) throw below) writes neither.
+    await db.batch([
+      db
+        .prepare("INSERT INTO operator_identities (op_id, email, display_name, created_at, updated_at, person_id, canonical_email) VALUES (?, ?, NULL, ?, ?, ?, ?)")
+        .bind(opId, e, ts, ts, person, canonical),
+      db
+        .prepare("INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT ?, 'operator:identity_first_seen', ?, ?, ?, 'system' WHERE changes() = 1")
+        .bind(opId, "operator identity minted for an OPERATOR_EMAILS address on first request", ts, opId),
+    ]);
+    // CONCURRENT FIRST SIGHT OF TWO SIBLING ADDRESSES. The kin lookup and the
+    // INSERT are two statements, and `canonical_email` is deliberately NOT
+    // unique (two rows sharing one is the whole point), so two aliases of one
+    // human arriving together each find nothing and each become their own
+    // person — permanently, because a later login returns at the `email` hit
+    // above and never re-folds. Re-reading after the write converges both racers
+    // on the oldest row's person, whichever of them got there first.
+    await reconcileMailbox(db, canonical, ts);
+    return opId;
+  } catch (err) {
+    // Lost a concurrent first-sight race on the UNIQUE(email): resolve to
+    // whoever won. One human is one id, always.
+    if (!(err instanceof Error) || !/UNIQUE|constraint/i.test(err.message)) throw err;
+    const race = await db.prepare("SELECT op_id FROM operator_identities WHERE email = ?").bind(e).first<{ op_id: string }>();
+    if (!race?.op_id) throw new OperatorIdentityError("could not resolve an operator identity");
+    return assertUsable(race.op_id);
+  }
+}
+
+/** A row that somehow holds a non-conforming id must not become a ledger actor. */
+function assertUsable(opId: string): string {
+  if (!OPERATOR_ACTOR_RE.test(opId)) throw new OperatorIdentityError("stored operator id has the wrong shape");
+  return opId;
+}
+
+/**
+ * Human labels for a set of `op_` ids, for CONSOLE DISPLAY ONLY. Ids that do
+ * not resolve are simply absent — the caller shows the opaque id, which is
+ * still accountable, rather than inventing an attribution.
+ */
+export async function operatorLabels(db: DbLike, opIds: Iterable<string>): Promise<Map<string, string>> {
+  // Shape-filtered before it can reach a query, de-duplicated, and bounded. The
+  // ids come from our own audit rows, but a validated IN-list is the difference
+  // between "no injection today" and "no injection".
+  const ids = [...new Set([...opIds].filter((id) => OPERATOR_ACTOR_RE.test(id)))].slice(0, 200);
+  const out = new Map<string, string>();
+  if (ids.length === 0) return out;
+  // CHUNKED: the 200 cap is twice D1's 100-parameter ceiling, so a single
+  // IN(...) 500s the ops console — the very surface you would use to
+  // investigate anything else (audit v10 B3). The cap stays at 200; only the
+  // statement is split.
+  const rows: { op_id: string; email: string; display_name: string | null }[] = [];
+  for (const chunk of inChunks(ids)) {
+    const { results } = await db
+      .prepare(`SELECT op_id, email, display_name FROM operator_identities WHERE op_id IN (${chunk.map(() => "?").join(",")})`)
+      .bind(...chunk)
+      .all<{ op_id: string; email: string; display_name: string | null }>();
+    rows.push(...results);
+  }
+  for (const r of rows) {
+    const label = (r.display_name ?? "").trim() || r.email;
+    if (label) out.set(r.op_id, label);
+  }
+  return out;
+}
+
+/** Resolve one label, falling back to the opaque id. Never throws. */
+export function labelFor(labels: Map<string, string>, actorId: string): string {
+  return labels.get(actorId) ?? actorId;
+}
+
+/**
+ * Re-point an existing operator identity at a new address. THE reason the
+ * mapping is a mutable table: the `op_` id — and therefore every ledger row,
+ * audit row and warning already attributed to this person — is untouched.
+ *
+ * RECONCILES AND DISCARDS, same as its siblings. Left as a bare UPDATE (its
+ * original shape), this was the one writer of `email`/`canonical_email` that
+ * neither reconciled the mailbox `linkOperators`/`operatorActorId` maintain
+ * nor discarded sign-offs the way `linkOperators`/`unlinkOperator` do (U-06):
+ * re-pointing id B onto an address that canonicalizes onto id A's mailbox left
+ * A and B sharing a mailbox under DIFFERENT persons — a `split_mailbox` this
+ * module's own invariant says should be impossible — and any sign-off A had
+ * already banked kept counting as a distinct person's signature after the two
+ * ids became (by mail-delivery fact) one human. `reconcileMailbox` folds the
+ * group the new address belongs to; the discard afterward re-prices every
+ * sign-off in whichever person the fold produced, exactly the rule
+ * `discardSignOffs` documents.
+ */
+export async function setOperatorEmail(
+  db: DbLike,
+  opId: string,
+  email: unknown,
+  now: () => string = () => new Date().toISOString(),
+): Promise<void> {
+  assertUsable(opId);
+  const e = normalize(email);
+  await requireRow(db, opId);
+  const ts = now();
+  const canonical = canonicalizeEmail(e);
+  // EVERY WRITE TO `email` WRITES `canonical_email`. There are exactly two, and
+  // leaving them out of step is wrong in both directions: aliases of the NEW
+  // address would not fold onto this person, and a different human later handed
+  // the OLD address would fold onto it — the one direction canonicalization is
+  // documented never to take.
+  await db
+    .prepare("UPDATE operator_identities SET email = ?, canonical_email = ?, updated_at = ? WHERE op_id = ?")
+    .bind(e, canonical, ts, opId)
+    .run();
+  // Fold this id into whatever person now shares its (possibly new) mailbox —
+  // the same repair `operatorActorId` runs after every mint (`:616`) — then
+  // discard sign-offs for the person the fold landed on, on BOTH sides: the
+  // group this id already belonged to, and the group it just joined. Either
+  // side's banked sign-offs are now worth a different number of distinct
+  // persons than when they were cast.
+  const before = await personMembers(db, await personOf(db, opId));
+  await reconcileMailbox(db, canonical, ts);
+  const after = await personMembers(db, await personOf(db, opId));
+  const touched = [...new Set([...before, ...after])];
+  if (touched.length > 0) await db.batch(discardSignOffs(db, touched));
+}
+
+/** Set (or clear, with null) the console's human label for an operator.
+ * `extra` rides the same batch as the write (I3-0755: the console route's audit
+ * line, as `linkOperators` carries its own), so the change and its record land
+ * together or not at all. */
+export async function setOperatorDisplayName(
+  db: DbLike,
+  opId: string,
+  displayName: string | null,
+  now: () => string = () => new Date().toISOString(),
+  extra: readonly DbStatement[] = [],
+): Promise<void> {
+  assertUsable(opId);
+  const raw = typeof displayName === "string" ? displayName.trim().slice(0, 100) : "";
+  if (hasUnsafeDisplayText(raw) || /[<>]/.test(raw)) throw new OperatorIdentityError("display name has control or markup characters, or invisible formatting characters such as direction marks");
+  await requireRow(db, opId);
+  await db.batch([db.prepare("UPDATE operator_identities SET display_name = ?, updated_at = ? WHERE op_id = ?").bind(raw.length === 0 ? null : raw, now(), opId), ...extra]);
+}
+
+/**
+ * Editing a row that does not exist must be an error, not a silent no-op —
+ * "I re-pointed the wrong id and nothing told me" is how an operator ends up
+ * believing an attribution that was never written. Checked with a read rather
+ * than an affected-row count because D1 and the test double report that count
+ * under different keys, and a guard that is only correct on one of them is not
+ * a guard.
+ */
+async function requireRow(db: DbLike, opId: string): Promise<void> {
+  const row = await db.prepare("SELECT op_id FROM operator_identities WHERE op_id = ?").bind(opId).first<{ op_id: string }>();
+  if (!row) throw new OperatorIdentityError("no such operator identity");
+}
+
+/**
+ * #135E-26 (I16-W01C; D-0920) — THE REVOCATION LEVER. Until this, removing an
+ * operator meant editing `OPERATOR_EMAILS` and redeploying, and nothing the
+ * database could read said an operator was gone. `operator_revocations`
+ * (migration 0166, a new table: no column on `operator_identities`) holds one
+ * row per revoked `op_` id.
+ *
+ * A PERSON IS REVOKED, NOT AN ADDRESS: every id sharing the named id's person is
+ * written, so a second allowlisted address of the same human is not a way back
+ * in. An id joined to the person LATER is not covered (see `isOperatorRevoked`).
+ * Their banked sign-offs are discarded in the SAME batch (`discardSignOffs`), so
+ * the dual-control quorum can no longer count a signature the revoked person
+ * cast; the console middleware refuses them before they can cast another.
+ *
+ * The caller (the route) runs this under dual control and refuses a caller
+ * revoking their own person; the audit line rides in `extra`, same batch.
+ */
+export async function revokeOperator(
+  db: DbLike,
+  opId: string,
+  revokedBy: string,
+  reason: string,
+  now: () => string = () => new Date().toISOString(),
+  extra: readonly DbStatement[] = [],
+): Promise<string[]> {
+  if (!OPERATOR_ACTOR_RE.test(opId)) throw new OperatorIdentityError("not an operator id");
+  const row = await db.prepare("SELECT COALESCE(person_id, op_id) AS person FROM operator_identities WHERE op_id = ?").bind(opId).first<{ person: string }>();
+  if (!row) throw new OperatorIdentityError("no such operator");
+  const members = await personMembers(db, row.person);
+  const ids = members.includes(opId) ? members : [opId, ...members];
+  const ts = now();
+  await db.batch([
+    ...ids.map((id) =>
+      db.prepare("INSERT INTO operator_revocations (op_id, revoked_by, reason, revoked_at) VALUES (?, ?, ?, ?) ON CONFLICT(op_id) DO NOTHING").bind(id, revokedBy, reason, ts),
+    ),
+    ...discardSignOffs(db, ids),
+    ...cancelScheduledTransfersStmts(db, ids, revokedBy, ts),
+    ...extra,
+  ]);
+  // The write is the control, so read it back rather than trusting it.
+  if (!(await isOperatorRevoked(db, opId))) throw new OperatorIdentityError("the revocation did not take");
+  return ids;
+}
+
+/** I39-FX-OPS (D-1158(4), INV-030): the `outcome` a revocation writes on the person's scheduled transfers. */
+export const REVOKED_REQUESTER_OUTCOME = "requester_revoked";
+
+/**
+ * I39-FX-OPS (D-1158(4), INV-030): the revoked person's one-signature transfers (`scheduled_account_transfers`,
+ * console.ts scheduleSoloTransfer) die in the revocation's batch: one `account:transfer_scheduled_refused` row per
+ * `scheduled` row whose `requested_by`, or one of whose stored `signers` (I41-CONSOLE, D-1195(7)), is one of `ids`
+ * (written BEFORE the flip, which is what selects them), then
+ * the flip to `refused` with outcome `requester_revoked`. The executor's own revoked-requester refusal
+ * (console.ts runDueScheduledTransfers) is the second stop.
+ */
+function cancelScheduledTransfersStmts(db: DbLike, ids: readonly string[], revokedBy: string, ts: string): DbStatement[] {
+  const json = JSON.stringify(ids);
+  // I41-CONSOLE (D-1195(7) "a"): a no-address row's stored signers (migration 0282 `signers`) are cancelled as its
+  // requester is; `json_each(NULL)` is empty, so a row with no stored signers is selected by `requested_by` alone.
+  const mine =
+    "state = 'scheduled' AND (requested_by IN (SELECT value FROM json_each(?)) OR EXISTS (SELECT 1 FROM json_each(signers) s WHERE s.value IN (SELECT value FROM json_each(?))))";
+  return [
+    db
+      .prepare(
+        `INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT ?, 'account:transfer_scheduled_refused', transfer_id || ': ${REVOKED_REQUESTER_OUTCOME}', ?, to_passport, ? FROM scheduled_account_transfers WHERE ${mine}`,
+      )
+      .bind(revokedBy, ts, auditActorKind(revokedBy), json, json),
+    db.prepare(`UPDATE scheduled_account_transfers SET state = 'refused', settled_at = ?, settled_by = ?, outcome = '${REVOKED_REQUESTER_OUTCOME}' WHERE ${mine}`).bind(ts, revokedBy, json, json),
+  ];
+}
+
+/**
+ * #131AF-12 (D-0928(1)), D-0931(1): the production writer of `operator_person_reviews` (migration 0200). A review is
+ * itself DUAL-CONTROLLED: `reviewers` (the console door passes the op ids whose `operator:review` sign-offs
+ * withDualControl consumed) must be at least two DIFFERENT persons, neither of them `opId`'s person, each known and
+ * unrevoked — so two never-linked addresses of one human can no longer vouch for each other (I16-RG-MONEY:1).
+ * dual_control.ts PERSON_REVIEWED counts a reviewed-person sign-off only when such a row names the requester's
+ * current person, a reviewer who resolves to another person, and a reviewer who is still unrevoked.
+ * ONLY `reviewers[0]` IS RECORDED (`reviewed_by`): migration 0200 has one reviewer column, so a co-signer revoked
+ * later does not void the review until a co-signer column lands (NEEDS-MIGRATION, I16-FXA report).
+ * Refused (OperatorIdentityError): a malformed id, an unknown id, self-review, fewer than two reviewer persons, a
+ * reviewer who is the reviewed person, a revoked reviewer. The INSERT re-checks every person and revocation IN THE
+ * STATEMENT, bound to the values read above it; a link/unlink/revoke landing in between NULLs `person_id`, whose NOT
+ * NULL then rolls back the whole batch — the caller's audit `extra` rides that SAME batch (I16-RG-CLIENT:8), so no
+ * review lands unaudited and no audit row names a review that did not land.
+ */
+export async function reviewOperatorPerson(
+  db: DbLike,
+  reviewers: readonly string[],
+  opId: string,
+  now: () => string = () => new Date().toISOString(),
+  extra: readonly DbStatement[] = [],
+): Promise<{ op_id: string; person_id: string; reviewed_by: string; reviewers: string[]; reviewed_at: string }> {
+  const signers = [...new Set(reviewers)];
+  if (!OPERATOR_ACTOR_RE.test(opId) || signers.some((r) => !OPERATOR_ACTOR_RE.test(r))) throw new OperatorIdentityError("not an operator id");
+  if (signers.includes(opId)) throw new OperatorIdentityError("an operator cannot review their own person mapping");
+  if (signers.length < 2) throw new OperatorIdentityError("a review needs two operators other than the one reviewed");
+  const ids = [opId, ...signers];
+  const { results: known } = await db
+    .prepare("SELECT op_id FROM operator_identities WHERE op_id IN (SELECT value FROM json_each(?))")
+    .bind(JSON.stringify(ids))
+    .all<{ op_id: string }>();
+  if (known.length !== ids.length) throw new OperatorIdentityError("no such operator");
+  for (const r of signers) if (await isOperatorRevoked(db, r)) throw new OperatorIdentityError("a revoked operator cannot review");
+  const [person, ...persons] = await Promise.all(ids.map((id) => personOf(db, id)));
+  if (persons.includes(person!)) throw new OperatorIdentityError("a reviewer who is the same person vouches for nothing");
+  if (new Set(persons).size < 2) throw new OperatorIdentityError("a review needs two different people, neither of them the one reviewed");
+  const ts = now();
+  const CUR = "COALESCE((SELECT person_id FROM operator_identities WHERE op_id = ?), ?)";
+  const signerHolds = `${CUR} = ? AND ? <> ? AND NOT EXISTS (SELECT 1 FROM operator_revocations WHERE op_id = ?)`;
+  const insert = db
+    .prepare(
+      `INSERT INTO operator_person_reviews (op_id, person_id, reviewed_by, reviewed_at)
+         SELECT ?, CASE WHEN ${CUR} = ?${signers.map(() => ` AND ${signerHolds}`).join("")} THEN ? ELSE NULL END, ?, ? WHERE 1
+       ON CONFLICT(op_id) DO UPDATE SET person_id = excluded.person_id, reviewed_by = excluded.reviewed_by, reviewed_at = excluded.reviewed_at`,
+    )
+    .bind(opId, opId, opId, person, ...signers.flatMap((s, i) => [s, s, persons[i], persons[i], person, s]), person, signers[0], ts);
+  try {
+    await db.batch([insert, ...extra]);
+  } catch (e) {
+    if (/NOT NULL constraint failed: operator_person_reviews\.person_id/i.test(e instanceof Error ? e.message : String(e))) {
+      throw new OperatorIdentityError("the person mapping changed while reviewing — review again");
+    }
+    throw e;
+  }
+  return { op_id: opId, person_id: person!, reviewed_by: signers[0]!, reviewers: signers, reviewed_at: ts };
+}
+
+/**
+ * True when `opId` has a revocation row. PER ID, NOT PER CURRENT PERSON, on
+ * purpose: `revokeOperator` already writes every id the person has at revocation
+ * time, and a person-wide read would let ONE full operator revoke a live colleague
+ * without dual control by `link`ing the colleague's id to a revoked one (a link
+ * moves the colleague into the revoked person). An address joined later is gated by
+ * the allowlist, which the revoke dialog says to edit as well. A
+ * database without migration 0166 has no revocation table and so no revocation:
+ * nothing could have written one. Any other read fault throws, and the
+ * middleware turns that into a 503 (fail closed).
+ */
+export async function isOperatorRevoked(db: DbLike, opId: string): Promise<boolean> {
+  try {
+    // Asked as "is this id LIVE", which always returns exactly one row: anything
+    // but an explicit live = 1 (no row, a NULL, a malformed answer) reads as
+    // revoked — fail closed, rather than treating a missing answer as "not revoked".
+    const row = await db
+      .prepare("SELECT NOT EXISTS (SELECT 1 FROM operator_revocations WHERE op_id = ?) AS live")
+      .bind(opId)
+      .first<{ live: number }>();
+    return row?.live !== 1;
+  } catch (e) {
+    if (/no such table: operator_revocations/i.test(e instanceof Error ? e.message : String(e))) return false;
+    throw e;
+  }
+}
+
+/** Every revoked id, for the roster read. Same missing-table rule as `isOperatorRevoked`. */
+export async function revokedOperatorIds(db: DbLike): Promise<Set<string>> {
+  try {
+    const { results } = await db.prepare("SELECT op_id FROM operator_revocations").bind().all<{ op_id: string }>();
+    return new Set(results.map((r) => r.op_id));
+  } catch (e) {
+    if (/no such table: operator_revocations/i.test(e instanceof Error ? e.message : String(e))) return new Set();
+    throw e;
+  }
+}
+
+/**
+ * I3-0261 (D-1082(4)): operator ACCESS is recorded in the audit log, which is also where its state is read back from
+ * (sealed, append-only; no second table to clear). `recordOperatorRole` keys on `item_id` = the `op_` id and
+ * `recordAccessConfig` on the newest `operator:access_config` row; both are called by console.ts's /ops/* middleware
+ * on every authenticated request, so what they record is what a request actually ran under. `operatorAccessChanges`
+ * (console.ts) reads these actions back for the integrity page.
+ */
+export const OPERATOR_ROLE_ACTIONS = ["operator:role_first_seen", "operator:role_changed"] as const;
+export const OPERATOR_ACCESS_ACTIONS = [
+  ...OPERATOR_ROLE_ACTIONS,
+  "operator:access_config",
+  "operator:address_added",
+  "operator:address_readded",
+  "operator:address_removed",
+  "operator:role_config_changed",
+] as const;
+const ROLE_ACTIONS_SQL = "('operator:role_first_seen', 'operator:role_changed')";
+
+/**
+ * I3-0261: an operator identity's effective role (auth.ts `operatorRole`, from OPS_FULL_GROUP / OPS_GROUPS_CLAIM) as
+ * this request derived it. The first time the identity is seen at any role: `operator:role_first_seen`
+ * (`role=<role>`); a role other than its newest recorded one: `operator:role_changed` (`role=<new> (was <old>)`);
+ * the same role: nothing. The INSERT is bound to the newest row it read (`MAX(audit_id) IS ?`, INV-058), so two
+ * concurrent requests that read the same row write one change between them.
+ */
+export async function recordOperatorRole(db: DbLike, opId: string, role: "full" | "support", now: string): Promise<void> {
+  // actor_id is the identity itself with actor_kind 'system', the shape of `operator:identity_first_seen` above.
+  const last = await db
+    .prepare(`SELECT audit_id, detail FROM audit_log WHERE item_id = ? AND action IN ${ROLE_ACTIONS_SQL} ORDER BY audit_id DESC LIMIT 1`)
+    .bind(opId)
+    .first<{ audit_id: number; detail: string }>();
+  const was = last ? (/^role=(full|support)(?![a-z_])/.exec(last.detail)?.[1] ?? null) : null;
+  if (was === role) return;
+  await db
+    .prepare(`INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT ?, ?, ?, ?, ?, 'system' WHERE (SELECT MAX(audit_id) FROM audit_log WHERE item_id = ? AND action IN ${ROLE_ACTIONS_SQL}) IS ?`)
+    .bind(opId, last ? "operator:role_changed" : "operator:role_first_seen", last ? `role=${role} (was ${was ?? "unreadable"})` : `role=${role}`, now, opId, opId, last?.audit_id ?? null)
+    .run();
+}
+
+/** The access configuration a request ran under, as `recordAccessConfig` stores it. */
+export interface OperatorAccessState {
+  operator_emails: string[];
+  full_group: string | null;
+  groups_claim: string;
+}
+
+/**
+ * I3-0261: the OPERATOR_EMAILS / OPS_FULL_GROUP / OPS_GROUPS_CLAIM configuration (auth.ts `accessConfigFromEnv`) a
+ * request ran under. The first one seen is recorded as an `operator:access_config` row; a configuration that differs
+ * from the newest such row writes a new one and, in the SAME batch and chained on it (`changes() = 1`, so a request
+ * that lost the race writes none of them): `operator:address_added` per new address — `operator:address_readded`
+ * when it has an operator identity or an earlier `operator:address_removed` row — `operator:address_removed` per
+ * address gone, and `operator:role_config_changed` when the full group or the groups claim changed. `item_id` is the
+ * address's `op_` id when it has one, else the address. Only a configuration a request ran under can be recorded: a
+ * change made and undone between two /ops requests leaves no row. `observedBy` (actor_id, actor_kind 'system') is
+ * the `op_` id of the request that ran under it.
+ */
+export async function recordAccessConfig(
+  db: DbLike,
+  observedBy: string,
+  cfg: { operatorEmails: readonly string[]; fullGroup?: string | null | undefined; groupsClaim?: string | undefined },
+  now: string,
+): Promise<void> {
+  const next: OperatorAccessState = { operator_emails: [...new Set(cfg.operatorEmails)].sort(), full_group: cfg.fullGroup ?? null, groups_claim: cfg.groupsClaim ?? "groups" };
+  const state = JSON.stringify(next);
+  const last = await db
+    .prepare("SELECT audit_id, detail FROM audit_log WHERE action = 'operator:access_config' ORDER BY audit_id DESC LIMIT 1")
+    .first<{ audit_id: number; detail: string }>();
+  if (last?.detail === state) return;
+  const stmts: DbStatement[] = [
+    db
+      .prepare("INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT ?, ?, ?, ?, ?, 'system' WHERE (SELECT MAX(audit_id) FROM audit_log WHERE action = 'operator:access_config') IS ?")
+      .bind(observedBy, "operator:access_config", state, now, null, last?.audit_id ?? null),
+  ];
+  if (last) {
+    const prev = parseAccessState(last.detail);
+    const row = (action: string, item: string, detail: string): DbStatement =>
+      db.prepare("INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT ?, ?, ?, ?, ?, 'system' WHERE changes() = 1").bind(observedBy, action, detail, now, item);
+    const before = new Set(prev?.operator_emails ?? []);
+    const after = new Set(next.operator_emails);
+    for (const e of next.operator_emails) {
+      if (before.has(e)) continue;
+      const opId = await opIdForAddress(db, e);
+      const removedBefore = await db.prepare("SELECT 1 AS x FROM audit_log WHERE item_id = ? AND action = 'operator:address_removed' LIMIT 1").bind(opId ?? e).first<{ x: number }>();
+      const again = opId !== null || removedBefore !== null;
+      stmts.push(row(again ? "operator:address_readded" : "operator:address_added", opId ?? e, again ? "an address that was an operator before is on OPERATOR_EMAILS again" : "a new address is on OPERATOR_EMAILS"));
+    }
+    for (const e of prev?.operator_emails ?? []) {
+      if (after.has(e)) continue;
+      stmts.push(row("operator:address_removed", (await opIdForAddress(db, e)) ?? e, "an address is no longer on OPERATOR_EMAILS"));
+    }
+    if (prev?.full_group !== next.full_group || prev?.groups_claim !== next.groups_claim) {
+      stmts.push(row("operator:role_config_changed", "OPS_FULL_GROUP", `OPS_FULL_GROUP ${JSON.stringify(prev?.full_group ?? null)} -> ${JSON.stringify(next.full_group)}; OPS_GROUPS_CLAIM ${JSON.stringify(prev?.groups_claim ?? null)} -> ${JSON.stringify(next.groups_claim)}`));
+    }
+  }
+  await db.batch(stmts);
+}
+
+/** A stored configuration, or null when the detail is not one (no JSON, or no `operator_emails` array: `.map` throws). */
+function parseAccessState(detail: string): OperatorAccessState | null {
+  try {
+    const v = JSON.parse(detail) as OperatorAccessState;
+    return { operator_emails: v.operator_emails.map(String), full_group: v.full_group, groups_claim: v.groups_claim };
+  } catch {
+    return null;
+  }
+}
+
+async function opIdForAddress(db: DbLike, email: string): Promise<string | null> {
+  return (await db.prepare("SELECT op_id FROM operator_identities WHERE email = ?").bind(email).first<{ op_id: string }>())?.op_id ?? null;
+}
+===== END FILE: services/trust-core/src/operators.ts =====
+
+===== BEGIN FILE: services/trust-core/src/otp-policy.ts =====
+/**
+ * OTP policy — the flag-11 fallback sign-in limits, as pure logic.
+ * (Decision: claude/PRODUCT-FLAG-DECISIONS.md, flag 11.)
+ *
+ * Pinned rules:
+ *  - 6-digit code, single-use
+ *  - expires 10 minutes after issue
+ *  - dead after 5 wrong attempts
+ *  - per-email send cooldown 60s, per-email hourly cap 5
+ *  - per-IP hourly send cap 20 (caller supplies the IP bucket count)
+ *  - NO account-existence oracle: the decision layer returns identical
+ *    surface responses whether or not the email maps to an account —
+ *    this module only encodes limit math, never account lookups.
+ *
+ * Dependency-free on purpose: graft into services/trust-core/src and wire
+ * to real storage. Times are epoch ms supplied by the caller (no Date.now()
+ * inside — determinism for tests, same convention as dates.ts).
+ */
+
+export const OTP_DIGITS = 6;
+export const OTP_TTL_MS = 10 * 60 * 1000;
+export const OTP_MAX_ATTEMPTS = 5;
+export const SEND_COOLDOWN_MS = 60 * 1000;
+export const SEND_HOURLY_CAP_PER_EMAIL = 5;
+export const SEND_HOURLY_CAP_PER_IP = 20;
+const HOUR_MS = 60 * 60 * 1000;
+
+export interface OtpRecord {
+  /** sha-256 hex of the code — the code itself is never stored. */
+  codeHash: string;
+  issuedAtMs: number;
+  attempts: number;
+  /** set when consumed by a successful verify (single-use). */
+  consumedAtMs: number | null;
+}
+
+export type SendDecision =
+  | { ok: true }
+  | {
+      ok: false;
+      reason: "cooldown" | "email_hourly_cap" | "ip_hourly_cap";
+      /** Seconds until THIS limit clears, when computable from the inputs
+       * given. Absent for `ip_hourly_cap` (the caller supplies only a count,
+       * not the bucket's own send times, so no clearing time is knowable
+       * here). AS-127: cooldown and email_hourly_cap were indistinguishable
+       * 429s to every caller downstream — this is the distinguishing
+       * signal a route/client can use instead of a flat "wait a minute". */
+      retryAfterSeconds?: number | undefined;
+    };
+
+/**
+ * May a new code be sent? `recentSendTimesMs` = this email's send times
+ * (any window ≥ 1h), `ipSendsLastHour` = count for the caller's IP bucket.
+ */
+export function canSendOtp(
+  recentSendTimesMs: readonly number[],
+  ipSendsLastHour: number,
+  nowMs: number,
+): SendDecision {
+  if (ipSendsLastHour >= SEND_HOURLY_CAP_PER_IP) {
+    return { ok: false, reason: "ip_hourly_cap" };
+  }
+  const lastHour = recentSendTimesMs.filter((t) => nowMs - t < HOUR_MS);
+  if (lastHour.length >= SEND_HOURLY_CAP_PER_EMAIL) {
+    const oldest = lastHour.reduce((a, b) => Math.min(a, b), Infinity);
+    const retryAfterSeconds = Math.max(0, Math.ceil((HOUR_MS - (nowMs - oldest)) / 1000));
+    return { ok: false, reason: "email_hourly_cap", retryAfterSeconds };
+  }
+  const newest = lastHour.reduce((a, b) => Math.max(a, b), -Infinity);
+  if (newest !== -Infinity && nowMs - newest < SEND_COOLDOWN_MS) {
+    const retryAfterSeconds = Math.max(0, Math.ceil((SEND_COOLDOWN_MS - (nowMs - newest)) / 1000));
+    return { ok: false, reason: "cooldown", retryAfterSeconds };
+  }
+  return { ok: true };
+}
+
+export type VerifyOutcome =
+  | { outcome: "consumed"; record: OtpRecord }
+  | { outcome: "wrong"; record: OtpRecord }
+  | { outcome: "dead"; reason: "expired" | "attempts" | "already_used" };
+
+/**
+ * Attempt a verify. Pure: returns the next record state; the caller persists
+ * it atomically (UPDATE ... WHERE attempts = prev.attempts for the
+ * single-use race, same discipline as credentials.ts dead-marking).
+ * `hashesMatch` is computed by the caller with the @dhwaja/canonical sha-256 hasher —
+ * this module never hashes (invariant #1: one hasher).
+ */
+export function verifyOtp(
+  record: OtpRecord,
+  hashesMatch: boolean,
+  nowMs: number,
+): VerifyOutcome {
+  if (record.consumedAtMs !== null) return { outcome: "dead", reason: "already_used" };
+  if (nowMs - record.issuedAtMs >= OTP_TTL_MS) return { outcome: "dead", reason: "expired" };
+  if (record.attempts >= OTP_MAX_ATTEMPTS) return { outcome: "dead", reason: "attempts" };
+  if (!hashesMatch) {
+    const next = { ...record, attempts: record.attempts + 1 };
+    return next.attempts >= OTP_MAX_ATTEMPTS
+      ? { outcome: "dead", reason: "attempts" }
+      : { outcome: "wrong", record: next };
+  }
+  return { outcome: "consumed", record: { ...record, consumedAtMs: nowMs } };
+}
+
+/** Format guard for a submitted code (before any hashing). */
+export function isWellFormedOtp(code: string): boolean {
+  return /^[0-9]{6}$/.test(code);
+}
+===== END FILE: services/trust-core/src/otp-policy.ts =====
+
+===== BEGIN FILE: services/trust-core/src/packs.ts =====
+import { RandomStream } from "@dhwaja/war-engine";
+import { sha256Hex } from "@dhwaja/canonical";
+import { fanKey, occurredDay, outboxStatements, type FanKey } from "./analytics-events.js";
+import { publishAfterCommit, type AnalyticsTickEnv } from "./analytics-outbox.js";
+import { outboxSpan, outboxSpanSeqs } from "./events.js";
+import { inChunks, type DbLike, type DbStatement } from "./db.js";
+import { isoWeek, serveRatings, stableStringify, RATING_DIMENSIONS, type ArtifactStore, type ArtifactReader } from "./ratings.js";
+import { warOptedIn, warOptedInIds } from "./war-consent.js";
+import { grantLiveAtSql } from "./standing.js";
+import { CASH_GUARD_SQL, CREATOR_CLOSED_SQL, cashGuardBinds, creatorNetCents, creditBalance, CREDIT_BACKING_CENTS, PACK_PRICE_CREDITS, PAYOUT_HOLD_MS } from "./credits.js";
+import { lotEdgeStmt } from "./credit-lots.js";
+import { accountBanned } from "./refunds.js";
+import { mintInstanceStatements, MAX_INSTANCES_PER_ACCOUNT, WarInstanceError } from "./war-instances.js";
+import { logError } from "./log.js";
+
+/**
+ * S-CW6b: packs. A pack costs credits and yields CARDS_PER_PACK cards drawn
+ * (heat-weighted) from the WEEK'S COMMITTED odds table, plus one cosmetic
+ * collector's variant. Provably fair: the draw is a pure function of
+ * (server_seed, client_seed, odds table), so the fan re-runs it from the
+ * revealed seed + the pinned odds hash and gets the same cards.
+ *
+ * HEAT → RARITY (design doc): a HOTTER creator (higher aggregate Power Rating)
+ * is RARER — a LOWER draw weight — so pulling a top creator is the chase.
+ * Rarity SHOWS strength, never adds it: the drawn card's live stats are
+ * whatever they are; the pack only affects how OFTEN it appears.
+ */
+
+export const CARDS_PER_PACK = 5;
+
+/**
+ * I3-0841 a (census option A, D-0994(3)) — THE SMALL-TABLE GUARD. A chosen creator's copies per pack are
+ * Binomial(6, p) with p = weight/T, so targeted cost per copy is 500/(6p) credits and beats the 200-credit direct price
+ * (and its 1/day/creator cap) once p > 41.67%, which needs a table of fewer than 103 creators. `openPack` and
+ * `commitPack` refuse (409, nothing charged, nothing committed) while this week's frozen odds table has fewer entries,
+ * or (both doors, `assertPackTableEligibleEnough`) fewer of its creators are still eligible.
+ * The refusal sentence is Jason's approved wording (I25-Q4a, D-1030), shown to the fan as `message`.
+ */
+export const MIN_PACK_TABLE_CREATORS = 103;
+export const SMALL_PACK_TABLE_REFUSAL = "packs open once the week's table is larger; buy directly";
+/** I25-Q4a (D-1030 approved the sentence): the refusal both doors throw, marked `userFacing` so `errorBody` (route-helpers.ts)
+ * answers it as `message` and apps/web shows it. */
+function smallTableRefusal(): WarInstanceError {
+  return Object.assign(new WarInstanceError(SMALL_PACK_TABLE_REFUSAL, 409), { userFacing: true as const });
+}
+function assertPackTableLargeEnough(table: OddsTable): void {
+  if (table.entries.length < MIN_PACK_TABLE_CREATORS) throw smallTableRefusal();
+}
+/** D-1010(7) (I25 JN-02 item 1): the same guard over the creators of the frozen table still ELIGIBLE to be minted when
+ * the pack is committed (commitPack, I26-W1-MONEY) and opened (openPack, before the commitment read, the draw and the debit) — `warOptedInIds` (opted in, verified, not retracted, not under
+ * `request_suppressions`) and not closed or staff-suspended (`CREATOR_CLOSED_SQL`), the predicates of openPack's mint
+ * gate except the ratings-artifact read. The price follows that live set (withheld slots are refunded), so a table frozen
+ * at 103 that thinned after the freeze prices like a small table and is refused the same way. */
+async function assertPackTableEligibleEnough(db: DbLike, table: OddsTable, nowIso: string): Promise<void> {
+  assertPackTableLargeEnough(table);
+  const opted = [...(await warOptedInIds(db, [...new Set(table.entries.map((e) => e.passport_id))], nowIso))]; // JN-02: the door's instant
+  let closed = 0;
+  for (const chunk of inChunks(opted)) {
+    const row = await db
+      .prepare(`SELECT COUNT(*) AS n FROM passports p WHERE p.passport_id IN (${chunk.map(() => "?").join(",")}) AND ${CREATOR_CLOSED_SQL("p.passport_id")}`)
+      .bind(...chunk)
+      .first<{ n: number }>();
+    closed += row?.n ?? 0;
+  }
+  if (opted.length - closed < MIN_PACK_TABLE_CREATORS) throw smallTableRefusal();
+}
+
+/**
+ * I3-0155 — THE ELIGIBILITY GATE FOR A PAID RANDOMIZED PRODUCT.
+ *
+ * A pack is bought with credits (dollar-backed, `CREDIT_BACKING_CENTS`) and
+ * yields a seeded draw over a published odds table. Several jurisdictions treat
+ * a paid randomized draw as a regulated product — a licence, an age floor, or a
+ * prohibition — and this rail had NO geographic or age exclusion anywhere in
+ * `src`: `grep -rn "excluded_regions|min_age" services/trust-core/src` answered
+ * nothing before this change.
+ *
+ * WHICH jurisdictions and WHAT age is a RULING, not a builder's call, so this
+ * ships with its table EMPTY and its refusal TESTED. While the table is empty
+ * the predicate refuses nothing and this rail behaves exactly as it did.
+ *
+ * THE ONE THING IT DOES DECIDE — and it is a code decision, not a policy one —
+ * is the direction it fails once a ruling EXISTS: an unknown region or an
+ * unknown age is a REFUSAL, never a pass. A gate whose answer is "we could not
+ * tell" must not sell the regulated product; otherwise every caller that omits
+ * the field is exempt from the ruling by accident.
+ *
+ * WAITING ON: the jurisdiction/age ruling (see this room's report, I3-0155).
+ * Until it lands, `PACK_REGION_POLICY` stays empty and nothing is excluded.
+ */
+export interface PackEligibility {
+  /** ISO 3166-1 alpha-2, optionally with a subdivision (`US`, `US-WA`). */
+  region?: string | null;
+  age_years?: number | null;
+}
+
+export interface PackRegionPolicy {
+  /** Regions where paid randomized packs may not be sold. A bare country code
+   * also excludes its subdivisions (`US` excludes `US-WA`). EMPTY = unruled. */
+  excluded_regions: readonly string[];
+  /** Minimum age in years, or null when unruled. */
+  min_age_years: number | null;
+}
+
+/** THE TABLE, DELIBERATELY EMPTY. Filled by the ruling, not by a builder. */
+export const PACK_REGION_POLICY: PackRegionPolicy = { excluded_regions: [], min_age_years: null };
+
+const REGION_RE = /^[A-Z]{2}(-[A-Z0-9]{1,3})?$/;
+/** openPack's guard refuses by NULLing statement 1's primary key; this is that constraint's message (SQLite/D1). */
+const GUARD_REFUSAL_RE = /NOT NULL constraint failed: credit_ledger\.entry_id\b/i;
+
+/** The refusal reason, or null when this buyer may open a pack. Pure. */
+export function packEligibilityRefusal(elig?: PackEligibility, policy: PackRegionPolicy = PACK_REGION_POLICY): string | null {
+  const regionRuled = policy.excluded_regions.length > 0;
+  const ageRuled = policy.min_age_years !== null;
+  if (!regionRuled && !ageRuled) return null; // unruled: this rail is unchanged
+  if (regionRuled) {
+    const region = typeof elig?.region === "string" ? elig.region.trim().toUpperCase() : "";
+    if (!REGION_RE.test(region)) return "packs are not available without a confirmed region";
+    const country = region.slice(0, 2);
+    if (policy.excluded_regions.some((r) => { const e = r.trim().toUpperCase(); return e === region || (e.length === 2 && e === country); })) {
+      return "packs are not available in your region";
+    }
+  }
+  if (ageRuled) {
+    const age = elig?.age_years;
+    if (typeof age !== "number" || !Number.isFinite(age)) return "packs are not available without a confirmed age";
+    if (age < policy.min_age_years!) return "packs are not available at your age";
+  }
+  return null;
+}
+
+/**
+ * REG-07 — THE ARMING PRECONDITION: WIRING BEFORE THE RULING.
+ *
+ * The gate above ships fail-closed with an EMPTY table, and the ordering that
+ * makes that safe — wire the callers, THEN fill the table — was a sentence in a
+ * report and nothing else. Measured: filling `excluded_regions` against the
+ * unwired tree turns 22 of 35 `test/packs.test.ts` cases red with "packs are
+ * not available without a confirmed region". Every buyer refused, by a message
+ * about their own region, for a defect that is ours.
+ *
+ * So the ordering is code. Each policy FIELD names the CALLER-SIDE source its
+ * value comes from, and a field may only be armed once that source is `live`.
+ * Arming a field whose source is `none` is a DEPLOYMENT fault: it fails at the
+ * door with `pack_gate_misconfigured` (500) and the field named in the log,
+ * never as a buyer-facing refusal.
+ */
+export type PackEligibilitySource = "live" | "none";
+
+export interface PackEligibilitySources {
+  /** `CF-IPCountry` on the request — read by `war-routes.ts`'s
+   * `packEligibilityFromRequest` and passed at both pack doors. Live. */
+  region: PackEligibilitySource;
+  /** NOT LIVE, AND THAT IS THE POINT. Nothing in this service records or
+   * verifies a birthdate or an age: `grep -rniE '\bdob\b|birth_?date|age_gate'
+   * services/trust-core/src` answers nothing. Arming `min_age_years` therefore
+   * refuses EVERY buyer whatever their age. Flip this to "live" in the SAME
+   * edit that adds the source, never in the edit that fills the table. */
+  age_years: PackEligibilitySource;
+}
+
+export const PACK_ELIGIBILITY_SOURCES: PackEligibilitySources = { region: "live", age_years: "none" };
+
+/** The deployment fault, or null. Defaults to the SHIPPED table and the SHIPPED
+ * sources on purpose: this asks whether THIS DEPLOYMENT armed a field ahead of
+ * its wiring, not whether a caller passed an odd policy. */
+export function packPolicyArmingFault(
+  sources: PackEligibilitySources = PACK_ELIGIBILITY_SOURCES,
+  policy: PackRegionPolicy = PACK_REGION_POLICY,
+): string | null {
+  if (policy.excluded_regions.length > 0 && sources.region !== "live") {
+    return "PACK_REGION_POLICY.excluded_regions is armed but no caller supplies `region`";
+  }
+  if (policy.min_age_years !== null && sources.age_years !== "live") {
+    return "PACK_REGION_POLICY.min_age_years is armed but no caller supplies `age_years`";
+  }
+  return null;
+}
+
+/** Is the SHIPPED table armed at all? */
+export function packGateArmed(policy: PackRegionPolicy = PACK_REGION_POLICY): boolean {
+  return policy.excluded_regions.length > 0 || policy.min_age_years !== null;
+}
+
+/**
+ * THE SEAM CHECK, asked at BOTH doors before the buyer predicate.
+ *
+ * Two faults, both OURS and neither the buyer's:
+ *  (a) a field armed with no source — `packPolicyArmingFault`;
+ *  (b) an UNWIRED CALL SITE: the shipped table is armed and this caller passed
+ *      no eligibility at all. A wired caller that could not determine the
+ *      region passes `{ region: null }` and gets the ordinary fail-closed
+ *      refusal, which is correct; `undefined` means the call site was never
+ *      taught to ask, which is not.
+ *
+ * Reads the module consts only, so a policy a test injects is untouched.
+ */
+export function assertPackGateWired(elig: PackEligibility | undefined, door: string): void {
+  const fault = packPolicyArmingFault() ?? (packGateArmed() && elig === undefined ? `${door} supplies no PackEligibility, but PACK_REGION_POLICY is armed` : null);
+  if (!fault) return;
+  // `door` rides in `err` (the fault sentence names it): log.ts:64 is an
+  // allowlist and adding a key to it is an edit in a file this room does not own.
+  logError({ cid: "unknown", hop: "http", msg: "pack_gate_misconfigured", err: fault });
+  throw new WarInstanceError("pack_gate_misconfigured", 500);
+}
+/** Max sum of the 7 Power-Rating bars (each 1..7). */
+const HEAT_MAX = RATING_DIMENSIONS.length * 7; // 49
+/** Draw weight from a creator's heat: hotter (higher sum) → lower weight, floored at 1. */
+export function heatWeight(barSum: number): number {
+  const clamped = Math.max(RATING_DIMENSIONS.length, Math.min(HEAT_MAX, barSum));
+  return HEAT_MAX + 1 - clamped; // 1 (hottest) .. 43 (coldest)
+}
+
+const oddsKey = (week: string): string => `war/odds/${week}.json`;
+
+export interface OddsTable {
+  week: string;
+  generated_at: string;
+  entries: { passport_id: string; weight: number }[];
+  content_hash: string;
+}
+
+/**
+ * WEEKLY CRON: compute the pack odds table from the live ratings artifacts
+ * (read-only, one-way — the draw never feeds back into ratings) and publish it
+ * to R2 once per week, create-if-absent (an odds table, like an edition, is
+ * frozen once written so an opened pack's odds_hash stays verifiable). Only
+ * opted-in, rated creators are eligible.
+ */
+export async function buildPackOdds(store: ArtifactStore, db: DbLike, passportIds: readonly string[], nowMs: number, now: () => string = () => new Date().toISOString()): Promise<{ week: string; count: number; written: boolean; corrupt?: boolean }> {
+  const week = isoWeek(nowMs);
+  const key = oddsKey(week);
+  const existing = await store.get(key);
+  if (existing !== null) {
+    try {
+      return { week, count: (JSON.parse(existing) as OddsTable).entries.length, written: false };
+    } catch {
+      // I3-0948 — THIS DOES NOT FALL THROUGH AND REWRITE, AND IT NEVER COULD.
+      // The only write below is `store.putIfAbsent`, which by contract refuses
+      // while the key is occupied (ratings.ts:107), so the old `/* fall through
+      // and rewrite a corrupt table */` was a claim the code cannot keep: every
+      // run this week re-read the same corrupt bytes, `servePackOdds` kept
+      // returning null, packs 503ed for the rest of the ISO week, and the
+      // caller could not tell that from "the table is already built".
+      // Overwriting a frozen artifact is NOT this function's decision to make —
+      // the sibling path for a corrupt frozen edition is "leave for operator
+      // forensics, never overwrite" (ratings.ts:608), and packs opened earlier
+      // this week verify against the bytes that were there. So the week still
+      // fails closed; what changes is that it says so, to a caller that can log
+      // and alert. See QUEUED in org/07-findings/W3-03-batch/W3-03-R3.
+      return { week, count: 0, written: false, corrupt: true };
+    }
+  }
+  const entries: { passport_id: string; weight: number }[] = [];
+  for (const psp of passportIds) {
+    if (!/^psp_[0-9a-f]{16}$/.test(psp)) continue;
+    // JN-02 (I34-W2-EXPIRY-B): the table's own instant `nowMs`, not the wall clock.
+    if (!(await warOptedIn(db, psp, new Date(nowMs).toISOString()))) continue;
+    const ratings = await serveRatings(store, db, psp, new Date(nowMs).toISOString()); // folds suppression
+    if (!ratings) continue;
+    const barSum = RATING_DIMENSIONS.reduce((s, d) => s + ratings.ratings[d].bar, 0);
+    entries.push({ passport_id: psp, weight: heatWeight(barSum) });
+  }
+  entries.sort((a, b) => (a.passport_id < b.passport_id ? -1 : 1)); // deterministic
+  // F4 (review): NEVER freeze an EMPTY table. putIfAbsent-ing `entries:[]` would
+  // make servePackOdds return null (empty) → packs 503 for the whole ISO week
+  // with no self-heal. Writing nothing lets a later run (once creators are
+  // eligible / ratings have materialized) publish the real table for the week.
+  if (entries.length === 0) return { week, count: 0, written: false };
+  const body: Omit<OddsTable, "content_hash"> = { week, generated_at: now(), entries };
+  const content_hash = await sha256Hex(stableStringify(body));
+  const table: OddsTable = { ...body, content_hash };
+  const written = await store.putIfAbsent(key, stableStringify(table));
+  return { week, count: entries.length, written };
+}
+
+/**
+ * UI-AUDIT — WHO THE CAP EXCLUDES, AND FOR HOW LONG.
+ *
+ * `buildPackOdds` costs 5 subrequests per candidate (measured: alerts.ts THE BUDGETS,
+ * test/i13-cron-budget.test.ts — `serveRatings` reads the per-creator object too) and the table is frozen per
+ * ISO week, so it cannot be paged across ticks the way the payout run is — the
+ * whole set has to be priced in one invocation. That bound is real and stays.
+ *
+ * What was wrong was WHICH creators it kept. The candidate list was
+ * `ORDER BY first_seq ASC LIMIT cap` — the first N to opt in — and opt-in order
+ * never changes. So creator N+1 was not "excluded this week": they were excluded
+ * from every week, permanently, by a rule they could satisfy only by having
+ * signed up earlier. Their opt-in did nothing and the product never said so.
+ * The cap was logged loudly when it bound, which is honest about the count and
+ * silent about the fact that it is always the same people.
+ *
+ * The window ROTATES instead. Same size, same cost, same one-tick build — but
+ * anchored at an offset derived from the ISO week, wrapping around the
+ * opt-in-ordered list. Every opted-in creator is in packs some weeks, and the
+ * rule is still one you can state to them: "packs cover N creators a week, and
+ * the window moves each week, so everyone who opted in comes round."
+ *
+ * DETERMINISTIC FOR A FIXED POPULATION, WHICH IS WEAKER THAN IT USED TO SAY
+ * (I3-0701). The anchor comes from the week string; the WRAP does not — the
+ * return is `(idx * cap) % total`, so the window this returns for one week
+ * moves whenever `total` (the live currently-opted-in count, counted at call
+ * time in `selectOddsCandidates`) changes. The old text here claimed the offset
+ * came "from the week string and nothing else — not from the clock, not from
+ * the row count at call time", and the `% total` on the line below is the row
+ * count at call time. Reducing an anchor into a list of `total` rows cannot be
+ * done without `total`, so this is a documentation defect rather than a bug to
+ * code around — but it bounds what may be concluded from it: two runs in the
+ * same week agree only while the opted-in count has not moved between them, and
+ * a re-run that had to publish a week's table a second time (see
+ * `buildPackOdds`) could therefore cover a different set than the first.
+ */
+export function oddsWindowOffset(week: string, total: number, cap: number): number {
+  if (total <= cap) return 0; // everyone fits; no rotation to do
+  // `2026-W35` → a stable integer. Weeks advance by one, so consecutive weeks
+  // get consecutive windows and the rotation is a slide rather than a shuffle.
+  const m = /^(\d{4})-W(\d{2})$/.exec(week);
+  const idx = m ? Number(m[1]) * 53 + Number(m[2]) : 0;
+  return ((idx * cap) % total + total) % total;
+}
+
+/**
+ * The candidates for one week's odds table: a rotating window of `cap` creators
+ * over the CURRENTLY-opted-in set, ordered by first opt-in (stable rotation).
+ * Returns the window AND the total, so the caller can log what it covers
+ * rather than only that it capped.
+ *
+ * W-07 — MUST NOT INCLUDE A SUBJECT WHO HAS SINCE OPTED OUT. This used to count
+ * and page over `DISTINCT subject … WHERE event_type = 'war_opt_in'` — every
+ * subject who EVER opted in, opt-outs included — so the rotating window could
+ * land on a slice of the opt-in-ordered list that is now entirely opted-out
+ * accounts while other creators are still live and simply rotated elsewhere
+ * this week. `buildPackOdds` then drops every one of them (`warOptedIn`
+ * check), publishes zero entries, and — because the table is create-if-absent
+ * and the offset is a pure function of the week — every retry that week picks
+ * the exact same dead window: packs 503 all week even though live, opted-in
+ * creators exist. The fix is to count and page only subjects whose LATEST
+ * `war_opt_in`/`war_opt_out` event is an opt-in (a cheap, sufficient
+ * approximation of `warOptedIn`'s full agency/lock precedence — `buildPackOdds`
+ * re-checks every candidate with the real gate, so an edge case here only
+ * costs a wasted candidate, never a wrong one), so a rotation never spends a
+ * slot on someone who cannot appear in the table anyway.
+ */
+export async function selectOddsCandidates(db: DbLike, cap: number, nowMs: number): Promise<{ subjects: string[]; total: number; offset: number }> {
+  // A subject currently counts as opted in iff the most recent of their
+  // war_opt_in/war_opt_out events (by seq) is an opt-in AND they still hold the
+  // standing `buildPackOdds` will require of them.
+  //
+  // I3-1307 — OPT-IN IS NOT THE ONLY WAY TO STOP BEING PACKABLE. The opt-out
+  // ordering below (W-07) stops a slot going to someone who opted back out, but
+  // a creator who was RETRACTED, un-claimed, or SUPPRESSED after opting in was
+  // still counted and still drew a slot; `buildPackOdds` then dropped every one
+  // of them (`serveRatings` folds suppression) and, if the window held only
+  // such creators, published nothing — and because the table is create-if-absent
+  // and the offset is anchored on the week, every retry that week selected the
+  // same dead window: packs 503 all week with live creators rotated elsewhere.
+  // The two standing clauses are the same two `buyCard`'s guarded debit uses
+  // (credits.ts:157) — a cheap, sufficient pre-filter; `buildPackOdds` still
+  // re-checks each candidate with the real gate, so an edge case here costs a
+  // wasted candidate, never a wrong one. D-0845(10): the standing clause is
+  // verified-only, the same claim_state `warOptedIn` (war-consent.ts) requires —
+  // a claimed-only window would otherwise publish no table for the whole week.
+  const CURRENTLY_OPTED_IN = `
+    SELECT subject, MIN(CASE WHEN event_type = 'war_opt_in' THEN seq END) AS first_seq
+    FROM trust_events
+    WHERE event_type IN ('war_opt_in', 'war_opt_out')
+      AND EXISTS (SELECT 1 FROM passports p WHERE p.passport_id = trust_events.subject AND p.retracted = 0 AND p.claim_state = 'verified'
+                    AND ${grantLiveAtSql("p.passport_id")})
+      AND NOT EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = trust_events.subject)
+    GROUP BY subject
+    HAVING MAX(CASE WHEN event_type = 'war_opt_in' THEN seq ELSE -1 END)
+         > MAX(CASE WHEN event_type = 'war_opt_out' THEN seq ELSE -1 END)
+  `;
+  // I3-1768 (D-1085(1), I34-EXPIRY-A): the grant-live term's one bound instant, the selection's own `nowMs`.
+  const nowIso = new Date(nowMs).toISOString();
+  const totalRow = await db.prepare(`SELECT COUNT(*) AS n FROM (${CURRENTLY_OPTED_IN})`).bind(nowIso).first<{ n: number }>();
+  const total = totalRow?.n ?? 0;
+  if (total === 0) return { subjects: [], total: 0, offset: 0 };
+  const offset = oddsWindowOffset(isoWeek(nowMs), total, cap);
+  const page = async (off: number, lim: number): Promise<string[]> => {
+    if (lim <= 0) return [];
+    const { results } = await db
+      .prepare(`SELECT subject FROM (${CURRENTLY_OPTED_IN}) ORDER BY first_seq ASC LIMIT ? OFFSET ?`)
+      .bind(nowIso, lim, off)
+      .all<{ subject: string }>();
+    return results.map((r) => r.subject);
+  };
+  const head = await page(offset, Math.min(cap, total - offset));
+  // Wrap: a window that runs off the end continues from the start, so the last
+  // creators to opt in are not permanently the ones who lose a partial window.
+  const tail = head.length < Math.min(cap, total) ? await page(0, Math.min(cap, total) - head.length) : [];
+  return { subjects: [...head, ...tail], total, offset };
+}
+
+/**
+ * PS-060 — THE PUBLISHED ANCHOR ITSELF, KEYED BY WEEK, NOT ONLY "NOW".
+ *
+ * `oddsKey` was private and the only reader was `servePackOdds` (below),
+ * scoped to the CURRENT week. Every fairness claim this file makes ends at
+ * `odds_hash matches the week's published table` — but nothing let anyone
+ * other than the server fetch that table and hash it themselves: the fan
+ * only ever sees the server's OWN computed disclosure
+ * (`computePackOddsDisclosure`, embedded in the commitment/reveal), never the
+ * raw artifact `content_hash` is a hash OF. That is an unpublished anchor: a
+ * number asserted, not a document anyone can independently check.
+ *
+ * This is the read a public verification route needs (mirroring the existing
+ * pattern for weekly artifacts — `GET /editions/anchors/:week` in index.ts).
+ * It is deliberately NOT limited to the current week: a fan verifying an OLD
+ * pack needs the table THAT WEEK froze, not this week's. Wiring the route
+ * itself is index.ts, outside this file's ownership — see OPEN QUESTIONS in
+ * this room's report; nothing here changes what a route would need to expose,
+ * since an `OddsTable` carries no secret (no seed, no account id).
+ */
+export async function servePackOddsForWeek(store: ArtifactReader, week: string): Promise<OddsTable | null> {
+  const raw = await store.get(oddsKey(week));
+  if (!raw) return null;
+  try {
+    const t = JSON.parse(raw) as OddsTable;
+    return Array.isArray(t.entries) && t.entries.length > 0 ? t : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Serve the current week's committed odds table (null if the cron has not run
+ * this week → packs 503, fail closed). */
+export async function servePackOdds(store: ArtifactReader, nowMs: number): Promise<OddsTable | null> {
+  return servePackOddsForWeek(store, isoWeek(nowMs));
+}
+
+/** The provably-fair stream for one pack open — server:client:packId-derived,
+ * so the pack id makes each open's draw independent even under a repeated
+ * server/client seed. */
+function packStream(serverSeed: string, clientSeed: string, packId: string): RandomStream {
+  return new RandomStream(serverSeed, clientSeed, packId.replace(/[^0-9a-f]/g, "").padEnd(8, "0").slice(0, 16));
+}
+
+/**
+ * Re-derive a pack's draw from its revealed inputs — this is the fan-side
+ * verification: given the committed odds table, the revealed server seed, the
+ * client seed and the pack id (all in the pack record / result), anyone
+ * reproduces the exact base creators + variant index. Pure.
+ */
+export async function replayPackDraw(table: OddsTable, serverSeed: string, clientSeed: string, packId: string): Promise<{ drawn: string[]; variant_index: number }> {
+  const stream = packStream(serverSeed, clientSeed, packId);
+  const drawn = await drawFromOdds(table, stream, CARDS_PER_PACK);
+  const variant_index = await stream.uniform(CARDS_PER_PACK);
+  return { drawn, variant_index };
+}
+
+/** The draw weight ACTUALLY used for a table entry — floored, floored at 1. The
+ * one place this floor is applied: `drawFromOdds` and `computePackOddsDisclosure`
+ * both call this, so a disclosed percentage can never drift from what the draw
+ * itself does with the same row (FAMILY-004 P1 — the control lives in one
+ * primitive, not re-typed at each caller). */
+function effectiveWeight(weight: number): number {
+  return Math.max(1, Math.floor(weight));
+}
+
+/** A weighted draw of `count` passports (WITH replacement — duplicates are fuel)
+ * from the committed table, using the provably-fair stream. Pure in
+ * (table, stream). */
+async function drawFromOdds(table: OddsTable, stream: RandomStream, count: number): Promise<string[]> {
+  const total = table.entries.reduce((s, e) => s + effectiveWeight(e.weight), 0);
+  if (total < 1) throw new WarInstanceError("empty odds table", 503);
+  const out: string[] = [];
+  for (let i = 0; i < count; i++) {
+    let r = await stream.uniform(total); // [0, total)
+    let picked = table.entries[table.entries.length - 1]!.passport_id;
+    for (const e of table.entries) {
+      const w = effectiveWeight(e.weight);
+      if (r < w) {
+        picked = e.passport_id;
+        break;
+      }
+      r -= w;
+    }
+    out.push(picked);
+  }
+  return out;
+}
+
+/** One creator's disclosed draw chance — a whole-number-of-basis-points share
+ * of ONE base slot, computed off the exact weight `drawFromOdds` uses. */
+export interface PackOddsEntry {
+  passport_id: string;
+  /** Chance of THIS passport landing in one base slot, in basis points
+   * (10000 = 100%). Integer, so rounding is explicit rather than a display
+   * artifact — `entries` always sums to exactly 10000. */
+  percent_bp: number;
+  /** I3-0415: the creator's live public name, or WITHDRAWN_CREATOR_LABEL; added by `oddsWithCreatorLabels` after the
+   * disclosure is computed, never part of the hashed table. */
+  display_name?: string;
+}
+
+/** PS-276 — the whole disclosed shape for one pack's contents: which creators
+ * can be drawn and each one's per-slot chance, keyed to the exact committed
+ * table (`content_hash`) the draw itself will use. */
+export interface PackOddsDisclosure {
+  week: string;
+  content_hash: string;
+  cards_per_pack: number;
+  entries: PackOddsEntry[];
+}
+
+/**
+ * PS-276 — odds + contents, disclosed pre-sale.
+ *
+ * Pure and total on any table `servePackOdds`/`buildPackOdds` can hand back: a
+ * table only ever exists with `entries.length > 0` and every entry's
+ * `effectiveWeight` floored at 1 (`heatWeight`), so `total >= entries.length >=
+ * 1` always — there is no OddsTable this throws on. That is the rung-1 finding:
+ * TODAY, a pack's contents (the ONLY randomness in a pack — which creator each
+ * of the `CARDS_PER_PACK` slots draws, plus a free foil of one of them) are
+ * fully known from the same committed table the draw itself reads, so the odds
+ * are computable — not a data-model gap to flag and approximate around.
+ *
+ * What is NOT disclosed here, deliberately, because it is not a probability:
+ * the free collector's variant is a uniform pick of WHICH of the
+ * `CARDS_PER_PACK` slots gets foiled (`stream.uniform(CARDS_PER_PACK)` in
+ * `openPack`/`replayPackDraw`) — 1/`CARDS_PER_PACK` for every slot regardless of
+ * who is drawn into it, costs nothing extra, and is stated as a flat fact by the
+ * caller rather than a per-entry number here.
+ *
+ * SUMS EXACTLY: floors each share to basis points, then hands the remainder (at
+ * most `entries.length - 1` bp, since remainders are all in [0, 1) of a
+ * basis-point) to the entries with the largest fractional remainder, ties by
+ * `passport_id` ascending — the table's own tie-break (`buildPackOdds`) — so the
+ * distribution is deterministic and re-runs identically off the same table.
+ */
+export function computePackOddsDisclosure(table: OddsTable): PackOddsDisclosure {
+  const weights = table.entries.map((e) => ({ passport_id: e.passport_id, w: effectiveWeight(e.weight) }));
+  const total = weights.reduce((s, e) => s + e.w, 0);
+  if (total < 1) throw new WarInstanceError("empty odds table", 503); // unreachable off a served table; see docblock
+  const shares = weights.map((e) => {
+    const exact = (e.w * 10000) / total;
+    const floor = Math.floor(exact);
+    return { passport_id: e.passport_id, floor, remainder: exact - floor };
+  });
+  let distributed = shares.reduce((s, e) => s + e.floor, 0);
+  const order = [...shares].sort((a, b) => b.remainder - a.remainder || (a.passport_id < b.passport_id ? -1 : 1));
+  const bump = new Set<string>();
+  for (const e of order) {
+    if (distributed >= 10000) break;
+    bump.add(e.passport_id);
+    distributed++;
+  }
+  const entries: PackOddsEntry[] = shares.map((e) => ({ passport_id: e.passport_id, percent_bp: e.floor + (bump.has(e.passport_id) ? 1 : 0) }));
+  return { week: table.week, content_hash: table.content_hash, cards_per_pack: CARDS_PER_PACK, entries };
+}
+
+/** I3-0415: the label a disclosed entry carries when its creator is no longer live (delisted, retracted, unclaimed or
+ * opted out after the table froze) — the same words war-routes.ts's odds routes serve. */
+export const WITHDRAWN_CREATOR_LABEL = "withdrawn creator";
+
+/**
+ * I3-0415 — THE ODDS LIST NAMES CREATORS. Adds a `display_name` to each disclosed entry, AFTER the disclosure is
+ * computed: the frozen `OddsTable`, its `content_hash` and every `percent_bp` are untouched, so the hash a fan checks
+ * is still the hash of the table. A name is served only for a passport that is live NOW — not retracted, claimed or
+ * verified, not closed or staff-suspended (`CREATOR_CLOSED_SQL`, the sale doors' predicate — I3-0415, D-0995(8)), not
+ * under `request_suppressions`, and opted in (`warOptedInIds`) — otherwise the entry carries
+ * `WITHDRAWN_CREATOR_LABEL`, never the old name. The SAME predicate as war-routes.ts `withCreatorLabels` (the
+ * GET /war/pack/odds doors); this export is the one spelling for the commitment door, and that route copy is a
+ * hand-off to fold into it. Chunked under D1's parameter cap (`inChunks`).
+ */
+export async function oddsWithCreatorLabels(db: DbLike, entries: readonly PackOddsEntry[]): Promise<(PackOddsEntry & { display_name: string })[]> {
+  if (entries.length === 0) return [];
+  const live = new Map<string, string>();
+  for (const chunk of inChunks(entries.map((e) => e.passport_id))) {
+    const { results } = await db
+      .prepare(
+        `SELECT p.passport_id AS passport_id, p.display_name AS display_name
+           FROM passports p
+          WHERE p.passport_id IN (${chunk.map(() => "?").join(",")})
+            AND p.retracted = 0 AND p.claim_state IN ('claimed','verified')
+            AND NOT ${CREATOR_CLOSED_SQL("p.passport_id")}
+            AND NOT EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = p.passport_id)`,
+      )
+      .bind(...chunk)
+      .all<{ passport_id: string; display_name: string }>();
+    for (const r of results) live.set(r.passport_id, r.display_name);
+  }
+  // S-1: the war gate for every live entry in two statements per chunk (war-consent.ts warOptedInIds), not 2+ each.
+  const opted = await warOptedInIds(db, [...live.keys()]);
+  const out: (PackOddsEntry & { display_name: string })[] = [];
+  for (const e of entries) {
+    const name = live.get(e.passport_id);
+    const eligible = name !== undefined && opted.has(e.passport_id);
+    out.push({ ...e, display_name: eligible ? name : WITHDRAWN_CREATOR_LABEL });
+  }
+  return out;
+}
+
+export interface PackResult {
+  pack_id: string;
+  cards: { instance_id: string; passport_id: string; variant: boolean }[];
+  variant_index: number;
+  server_seed: string;
+  server_seed_hash: string;
+  /** UI-AUDIT F-P4: the fan's own seed, echoed back. They sent it, so this
+   * discloses nothing — but the reveal panel prints the REPLAY INPUTS, and a
+   * panel that omits one of the three cannot be used to replay anything. It
+   * asked the reader to remember what their browser had generated a moment ago. */
+  client_seed: string;
+  odds_hash: string;
+  /** I3-0235: the committed odds table's week (`GET /war/pack/odds/:week`). */
+  edition_week: string;
+  /** F-P1: slots whose drawn creator is no longer eligible to be in a pack
+   * (opted out, retracted, or suppressed). The draw is unchanged and still
+   * replayable; these minted nothing and were not charged for. Present so the
+   * reveal can say what happened instead of silently showing four cards where
+   * the odds say six. */
+  withheld: number;
+  /** What the fan was actually charged, after any withheld slots. */
+  price_credits: number;
+  /** I3-1322: null when the post-commit balance read failed — the pack is bought
+   * either way, and a read fault must not turn a committed sale into an error. */
+  balance: number | null;
+}
+
+export interface PackMinters {
+  instanceId: () => string; // ci_
+  logId: () => string; // cil_
+  saleId: () => string; // sal_
+  ledgerId: () => string; // cle_
+}
+
+/** What `commitPack` mints. Separate from `PackMinters` because these two are
+ * produced at COMMIT time and the open must not be able to produce either — a
+ * seed minted inside the open is a seed chosen after the client's, which is the
+ * entire defect this flow exists to close. */
+export interface PackCommitMinters {
+  packId: () => string; // wpk_
+  serverSeed: () => string; // CSPRNG hex
+}
+
+/** The half of a commitment a fan may see: everything except the seed. */
+export interface PackCommitment {
+  pack_id: string;
+  server_seed_hash: string;
+  odds_hash: string;
+  expires_at: string;
+  /** PS-276/(d) — odds + contents, DERIVED from the same table `odds_hash`
+   * names, never re-typed. A commitment is minted only once `servePackOdds`
+   * has returned a table (the `if (!table) throw …` above), so every
+   * `PackCommitment` this function can ever return carries a computable
+   * disclosure — there is no commitment without one. This is what makes the
+   * commitment leg (called on store-page load, before the fan can click open)
+   * the pre-sale gate the ruling asks for: the open itself never has to check
+   * disclosure separately, because there is no commitment to open without it. */
+  odds: PackOddsDisclosure;
+}
+
+/**
+ * How long a commitment stands before it must be re-taken.
+ *
+ * It is a ceiling on how stale a published `server_seed_hash` may be when it is
+ * finally spent, and it is deliberately short: the odds table is frozen per ISO
+ * week, so a commitment that outlives its week would refuse at open time anyway
+ * (`odds_hash` mismatch), and a fan holding a week-old commitment is a fan whose
+ * store page has been open since Tuesday. Thirty minutes matches the Connect
+ * OAuth flow's own TTL — long enough that nobody hits it by reading the page,
+ * short enough that abandoned rows are not a table.
+ */
+export const PACK_COMMIT_TTL_MS = 30 * 60 * 1000;
+
+/**
+ * THE COMMITMENT — the half of provable fairness that did not exist.
+ *
+ * Mints a server seed, stores it, and publishes ONLY its hash. Called before the
+ * fan's client seed exists, which is the whole point: a server that has already
+ * published `sha256(seed)` cannot afterwards pick a seed it likes better,
+ * because the reveal has to hash to the value the fan is already holding.
+ *
+ * IDEMPOTENT WHILE ONE IS LIVE. A reload of the store page must not churn a row
+ * or hand out a second commitment, so an unopened, unexpired commitment for this
+ * account is RETURNED rather than replaced. That also bounds the table to one
+ * live row per account, which is why an authenticated caller cannot use this as
+ * a write amplifier.
+ *
+ * Note what this deliberately does NOT do: it does not reserve credits, check
+ * the balance, or promise a pack. It is a commitment about randomness, not about
+ * money — the open still does every economic check it did before, and a
+ * commitment whose open is refused for want of credits stays live for the retry.
+ */
+export async function commitPack(
+  db: DbLike,
+  store: ArtifactReader,
+  accountId: string,
+  m: PackCommitMinters,
+  nowMs: number,
+  now: () => string = () => new Date().toISOString(),
+  /** I3-0155: the buyer's region/age, as the route knows them. */
+  elig?: PackEligibility,
+  policy: PackRegionPolicy = PACK_REGION_POLICY,
+): Promise<PackCommitment> {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(accountId)) throw new WarInstanceError("bad account id", 500);
+  // I3-0155, DOOR 1 OF 2. Asked here as well as at `openPack` because a
+  // commitment is the thing the store page hands the buyer: minting one for a
+  // buyer this rail may not sell to publishes an offer that cannot be honoured.
+  // The same predicate, one function, both doors (FAMILY-004 P1).
+  // REG-07: the WIRING check first — an armed table this call site cannot feed
+  // is our fault, not the buyer's, and must not answer as a refusal.
+  assertPackGateWired(elig, "commitPack");
+  {
+    const refusal = packEligibilityRefusal(elig, policy);
+    if (refusal) throw new WarInstanceError(refusal, 403);
+  }
+  const table = await servePackOdds(store, nowMs);
+  if (!table) throw new WarInstanceError("packs are not available right now", 503);
+  // I26-W1-MONEY (I25-FX-MONEY open 1): the live eligible count, as door 2 — a commitment on a table that thinned since the
+  // freeze would only be refused at the open, so it is refused here, before anything is committed.
+  await assertPackTableEligibleEnough(db, table, new Date(nowMs).toISOString()); // I3-0841 a, door 1 of 2
+  // Computed once, off the served table, and reused for BOTH return paths below
+  // — a live commitment reused on reload and a freshly-minted one get the exact
+  // same disclosure for the exact same `odds_hash`, never two computations that
+  // could drift.
+  // I3-0415: named AFTER the disclosure is computed (content_hash and percent_bp untouched).
+  const disclosure = computePackOddsDisclosure(table);
+  const odds = { ...disclosure, entries: await oddsWithCreatorLabels(db, disclosure.entries) };
+
+  const live = await db
+    .prepare("SELECT pack_id, server_seed_hash, odds_hash, expires_at FROM pack_commitments WHERE account_id = ? AND opened_at IS NULL AND expires_at > ? ORDER BY committed_at DESC LIMIT 1")
+    .bind(accountId, new Date(nowMs).toISOString())
+    .first<Omit<PackCommitment, "odds">>();
+  // A live commitment against THIS week's table is handed straight back. One
+  // against a table that has since rolled over is not: it could never be
+  // opened, so returning it would hand the fan a commitment guaranteed to fail.
+  if (live && live.odds_hash === table.content_hash) return { ...live, odds };
+
+  const serverSeed = m.serverSeed();
+  if (!/^[0-9a-f]{8,128}$/.test(serverSeed)) throw new WarInstanceError("bad server seed", 500);
+  const packId = m.packId();
+  if (!WPK_RE.test(packId)) throw new WarInstanceError("bad pack id", 500);
+  const seedHash = await sha256Hex(serverSeed);
+  const ts = now();
+  const nowIso = new Date(nowMs).toISOString();
+  const expiresAt = new Date(nowMs + PACK_COMMIT_TTL_MS).toISOString();
+  // PS-058 — "ONE LIVE ROW PER ACCOUNT" IS ENFORCED HERE, NOT BY THE READ ABOVE.
+  // That SELECT is a fast-path only (skip minting a seed at all on a plain
+  // reload); it is not what makes the bound true, and two ways past it leave a
+  // second live row: (a) the existing live commitment is against a table that
+  // has since rolled over — `live.odds_hash !== table.content_hash` — so the
+  // read above does NOT return early, and nothing retires the stale row before
+  // this mints a new one; (b) two concurrent commits both read "no live row"
+  // before either has inserted (the read and the insert are not one
+  // statement). ONE `db.batch` closes both: its UPDATE retires this account's
+  // live rows against ANOTHER table (case (a)), and its INSERT lands only when
+  // no live row for THIS table exists (case (b)). D1 batches don't interleave,
+  // so exactly one live row survives, matching the same all-or-nothing
+  // discipline `openPack` uses for its own invariants.
+  // I3-1658 — and the SURVIVOR is the FIRST row for this table, not the last:
+  // the UPDATE retires only live rows against another table (case (a)), and the
+  // INSERT lands only if no live row for THIS table exists (case (b)). A later
+  // concurrent commit therefore adds nothing and reads back the same row, so no
+  // caller is handed a commitment a sibling's batch then retires (a 409 at open).
+  await db.batch([
+    db
+      .prepare("UPDATE pack_commitments SET expires_at = ? WHERE account_id = ? AND opened_at IS NULL AND expires_at > ? AND odds_hash <> ?")
+      .bind(nowIso, accountId, nowIso, table.content_hash),
+    db
+      .prepare(
+        "INSERT INTO pack_commitments (pack_id, account_id, server_seed, server_seed_hash, odds_hash, committed_at, expires_at, opened_at) SELECT ?, ?, ?, ?, ?, ?, ?, NULL WHERE NOT EXISTS (SELECT 1 FROM pack_commitments WHERE account_id = ? AND opened_at IS NULL AND expires_at > ? AND odds_hash = ?)",
+      )
+      .bind(packId, accountId, serverSeed, seedHash, table.content_hash, ts, expiresAt, accountId, nowIso, table.content_hash),
+  ]);
+  // Return what is live AFTER the batch, never what this call tried to write.
+  const won = await db
+    .prepare("SELECT pack_id, server_seed_hash, odds_hash, expires_at FROM pack_commitments WHERE account_id = ? AND opened_at IS NULL AND expires_at > ? AND odds_hash = ? ORDER BY committed_at DESC LIMIT 1")
+    .bind(accountId, nowIso, table.content_hash)
+    .first<Omit<PackCommitment, "odds">>();
+  // Opened (or expired) by a concurrent call in the window: refuse honestly
+  // rather than hand back a row that can no longer be opened.
+  if (!won) throw new WarInstanceError("that pack commitment was just used — request a new one", 409);
+  return { ...won, odds };
+}
+
+/** Drop commitments that were never opened and have aged out. Housekeeping only:
+ * an expired commitment already refuses at open, so this is about the table not
+ * growing, never about correctness. Returns how many were removed. */
+export async function pruneExpiredPackCommitments(db: DbLike, nowMs: number, limit = 500): Promise<number> {
+  const r = await db
+    .prepare("DELETE FROM pack_commitments WHERE pack_id IN (SELECT pack_id FROM pack_commitments WHERE opened_at IS NULL AND expires_at <= ? LIMIT ?)")
+    .bind(new Date(nowMs).toISOString(), Math.max(1, Math.min(5000, limit)))
+    .run();
+  return r.changes ?? 0;
+}
+
+/**
+ * ONE CREATOR'S LIVE STANDING, AS SQL (I3-0183). Bind the passport id FOUR
+ * times. This is the same predicate `buyCard`'s guarded debit correlates on
+ * (credits.ts:157, the BF-20 fix recorded by KM-028/KM-210), spelled here
+ * because that constant is not exported; the two must stay identical, and
+ * hoisting it into `credits.ts` as one export is QUEUED for the orchestrator
+ * (org/07-findings/W3-03-batch/W3-03-R3). It covers the three flips that are
+ * expressible in SQL — retraction/unclaim, suppression, and an opt-out that is
+ * later than the latest opt-in. `serveRatings`' other half (whether a ratings
+ * artifact exists at all) stays a pre-batch read: it is an object-store read,
+ * not a SQL predicate.
+ */
+/** D-0960(2)/TERMS 7.4 (I20-L02): the roster's pre-batch closed-creator read (credits.ts CREATOR_CLOSED_SQL). */
+async function creatorClosedNow(db: DbLike, psp: string): Promise<boolean> {
+  return (await db.prepare(`SELECT ${CREATOR_CLOSED_SQL("?")} AS c`).bind(psp).first<{ c: number }>())?.c === 1;
+}
+
+/** I3-1768 (D-1082(1), I32-FX1-VERIFIED): the creator's latest grant or renewal has not lapsed at the open's instant
+ * (standing.ts `grantLiveAtSql`). Binds `liveStandingBinds(psp, ts)`. Asked twice, as `buyCard` asks its gate: by the
+ * pre-batch `earning` read (`grantLiveNow`, so a lapsed creator's slot is WITHHELD, F-P1, and the pack still opens)
+ * and inside the guarded debit (so a grant lapsing between the two cannot be paid). */
+const grantLiveNow = async (db: DbLike, psp: string, ts: string): Promise<boolean> =>
+  (await db.prepare(`SELECT ${grantLiveAtSql("?")} AS ok`).bind(psp, ts).first<{ ok: number }>())?.ok === 1;
+const liveStandingBinds = (psp: string, ts: string): string[] => [psp, ts, psp, psp, psp];
+const LIVE_STANDING_SQL =
+  `EXISTS (SELECT 1 FROM passports p WHERE p.passport_id = ? AND p.retracted = 0 AND p.claim_state = 'verified' AND NOT ${CREATOR_CLOSED_SQL("p.passport_id")} AND ${grantLiveAtSql("p.passport_id")})` + // D-0960(2)/TERMS 7.4 (I20-L02): no sale to a closed creator // I3-1268: serveRatings' pre-batch gate is verified-only
+  " AND NOT EXISTS (SELECT 1 FROM request_suppressions s WHERE s.passport_id = ?)" +
+  " AND COALESCE((SELECT MAX(seq) FROM trust_events WHERE subject = ? AND event_type = 'war_opt_in'), -1)" +
+  " > COALESCE((SELECT MAX(seq) FROM trust_events WHERE subject = ? AND event_type = 'war_opt_out'), -1)";
+
+const CI_RE = /^ci_[0-9a-f]{20}$/;
+const WPK_RE = /^wpk_[0-9a-f]{20}$/;
+/**
+ * I3-1499 (D-0920 A): what the PERMANENT receipt (`war_packs.drawn_passports`) and
+ * `packReveal` hold in a slot whose creator was withheld (opted out, retracted or
+ * suppressed). The slot keeps its position, so the reveal still lines up against
+ * `replayPackDraw`, but the receipt no longer names a creator whose only fact in it
+ * is that they were not eligible. Not a passport id shape, so it cannot collide.
+ */
+export const WITHHELD_SLOT = "withheld";
+const SEED_RE = /^[0-9a-f]{8,64}$/;
+
+/**
+ * Buy-and-open a pack, atomically. Spends PACK_PRICE_CREDITS, draws
+ * CARDS_PER_PACK creators (heat-weighted) from the committed table plus one
+ * cosmetic variant, mints the instances, credits each STILL-ELIGIBLE drawn
+ * creator their share, and writes the pack audit record — all in ONE batch with
+ * the NULL-PK force-rollback discipline (insufficient balance / full shelf →
+ * nothing happens). The server seed is revealed in the result.
+ *
+ * PRE-COMMITTED, AND THAT IS NOW THE ACTUAL GUARANTEE (UI-AUDIT F-P4).
+ *
+ * This function used to mint its own server seed, INSIDE this call, after the
+ * request carrying the fan's client seed had arrived — while the reveal panel
+ * told fans "the server committed to its secret seed BEFORE you opened … nobody
+ * could have steered it after the fact". That was the one claim in the product a
+ * fan could not check for themselves, and it was false: with the client seed in
+ * hand, nothing stopped a server from trying seeds until it liked the draw.
+ *
+ * The seed now arrives from a COMMITMENT made earlier, by
+ * `commitPack` — a row holding the seed and publishing only its hash, written
+ * before the fan's seed exists. This call reveals the seed and consumes the
+ * commitment. So the chain a fan can verify is complete:
+ *
+ *   1. `server_seed_hash` was handed to them BEFORE they sent `client_seed`;
+ *   2. `sha256(server_seed)` from this response equals it;
+ *   3. `replayPackDraw(server_seed, client_seed, pack_id, odds)` gives these cards;
+ *   4. `odds_hash` matches the week's published table.
+ *
+ * Steps 1–2 are the ones that were missing, and they are the ones that make the
+ * client seed mean anything: the server was committed before it could see it.
+ *
+ * The commitment also pins the ODDS TABLE it was made against. If the ISO week
+ * rolls over between commit and open, this refuses rather than drawing against a
+ * table nobody committed to — a stale commitment is a re-commit, not a silent
+ * substitution.
+ *
+ * CONSENT/SUPPRESSION BITE LIVE ON EARNINGS (review F1). The DRAW is frozen to
+ * this week's committed odds (so it stays replayable), but a creator who opted
+ * OUT or lost standing / was suppressed AFTER the freeze must not keep earning.
+ * Their card still mints (the fan pulled it fairly; its live stats already
+ * reflect suppression at render), but NO sales row accrues to them — their share
+ * stays with the platform, unpaid. Mirrors buyCard's live gate, applied per
+ * drawn creator; withholds the lapsed creator's share rather than refusing the
+ * fan's whole pack for one lapsed creator.
+ */
+export async function openPack(
+  db: DbLike,
+  store: ArtifactReader,
+  accountId: string,
+  packId: string,
+  clientSeed: string,
+  m: PackMinters,
+  nowMs: number,
+  now: () => string = () => new Date().toISOString(),
+  /** `ANALYTICS_FAN_SECRET`. Undefined is refused by `fanKey` (ADR-0006 §2). */
+  fanSecret?: string,
+  pubEnv?: AnalyticsTickEnv,
+  pubCtx?: { waitUntil(p: Promise<unknown>): void },
+  /** I3-0155: the buyer's region/age, as the route knows them. */
+  elig?: PackEligibility,
+  policy: PackRegionPolicy = PACK_REGION_POLICY,
+): Promise<PackResult> {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(accountId)) throw new WarInstanceError("bad account id", 500);
+  if (typeof clientSeed !== "string" || !SEED_RE.test(clientSeed)) throw new WarInstanceError("client_seed must be 8..64 lowercase hex chars", 400);
+  if (!WPK_RE.test(packId)) throw new WarInstanceError("bad pack id", 400);
+  // I3-0155, DOOR 2 OF 2 — the door that actually spends money and mints cards.
+  // `commitPack`'s check does not cover it: a commitment minted before a
+  // ruling, or before the buyer's region was known, is opened HERE, and the
+  // commitment row carries no eligibility of its own.
+  // REG-07: the WIRING check first, per call site — `commitPack`'s does not
+  // cover this door (FAMILY-004: the control at ONE caller is the trap).
+  assertPackGateWired(elig, "openPack");
+  {
+    const refusal = packEligibilityRefusal(elig, policy);
+    if (refusal) throw new WarInstanceError(refusal, 403);
+  }
+  // I3-1605 — war-routes.ts checks accountBanned() before calling this, but
+  // everything below (servePackOdds, the commitment read, the live-standing
+  // reads) is async work between that route-level check and the guarded debit
+  // below, so a ban landing in that window used to still spend. Re-asked here,
+  // same as war-match.ts:311's A-014 fix for joinQueue: closes the window this
+  // function itself opens, at the cost of the same tiny remaining gap between
+  // this check and the batch below that every other pre-check in this codebase
+  // (accountBanned, rate limits) already accepts.
+  if (await accountBanned(db, accountId)) throw new WarInstanceError("account_suspended", 403);
+  const table = await servePackOdds(store, nowMs);
+  if (!table) throw new WarInstanceError("packs are not available right now", 503); // odds cron hasn't run
+  await assertPackTableEligibleEnough(db, table, new Date(nowMs).toISOString()); // I3-0841 a, door 2 of 2: before the commitment read, the draw and the debit (D-1010(7): counted live)
+
+  // THE COMMITMENT IS THE SEED'S ONLY SOURCE. Nothing in this function may mint
+  // one: a seed minted here is a seed chosen after the client's, which is the
+  // whole defect. Account-bound and unopened, or there is no pack.
+  const commit = await db
+    .prepare("SELECT server_seed, server_seed_hash, odds_hash, expires_at FROM pack_commitments WHERE pack_id = ? AND account_id = ? AND opened_at IS NULL")
+    .bind(packId, accountId)
+    .first<{ server_seed: string; server_seed_hash: string; odds_hash: string; expires_at: string }>();
+  if (!commit) throw new WarInstanceError("no open pack commitment — request one and try again", 409);
+  if (Date.parse(commit.expires_at) <= nowMs) throw new WarInstanceError("that pack commitment expired — request a new one", 409);
+  // The week rolled over between commit and open. Refusing is the honest answer:
+  // drawing against a table the commitment did not name would make `odds_hash`
+  // in the reveal a claim about a different table than the one committed to.
+  if (commit.odds_hash !== table.content_hash) throw new WarInstanceError("this week's odds changed — request a new pack and try again", 409);
+  const serverSeed = commit.server_seed;
+  if (!/^[0-9a-f]{8,128}$/.test(serverSeed)) throw new WarInstanceError("bad server seed", 500);
+
+  // Draw (pure): stream = server:client:packId, bound to this open.
+  const stream = packStream(serverSeed, clientSeed, packId);
+  const drawn = await drawFromOdds(table, stream, CARDS_PER_PACK);
+  const variantIndex = await stream.uniform(CARDS_PER_PACK); // which base card gets the foil
+
+  // F1 (review): the LIVE gate. The draw above is frozen (replayable), but a
+  // creator who opted out / lost standing / was suppressed AFTER this week's
+  // odds froze must not be in this pack. Each DISTINCT drawn creator is checked
+  // once against the same gate `buyCard` uses (warOptedIn && serveRatings — the
+  // latter folds suppression).
+  //
+  // UI-AUDIT F-P1 — WHAT THIS GATE USED TO DECIDE, AND WHAT IT HAD TO.
+  //
+  // It gated the MONEY only. The comment said so plainly: "Their card still
+  // mints regardless; only the money is withheld (to platform)." So a creator
+  // who had opted OUT of the game, or been RETRACTED, or filed a delisting
+  // request and been SUPPRESSED, was still drawn, still minted into a stranger's
+  // collection, and still rendered on the reveal screen under their passport id.
+  //
+  // Both halves of that are things this product promises not to do:
+  //
+  //  • `removal.ts` calls suppression "the row that already means 'gone'
+  //    everywhere in this codebase" — every public surface 404s them and the
+  //    registry drops them. A pack rail that keeps handing their card out is
+  //    that promise broken by the one surface nobody checked, and worse than a
+  //    stale listing: a card is a NEW artifact, created after the person asked
+  //    to be gone, that persists in someone's collection.
+  //  • `war_opt_in` exists because "cards-of-you-for-sale" is a consent decision
+  //    with its own narrow scope (schema ACTOR_POLICY). Minting from a creator
+  //    who opted out is the withdrawn consent ignored, and withholding their 80%
+  //    makes it worse rather than better — the card exists and they are not even
+  //    paid for it.
+  //
+  // So the gate decides MINTING now, and the money follows the mint. The DRAW is
+  // untouched — it stays frozen and replayable from the seeds (`war_packs.drawn_passports`
+  // records it with each withheld slot as `WITHHELD_SLOT`, I3-1499), so provable fairness is unaffected: the fan
+  // can still verify that this stream produced these five names. What changes is
+  // that an ineligible name yields no card, and the fan is not charged for it.
+  const ts = now(); // hoisted (I32-FX1-VERIFIED): the pre-batch grant read and the batch share ONE instant
+  const earning = new Set<string>();
+  for (const psp of new Set(drawn)) {
+    // D-0960(2)/TERMS 7.4 (I20-L02): a closed creator's slot is withheld (no mint, no sale), like an opted-out one.
+    // I3-1768 (D-1082(1)): so is a creator whose grant lapsed at `ts`, before the sweep folds claim_state back.
+    // JN-02 (I34-W2-EXPIRY-B): every gate here at `ts`.
+    if ((await warOptedIn(db, psp, ts)) && (await serveRatings(store, db, psp, ts)) && !(await creatorClosedNow(db, psp)) && (await grantLiveNow(db, psp, ts))) earning.add(psp);
+  }
+  /** The drawn slots that may actually mint. A withheld slot keeps its position
+   * so the fan can line the reveal up against the replayed draw. */
+  const mintable = drawn.map((psp) => earning.has(psp));
+  const withheld = mintable.filter((ok) => !ok).length;
+
+  // F-P1: charge for what is delivered. A withheld slot is refunded pro rata at
+  // open time rather than after the fact — the fan never pays for a card that
+  // was not minted. A pack where NOTHING is mintable costs nothing and mints
+  // nothing (it is still recorded, so the draw stays auditable).
+  const perCardPrice = Math.floor(PACK_PRICE_CREDITS / CARDS_PER_PACK);
+  const price = PACK_PRICE_CREDITS - withheld * perCardPrice;
+  const week = isoWeek(nowMs);
+  const ledgerId = m.ledgerId();
+
+  // Per-drawn-creator earnings: the pack's creator-share split evenly across the
+  // CARDS_PER_PACK base draws (the variant is a free cosmetic, it earns nothing
+  // extra). Rounding remainder stays with the platform.
+  // Derived from the PER-CARD price, not from the (now possibly reduced) pack
+  // price divided by five. Dividing the reduced price would shrink every
+  // remaining creator's share because SOMEBODY ELSE's slot was withheld, which
+  // is a creator being paid less for reasons that have nothing to do with them.
+  const perCardNet = creatorNetCents(perCardPrice);
+  const grossBackingPerCard = perCardPrice * CREDIT_BACKING_CENTS;
+  // Hoisted out of the per-sale statement below because the analytics row beside
+  // it needs the same instant's DAY (ADR-0006 §3's scheduled-clear cell), and
+  // two `Date.parse(ts) + PAYOUT_HOLD_MS` in one batch is two chances to drift.
+  const packClearsAt = new Date(Date.parse(ts) + PAYOUT_HOLD_MS).toISOString();
+
+  // Mint 5 base instances + 1 variant (a foil of drawn[variantIndex]).
+  const instances: { instance_id: string; passport_id: string; variant: boolean }[] = [];
+  const mintStmts: DbStatement[] = [];
+  /** One entry per DRAWN slot, in draw order. `instanceId` is null for a slot
+   * whose creator is no longer eligible (F-P1) — the slot is kept so the reveal
+   * and the replayed draw line up position for position. */
+  const cards: { instanceId: string | null; passportId: string; variant: boolean }[] = [];
+  for (let i = 0; i < drawn.length; i++) {
+    if (!mintable[i]) { cards.push({ instanceId: null, passportId: drawn[i]!, variant: false }); continue; }
+    const iid = m.instanceId();
+    if (!CI_RE.test(iid)) throw new WarInstanceError("bad instance id", 500);
+    cards.push({ instanceId: iid, passportId: drawn[i]!, variant: false });
+    mintStmts.push(...mintInstanceStatements(db, { instanceId: iid, logId: m.logId(), ownerId: accountId, passportId: drawn[i]!, source: "pack", bound: false, ts }));
+  }
+  // The variant is a foil of one of the base draws, so it lives or dies with
+  // that draw's eligibility — a foil of a withdrawn creator is the same artifact
+  // with more of them in it.
+  if (mintable[variantIndex]) {
+    const viid = m.instanceId();
+    if (!CI_RE.test(viid)) throw new WarInstanceError("bad instance id", 500);
+    cards.push({ instanceId: viid, passportId: drawn[variantIndex]!, variant: true });
+    mintStmts.push(...variantMintStatements(db, { instanceId: viid, logId: m.logId(), ownerId: accountId, passportId: drawn[variantIndex]!, ts }));
+  }
+  for (const c of cards) if (c.instanceId !== null) instances.push({ instance_id: c.instanceId, passport_id: c.passportId, variant: c.variant });
+
+  // A pack where NOTHING is mintable is refused rather than sold for nothing:
+  // the fan gets a plain answer and their credits, and no 0-credit `spend` row
+  // is written (the ledger's `credits` column is a signed amount, and a zero
+  // entry is neither a spend nor a grant). It means this week's odds table has
+  // gone stale against the live gate, which is an operator problem, not
+  // something to hand a fan an empty pack over.
+  if (instances.length === 0) throw new WarInstanceError("packs are not available right now", 503);
+
+  // Recomputed AND checked against what was published at commit time. If a
+  // stored seed ever stopped hashing to its own published commitment, that is
+  // tampering with the one row this whole guarantee rests on, and the honest
+  // answer is to refuse the pack rather than reveal a seed that proves nothing.
+  const seedHash = await sha256Hex(serverSeed);
+  if (seedHash !== commit.server_seed_hash) throw new WarInstanceError("pack commitment is inconsistent — refusing to open it", 500);
+
+  // ONE `pack_opened` PER DISTINCT EARNING CREATOR, not one per drawn slot: the
+  // cell is `creator_metrics_daily.packs_opened` for THAT creator, and a
+  // creator drawn into two slots of one pack was in one pack. The keys are
+  // awaited here, before any statement is built (analytics-events.ts).
+  const packKeys: [string, FanKey][] = [];
+  for (const psp of earning) packKeys.push([psp, await fanKey(fanSecret, accountId, psp)]);
+
+  // I3-0183 — THE ELIGIBILITY GATE, RE-ASKED INSIDE THE GUARD.
+  //
+  // `earning` above is a PRE-BATCH read: up to 15 D1/R2 round trips separate it
+  // from the batch below, and until now the debit re-checked funds and shelf
+  // capacity but not standing. An opt-out, retraction or suppression landing in
+  // that window minted the card and paid the sales row anyway — the BF-20 class
+  // `buyCard` closed with `WAR_ELIGIBLE_SQL` and `tips.ts` closed after it, left
+  // open on this rail. Folding it into the SAME CASE the balance and the shelf
+  // ride means a flip anywhere in the window NULLs the primary key and rolls the
+  // whole batch back: no mint, no sales row, no debit, and `opened_at` is not
+  // set, so the commitment survives and the retry re-prices the pack with that
+  // creator withheld (F-P1). That is the same all-or-nothing answer this batch
+  // already gives for an insufficient balance, and it is why the refusal is safe
+  // to make indistinguishable: the fan's recourse is one retry.
+  const earners = [...earning];
+  const standingSql = earners.map(() => ` AND (${LIVE_STANDING_SQL})`).join("");
+  const standingBinds = earners.flatMap((p) => liveStandingBinds(p, ts));
+
+  const stmts: DbStatement[] = [
+    // 1. Guarded debit — balance covers the price (total AND cash-backed: a
+    //    pack's sales are creator cash — credits.ts CASH_ORIGINS) AND the shelf
+    //    has room for all 6 mints (the same MAX the mints guard on) AND every
+    //    creator this batch pays is STILL eligible at debit time
+    //    (`LIVE_STANDING_SQL`, one clause per earner). NULL PK → whole batch
+    //    rolls back (mints + sales included). One indistinguishable refusal.
+    db
+      .prepare(
+        `INSERT INTO credit_ledger (entry_id, account_id, kind, origin, credits, ref, idem, reason, at)
+         SELECT CASE
+                  WHEN ${CASH_GUARD_SQL}
+                   AND (SELECT COUNT(*) FROM card_instances WHERE owner_id = ? AND consumed_at IS NULL) <= ?${standingSql}
+                  THEN ? ELSE NULL END,
+                ?, 'spend', 'store_spend', ?, ?, NULL, 'pack', ?`,
+      )
+      .bind(...cashGuardBinds(accountId, price, ts), accountId, MAX_INSTANCES_PER_ACCOUNT - instances.length, ...standingBinds, ledgerId, accountId, -price, packId, ts),
+    // 2. The pack record — predicated on the debit landing.
+    db
+      .prepare(
+        `INSERT INTO war_packs (pack_id, account_id, edition_week, server_seed, server_seed_hash, client_seed, odds_hash, drawn_passports, variant_index, instance_ids, price_credits, opened_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          WHERE EXISTS (SELECT 1 FROM credit_ledger WHERE entry_id = ? AND ref = ?)`,
+      )
+      .bind(packId, accountId, week, serverSeed, seedHash, clientSeed, table.content_hash, JSON.stringify(drawn.map((psp, i) => (mintable[i] ? psp : WITHHELD_SLOT))), variantIndex, JSON.stringify(instances.map((c) => c.instance_id)), price, ts, ledgerId, packId),
+    // 3. Per-creator sales rows — one per base draw that actually MINTED,
+    //    predicated on the debit. Since F-P1 the two sets are the same set: an
+    //    ineligible creator's draw mints nothing and the fan is not charged for
+    //    it, so there is no share to withhold and nothing lands with the
+    //    platform. Earnings conservation holds: Σ paid ≤ gross, always.
+    ...drawn.flatMap((psp, i) =>
+      earning.has(psp)
+        ? ((saleId: string) => [
+            db
+              .prepare(
+                `INSERT INTO sales (sale_id, account_id, passport_id, product, credits_spent, gross_backing_cents, platform_cut_cents, creator_net_cents, instance_ids, clears_at, reversed, at)
+                 SELECT ?, ?, ?, 'pack', ?, ?, ?, ?, ?, ?, 0, ?
+                  WHERE EXISTS (SELECT 1 FROM credit_ledger WHERE entry_id = ? AND ref = ?)`,
+              )
+              .bind(saleId, accountId, psp, perCardPrice, grossBackingPerCard, grossBackingPerCard - perCardNet, perCardNet, JSON.stringify([cards[i]!.instanceId]), packClearsAt, ts, ledgerId, packId),
+            // I20-Q1: which purchase(s) paid for this card slot, FIFO, predicated on the sale row (credit-lots.ts).
+            lotEdgeStmt(db, saleId, accountId, perCardPrice, ts),
+            // ONE `market_sale` PER SALE ROW (S-12), not per distinct creator —
+            // the opposite of `pack_opened` below, and for the opposite reason.
+            // `packs_opened` is a per-fan fact about a creator, so a creator
+            // drawn into two slots was in ONE pack; `creator_revenue_daily.sales`
+            // is the count of `sales` ROWS and its money is those rows' money, so
+            // a creator drawn twice earned twice and is owed two rows. Emitting
+            // per creator here would under-count `sales` and lose one slot's
+            // gross, which `refunds.ts`'s per-sale-row fan-out would then have no
+            // event to reverse.
+            ...outboxStatements(db, {
+              kind: "market_sale",
+              passportId: psp,
+              occurredDay: occurredDay(ts),
+              amountCents: grossBackingPerCard,
+              dims: { clears_day: packClearsAt.slice(0, 10), net_cents: perCardNet, platform_cut_cents: grossBackingPerCard - perCardNet },
+            }),
+          ])(m.saleId())
+        : [],
+    ),
+    // 4. The mints.
+    ...mintStmts,
+    // 5. Mark the commitment consumed. This UPDATE is the READABLE state, not
+    //    the lock — a zero-row UPDATE does not throw, so it could not make two
+    //    concurrent opens exclusive on its own.
+    //
+    //    THE LOCK IS `war_packs.pack_id`, AND IT IS LOAD-BEARING NOW IN A WAY IT
+    //    WAS NOT BEFORE. Until commitments existed, `pack_id` was minted fresh
+    //    inside every open, so its primary key never collided and never did any
+    //    work. The id now comes from the commitment, so a second open of the
+    //    same commitment attempts the SAME primary key: statement 2 above throws,
+    //    the whole batch rolls back, and the fan is not double-charged and does
+    //    not get two packs from one committed seed. Stated here because deleting
+    //    or re-minting that id would silently remove the only thing making a
+    //    commitment single-use.
+    db
+      .prepare("UPDATE pack_commitments SET opened_at = ? WHERE pack_id = ? AND account_id = ? AND opened_at IS NULL")
+      .bind(ts, packId, accountId),
+    // 6. The analytics rows, in THIS batch (ADR-0006 §2). They need no
+    //    predicate of their own: statement 1's NULL PK rolls the whole batch
+    //    back when any precondition fails, so these rows exist iff the pack
+    //    was opened and paid for.
+    ...packKeys.flatMap(([psp, key]) => outboxStatements(db, { kind: "pack_opened", passportId: psp, occurredDay: occurredDay(ts), fanKey: key }, { accountId })),
+  ];
+
+  // OP-04 — A THROW FROM `db.batch` IS NOT PROOF NOTHING HAPPENED. It is also
+  // how the guard ITSELF signals a refusal: statement 1's NULL PK on a failed
+  // precondition is a NOT-NULL constraint violation, which throws. A genuine
+  // transport error after the batch already committed throws the identical
+  // shape of exception. The two cannot be told apart from the exception alone,
+  // so the exception is not what decides "refused" vs "happened" — swallow it
+  // here and let the `spent` read below (this attempt's OWN `ledgerId`, so it
+  // can only match a row THIS call wrote) be the one check that does, whether
+  // or not `batch` reported an error.
+  let seqs: number[] = [];
+  let batchFault: unknown = null;
+  try {
+    const span = outboxSpan(db);
+    const spanRes = await db.batch([span.open, ...stmts, span.close]);
+    seqs = outboxSpanSeqs(spanRes[0], spanRes[spanRes.length - 1]);
+  } catch (e) {
+    batchFault = e; // see above — `spent` below decides whether anything happened
+  }
+  // I16-RG-MONEY:11: a batch that RETURNED committed — the guard refuses only by throwing (statement 1's
+  // NULL PK) — so the debit landed and nothing is read: a fault on that read used to answer a charged fan
+  // with an outage. The read decides only after a throw, which is the one case it is ambiguous.
+  const spent = batchFault === null ? true : await db.prepare("SELECT 1 AS x FROM credit_ledger WHERE entry_id = ?").bind(ledgerId).first();
+  if (!spent) {
+    // D-0930(6) (the #932c shape): nothing was debited. Only the guard's own NOT NULL
+    // refusal is the fan's 409; any other fault (timeout, dropped connection) is an
+    // outage and propagates as one — never "insufficient credits" (buyCard, credits.ts, PS-070).
+    // I16-RG-MONEY:10: the guard's OWN column (statement 1's `credit_ledger.entry_id`), not any NOT NULL —
+    // a NOT NULL fault on another column is a code/schema bug and surfaces as one.
+    if (!(batchFault instanceof Error && GUARD_REFUSAL_RE.test(batchFault.message))) throw batchFault;
+    throw new WarInstanceError("pack refused: insufficient credits or your card shelf is full", 409);
+  }
+  // The debit landed. If `batch` above threw, that was a transport error AFTER
+  // a successful commit, not a refusal — the pack was bought and minted, and
+  // saying otherwise is exactly the bug this closes.
+  if (pubEnv && pubCtx) publishAfterCommit(pubEnv, pubCtx, seqs);
+
+  // F3 (review): the pack audit record lives in war_packs (D1), which the
+  // full-fan-audit / erasure paths cover correctly. We do NOT mirror it to a
+  // permanent R2 blob — that blob carried the fan's client_seed, never expired,
+  // and outlived account erasure (unlinkable, but needless data retention). The
+  // fan receives the complete replay inputs in THIS response to keep if they
+  // want to verify later.
+
+  // I3-1322: the sale is COMMITTED here. A fault on this read used to throw past
+  // the commit, so the fan saw an error for a pack they had paid for and the
+  // response carrying the seed was lost; the balance is a convenience, the pack
+  // is not (`packReveal` below re-serves the replay inputs).
+  let balance: number | null = null;
+  try {
+    balance = await creditBalance(db, accountId);
+  } catch (e) {
+    logError({ cid: "unknown", hop: "http", msg: "pack_balance_unread", err: e instanceof Error ? e.name : typeof e });
+  }
+  return {
+    pack_id: packId,
+    cards: instances,
+    variant_index: variantIndex,
+    server_seed: serverSeed,
+    server_seed_hash: seedHash,
+    client_seed: clientSeed,
+    odds_hash: table.content_hash,
+    edition_week: table.week, // I3-0235: which week's published odds table to check odds_hash against
+    withheld,
+    price_credits: price,
+    balance,
+  };
+}
+
+/** I3-1322 — the replay inputs of ONE opened pack, own-scoped. */
+export interface PackReveal {
+  pack_id: string;
+  edition_week: string;
+  server_seed: string;
+  server_seed_hash: string;
+  client_seed: string;
+  odds_hash: string;
+  /** I3-1499: a withheld slot reads `WITHHELD_SLOT`, in position. */
+  drawn_passports: string[];
+  /** I3-1499: per slot, true where the creator was withheld (no card, not charged). */
+  withheld: boolean[];
+  variant_index: number;
+  instance_ids: string[];
+  price_credits: number;
+  opened_at: string;
+}
+
+/**
+ * I3-1322: re-serve an opened pack's replay inputs to the fan who opened it, so a
+ * lost `openPack` response no longer costs them the seed (the only other reader
+ * was the full data export). Own-scoped by a bound `account_id = ?` in the same
+ * statement as the pack id (INV-009), so another account's pack and a pack that
+ * does not exist are the same `null`. `war_packs` rows exist only for committed
+ * opens (statement 2 of `openPack`'s batch is predicated on the debit), so the
+ * seed is never revealed for an unopened commitment.
+ */
+export async function packReveal(db: DbLike, accountId: string, packId: string): Promise<PackReveal | null> {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(accountId)) throw new WarInstanceError("bad account id", 500);
+  if (!WPK_RE.test(packId)) return null;
+  const r = await db
+    .prepare(
+      `SELECT pack_id, edition_week, server_seed, server_seed_hash, client_seed, odds_hash, drawn_passports, variant_index, instance_ids, price_credits, opened_at
+         FROM war_packs WHERE pack_id = ? AND account_id = ?`,
+    )
+    .bind(packId, accountId)
+    .first<Omit<PackReveal, "drawn_passports" | "instance_ids"> & { drawn_passports: string; instance_ids: string }>();
+  if (!r) return null;
+  const list = (v: string): string[] => {
+    try {
+      const a = JSON.parse(v) as unknown;
+      return Array.isArray(a) ? a.filter((x): x is string => typeof x === "string") : [];
+    } catch {
+      return [];
+    }
+  };
+  const drawn = list(r.drawn_passports);
+  return { ...r, drawn_passports: drawn, withheld: drawn.map((p) => p === WITHHELD_SLOT), instance_ids: list(r.instance_ids) };
+}
+
+/** PS-238 — one line of a fan's OWN pack spend history: what they paid and
+ * when, own-scoped (INV-009: `account_id = ?`, bound, never a hand-filtered
+ * scan). Rung 1 held: this is exactly `war_packs`, the audit record `openPack`
+ * already writes on every sale — no new column, no new table, nothing
+ * re-derived. Newest first, bounded so a heavy fan's history is one page, not
+ * one row per pack ever opened. */
+export interface PackSpendRow {
+  pack_id: string;
+  edition_week: string;
+  price_credits: number;
+  opened_at: string;
+}
+
+const PACK_SPEND_HISTORY_MAX = 500;
+
+/** The fan's own pack spend, newest first. `accountId` is a bound parameter,
+ * never interpolated — the same predicate every own-scoped read on this table
+ * uses (`account_data.ts`'s full-export query is the other reader of
+ * `war_packs`, and it is `account_id = ?` too). */
+export async function packSpendHistory(db: DbLike, accountId: string, limit = 100): Promise<PackSpendRow[]> {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(accountId)) throw new WarInstanceError("bad account id", 500);
+  const { results } = await db
+    .prepare("SELECT pack_id, edition_week, price_credits, opened_at FROM war_packs WHERE account_id = ? ORDER BY opened_at DESC LIMIT ?")
+    .bind(accountId, Math.max(1, Math.min(PACK_SPEND_HISTORY_MAX, limit)))
+    .all<PackSpendRow>();
+  return results;
+}
+
+/** Variant mint statements — same shape as mintInstanceStatements but sets
+ * variant = 1. Cap-guarded as a no-op like every other mint. */
+function variantMintStatements(db: DbLike, args: { instanceId: string; logId: string; ownerId: string; passportId: string; ts: string }): DbStatement[] {
+  const base = mintInstanceStatements(db, { instanceId: args.instanceId, logId: args.logId, ownerId: args.ownerId, passportId: args.passportId, source: "pack", bound: false, ts: args.ts });
+  // The first statement is the instance INSERT; add variant=1 by re-issuing it
+  // with the column set. Simpler: run the base insert then flag it in the same
+  // batch (a guarded UPDATE predicated on the row existing).
+  base.push(db.prepare("UPDATE card_instances SET variant = 1 WHERE instance_id = ? AND owner_id = ?").bind(args.instanceId, args.ownerId));
+  return base;
+}
+===== END FILE: services/trust-core/src/packs.ts =====
+
+===== END OF CHUNK 58 OF 73 =====

@@ -1,0 +1,1866 @@
+DHWAJA CODE REVIEW — server — CHUNK 7 OF 75
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: apps/creator-console
+Files in this chunk (9):
+  - apps/creator-console/src/onboarding.ts
+  - apps/creator-console/src/onetime.ts
+  - apps/creator-console/src/payout.ts
+  - apps/creator-console/src/platforms.ts
+  - apps/creator-console/src/profile.ts
+  - apps/creator-console/src/router.ts
+  - apps/creator-console/src/session.ts
+  - apps/creator-console/src/signature.ts
+  - apps/creator-console/src/typed-resume.ts
+
+
+===== BEGIN FILE: apps/creator-console/src/onboarding.ts =====
+import type { KVStore } from "./session.js";
+import { LAPSE_COSTS } from "./lapse-costs.js";
+
+/**
+ * #131BR-01 (I16-W01D; JUDGE I16-JN-TA rejected the email-only close). The
+ * "Turn on protection alerts" step is done only when the roundup can actually
+ * reach the creator: a verified address AND the digest stream on AND its email
+ * half on. `digest_email_enabled` absent (a server older than 0051) reads as on,
+ * as api.ts ContactStateDto documents; a missing read is NOT on.
+ */
+export function protectionAlertsOn(c: { email_verified?: boolean; digests_enabled?: boolean; digest_email_enabled?: boolean } | null | undefined): boolean {
+  return !!c && c.email_verified === true && c.digests_enabled === true && c.digest_email_enabled !== false;
+}
+
+/**
+ * S98 — the onboarding golden path as a PURE step model. Progress is derived
+ * from SERVER state wherever a read exists (passkeys, linked accounts, published
+ * releases, and — since the caller (main.ts) added a verified-email read — the
+ * protection/contact step too: all four self-heal across devices), and from a
+ * small per-passport LOCAL mark only where no server read exists yet (bio-link
+ * placement, having viewed your own passport — both are actions whose outcome
+ * lives outside a creator-readable API today; known gap, documented; I3-0447).
+ *
+ * The model never touches the DOM or the network: the controller fetches, this
+ * derives, the view renders — whether `contactMarked` below carries a server or
+ * a local value is the CALLER's decision, not this module's.
+ */
+
+/**
+ * F9 — THE GOLDEN PATH, RE-ORDERED AS **assert → reveal → appointment**.
+ *
+ * What it was: claim → passkey → accounts → protection → drop → biolink, and
+ * three things were wrong with that shape.
+ *
+ *  1. `drop` — MINT A COLLECTIBLE — sat fourth of six in a checklist whose
+ *     completion banner claims "you're provably you". A drop is a fine thing to
+ *     do and it is not a thing that makes you provably you; it was the
+ *     highest-effort step in the funnel, placed before the creator had been
+ *     shown what a fan sees. It is off the list and offered from the finished
+ *     state instead, where it belongs: the ladder after the trust, not inside it.
+ *  2. THERE WAS NO REVEAL. Every step was something to DO. Nothing at any point
+ *     showed the creator the thing they came for — the answer a fan gets when
+ *     they check them — so a creator could complete the whole list without ever
+ *     seeing their own verdict, and without learning that the accounts they
+ *     added are not yet served to anybody.
+ *  3. THERE WAS NO APPOINTMENT. The two things that genuinely take time — a
+ *     proof reaching fans at the next registry build, and an operator deciding a
+ *     verification — are invisible, so "All set 🎉" was the last thing a creator
+ *     heard on a passport where nothing was being served yet. A checklist that
+ *     ends in a false all-clear is worse than one that ends in a date.
+ */
+export type StepId = "claim" | "passkey" | "accounts" | "protection" | "reveal" | "biolink" | "appointment";
+
+export interface StepState {
+  id: StepId;
+  title: string;
+  done: boolean;
+  detail: string;
+}
+
+export interface OnboardingInputs {
+  signedIn: boolean;
+  passkeyCount: number;
+  /**
+   * ACTIVE ACCOUNTS ON THE PASSPORT, FROM THE CREATOR'S OWN LIST — not from the
+   * public presentation, and that difference is the whole of this defect.
+   *
+   * This used to be `tabs.links` off `GET /p/:id/presentation`, i.e. the PUBLIC
+   * view, which drops every asserted-but-unproven row. Manual review is the only
+   * claim path for Instagram, TikTok and OnlyFans, and there is no manual
+   * ACCOUNT proof at all for an already-claimed passport — so a creator on those
+   * platforms can add accounts all day and this number never moves. "Link your
+   * accounts" could not be completed, and therefore neither could the checklist:
+   * "All set — you're provably you 🎉" was unreachable by construction, for
+   * exactly the creators the product is most for.
+   *
+   * `GET /account/accounts` is the creator's OWN read and lists every row on the
+   * passport with its standing, so this counts what they actually did.
+   */
+  linkedAccounts: number;
+  /** Of those, how many are served to fans as confirmed. Used for the step's
+   * DETAIL line — the step is done when the creator has done their part, and
+   * this says how much of it Dhwaja has been able to check. */
+  confirmedAccounts: number;
+  /** Published releases (any drop counts). Still read — the FINISHED state
+   * offers a drop as the next thing, and says so differently once one exists. */
+  releaseCount: number;
+  /** Local marks (per passport). `contactMarked` is the CALLER's
+   * already-resolved value — pass the server signal (verified email) when one
+   * exists and fall back to the local mark only when it doesn't (main.ts does
+   * this today, so this step already self-heals across devices). `bioLinkMarked`
+   * and `revealMarked` have no server read yet and stay per-device only; that
+   * remains a known, documented gap (I3-0447). */
+  contactMarked: boolean;
+  /** #131BR-01: the address IS verified but the roundup is switched off, so
+   * the not-done copy says that instead of asking for a verified email. */
+  contactVerifiedAlertsOff?: boolean;
+  bioLinkMarked: boolean;
+  revealMarked: boolean;
+  /**
+   * THE APPOINTMENT'S INPUTS — every one of them a thing that is already true or
+   * already in flight, never a thing to do.
+   */
+  appointment: {
+    /** Active accounts the registry would NOT publish yet (`serving` is
+     * `not_served` or `caution`). The gap between what the creator asserted and
+     * what a fan can see, which nothing used to name. */
+    unserved: number;
+    /** Of those, how many have a self-serve proof path — the difference between
+     * "prove it" and "there is nothing you can do here yet". */
+    provable: number;
+    /** An operator is holding a verification request. */
+    verificationPending: boolean;
+    /** A "not mine" correction is queued against one of their rows. */
+    correctionPending: boolean;
+    /** Verification lapses within the warning window, with the date. */
+    expiresAt: string | null;
+  };
+}
+
+export function deriveSteps(i: OnboardingInputs): StepState[] {
+  return [
+    {
+      id: "claim",
+      title: "Claim your passport",
+      done: i.signedIn,
+      // I3-1908: a signed-in session token is only ever minted AFTER a proven
+      // claim (session.ts), so `signedIn` is real evidence of proof — but the
+      // proof happened AT CLAIM TIME, not at this instant, and the old copy
+      // read as a present-tense re-verification. Say when it happened.
+      detail: i.signedIn ? "You proved control of a listed account when you claimed this passport." : "Prove control of one of your listed accounts with a bio code.",
+    },
+    {
+      id: "passkey",
+      title: "Register a passkey",
+      done: i.passkeyCount > 0,
+      detail: i.passkeyCount > 0 ? `${i.passkeyCount} signing device${i.passkeyCount === 1 ? "" : "s"} registered.` : "Your passkey signs drops and broadcasts — the unforgeable 'by creator' mark.",
+    },
+    {
+      id: "accounts",
+      title: "Link your accounts",
+      // THE STEP IS ABOUT WHAT THE CREATOR DID, NOT ABOUT WHAT DHWAJA COULD
+      // CHECK. Whether an account can be proved is a property of the PLATFORM —
+      // only four of them expose a fetchable public profile — so gating this on
+      // proof made the checklist un-completable for anyone whose accounts are on
+      // Instagram, TikTok or OnlyFans. The detail line still says how many are
+      // confirmed, because that is the number that matters to fans and the one
+      // an operator looks at; it just is not the creator's homework.
+      done: i.linkedAccounts >= 2,
+      detail:
+        i.linkedAccounts >= 2
+          ? `${i.linkedAccounts} accounts on your passport${i.confirmedAccounts > 0 ? `, ${i.confirmedAccounts} confirmed to fans` : " — none confirmed yet"}.`
+          : "Add your other platforms — proof works today for a handful of platforms; others still get listed as unconfirmed until a proof path exists (2+ recommended).",
+    },
+    {
+      id: "protection",
+      title: "Turn on protection alerts",
+      done: i.contactMarked,
+      detail: i.contactMarked
+        ? "You'll hear about warnings and reports that concern you."
+        : i.contactVerifiedAlertsOff
+          ? "Your email is verified, but the roundup is switched off — turn digest email back on under Digests to hear about warnings and reports that concern you."
+          : "A verified email gets you the roundup: warnings protecting you, report outcomes, weekly digest.",
+    },
+    {
+      // REVEAL — the step that was missing, and the one the creator came for.
+      // Everything above it is something they told us; this is the first time
+      // the product tells them something back, and what it tells them is the
+      // only thing that matters: what a fan gets when they check you.
+      id: "reveal",
+      title: "See what a fan sees",
+      done: i.revealMarked,
+      detail: i.revealMarked
+        ? servedLine(i)
+        : "Open your own passport page — the verdict, the accounts on it, and anything Dhwaja is warning fans about. It takes ten seconds and it is the whole product.",
+    },
+    {
+      id: "biolink",
+      title: "Put your proof link in your bio",
+      done: i.bioLinkMarked,
+      detail: i.bioLinkMarked ? "Fans can check you from your bio." : "The link IS the proof — paste it everywhere you are.",
+    },
+    {
+      // APPOINTMENT — not a task. It is done when there is nothing outstanding,
+      // and while something IS outstanding its detail names WHAT and WHEN.
+      // A checklist that ends in "All set 🎉" on a passport serving nothing is a
+      // false all-clear; this is the step that refuses to give one.
+      id: "appointment",
+      title: "Know what happens next",
+      done: appointmentClear(i),
+      detail: appointmentLine(i),
+    },
+  ];
+}
+
+/** What the registry would publish right now, said plainly. */
+function servedLine(i: OnboardingInputs): string {
+  const served = Math.max(0, i.linkedAccounts - i.appointment.unserved);
+  if (i.linkedAccounts === 0) return "Nothing is on your passport yet, so a fan checking you gets \u201cnot listed\u201d.";
+  if (i.appointment.unserved === 0) return `All ${i.linkedAccounts} of your accounts answer for you when a fan checks them.`;
+  return `${served} of ${i.linkedAccounts} answer for you today; ${i.appointment.unserved} ${i.appointment.unserved === 1 ? "is" : "are"} on your passport but not yet served to fans.`;
+}
+
+/** Nothing outstanding, in either direction. */
+function appointmentClear(i: OnboardingInputs): boolean {
+  const a = i.appointment;
+  return a.unserved === 0 && !a.verificationPending && !a.correctionPending && a.expiresAt === null;
+}
+
+/**
+ * ONE SENTENCE, AND IT NAMES THE NEAREST REAL THING.
+ *
+ * Ordered by what a creator can act on soonest and cares about most: a proof
+ * they can take right now beats a queue they can only wait on, and a deadline
+ * beats both because it is the only one that runs out.
+ */
+export function appointmentLine(i: OnboardingInputs): string {
+  const a = i.appointment;
+  // PINNED TO THE SAME CONSTANT AS THE BANNER AND THE VERIFICATION PAGE
+  // (views.ts LAPSE_COSTS). The old sentence said a lapse "drops you out of the
+  // registry"; the fold walks verified \u2192 claimed (verification.ts:9-11) and the
+  // registry serves claimed too (discovery-page.ts:154), so it said the one
+  // thing that does not happen.
+  if (typeof a.expiresAt === "string" && a.expiresAt.length >= 10) return `Your verified status lapses on ${a.expiresAt.slice(0, 10)}. Renewing before then costs you nothing, and it is the one date here with a deadline. ${LAPSE_COSTS}`;
+  // AS-067: PROOF BEFORE QUEUE, per the docblock above — a thing the creator can
+  // do right now outranks a thing they can only wait on. A pending correction
+  // needs no further creator action, so it is named only once nothing more
+  // actionable is outstanding.
+  if (a.provable > 0) {
+    // AS-071: the promised window is the artifact cron (6-hourly,
+    // services/trust-core/wrangler.jsonc "17 */6 * * *") plus one churn-budget
+    // rebuild delay (services/trust-core/src/account-standing.ts:491-492) — up
+    // to ~12h worst case, not the "few hours" the old copy implied.
+    return `${a.provable} of your accounts can be proved right now, and until one is, a fan checking that handle gets no answer for you. A proof reaches fans at the next registry build \u2014 up to about 12 hours, not instantly.`;
+  }
+  if (a.correctionPending) return "You told us an account isn\u2019t yours. It stays on your public page until a person at Dhwaja acts, and we\u2019ll tell you when they do.";
+  if (a.unserved > 0) {
+    return `${a.unserved} of your accounts sit on your passport unproven, and none of them has a self-serve proof yet \u2014 Dhwaja can\u2019t fetch a login-walled profile to check a code. That is a gap in Dhwaja, not homework for you; verification is the route for those.`;
+  }
+  if (a.verificationPending) return "Your verification request is with an operator. There is nothing else to do and nothing expires while you wait.";
+  return "Nothing is pending. Every account you added is served to fans, and we\u2019ll email you if that changes \u2014 a report naming you, a warning published for you, or a proof about to lapse.";
+}
+
+export function nextStep(steps: StepState[]): StepState | null {
+  return steps.find((s) => !s.done) ?? null;
+}
+
+export function completedCount(steps: StepState[]): number {
+  return steps.filter((s) => s.done).length;
+}
+
+// --- the small local mark store (per passport, injected KV) -------------------
+
+// `welcome` is not a checklist step — it is the per-passport, per-browser record
+// that the welcome interstitial has been SHOWN, so the four claim landings send a
+// creator there once instead of on every sign-in. It rides this store because it
+// is exactly the same kind of fact as the other two (no server read exists, and
+// none should: whether a screen was displayed in one browser is not passport
+// state). A store that refuses to persist (private browsing) degrades to showing
+// the screen again, which is the harmless direction.
+/** F9 adds `reveal`: the creator opened their own public page. Local, like
+ * `biolink`, because "did you look at it" is not a thing the server can know. */
+const MARKS = new Set(["contact", "biolink", "welcome", "reveal"]);
+const PSP_RE = /^psp_[0-9a-f]{16}$/;
+
+export class OnboardingMarks {
+  constructor(private readonly store: KVStore) {}
+
+  private key(passportId: string, mark: string): string | null {
+    if (!PSP_RE.test(passportId) || !MARKS.has(mark)) return null;
+    return `dhwaja.onboarding.${passportId}.${mark}`;
+  }
+
+  has(passportId: string, mark: "contact" | "biolink" | "welcome" | "reveal"): boolean {
+    const k = this.key(passportId, mark);
+    return k !== null && this.store.get(k) === "1";
+  }
+
+  set(passportId: string, mark: "contact" | "biolink" | "welcome" | "reveal"): void {
+    const k = this.key(passportId, mark);
+    if (k) this.store.set(k, "1");
+  }
+
+  /** Remove this passport's marks — called at sign-out so a shared browser
+   * doesn't accumulate keys enumerating which passports signed in here
+   * (review LOW). */
+  clearFor(passportId: string): void {
+    for (const mark of MARKS) {
+      const k = this.key(passportId, mark);
+      if (k) this.store.remove(k);
+    }
+  }
+}
+===== END FILE: apps/creator-console/src/onboarding.ts =====
+
+===== BEGIN FILE: apps/creator-console/src/onetime.ts =====
+/**
+ * ONE-TIME VALUES — the guard for things trust-core will hand back exactly once.
+ *
+ * `POST /account/reverse-codes/pool/:id/generate` and the drop's `codes:
+ * {generate_count}` block both return VOUCHER VALUES in their response body and
+ * nowhere else, except that `GET /account/reverse-codes/pool/:id/generated`
+ * lets the creator re-view the Dhwaja-GENERATED codes of one of their own pools
+ * (I3-2144; creator-only, no-store). No route lists the values of a pool whose
+ * codes the creator uploaded, and none exists in support, so for those the
+ * markup on screen plus whatever the creator saved is the entire set. A render, a nav click, a reload or a closed tab
+ * destroys them silently, and the vouchers stay live in the pool: claimable by
+ * fans, unhonourable by the creator.
+ *
+ * WHAT WENT WRONG BEFORE, AND WHY THIS IS A MODULE.
+ *
+ * The first version of this guard was a counter in `main.ts` consulted by three
+ * places — `hashchange`, `beforeunload` and sign-out. Every OTHER write handler
+ * on `#/codes` (`rc-create-form`, `rc-upload-form`, `rc-close`) called
+ * `await render()` unconditionally, and a render replaces the whole app root, so
+ * three controls sitting on the same screen as the panel — a screen whose own
+ * copy invites using them, "Two ways, and they mix freely in one pool" — wiped
+ * an unsaved batch with no prompt at all. A second `Generate vouchers` did the
+ * same thing to the first batch. Meanwhile the counter was reset only by the
+ * save controls and by `hashchange`, so after one of those silent wipes the
+ * guard went on claiming "3 generated codes are on screen" over an empty screen,
+ * forever — training the creator to dismiss the one prompt that matters.
+ *
+ * Both defects have the same root: the guard was attached to a HANDCOUNTED LIST
+ * OF CALLERS. So it is not any more. There are exactly two ways markup on this
+ * screen is replaced — `render()` (the whole root) and `setResult()` (one result
+ * box) — and BOTH now run through this guard, which means a control that has not
+ * been written yet is covered by construction. The two producers additionally
+ * ask BEFORE they mint, because consent after minting is not consent: the second
+ * batch would already exist and be unreadable.
+ *
+ * NOTHING HERE IS STORED. The count is a plain in-memory number and the values
+ * live only in the read-only box on screen and in whatever the creator saved —
+ * no storage, no session, no URL, so there is nothing to leak and nothing that
+ * outlives the tab.
+ */
+
+/**
+ * The id of the one-time panel (`rcGeneratedCodesView`). It is the ONE marker
+ * that voucher values are on screen, which is what lets `destroysOneTimePanel`
+ * decide from the DOM rather than from bookkeeping that can go stale.
+ */
+export const ONETIME_PANEL_ID = "rc-generated";
+
+/**
+ * The prompt. It states the count, states the irreversibility, and asks a
+ * question whose "cancel" is the safe answer — a creator who mashes Escape
+ * keeps their vouchers.
+ */
+export function discardPrompt(count: number): string {
+  return `${count} generated code${count === 1 ? " is" : "s are"} on screen and Dhwaja can never show ${count === 1 ? "it" : "them"} again. Leave without saving ${count === 1 ? "it" : "them"}?`;
+}
+
+/** Just enough of the page to ask. Injected so the state machine is testable. I3-0422 a: the ask is the in-page
+ * dialog (`askConfirm`, src/dialog.ts), so it answers asynchronously. */
+export interface OneTimeHost {
+  confirm(message: string): Promise<boolean>;
+}
+
+/**
+ * Would replacing this element's contents take the one-time panel off the
+ * screen? Derived from the live DOM, so a partial render that happens to
+ * contain the panel is caught without anyone having listed it. The save-status
+ * box lives INSIDE the panel, so writing to it is not a destruction and does
+ * not prompt.
+ */
+export function destroysOneTimePanel(el: Element): boolean {
+  if (el.id === ONETIME_PANEL_ID) return true;
+  return el.querySelector(`#${ONETIME_PANEL_ID}`) !== null;
+}
+
+export class OneTime {
+  private count = 0;
+  constructor(private readonly host: OneTimeHost) {}
+
+  /** How many unsaved one-time values are on screen right now. */
+  get pending(): number {
+    return this.count;
+  }
+
+  /**
+   * Arm the guard for a batch that is now on screen. A non-positive or
+   * non-integer count arms nothing — a guard that cannot say a true number
+   * should not be prompting with one.
+   */
+  arm(count: number): void {
+    this.count = Number.isInteger(count) && count > 0 ? count : 0;
+  }
+
+  /** The creator has saved them (or they are gone). Stop asking. */
+  release(): void {
+    this.count = 0;
+  }
+
+  /**
+   * May the pending batch be destroyed? True when nothing is at stake, or when
+   * the creator said so. NO side effect on true — the caller decides whether the
+   * destruction actually happens, and `consume()` is the version that commits.
+   */
+  async mayDiscard(): Promise<boolean> {
+    if (this.count === 0) return true;
+    return (await this.host.confirm(discardPrompt(this.count))) === true;
+  }
+
+  /**
+   * Ask once, and on "yes" clear the counter in the same step. This is what
+   * every caller that is about to destroy the panel uses, and it is why
+   * signing out with unsaved codes prompts ONCE: the sign-out handler consumes
+   * the consent, so the `hashchange` it then triggers finds nothing pending and
+   * asks nothing. (Before, it asked twice and answering "no" to the second
+   * bounced the hash back AFTER `logoutAll()` had already run.)
+   */
+  async consume(): Promise<boolean> {
+    if (!(await this.mayDiscard())) return false;
+    this.release();
+    return true;
+  }
+}
+===== END FILE: apps/creator-console/src/onetime.ts =====
+
+===== BEGIN FILE: apps/creator-console/src/payout.ts =====
+import type { PayoutTagInputDto } from "./api.js";
+
+/**
+ * Payout-tag rules, MIRRORED on the client (M3).
+ *
+ * The server module `services/trust-core/src/payout.ts` owns every rule —
+ * verified-only, per-type format validation, the 10-tag cap, the 24h cooling-off
+ * — and re-checks all of it on both legs of the signed ceremony. This file
+ * exists so the form can (a) offer the real vocabulary instead of a free-text
+ * type field, and (b) refuse an obviously-unsendable set BEFORE asking the
+ * creator to touch their authenticator: a passkey ceremony run for a set the
+ * server will 400 is a security prompt spent on nothing.
+ *
+ * Same two hard rules as codes.ts:
+ *  1. MIRROR, never authority — a set that passes here can still be refused,
+ *     and the server's own sentence is then shown verbatim.
+ *  2. Nothing here softens the money path. Parsing never "fixes" a value
+ *     (no rewriting an address the creator typed); a line it can't read is
+ *     reported with its line number and the whole set is refused, because a
+ *     payout set the creator half-meant is exactly the artifact this screen
+ *     must never sign.
+ *
+ * `apps/creator-console/test/payout.test.ts` pins the vocabulary and caps
+ * against the server sources, so a change over there fails this suite instead
+ * of drifting.
+ */
+
+/** Mirrors `PAYOUT_TAG_TYPES` in @dhwaja/schema (one vocabulary: the ledger's
+ * grammar, the server validator and this form all read the same list). */
+export const PAYOUT_TAG_TYPES = ["btc", "eth", "sol", "cashapp", "venmo", "throne", "other_url"] as const;
+export type PayoutTagType = (typeof PAYOUT_TAG_TYPES)[number];
+/** Mirrors `MAX_TAGS`. */
+export const MAX_PAYOUT_TAGS = 10;
+/** Mirrors `PAYOUT_COOLING_OFF_MS` (24h), expressed in hours for copy. */
+export const PAYOUT_COOLING_OFF_HOURS = 24;
+/** Mirrors the tag-value length bound in `validateTag` (`v.length > 128`). */
+export const MAX_TAG_VALUE_LEN = 128;
+/** THE EXACT TOKEN the payout routes answer with 503 when passkey config is
+ * absent (`{ error: "passkeys_unavailable" }`). Fail closed: no passkeys means
+ * NO payout changes, never an unsigned fallback — the view must say that
+ * honestly rather than "try again". */
+export const PASSKEYS_UNAVAILABLE_ERROR = "passkeys_unavailable";
+/** THE EXACT SENTENCE `planPayoutTagChange` refuses an unverified creator with
+ * (403). Payout tags are the highest-stakes creator surface, so only a passport
+ * an operator actually vetted may stand behind one.
+ *
+ * It is `requireVerifiedCreator`'s sentence now, not payout.ts's own: the write
+ * gate moved onto the repo-wide mint chokepoint (verified-creator.ts), which
+ * asks the third question the local `if` never did — a SUPPRESSED creator could
+ * previously still move where the money goes. Same string the reverse-codes
+ * screen pins (`codes.ts VERIFIED_ONLY_ERROR`), pinned to the same source. */
+export const PAYOUT_VERIFIED_ONLY_ERROR = "verified creators only";
+
+/** Human labels for the form's type picker. Fallback = the raw key, so a type
+ * added server-side shows up rather than disappearing. */
+export const PAYOUT_TYPE_LABEL: Record<string, string> = {
+  btc: "Bitcoin address",
+  eth: "Ethereum address",
+  sol: "Solana address",
+  cashapp: "Cash App ($cashtag)",
+  venmo: "Venmo handle",
+  throne: "Throne handle",
+  other_url: "Other (https link)",
+};
+
+const TYPES = new Set<string>(PAYOUT_TAG_TYPES);
+
+export interface PayoutParseProblem {
+  /** 1-indexed line of the textarea, so the creator can go fix it. */
+  line: number;
+  reason: string;
+}
+
+export interface PayoutTagPlan {
+  /** The set that would be submitted — exactly what the server will sign over
+   * (it dedups again server-side; duplicates here are collapsed the same way). */
+  tags: PayoutTagInputDto[];
+  problems: PayoutParseProblem[];
+  /** True only when every non-empty line parsed and the count fits the cap.
+   * An EMPTY textarea is sendable on purpose: submitting the empty set is how
+   * a creator removes every destination (the safe direction), and the view
+   * warns about it in words before the ceremony. */
+  sendable: boolean;
+}
+
+/**
+ * Parse the payout textarea: one destination per line, `type value` (whitespace
+ * separated, e.g. `eth 0x12…` or `cashapp $handle`). Case-insensitive on the
+ * TYPE only — the VALUE is never rewritten (an address "helpfully" case-folded
+ * is money sent somewhere the creator did not write).
+ */
+export function parsePayoutTags(text: unknown): PayoutTagPlan {
+  const lines = String(text ?? "").split(/\r\n|\r|\n/);
+  const problems: PayoutParseProblem[] = [];
+  const seen = new Set<string>();
+  const tags: PayoutTagInputDto[] = [];
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i]!.trim();
+    if (raw === "") continue;
+    const m = /^(\S+)\s+(.+)$/.exec(raw);
+    if (!m) {
+      problems.push({ line: i + 1, reason: `needs a type and a value, e.g. "eth 0x…" — the types are: ${PAYOUT_TAG_TYPES.join(", ")}` });
+      continue;
+    }
+    const type = m[1]!.toLowerCase();
+    const value = m[2]!.trim();
+    if (!TYPES.has(type)) {
+      problems.push({ line: i + 1, reason: `unknown type "${m[1]!.slice(0, 20)}" — the types are: ${PAYOUT_TAG_TYPES.join(", ")}` });
+      continue;
+    }
+    if (value.length > MAX_TAG_VALUE_LEN) {
+      problems.push({ line: i + 1, reason: `value is over ${MAX_TAG_VALUE_LEN} characters` });
+      continue;
+    }
+    const k = `${type}\u0000${value}`;
+    if (seen.has(k)) continue; // a set is a set — same collapse the server does
+    seen.add(k);
+    tags.push({ type, value });
+  }
+  if (tags.length > MAX_PAYOUT_TAGS) {
+    problems.push({ line: 0, reason: `at most ${MAX_PAYOUT_TAGS} destinations — this set has ${tags.length}` });
+  }
+  return { tags, problems, sendable: problems.length === 0 };
+}
+
+/** The textarea prefill for the currently-rendering set — the exact inverse of
+ * `parsePayoutTags`, so "load current, submit unchanged" round-trips to the
+ * server's `{ unchanged: true }` no-op. */
+export function payoutTagsText(tags: readonly { type: string; value: string }[]): string {
+  return tags.map((t) => `${t.type} ${t.value}`).join("\n");
+}
+===== END FILE: apps/creator-console/src/payout.ts =====
+
+===== BEGIN FILE: apps/creator-console/src/platforms.ts =====
+import { CanonicalizeError, LINK_BIO_VERIFIABLE_HOSTS, PLATFORMS, canonicalize, isLinkBioVerifiableHost, normalizePlatform } from "@dhwaja/canonical";
+
+/**
+ * WHICH ACCOUNTS CAN ACTUALLY BE PROVED FROM THIS SCREEN.
+ *
+ * THE DEFECT THIS EXISTS FOR. The console rendered a "Prove it" button on every
+ * unproven account row and wired it to `POST /account/prove/start`. That route
+ * refuses with 409 *"this platform requires manual verification"* for every
+ * platform without a fetchable `publicProfile` — which is all but four of them
+ * (reddit, linktree, allmylinks, beacons) — and manual ACCOUNT proof on an
+ * already-claimed passport is not built (`manual-claims.ts` says so in its own
+ * SCOPE note, and it cannot be built without a ledger change: `approveItem`'s
+ * claim branch appends `claim_proven`, which `events.ts` refuses for a passport
+ * that is not `unclaimed`). Measured end to end: add a tiktok account → the
+ * console offers "Prove it" → 409 → the manual fallback answers "passport
+ * already claimed" → the account is dropped from the creator's own public page.
+ * A button that cannot work, followed by a refusal that names a door that does
+ * not exist.
+ *
+ * WHY THIS IS DERIVED, NOT MIRRORED. `@dhwaja/canonical` is already bundled into
+ * this app (the account canonicalizer comes from it), and `PLATFORMS` is the
+ * SAME table `verify-fetch.ts` reads server-side to decide the 409. Copying the
+ * list into the console would be a second source of truth that drifts silently
+ * the first time a platform gains a `publicProfile`; importing it means the
+ * button appears the same day the server would honour it.
+ *
+ * The predicate below is `verificationTarget` (verify-fetch.ts) restated over
+ * the same table:
+ *   - `domain`  → proved by DNS TXT. A different flow (`acct-prove-domain`), and
+ *                 it works, so it is provable.
+ *   - `url`     → proved by bio code ONLY on a host a human has reviewed as
+ *                 owner-authored (`LINK_BIO_VERIFIABLE_HOSTS`), which ships
+ *                 EMPTY — so today every plain link answers false, and the
+ *                 predicate says so by reading the list rather than by assuming
+ *                 it stays empty.
+ *   - `handle`  → provable iff the platform carries a `publicProfile`.
+ *   - `pid`     → never: `profileUrl` builds a target for handles only.
+ */
+
+/** Is there a working, self-serve proof for this account today? */
+export function autoProvable(platform: string, idKind: string, id: string): boolean {
+  if (idKind === "domain") return true; // DNS TXT — `/account/prove/domain/*`
+  if (idKind === "url") return isLinkBioVerifiableHost(linkHost(id));
+  if (idKind !== "handle") return false;
+  const spec = PLATFORMS[platform];
+  return Boolean(spec?.publicProfile);
+}
+
+/** The host out of a stored link norm (`<host>[:port]<path>[?query]`, host
+ * already lowercased by the canonicalizer). Never throws on junk — an
+ * unparseable value is simply not on the allowlist. */
+function linkHost(norm: string): string {
+  const s = String(norm ?? "");
+  const cut = s.search(/[/:?#]/);
+  return (cut === -1 ? s : s.slice(0, cut)).toLowerCase();
+}
+
+/**
+ * The platforms whose handles can be proved with a bio code today, in a stable
+ * order — for copy that has to NAME them rather than leave a creator guessing
+ * which of the hundred-odd listed platforms the button will work on.
+ */
+export function provablePlatforms(): string[] {
+  return Object.keys(PLATFORMS)
+    .filter((k) => Boolean(PLATFORMS[k]?.publicProfile))
+    .sort();
+}
+
+/** Whether any link host has been reviewed yet — the copy about links has to be
+ * different when the allowlist is empty (today) from when it is not. */
+export function anyLinkHostVerifiable(): boolean {
+  return LINK_BIO_VERIFIABLE_HOSTS.size > 0;
+}
+
+/**
+ * Every platform key the canonicalizer accepts, sorted — the vocabulary the
+ * Add-account form must state instead of the three-example placeholder that let
+ * a creator type `twitter`, `Bluesky` or `kick` and spend a passkey ceremony on
+ * a value the server was always going to reject.
+ */
+export function knownPlatforms(): string[] {
+  return Object.keys(PLATFORMS).sort();
+}
+
+/**
+ * WHICH id_kind A PLATFORM IDENTIFIES CREATORS BY — the ASK side of CCFIX/JY-01
+ * (QUEUE #120).
+ *
+ * S-034's CCFIX fixed the SEND side: the add-account form derives `id_kind`
+ * from `PLATFORMS` and signs `pid` for a platform whose canonical identity is
+ * an immutable profile id. The ASK side was left exactly as it was — one field
+ * labelled "Handle", for every platform, with no placeholder and no validation.
+ * So the form asks a spotify or weibo creator for a handle, they type their
+ * handle, and `canonicalAccount(platform, "pid", "novavega")` ACCEPTS it: the
+ * pid branch has no shape rule at all (index.ts:252 checks only length, ASCII
+ * and forbidden bytes). The passkey ceremony runs, the ledger records
+ * `v1|weibo|pid|novavega` forever, the banner says "Added (signed).", and the
+ * subject will never match the `v1|weibo|pid|<number>` a fan's canonicalizer
+ * derives from the profile URL. Right id_kind, wrong id, no error anywhere —
+ * the silent failure moved one field to the left rather than being closed.
+ *
+ * WHY THIS LIVES IN THIS FILE and not next to the form. Same argument the
+ * docblock at the top of this module already makes for `autoProvable`: this is
+ * DERIVED from `PLATFORMS`, never mirrored, so a platform added or reclassified
+ * in `@dhwaja/canonical` changes the label the same day it changes the
+ * signature. It also makes the label and the `id_kind` that gets signed read
+ * the SAME predicate — a second copy is how the form would go back to asking
+ * for one thing and sending another.
+ *
+ * `pidOnlyPlatform` moved here verbatim from `main.ts` for that reason; its
+ * argument is unchanged and is reproduced below.
+ *
+ * A platform is "pid-only" ONLY when EVERY shape its extract rule can produce
+ * is a pid:
+ *   - `music-id` (apple music, deezer): the sole identifier is the trailing
+ *     numeric artist id — there is no handle form at all.
+ *   - `prefix` with every `prefixes[].idKind === "pid"`: every declared URL
+ *     shape for that platform carries a profile id.
+ *
+ * A platform whose prefixes MIX handle and pid shapes (steam: `/id/<vanity>` is
+ * a handle, `/profiles/<pid>` is a pid) is deliberately EXCLUDED: this form
+ * cannot tell, from a bare typed string, which of the two the creator means,
+ * and guessing "pid" would silently break the common vanity-handle case to fix
+ * the rarer one. Anything not in the table, or not uniformly pid, keeps the
+ * "handle" default.
+ */
+export function pidOnlyPlatform(platformKey: string): boolean {
+  const spec = (PLATFORMS as Record<string, { extract?: { kind?: string; prefixes?: ReadonlyArray<{ idKind?: string }> } }>)[platformKey];
+  const extract = spec?.extract;
+  if (!extract) return false;
+  if (extract.kind === "music-id") return true;
+  if (extract.kind === "prefix" && Array.isArray(extract.prefixes) && extract.prefixes.length > 0) {
+    return extract.prefixes.every((p) => p.idKind === "pid");
+  }
+  return false;
+}
+
+export interface AccountIdField {
+  /** What the form will sign. `null` = no platform typed yet / not in the table. */
+  kind: "handle" | "pid" | null;
+  label: string;
+  placeholder: string;
+  hint: string;
+}
+
+/** `normalizePlatform` THROWS on anything it does not know, and both callers
+ * below run on partially-typed input — the label re-renders on every keystroke,
+ * so "weib" reaches here before "weibo" does. A resolver that throws there would
+ * take the whole form down mid-word. Unknown → `null`, and the unknown-platform
+ * path (which already has good copy) keeps owning the error. */
+function knownPlatformKey(raw: string): string | null {
+  const t = String(raw ?? "").trim();
+  if (!t) return null;
+  try {
+    const norm = normalizePlatform(t);
+    return PLATFORMS[norm] ? norm : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The neutral field, before a platform has been named. Deliberately does NOT
+ * say "Handle": at this point the form does not know, and the old label was a
+ * claim it had no basis for. */
+const UNKNOWN_FIELD: AccountIdField = {
+  kind: null,
+  label: "Account",
+  placeholder: "your handle, or the URL of your profile page",
+  hint: "Type the platform first and this box will say exactly what that platform identifies you by.",
+};
+
+/**
+ * HOW THE FORM MUST ASK, for a given platform.
+ *
+ * WHY A pid PLATFORM IS ASKED FOR A URL. Nobody knows their own weibo `u/` id or
+ * spotify artist id off the top of their head — that is what makes "Handle" such
+ * an effective trap. They DO have the profile page open. `@dhwaja/canonical`'s
+ * `canonicalize()` is the same function a fan's client runs on that URL, so a
+ * pasted URL yields the id that will match BY CONSTRUCTION rather than by the
+ * creator transcribing it correctly. The bare id stays acceptable for anyone who
+ * does know it.
+ *
+ * NOTE THE pid SHAPE IS NOT ASSERTED ANYWHERE, and must not be. The table
+ * declares `idKind: "pid"` and nothing more: weibo, pixiv, tidal, stackoverflow,
+ * fantia and manyvids ids are numeric, but a spotify artist id is base-62
+ * (`0OdUWJ0sBjDrqHygGUXeCF`) and is shaped exactly like a handle. A "pids are
+ * digits" rule would be a fact this product does not own, and it would refuse
+ * every spotify creator. So the copy says "profile id" without promising a
+ * shape, and `accountIdProblem` refuses only what is CERTAINLY wrong.
+ */
+export function accountIdField(rawPlatform: string): AccountIdField {
+  const norm = knownPlatformKey(rawPlatform);
+  if (norm === null) return UNKNOWN_FIELD;
+  if (pidOnlyPlatform(norm)) {
+    return {
+      kind: "pid",
+      label: `Profile ID or profile URL`,
+      placeholder: `https://… your ${norm} profile page`,
+      hint: `${norm} identifies creators by a profile ID, not by a handle — a handle typed here would be recorded as an ID and would never match what fans checking you see. Paste your profile URL and Dhwaja reads the ID out of it with the same code a fan's check uses.`,
+    };
+  }
+  return {
+    kind: "handle",
+    label: "Handle or profile URL",
+    placeholder: `your ${norm} handle`,
+    hint: `${norm} identifies creators by handle. Paste the profile URL instead if you'd rather not retype it.`,
+  };
+}
+
+/**
+ * WHAT WENT WRONG, for an entry that cannot be right — checked BEFORE the
+ * passkey ceremony, because this form's own rule is that "a ceremony run for a
+ * value the server will reject is a security prompt spent on nothing".
+ *
+ * Returns `null` when nothing is CERTAINLY wrong. This is deliberately not a
+ * shape validator (see `accountIdField`): it names only the two errors that are
+ * provable from the table.
+ */
+export function accountIdProblem(rawPlatform: string, rawId: string): string | null {
+  const typed = String(rawId ?? "").trim();
+  if (!typed) return null; // `required` already covers it
+  const norm = knownPlatformKey(rawPlatform);
+  if (norm === null) return null; // the unknown-platform path owns this
+
+  // 1. A URL that resolves to a DIFFERENT platform. Certainly wrong, and the
+  //    old form would have minted the whole URL as the id.
+  if (/^(?:[a-z][a-z0-9+.-]*:\/\/|[a-z0-9-]+\.[a-z]{2,}\/)/i.test(typed)) {
+    try {
+      const sub = canonicalize(typed);
+      if (sub.platform !== norm && sub.platform !== "url") {
+        return `That link is a ${sub.platform} profile, but the Platform box says ${norm}. Nothing was added and your passkey wasn't asked for anything.`;
+      }
+    } catch (e) {
+      if (e instanceof CanonicalizeError) return `That doesn't look like a profile URL Dhwaja can read — ${e.message.slice(0, 120)}. Nothing was added and your passkey wasn't asked for anything.`;
+      return null;
+    }
+    return null;
+  }
+
+  // 2. A leading "@" on a pid platform. Certainly a handle: "@" is stripped from
+  //    a handle by `canonicalAccount` but NOT from a pid, so it would be minted
+  //    into the subject verbatim and could not match anything, ever.
+  if (pidOnlyPlatform(norm) && typed.startsWith("@")) {
+    return `"${typed.slice(0, 30)}" is a handle, and ${norm} identifies creators by a profile ID. Open your ${norm} profile and paste its URL here instead — Dhwaja will read the ID out of it. Nothing was added and your passkey wasn't asked for anything.`;
+  }
+  return null;
+}
+===== END FILE: apps/creator-console/src/platforms.ts =====
+
+===== BEGIN FILE: apps/creator-console/src/profile.ts =====
+/**
+ * I23-W1-PROFILE (D-0992(5), I3-0220 c) — the creator-console editor for the
+ * bio, links and avatar on the public passport. Server side:
+ * `services/trust-core/src/creator-profile.ts` (`/account/creator-profile*`).
+ *
+ * Pure renderers and form readers, the same contract as views.ts: data in, an
+ * HTML string out, every dynamic value through `esc`. The creator's links are
+ * shown as TEXT inside inputs, never as an href (views.ts: a rendered value
+ * never carries an untrusted URL into an href). Fetching and DOM wiring belong
+ * to main.ts (hand-off).
+ */
+
+export interface CreatorProfileDto {
+  bio: string | null;
+  links: string[];
+  avatar_hash: string | null;
+  hidden: { bio: boolean; links: boolean; avatar: boolean };
+  avatar_choices: string[];
+  limits: { bio_max: number; max_links: number };
+}
+
+const HASH_RE = /^[0-9a-f]{64}$/;
+
+function esc(s: unknown): string {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!);
+}
+
+/** The server's refusal codes, in words a creator can act on. An unknown code
+ * falls back to a generic sentence, never to the raw code. */
+export const PROFILE_ERROR_COPY: Readonly<Record<string, string>> = {
+  bio_required: "Write a bio first, or clear it.",
+  bio_empty: "That bio is empty once markup is removed. Use Clear to remove it instead.",
+  bio_too_long: "That bio is too long.",
+  bio_platform_voice: "A bio can't say it is verified by, or speaks for, Dhwaja.",
+  link_invalid: "That isn't a web address we can use.",
+  link_not_https: "Links must start with https://.",
+  link_credentials: "Links can't include a user name or password.",
+  link_port: "Links can't name a port.",
+  link_host: "Links must point at a public, named website.",
+  link_shortener: "Short links hide where they go. Use the full address.",
+  link_warned: "That site carries a Dhwaja warning, so it can't be linked.",
+  link_lookalike: "That site looks like another creator's or brand's, so it can't be linked. If it's yours, add it as a domain on your passport first.",
+  link_other_creator: "That account is listed on another creator's passport, so it can't be linked here.",
+  link_screen_unavailable: "We couldn't finish checking that site. Try again in a little while.",
+  links_invalid: "Links must be a list.",
+  links_too_many: "That's more links than a passport can show.",
+  links_duplicate: "The same link is listed twice.",
+  avatar_invalid: "Pick one of your stored images.",
+  avatar_not_found: "That image isn't one of yours.",
+  avatar_not_image: "An avatar must be an image.",
+  avatar_unservable: "That image can't be shown right now.",
+  field_invalid: "Something went wrong. Reload and try again.",
+  unauthorized: "Your session ended. Sign in again.",
+};
+export function profileErrorCopy(code: unknown): string {
+  return (typeof code === "string" && PROFILE_ERROR_COPY[code]) || "That didn't save. Try again.";
+}
+
+function hiddenNote(hidden: boolean): string {
+  return hidden ? `<p class="ds-banner banner banner-warn">Dhwaja moderation has hidden this from your public page. You can still edit it; it stays hidden until a moderator restores it.</p>` : "";
+}
+
+/** `mediaBase` is the API origin `/media/<hash>` is served from; when it is not
+ * an https origin the picker shows short hashes instead of thumbnails. */
+export function profileEditorPanel(p: CreatorProfileDto | null, read?: { status: number } | null, mediaBase?: string | null): string {
+  const head = `<section id="public-profile"><h3>Bio, links and picture</h3>
+  <p class="hint">These show on your public passport page, marked as written by you. Fans can report them, and Dhwaja moderation can hide them.</p>`;
+  if (!p) {
+    const why = read?.status === 401 ? "Your session ended. Sign in again." : "We couldn't load your bio, links and picture just now. Nothing has changed; try again.";
+    return `${head}<p class="ds-banner banner banner-err">${esc(why)}</p></section>`;
+  }
+  let base: string | null = null;
+  try {
+    if (typeof mediaBase === "string" && new URL(mediaBase).protocol === "https:") base = new URL(mediaBase).origin;
+  } catch {
+    base = null;
+  }
+  const max = Math.max(0, Math.min(p.limits.max_links, 10));
+  const linkInputs = Array.from({ length: max }, (_, i) => `<label>Link ${i + 1}<input name="link_${i}" type="url" inputmode="url" maxlength="512" placeholder="https://" value="${esc(p.links[i] ?? "")}" /></label>`).join("");
+  const choices = p.avatar_choices.filter((h) => HASH_RE.test(h));
+  const picker = choices.length
+    ? choices
+        .map((h) => {
+          const label = base ? `<img src="${esc(`${base}/media/${h}/thumb`)}" alt="Stored image ${esc(h.slice(0, 8))}" width="64" height="64" loading="lazy" />` : esc(h.slice(0, 12));
+          return `<label class="avatar-choice"><input type="radio" name="avatar" value="${esc(h)}"${p.avatar_hash === h ? " checked" : ""} /> ${label}</label>`;
+        })
+        .join("")
+    : `<p class="hint">Your picture comes from art you have already published in a signed release. You have none stored yet.</p>`;
+  return `${head}
+  <form id="profile-bio-form">${hiddenNote(p.hidden.bio)}
+    <label>Bio (up to ${esc(p.limits.bio_max)} characters)<textarea name="bio" maxlength="${esc(p.limits.bio_max)}">${esc(p.bio ?? "")}</textarea></label>
+    <button class="ds-btn" type="submit">Save bio</button> <button class="ds-btn" type="button" data-act="profile-clear" data-field="bio">Clear bio</button>
+  </form>
+  <form id="profile-links-form">${hiddenNote(p.hidden.links)}
+    <p class="hint">https links only. Short links and sites that look like another creator's or brand's are refused.</p>
+    ${linkInputs}
+    <button class="ds-btn" type="submit">Save links</button> <button class="ds-btn" type="button" data-act="profile-clear" data-field="links">Clear links</button>
+  </form>
+  <form id="profile-avatar-form">${hiddenNote(p.hidden.avatar)}
+    <fieldset><legend>Picture</legend>${picker}</fieldset>
+    ${choices.length ? `<button class="ds-btn" type="submit">Use this picture</button> ` : ""}<button class="ds-btn" type="button" data-act="profile-clear" data-field="avatar">Remove picture</button>
+  </form>
+  <div id="public-profile-result" aria-live="polite"></div></section>`;
+}
+
+/** Minimal form surface so the readers are testable without a DOM. */
+export interface FormLike {
+  get(name: string): unknown;
+}
+
+export function readBioForm(f: FormLike): string {
+  const v = f.get("bio");
+  return typeof v === "string" ? v : "";
+}
+
+/** The non-empty link inputs, in order, trimmed. An empty list means "clear". */
+export function readLinksForm(f: FormLike, maxLinks: number): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < Math.min(maxLinks, 10); i++) {
+    const v = f.get(`link_${i}`);
+    if (typeof v === "string" && v.trim() !== "") out.push(v.trim());
+  }
+  return out;
+}
+
+export function readAvatarForm(f: FormLike): string | null {
+  const v = f.get("avatar");
+  return typeof v === "string" && HASH_RE.test(v) ? v : null;
+}
+===== END FILE: apps/creator-console/src/profile.ts =====
+
+===== BEGIN FILE: apps/creator-console/src/router.ts =====
+/**
+ * Hash router (S100): a closed set of console routes — anything else falls back
+ * to signin/dashboard. The route NAME still comes from the closed set; the only
+ * free-form part is an OPTIONAL, strictly-validated query string used to PREFILL
+ * the drop form (S90d) — every prefill field is whitelisted + shape-checked here,
+ * so the URL can never smuggle anything but bounded, known-safe values into a view.
+ */
+
+export type Route = "signin" | "welcome" | "dashboard" | "roi" | "funnel" | "catalog" | "campaigns" | "recognize" | "handshakes" | "newsletter" | "questions" | "passkeys" | "broadcast" | "collectible" | "drop" | "sign" | "codes" | "onboarding" | "profile" | "billing" | "payout" | "earnings" | "intelligence" | "media" | "digests" | "verification" | "accounts" | "agencies" | "report";
+
+const ROUTES: ReadonlySet<string> = new Set(["signin", "welcome", "dashboard", "roi", "funnel", "catalog", "campaigns", "recognize", "handshakes", "newsletter", "questions", "passkeys", "broadcast", "collectible", "drop", "sign", "codes", "onboarding", "profile", "billing", "payout", "earnings", "intelligence", "media", "digests", "verification", "accounts", "agencies", "report"]);
+
+/**
+ * `#/signin` IS REACHABLE WITH A TOKEN IN THE STORE, and that is a lockout fix
+ * rather than a nicety.
+ *
+ * `isSignedIn()` is a SHAPE check on the stored bearer — it cannot see an expiry
+ * — so a creator whose 30-day session lapsed still reads as signed in here.
+ * Every page then 401s, and this function used to answer `dashboard` to an
+ * explicit `#/signin`, so the one screen that could fix it was unreachable by
+ * navigation, by a typed hash, and by a link in an error message. The only way
+ * out was the header's "Sign out (all devices)" button — which, for a creator
+ * with no passkey, is itself the permanent one-way door.
+ *
+ * A creator who asks for the sign-in screen gets the sign-in screen. Nothing is
+ * signed out by rendering it (the token stays in the store until a sign-in
+ * replaces it or a sign-out clears it), so the cost of honouring the request is
+ * zero and the cost of refusing it was a locked-out creator.
+ */
+export function parseRoute(hash: string, signedIn: boolean): Route {
+  // The route name is [a-z-]+; an optional ?query is ignored for routing.
+  const m = /^#\/([a-z-]+)(?:\?.*)?$/.exec(hash ?? "");
+  const name = m?.[1] ?? "";
+  if (!signedIn) return "signin"; // every view but signin needs a session
+  if (name === "signin") return "signin"; // asked for by name → honoured
+  if (ROUTES.has(name)) return name as Route;
+  return "dashboard";
+}
+
+/** Validated prefill for the drop form (S90d). Only these keys, each shape-checked;
+ * anything malformed is dropped. Values are still HTML-escaped by the view and
+ * re-validated server-side at drop time — this is a convenience, not a trust input. */
+export interface DropPrefill {
+  title?: string;
+  released_at?: string;
+  edition_size?: string;
+  version?: string;
+}
+
+/** Parse the drop-form prefill from a `#/drop?title=…&released_at=…` hash. */
+export function parseDropPrefill(hash: string): DropPrefill {
+  const q = (hash ?? "").split("?")[1];
+  if (!q) return {};
+  let params: URLSearchParams;
+  try {
+    params = new URLSearchParams(q);
+  } catch {
+    return {};
+  }
+  const out: DropPrefill = {};
+  const title = params.get("title");
+  if (title) {
+    const t = title.replace(/[<>]/g, "").slice(0, 120).trim();
+    if (t) out.title = t;
+  }
+  const rel = params.get("released_at");
+  if (rel && /^\d{4}-\d{2}-\d{2}$/.test(rel)) out.released_at = rel;
+  const ed = params.get("edition_size");
+  if (ed && /^\d{1,7}$/.test(ed)) out.edition_size = ed;
+  const ver = params.get("version");
+  if (ver) {
+    const v = ver.replace(/[<>]/g, "").slice(0, 20).trim();
+    if (v) out.version = v;
+  }
+  return out;
+}
+
+/** Build a `#/drop?…` link that prefills the drop form (only valid keys emitted). */
+export function dropHref(prefill: DropPrefill): string {
+  const p = new URLSearchParams();
+  if (prefill.title) p.set("title", prefill.title);
+  if (prefill.released_at && /^\d{4}-\d{2}-\d{2}$/.test(prefill.released_at)) p.set("released_at", prefill.released_at);
+  if (prefill.edition_size && /^\d{1,7}$/.test(String(prefill.edition_size))) p.set("edition_size", String(prefill.edition_size));
+  if (prefill.version) p.set("version", prefill.version);
+  const q = p.toString();
+  return q ? `#/drop?${q}` : "#/drop";
+}
+
+/**
+ * The passport id a creator arrived with, from `#/signin?psp=psp_…`.
+ *
+ * WHY THIS EXISTS. Every claim door — bio code, manual review, domain TXT, OAuth
+ * — begins with a `passport_id`, and this console has, deliberately, NO
+ * handle→passport lookup (`claim-routes.ts` names it: "NO ORACLE… deliberately
+ * no handle→passport lookup", because such a lookup would answer "is @x listed?"
+ * for anyone who asked). The consequence for a real creator was that the fan
+ * app's "Is this you? → Claim your Passport" button dropped them on a screen
+ * with four forms, all asking for a `psp_…` string the previous page knew and
+ * did not pass on. The only way to get it was to go back to the fan app and read
+ * it off the passport — a minute of the creator's first ten, spent on clerical
+ * work, at the exact moment they are most likely to leave.
+ *
+ * Passing it in the link costs nothing and gives nothing away: the id is already
+ * public (it IS the passport URL), the fan app only ever emits one it has
+ * already shape-validated, and the value is re-checked here and used only to
+ * prefill a form field the creator can edit. It is a convenience, not a trust
+ * input — the same posture as the drop prefill above. Nothing is looked up, no
+ * request is made, and an id that does not exist simply fails at `/claim/start`
+ * exactly as a typed one would.
+ */
+export function parseClaimPassportId(hash: string): string | null {
+  const q = (hash ?? "").split("?")[1];
+  if (!q) return null;
+  let params: URLSearchParams;
+  try {
+    params = new URLSearchParams(q);
+  } catch {
+    return null;
+  }
+  const psp = params.get("psp");
+  return psp && /^psp_[0-9a-f]{16}$/.test(psp) ? psp : null;
+}
+
+/**
+ * PS-261: a signed-out creator following a deep link (e.g. a `#/drop?...`
+ * notification link, or a shared `#/collectible` URL) was routed to `signin`
+ * by `parseRoute` above — correctly, since every page but signin needs a
+ * session — but nothing in the console remembered the ORIGINAL hash. Every
+ * sign-in success path in `main.ts` (passkey re-entry, the OAuth-callback
+ * return, and the claim flow) lands the creator on a fixed post-auth hash
+ * (`"#/"`), overwriting `window.location.hash` before the app repaints. The
+ * deep link is silently discarded — the exact bug the row describes, just not
+ * inside `parseRoute` itself (rule 22(l): the cited range is the router file,
+ * not the mechanism; the mechanism is "nothing computes a return hash").
+ *
+ * `postSigninHash` is the missing piece: given the hash the creator actually
+ * arrived on, it returns the hash the app should land on once `signedIn`
+ * becomes true. It reuses the same closed route set `parseRoute` reads from,
+ * so it can only ever return a value `parseRoute(_, true)` would itself
+ * accept — no smuggling. `main.ts`'s sign-in success handlers are the
+ * intended caller (`window.location.hash = postSigninHash(returnHash)`
+ * instead of the current hardcoded `"#/"`); wiring those call sites is
+ * outside this room's ownership (`apps/creator-console/src/router.ts` only)
+ * and is filed under OPEN QUESTIONS.
+ */
+export function postSigninHash(hash: string): string {
+  const m = /^#\/([a-z-]+)(?:\?.*)?$/.exec(hash ?? "");
+  const name = m?.[1] ?? "";
+  if (!name || name === "signin" || !ROUTES.has(name)) return "#/dashboard";
+  return hash;
+}
+
+/**
+ * I3-1206 (D-1079(4)): WHERE A LAPSED-SESSION SIGN-IN RETURNS. The three decisions under main.ts `lapsedResume`;
+ * what the screen carries back is typed-resume.ts.
+ */
+/** A screen may be stashed for a lapsed sign-in: there is a passport to bind it to, and it is not sign-in itself. */
+export function canStashLapsed(hash: string, passportId: string | null): boolean {
+  return passportId !== null && passportId !== "" && parseRoute(hash, true) !== "signin";
+}
+
+/** Where a sign-in lands with a stash in hand: the stashed route when the passport now signed in is the one that
+ * lapsed (and the stash is kept for the paint), otherwise `postSigninHash(fallback)` and the stash is dropped. */
+export function signinLanding(stash: { hash: string; passportId: string } | null, passportNow: string | null, fallback: string): { hash: string; keepStash: boolean } {
+  if (stash && stash.passportId === passportNow) return { hash: postSigninHash(stash.hash), keepStash: true };
+  return { hash: postSigninHash(fallback), keepStash: false };
+}
+
+/** What a paint does to a stash: the sign-in screen keeps it; the stashed route restores it; any other route drops it. */
+export function resumeOnPaint(stashHash: string, paintedHash: string, signedIn: boolean): "keep" | "restore" | "drop" {
+  if (parseRoute(paintedHash, signedIn) === "signin") return "keep";
+  return paintedHash === postSigninHash(stashHash) ? "restore" : "drop";
+}
+===== END FILE: apps/creator-console/src/router.ts =====
+
+===== BEGIN FILE: apps/creator-console/src/session.ts =====
+/**
+ * Creator session HANDLE store (S100; I25-W1-COOKIE, I3-0714 a). The creator session is an HttpOnly cookie trust-core
+ * sets after a proven claim (services/trust-core/src/csrf.ts; docs/SESSION-COOKIES.md): page script never sees it.
+ * What a sign-in hands the page, in the field the token used to arrive in, is its CSRF HANDLE (`creator.<hex>`), held
+ * here beside the passport this console is signed in as and sent as `Authorization: Dhwaja-Csrf <handle>`
+ * (`sessionAuthorization`). Storage is INJECTED and the browser bootstrap passes MEMORY (main.ts): nothing about a
+ * session is written to localStorage; a load asks GET /session/csrf?kind=creator again (api.ts syncSession). Both values are shape-validated on read AND
+ * write: a corrupted or hostile store entry must never reach an Authorization
+ * header or a rendered view verbatim.
+ */
+
+export interface KVStore {
+  get(key: string): string | null;
+  set(key: string, value: string): void;
+  remove(key: string): void;
+}
+
+/** In-memory KV (default; also the artifact-safe fallback when no storage). */
+export function memoryStore(): KVStore {
+  const m = new Map<string, string>();
+  return {
+    get: (k) => m.get(k) ?? null,
+    set: (k, v) => void m.set(k, v),
+    remove: (k) => void m.delete(k),
+  };
+}
+
+/** The Authorization value for a held handle (trust-core csrf.ts CSRF_SCHEME). */
+export function sessionAuthorization(handle: string): string {
+  return `Dhwaja-Csrf ${handle}`;
+}
+
+const TOKEN_KEY = "dhwaja.creator.session";
+/** RG-03 (D-1010(1)): the key the pre-I25 build kept a live creator BEARER under in localStorage; main.ts removes it at start. */
+export const LEGACY_SESSION_KEY = TOKEN_KEY;
+const PASSPORT_KEY = "dhwaja.creator.passport";
+const TOKEN_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+export const PSP_RE = /^psp_[0-9a-f]{16}$/;
+
+export class CreatorSession {
+  constructor(private readonly store: KVStore) {}
+
+  /** I3-0986 c: bumped on every set/clear in THIS tab, so a late answer can tell the session changed under it. */
+  private gen = 0;
+
+  /** Take BEFORE an awaited sign-in / refresh / revoke call. The stored token is part of it, so a sign-out in another
+   * tab (same store) also invalidates it. */
+  snapshot(): string {
+    return `${this.gen}|${this.get() ?? ""}`;
+  }
+
+  /** Store the session only if nothing set or cleared it since `snap`. Returns whether it was stored. */
+  setIfCurrent(snap: string, token: string, passportId: string): boolean {
+    if (snap !== this.snapshot()) return false;
+    this.set(token, passportId);
+    return true;
+  }
+
+  /** Clear the session only if nothing set or cleared it since `snap`. Returns whether it was cleared. */
+  clearIfCurrent(snap: string): boolean {
+    if (snap !== this.snapshot()) return false;
+    this.clear();
+    return true;
+  }
+
+  get(): string | null {
+    const t = this.store.get(TOKEN_KEY);
+    return t && TOKEN_RE.test(t) ? t : null;
+  }
+
+  passportId(): string | null {
+    const p = this.store.get(PASSPORT_KEY);
+    return p && PSP_RE.test(p) ? p : null;
+  }
+
+  /** Store the signed-in identity. Both parts must be well-formed or nothing
+   * is stored (a half-identity is worse than none). */
+  set(token: string, passportId: string): void {
+    if (typeof token !== "string" || !TOKEN_RE.test(token)) return;
+    if (typeof passportId !== "string" || !PSP_RE.test(passportId)) return;
+    this.gen++;
+    this.store.set(TOKEN_KEY, token);
+    this.store.set(PASSPORT_KEY, passportId);
+  }
+
+  clear(): void {
+    this.gen++;
+    this.store.remove(TOKEN_KEY);
+    this.store.remove(PASSPORT_KEY);
+  }
+
+  isSignedIn(): boolean {
+    return this.get() !== null && this.passportId() !== null;
+  }
+}
+
+// --- the manual claim in progress -------------------------------------------
+
+const MANUAL_KEY = "dhwaja.creator.manualclaims";
+/** `crypto.randomUUID()` twice, hyphens stripped — 64 lowercase hex. */
+const CLAIM_REF_RE = /^[0-9a-f]{64}$/;
+const CLAIM_CODE_RE = /^[A-Za-z0-9-]{1,64}$/;
+/** How many in-flight manual claims this browser remembers. A creator needs
+ * one; a handful covers "I started one for two different accounts" without
+ * letting a shared browser accumulate a list of passports that signed in here. */
+const MAX_PENDING = 5;
+
+export interface PendingManualClaim {
+  passport_id: string;
+  claim_ref: string;
+  /** The code the creator posted publicly — the ONLY recovery handle if the ref
+   * is lost, and recoverable by them from their own bio. */
+  code: string;
+  platform: string;
+  handle: string;
+  started_at: string;
+}
+
+/**
+ * THE ONE-TIME CLAIM REFERENCE, WRITTEN DOWN.
+ *
+ * `POST /claim/manual/start` returns a `claim_ref` once and stores only its
+ * SHA-256. The console rendered it into a button's `data-ref` attribute and
+ * NOWHERE ELSE — not persisted, not shown, not copyable — under a sentence
+ * telling the creator they did not have to stay on the page. Manual review is
+ * the only claim path for Instagram, TikTok and OnlyFans, and (with the link
+ * host allowlist shipping empty) for every Tier-2 link as well.
+ *
+ * So the ordinary sequence locked people out permanently: post the code, close
+ * the tab, operator approves, passport is claimed IN THEIR NAME — and now
+ * `/claim/manual/start` answers 409 "passport already claimed", the bio-code
+ * claim answers the same, and `/account/creator-signin` answers 403 because no
+ * session ever existed and so no passkey was ever enrolled. Claimed, never
+ * signed in, no door.
+ *
+ * This is the fix's memory half: the ref is written to the SAME injected store
+ * the session uses (localStorage in the browser, memory in tests and private
+ * mode), keyed per passport, so the sign-in screen can offer "check the claim
+ * you started" to a creator who comes back days later. Every field is
+ * shape-validated on write AND on read — a corrupted or hostile store entry must
+ * never reach a request body or a rendered view verbatim.
+ *
+ * IT IS NOT THE ONLY COPY, and the view says so: a browser can be cleared, and
+ * the ref cannot be re-issued. That is why the same panel renders the ref as a
+ * copyable value and tells the creator to keep it.
+ */
+export class ManualClaimStore {
+  constructor(private readonly store: KVStore) {}
+
+  private read(): PendingManualClaim[] {
+    const raw = this.store.get(MANUAL_KEY);
+    if (!raw) return [];
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return [];
+    }
+    if (!Array.isArray(parsed)) return [];
+    const out: PendingManualClaim[] = [];
+    for (const e of parsed) {
+      const c = ManualClaimStore.clean(e);
+      if (c && !out.some((x) => x.passport_id === c.passport_id)) out.push(c);
+    }
+    return out.slice(0, MAX_PENDING);
+  }
+
+  /** Shape gate, applied identically on the way in and on the way out. */
+  private static clean(e: unknown): PendingManualClaim | null {
+    if (!e || typeof e !== "object") return null;
+    const r = e as Record<string, unknown>;
+    const passport_id = typeof r.passport_id === "string" ? r.passport_id : "";
+    const claim_ref = typeof r.claim_ref === "string" ? r.claim_ref : "";
+    const code = typeof r.code === "string" ? r.code : "";
+    if (!PSP_RE.test(passport_id) || !CLAIM_REF_RE.test(claim_ref) || !CLAIM_CODE_RE.test(code)) return null;
+    return {
+      passport_id,
+      claim_ref,
+      code,
+      platform: typeof r.platform === "string" ? r.platform.slice(0, 40) : "",
+      handle: typeof r.handle === "string" ? r.handle.slice(0, 200) : "",
+      started_at: typeof r.started_at === "string" ? r.started_at.slice(0, 40) : "",
+    };
+  }
+
+  all(): PendingManualClaim[] {
+    return this.read();
+  }
+
+  get(passportId: string): PendingManualClaim | null {
+    return this.read().find((c) => c.passport_id === passportId) ?? null;
+  }
+
+  /** Newest first, one entry per passport, capped. A malformed entry is dropped
+   * rather than stored — a half-identity is worse than none, same rule as the
+   * session store. */
+  save(entry: PendingManualClaim): void {
+    const c = ManualClaimStore.clean(entry);
+    if (!c) return;
+    const next = [c, ...this.read().filter((x) => x.passport_id !== c.passport_id)].slice(0, MAX_PENDING);
+    try {
+      this.store.set(MANUAL_KEY, JSON.stringify(next));
+    } catch {
+      /* storage full / disabled — the panel still shows the ref to copy */
+    }
+  }
+
+  /** Drop one passport's entry: the claim finished (or the creator cleared it).
+   * Removing the key entirely when nothing is left keeps a shared browser from
+   * carrying an empty marker that says somebody claimed here. */
+  clear(passportId: string): void {
+    const next = this.read().filter((c) => c.passport_id !== passportId);
+    if (next.length === 0) this.store.remove(MANUAL_KEY);
+    else this.store.set(MANUAL_KEY, JSON.stringify(next));
+  }
+}
+===== END FILE: apps/creator-console/src/session.ts =====
+
+===== BEGIN FILE: apps/creator-console/src/signature.ts =====
+/**
+ * S91 · Slice 2 — the in-browser signature editor's PURE core.
+ *
+ * All the math + validation lives here (unit-tested, DOM-free); main.ts does only
+ * the thin canvas glue (drawImage / fillText / toBlob). Nothing here touches the
+ * DOM, the network, or a real image — it computes sizes and placements from plain
+ * numbers, so the compositing is deterministic and reviewable.
+ *
+ * The exported PNG is what the creator's passkey signs (its sha256 becomes the
+ * release's `exact_hash`) and what Slice 1 stores. So these caps mirror the
+ * server's: an export can never exceed the byte/pixel limits the upload enforces.
+ */
+
+/** The output raster's longest side. This alone keeps the export under the
+ * server's 40 MP pixel cap (2048² ≈ 4.2 MP), but NOT necessarily under the 8 MiB
+ * BYTE cap — a detailed/noisy 2048² lossless PNG can encode past 8 MiB. So the
+ * exporter (main.ts) shrinks down this ladder until the encoded bytes fit, and
+ * refuses before signing if even the floor is too big. */
+export const MAX_OUTPUT_DIM = 2048;
+/** Server's per-asset byte cap (MAX_MEDIA_BYTES) — mirrored so the client never
+ * signs a drop whose bytes the upload would 413. */
+export const MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
+/** Longest-side ladder the exporter walks to fit MAX_OUTPUT_BYTES (PNG has no
+ * quality knob, so we reduce dimensions). The floor still shows a usable image. */
+export const OUTPUT_DIM_LADDER: readonly number[] = [MAX_OUTPUT_DIM, 1600, 1280, 1024, 800];
+/** Signature text is a short mark, not a caption. */
+export const MAX_SIG_TEXT = 40;
+/** Scale is the signature's height as a fraction of the canvas's SHORTER side. */
+export const MIN_SIG_SCALE = 0.02;
+export const MAX_SIG_SCALE = 0.4;
+
+export type SignatureStyle = "script" | "sans";
+
+/**
+ * S91 follow-up (DIRECTION §3) — THE THREE MARKS, and why they share one spec.
+ *
+ * `text` was the whole editor; `draw` (freehand, captured with a pointer) and
+ * `image` (an uploaded transparent PNG of a real signature) are the two the
+ * roadmap parked. They are ONE mode field on ONE spec rather than three editors
+ * because the placement semantics are identical and must stay identical: the
+ * anchor is the mark's LEFT/BASELINE as a fraction of the canvas, and `scale` is
+ * its HEIGHT as a fraction of the shorter side. A creator who places a text mark,
+ * switches to freehand and switches back must find it where they left it — and,
+ * more to the point, three copies of that arithmetic is how one of them drifts
+ * and a mark lands off-canvas in the exported PNG that the passkey signs.
+ */
+export type SignatureMode = "text" | "draw" | "image";
+
+/** A point in the DRAWING PAD's own normalized space (0..1 on both axes). The
+ * pad's pixel size is a UI detail that changes with the viewport; storing
+ * normalized points means the same mark composites identically onto a 2048px
+ * export and onto a 800px one. */
+export interface StrokePoint {
+  x: number;
+  y: number;
+}
+export type Stroke = readonly StrokePoint[];
+
+/** Caps on a freehand mark. These are not tidiness: the stroke set is walked
+ * once per composite and the exporter composites up to `OUTPUT_DIM_LADDER.length`
+ * times, so an unbounded point count is a hang in the one place the creator is
+ * waiting on a passkey. A signature is a few strokes of a few hundred points;
+ * these are far past anything hand-drawn and still bounded. */
+export const MAX_STROKES = 64;
+export const MAX_POINTS_PER_STROKE = 4096;
+export const MAX_TOTAL_POINTS = 16_384;
+/** Stroke width as a fraction of the mark's own height, so a signature drawn
+ * small and scaled up keeps its proportions instead of turning into hairlines. */
+export const STROKE_WIDTH_RATIO = 0.06;
+
+/** An uploaded signature PNG, before it is decoded. Mirrors the art input's own
+ * ceiling in spirit but far lower: a signature is a small transparent overlay,
+ * and the file never leaves the browser — it is composited into the exported PNG
+ * and the ORIGINAL is never uploaded, exactly like the art. */
+export const MAX_SIG_IMAGE_BYTES = 4 * 1024 * 1024;
+/** Post-decode dimension cap. `createImageBitmap` has already allocated by the
+ * time we see this, so the byte cap above is the real defence; this refuses the
+ * pathological aspect ratios that would make the placement math meaningless. */
+export const MAX_SIG_IMAGE_DIM = 4096;
+export const MAX_SIG_IMAGE_ASPECT = 20;
+
+export interface SignatureSpec {
+  /** Which mark is being placed. Absent → `text`, so every existing caller and
+   * every stored spec keeps meaning what it meant. */
+  mode?: SignatureMode;
+  text: string;
+  /** Freehand strokes in pad-normalized space. Only read in `draw` mode. */
+  strokes?: readonly Stroke[];
+  /** Normalized anchor (0..1) of the signature's LEFT/BASELINE within the canvas. */
+  xNorm: number;
+  yNorm: number;
+  /** Height as a fraction of the shorter canvas side (clamped to [MIN,MAX]). */
+  scale: number;
+  color: string;
+  style: SignatureStyle;
+}
+
+/** Pixel-space placement the canvas glue applies verbatim. */
+export interface SignatureLayout {
+  text: string;
+  x: number;
+  y: number;
+  fontPx: number;
+  color: string;
+  fontFamily: string;
+}
+
+const CONTROL = /[\u0000-\u001f\u007f]/g;
+
+/** A signature mark: printable, single-line, capped. Returns "" when nothing
+ * usable is left (the caller refuses to composite an empty mark). */
+export function sanitizeSignatureText(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  return raw.replace(CONTROL, " ").replace(/\s+/g, " ").trim().slice(0, MAX_SIG_TEXT);
+}
+
+/** Only a #rgb / #rrggbb hex color is allowed to reach `fillStyle` — not because
+ * fillStyle is an injection sink, but so the composite is deterministic and a
+ * stray value can't silently paint `transparent`. Anything else → black. */
+export function safeColor(raw: unknown): string {
+  return typeof raw === "string" && /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(raw) ? raw.toLowerCase() : "#000000";
+}
+
+function clampNum(n: unknown, lo: number, hi: number, dflt: number): number {
+  const v = typeof n === "number" && Number.isFinite(n) ? n : dflt;
+  return v < lo ? lo : v > hi ? hi : v;
+}
+
+/**
+ * Fit source image dimensions into the output raster: never upscale, and cap the
+ * longest side at MAX_OUTPUT_DIM so the export stays within the server's pixel +
+ * byte caps. Returns whole pixels ≥ 1.
+ */
+export function planCanvasSize(srcW: number, srcH: number, maxDim = MAX_OUTPUT_DIM): { width: number; height: number } {
+  const w = typeof srcW === "number" && Number.isFinite(srcW) && srcW > 0 ? srcW : 1;
+  const h = typeof srcH === "number" && Number.isFinite(srcH) && srcH > 0 ? srcH : 1;
+  const longest = Math.max(w, h);
+  const factor = longest > maxDim ? maxDim / longest : 1; // never upscale
+  return { width: Math.max(1, Math.round(w * factor)), height: Math.max(1, Math.round(h * factor)) };
+}
+
+/**
+ * Turn a spec into an exact pixel placement for a `canvasW × canvasH` raster.
+ * Position is clamped so the anchor stays on-canvas; the font size derives from
+ * `scale × shorter-side`. All-defaults-safe: a malformed spec yields a centered,
+ * black, minimally-scaled mark rather than throwing.
+ */
+export function computeSignatureLayout(canvasW: number, canvasH: number, spec: Partial<SignatureSpec>): SignatureLayout {
+  const cw = typeof canvasW === "number" && Number.isFinite(canvasW) && canvasW > 0 ? canvasW : 1;
+  const ch = typeof canvasH === "number" && Number.isFinite(canvasH) && canvasH > 0 ? canvasH : 1;
+  const shorter = Math.min(cw, ch);
+  const scale = clampNum(spec.scale, MIN_SIG_SCALE, MAX_SIG_SCALE, 0.06);
+  const fontPx = Math.max(1, Math.round(shorter * scale));
+  const x = Math.round(clampNum(spec.xNorm, 0, 1, 0.5) * cw);
+  const y = Math.round(clampNum(spec.yNorm, 0, 1, 0.9) * ch);
+  const style: SignatureStyle = spec.style === "sans" ? "sans" : "script";
+  const fontFamily = style === "sans" ? "system-ui, sans-serif" : '"Segoe Script", "Brush Script MT", cursive';
+  return { text: sanitizeSignatureText(spec.text), x, y, fontPx, color: safeColor(spec.color), fontFamily };
+}
+
+/** The full CSS font string for the canvas 2D context (fontPx already integral). */
+export function canvasFont(layout: SignatureLayout): string {
+  return `${layout.fontPx}px ${layout.fontFamily}`;
+}
+
+// ---------------------------------------------------------------------------
+// FREEHAND (mode: "draw")
+// ---------------------------------------------------------------------------
+
+/**
+ * Coerce whatever the pad handed us into a bounded, finite, in-range stroke set.
+ *
+ * EVERY VALUE IS UNTRUSTED HERE even though the producer is our own pointer
+ * handler, for the reason the rest of this module states about the spec: this
+ * function's output is walked by the exporter, which runs up to five composites
+ * while the creator waits on a passkey ceremony, and it decides where ink lands
+ * in the PNG whose sha256 becomes the release's `exact_hash`. A NaN coordinate
+ * would silently break a path; an unbounded point array is a hang.
+ *
+ * Degenerate strokes are DROPPED rather than kept as dots: a pointer-down with
+ * no movement is a tap, not a mark, and a stroke set that is entirely taps has
+ * no bounds to scale by (see `strokeBounds`).
+ */
+export function sanitizeStrokes(raw: unknown): Stroke[] {
+  if (!Array.isArray(raw)) return [];
+  const out: Stroke[] = [];
+  let total = 0;
+  for (const s of raw) {
+    if (out.length >= MAX_STROKES || total >= MAX_TOTAL_POINTS) break;
+    if (!Array.isArray(s)) continue;
+    const pts: StrokePoint[] = [];
+    const cap = Math.min(s.length, MAX_POINTS_PER_STROKE * 4);
+    for (let i = 0; i < cap; i++) {
+      const p = s[i];
+      if (pts.length >= MAX_POINTS_PER_STROKE || total + pts.length >= MAX_TOTAL_POINTS) break;
+      const px = (p as StrokePoint | undefined)?.x;
+      const py = (p as StrokePoint | undefined)?.y;
+      if (typeof px !== "number" || typeof py !== "number" || !Number.isFinite(px) || !Number.isFinite(py)) continue;
+      pts.push({ x: px < 0 ? 0 : px > 1 ? 1 : px, y: py < 0 ? 0 : py > 1 ? 1 : py });
+    }
+    // Two points is the shortest thing that is a line rather than a tap.
+    if (pts.length < 2) continue;
+    total += pts.length;
+    out.push(pts);
+  }
+  return out;
+}
+
+/** The tight box the ink occupies in pad space, or null when there is no ink.
+ * The mark is scaled and anchored by THIS box, not by the pad, so a signature
+ * drawn in one corner of the pad places exactly like one drawn across it — the
+ * pad is a canvas to draw on, not a frame that has to be filled. */
+export function strokeBounds(strokes: readonly Stroke[]): { x: number; y: number; w: number; h: number } | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const s of strokes) {
+    for (const p of s) {
+      if (p.x < minX) minX = p.x;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.y > maxY) maxY = p.y;
+    }
+  }
+  if (!Number.isFinite(minX) || !Number.isFinite(minY)) return null;
+  // A perfectly horizontal or vertical mark has a zero-extent axis, which is
+  // real ink and must not be divided by. The floor is one pad-pixel-ish.
+  const w = Math.max(maxX - minX, 1e-6);
+  const h = Math.max(maxY - minY, 1e-6);
+  return { x: minX, y: minY, w, h };
+}
+
+/** Pixel-space freehand placement the canvas glue strokes verbatim. */
+export interface StrokeLayout {
+  /** Polylines in canvas pixels, ready for `moveTo`/`lineTo`. */
+  paths: StrokePoint[][];
+  color: string;
+  lineWidth: number;
+}
+
+/**
+ * Place a freehand mark with the SAME anchor and scale semantics as text.
+ *
+ * `scale × shorter side` is the mark's HEIGHT — the same sentence
+ * `computeSignatureLayout` uses for `fontPx` — and `(xNorm, yNorm)` is its
+ * LEFT/BASELINE, so the bottom of the ink sits on `y` exactly as a text
+ * baseline does. That equivalence is the reason switching modes does not move
+ * the mark, and it is asserted in the tests rather than left to the reader.
+ *
+ * Width follows the ink's own aspect ratio; nothing is clamped to the canvas,
+ * for the same reason the text layout does not measure and clamp its own
+ * advance width — the anchor is clamped, the mark may overhang, and that is the
+ * creator's placement choice on their own art.
+ */
+export function computeStrokeLayout(canvasW: number, canvasH: number, spec: Partial<SignatureSpec>): StrokeLayout {
+  const cw = typeof canvasW === "number" && Number.isFinite(canvasW) && canvasW > 0 ? canvasW : 1;
+  const ch = typeof canvasH === "number" && Number.isFinite(canvasH) && canvasH > 0 ? canvasH : 1;
+  const strokes = sanitizeStrokes(spec.strokes);
+  const box = strokeBounds(strokes);
+  const color = safeColor(spec.color);
+  if (!box) return { paths: [], color, lineWidth: 1 };
+  const shorter = Math.min(cw, ch);
+  const scale = clampNum(spec.scale, MIN_SIG_SCALE, MAX_SIG_SCALE, 0.06);
+  const heightPx = Math.max(1, shorter * scale);
+  // AN ASPECT CEILING, THE SAME ONE THE UPLOADED SIBLING HAS.
+  //
+  // `box.h` is floored at 1e-6 so a perfectly flat mark is not divided by zero —
+  // but `heightPx / box.h` then multiplies it by ~1.2e8, and a review reproduced
+  // that with an ORDINARY MOUSE DRAG at constant y (or any stroke drawn above
+  // the pad, whose points all clamp to y = 0): a 3-point horizontal drag became
+  // ink 61 million pixels wide, with the size slider inert. `computeImageLayout`
+  // refuses exactly this for an uploaded overlay, on the argument that past the
+  // cap "the placement stops describing anything the creator can see" — and the
+  // module header says the three modes must not drift. So the flat mark is
+  // scaled by its WIDTH instead, capped at the same ratio.
+  const k = box.w / box.h > MAX_SIG_IMAGE_ASPECT ? (heightPx * MAX_SIG_IMAGE_ASPECT) / box.w : heightPx / box.h;
+  const x0 = clampNum(spec.xNorm, 0, 1, 0.5) * cw;
+  const baseline = clampNum(spec.yNorm, 0, 1, 0.9) * ch;
+  const paths = strokes.map((s) => s.map((p) => ({ x: x0 + (p.x - box.x) * k, y: baseline - heightPx + (p.y - box.y) * k })));
+  return { paths, color, lineWidth: Math.max(1, heightPx * STROKE_WIDTH_RATIO) };
+}
+
+// ---------------------------------------------------------------------------
+// UPLOADED SIGNATURE IMAGE (mode: "image")
+// ---------------------------------------------------------------------------
+
+/** Pixel-space placement for an overlay image, ready for `drawImage`. */
+export interface ImageLayout {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Place a decoded overlay image with the SAME anchor and scale semantics again:
+ * height is `scale × shorter side`, the anchor is LEFT/BASELINE, and the width
+ * follows the image's own aspect ratio so a scanned signature is never squashed.
+ *
+ * Returns null for an image this editor will not composite — a non-positive or
+ * non-finite dimension, a side past `MAX_SIG_IMAGE_DIM`, or an aspect ratio past
+ * `MAX_SIG_IMAGE_ASPECT`. The last one is not fussiness: at 20:1 the height that
+ * makes the mark visible makes it wider than any canvas, so the placement stops
+ * describing anything the creator can see, and "the mark is somewhere off the
+ * right edge of the art you are about to sign" is the wrong thing to discover
+ * after the ceremony.
+ */
+export function computeImageLayout(canvasW: number, canvasH: number, imgW: number, imgH: number, spec: Partial<SignatureSpec>): ImageLayout | null {
+  const cw = typeof canvasW === "number" && Number.isFinite(canvasW) && canvasW > 0 ? canvasW : 1;
+  const ch = typeof canvasH === "number" && Number.isFinite(canvasH) && canvasH > 0 ? canvasH : 1;
+  if (typeof imgW !== "number" || typeof imgH !== "number" || !Number.isFinite(imgW) || !Number.isFinite(imgH) || imgW <= 0 || imgH <= 0) return null;
+  if (imgW > MAX_SIG_IMAGE_DIM || imgH > MAX_SIG_IMAGE_DIM) return null;
+  const aspect = imgW / imgH;
+  if (aspect > MAX_SIG_IMAGE_ASPECT || aspect < 1 / MAX_SIG_IMAGE_ASPECT) return null;
+  const shorter = Math.min(cw, ch);
+  const scale = clampNum(spec.scale, MIN_SIG_SCALE, MAX_SIG_SCALE, 0.06);
+  const height = Math.max(1, Math.round(shorter * scale));
+  const width = Math.max(1, Math.round(height * aspect));
+  const x = Math.round(clampNum(spec.xNorm, 0, 1, 0.5) * cw);
+  const y = Math.round(clampNum(spec.yNorm, 0, 1, 0.9) * ch) - height; // baseline → top
+  return { x, y, width, height };
+}
+
+/** Does this spec describe a mark worth compositing? The exporter asks before it
+ * refuses an empty signature, and each mode answers for itself — an empty text
+ * box, a pad with no ink and a missing overlay are the same "nothing to place". */
+export function hasMark(spec: Partial<SignatureSpec>, hasImage = false): boolean {
+  const mode: SignatureMode = spec.mode === "draw" || spec.mode === "image" ? spec.mode : "text";
+  if (mode === "text") return sanitizeSignatureText(spec.text).length > 0;
+  if (mode === "draw") return strokeBounds(sanitizeStrokes(spec.strokes)) !== null;
+  return hasImage;
+}
+
+
+/**
+ * DOES THE MARK ACTUALLY LAND ON THE ART? — the F16 review's HIGH.
+ *
+ * `hasMark` asks whether there IS a mark; it never asked whether it lands. All
+ * three layouts clamp the ANCHOR and nothing else, and the anchor's own range is
+ * [0,1] — so `xNorm = 1` puts the mark's left edge exactly on the right border
+ * and `yNorm = 0` puts its baseline on the top one. The stock sliders reach both
+ * (`sig_x` max 100, `sig_y` min 0), so with no DOM tampering at all a creator
+ * could run the whole ceremony — passkey and mint — on art with nothing composited
+ * onto it. The exported PNG is then the bare art, its sha256 becomes the release's
+ * `exact_hash`, and a fan reads it as authenticated provenance.
+ *
+ * The submit gate asks THIS instead. It is a bounding-box intersection against
+ * the canvas, computed from the same layout each mode already returns — not a
+ * second placement model that could disagree with the one that draws.
+ *
+ * TEXT IS THE APPROXIMATE CASE, deliberately. Measuring a glyph run needs a
+ * canvas, and this module is DOM-free on purpose; the width used is a
+ * conservative under-estimate (a third of the font size per character), so the
+ * test can only ever be STRICTER than reality — it can refuse a mark whose tail
+ * would have shown, never accept one that is wholly off. Refusing early is
+ * recoverable: the creator moves a slider. Accepting is not: the passkey has
+ * signed.
+ */
+export function markOnCanvas(canvasW: number, canvasH: number, spec: Partial<SignatureSpec>, imgW?: number, imgH?: number): boolean {
+  const cw = typeof canvasW === "number" && Number.isFinite(canvasW) && canvasW > 0 ? canvasW : 1;
+  const ch = typeof canvasH === "number" && Number.isFinite(canvasH) && canvasH > 0 ? canvasH : 1;
+  const mode: SignatureMode = spec.mode === "draw" || spec.mode === "image" ? spec.mode : "text";
+  const overlaps = (x0: number, y0: number, x1: number, y1: number): boolean => x1 > 0 && y1 > 0 && x0 < cw && y0 < ch && x1 > x0 && y1 > y0;
+
+  if (mode === "draw") {
+    const l = computeStrokeLayout(cw, ch, spec);
+    if (l.paths.length === 0) return false;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const path of l.paths) {
+      for (const p of path) {
+        if (p.x < minX) minX = p.x;
+        if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y;
+        if (p.y > maxY) maxY = p.y;
+      }
+    }
+    // THE PATH IS THE MARK; the stroke's own half-width is not counted. Padding
+    // the box by `lineWidth / 2` made the test pass for a signature placed
+    // entirely past the right edge, because half a line of ink technically
+    // crosses it — and "a hairline of your signature's shadow is on the art" is
+    // not what the creator is being asked to confirm. Not counting it can only
+    // make this stricter, which is the safe direction: a refusal costs a slider
+    // nudge, and an acceptance costs a passkey.
+    return overlaps(minX, minY, maxX, maxY);
+  }
+
+  if (mode === "image") {
+    const l = computeImageLayout(cw, ch, imgW ?? 0, imgH ?? 0, spec);
+    return l !== null && overlaps(l.x, l.y, l.x + l.width, l.y + l.height);
+  }
+
+  const l = computeSignatureLayout(cw, ch, spec);
+  if (!l.text) return false;
+  const width = l.text.length * l.fontPx * 0.33; // deliberate under-estimate; see above
+  return overlaps(l.x, l.y - l.fontPx, l.x + width, l.y);
+}
+===== END FILE: apps/creator-console/src/signature.ts =====
+
+===== BEGIN FILE: apps/creator-console/src/typed-resume.ts =====
+/**
+ * I3-1206 (D-1079(4), D-1082(13)): WHAT A ROUTE CARRIES ACROSS A LAPSED-SESSION SIGN-IN. main.ts `lapsedResume`
+ * snapshots the screen when the creator leaves it for sign-in and puts the values back when the same passport lands
+ * on the same hash. In memory only: the snapshot is a plain object in a module variable and never touches browser
+ * storage (dirty-form.ts: unsent words in storage on a shared computer are a leak).
+ *
+ * Carried: the typed controls — dirty-form.ts's population, text-like inputs and textareas, not read-only, not
+ * disabled; i32-ops-lapsed-resume.test.ts holds the two selections equal — plus the enabled `<select>` choices and the
+ * enabled radio choices (the broadcast audience, D-1082(13)). Since I32 B12 (I34-W2-CLIENTS) the population includes date
+ * and range (a slider still at its rendered value is not snapshotted). Not carried: checkboxes, colour and file inputs. A control is keyed by the id of its nearest ancestor that has one, its name (or id) and its ordinal among
+ * same-keyed controls (a radio group by its name alone), so a re-render of the same view finds it again and a
+ * different view finds nothing.
+ *
+ * These helpers walk the live DOM, so they live apart from router.ts: router.ts is pure (string -> route) and is
+ * imported by views.ts, which the trust-core program reaches through its console-render tests; DOM names there broke
+ * `tsc -p services/trust-core` (I32-FX0, handoff H1).
+ */
+import { renderedValue } from "./dirty-form.js";
+
+const RESUME_TYPED_INPUTS = new Set(["", "text", "email", "url", "search", "tel", "number", "date", "range"]);
+
+type TypedControl = HTMLInputElement | HTMLTextAreaElement;
+
+function resumeControls(root: ParentNode): Map<string, TypedControl> {
+  const out = new Map<string, TypedControl>();
+  const seen = new Map<string, number>();
+  for (const el of Array.from(root.querySelectorAll("input, textarea"))) {
+    const tag = el.tagName.toLowerCase();
+    if (tag === "input" && !RESUME_TYPED_INPUTS.has((el.getAttribute("type") ?? "").toLowerCase())) continue;
+    const c = el as TypedControl;
+    if (c.readOnly || c.disabled) continue;
+    const base = `${c.parentElement?.closest("[id]")?.id ?? ""}|${c.getAttribute("name") ?? c.id}`;
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    out.set(`${base}|${n}`, c);
+  }
+  return out;
+}
+
+/** The enabled `<select>`s under `root`, keyed like `resumeControls` under a `select|` prefix. A choice is carried
+ * too, because a restored text with its list reset to the first option is a different request (a code batch into
+ * another pool, a report under another category). */
+function resumeSelects(root: ParentNode): Map<string, HTMLSelectElement> {
+  const out = new Map<string, HTMLSelectElement>();
+  const seen = new Map<string, number>();
+  for (const el of Array.from(root.querySelectorAll("select"))) {
+    if (el.disabled) continue;
+    const base = `select|${el.parentElement?.closest("[id]")?.id ?? ""}|${el.getAttribute("name") ?? el.id}`;
+    const n = seen.get(base) ?? 0;
+    seen.set(base, n + 1);
+    out.set(`${base}|${n}`, el);
+  }
+  return out;
+}
+
+/** The enabled, named radios under `root`, grouped under `radio|<nearest id>|<name>`. A radio's choice is carried for
+ * the same reason a list's is: a broadcast restored with its audience reset to the first radio is sent to people the
+ * creator did not choose (I3-1206, the Followers-only audience coming back as Public). */
+function resumeRadios(root: ParentNode): Map<string, HTMLInputElement[]> {
+  const out = new Map<string, HTMLInputElement[]>();
+  for (const el of Array.from(root.querySelectorAll<HTMLInputElement>('input[type="radio"]'))) {
+    const name = el.getAttribute("name");
+    if (el.disabled || !name) continue;
+    const key = `radio|${el.parentElement?.closest("[id]")?.id ?? ""}|${name}`;
+    const group = out.get(key);
+    if (group) group.push(el);
+    else out.set(key, [el]);
+  }
+  return out;
+}
+
+/** What is in the typed controls, the lists and the radio groups under `root` now: key -> value, empty values (and
+ * a radio group with nothing checked) left out. */
+export function typedSnapshot(root: ParentNode): Record<string, string> {
+  const snap: Record<string, string> = {};
+  for (const [k, c] of resumeControls(root)) if (c.value !== "" && ((c.getAttribute("type") ?? "").toLowerCase() !== "range" || c.value !== renderedValue(c))) snap[k] = c.value;
+  for (const [k, sel] of resumeSelects(root)) snap[k] = sel.value;
+  for (const [k, group] of resumeRadios(root)) {
+    const on = group.find((r) => r.checked);
+    if (on) snap[k] = on.value;
+  }
+  return snap;
+}
+
+/** Put a snapshot back into the controls under `root` that have the same key. `value` only: `defaultValue` stays what
+ * the view rendered, so a restored value is still unsent input to the dirty-form guard. A restored radio is clicked,
+ * so the `change` the view listens for fires and what it derives from the choice (the broadcast's audience note,
+ * the signature mode's panel, the billing price: each a `change` listener in main.ts) follows it. Returns how many were set. */
+export function restoreTyped(root: ParentNode, snap: Record<string, string>): number {
+  let n = 0;
+  for (const [k, c] of resumeControls(root)) {
+    const v = snap[k];
+    if (v === undefined) continue;
+    c.value = v;
+    n++;
+  }
+  for (const [k, sel] of resumeSelects(root)) {
+    const v = snap[k];
+    if (v === undefined || !Array.from(sel.options).some((o) => o.value === v)) continue; // an option gone since is not invented
+    sel.value = v;
+    n++;
+  }
+  for (const [k, group] of resumeRadios(root)) {
+    const pick = group.find((r) => r.value === snap[k]); // a radio's value is a string, so no key in the snapshot finds none
+    if (!pick) continue; // a radio gone since is not invented
+    pick.click(); // checks it and sends the input and change a creator's click sends; a radio already checked sends none
+    n++;
+  }
+  return n;
+}
+===== END FILE: apps/creator-console/src/typed-resume.ts =====
+
+===== END OF CHUNK 7 OF 75 =====

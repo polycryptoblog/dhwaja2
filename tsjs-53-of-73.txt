@@ -1,0 +1,1205 @@
+DHWAJA CODE REVIEW — tsjs — CHUNK 53 OF 73
+============================================================
+This is one slice of a larger codebase bundle split for review.
+Files referenced but not shown here live in other chunks (see INDEX.md).
+Areas in this chunk: services/trust-core/src (ids*), services/trust-core/src (importer*)
+Files in this chunk (2):
+  - services/trust-core/src/ids.ts
+  - services/trust-core/src/importer.ts
+
+
+===== BEGIN FILE: services/trust-core/src/ids.ts =====
+/**
+ * The ONE mint for opaque, non-enumerable identifiers.
+ *
+ * Every queue id, account id, device id, challenge id, batch id and operator id
+ * in this service is minted here. The rule the module exists to enforce:
+ *
+ *   AN IDENTIFIER MUST NOT ENCODE WHEN IT WAS CREATED.
+ *
+ * These ids used to be `uuid7().replace(/-/g, "").slice(0, 20)`. UUIDv7's first
+ * 12 hex characters ARE a 48-bit big-endian millisecond timestamp, so every such
+ * id published its own creation instant to anyone holding it and had only ~26
+ * bits of randomness left in the 20-character body. Three ids minted in the same
+ * millisecond shared their first 13 characters. That is an enumeration handle
+ * (guess neighbours of a known id) AND a disclosure (a fan's `acc_`, the subject
+ * of their session token, dated their sign-up to the millisecond).
+ *
+ * `removal.ts` already documented the rule for `rmv_` ("must carry no timestamp
+ * prefix an attacker could use to narrow a search") and `packages/schema`'s
+ * `mintPassportId` already took real random hex. This module generalises both.
+ *
+ * THE ONE EXCEPTION, on purpose: `event_id` (`events.ts`) stays a full UUIDv7.
+ * An event's `created_at` is line 4 of its own hashed preimage and is served on
+ * every public proof receipt, so the id's time prefix hides nothing — and the
+ * time ordering it buys makes chain replay and cursor paging cheap. Do NOT
+ * "fix" it; `tests/invariants/id-entropy.test.ts` pins that exemption by
+ * name — a PROTECTED guard, so the exemption list cannot be widened without
+ * a manifest diff in the same change.
+ *
+ * NOT a hasher. The single-hasher invariant (SHA-256 only from
+ * `@dhwaja/canonical`) is untouched: nothing here digests anything.
+ */
+
+/** `n` CSPRNG bytes as lowercase hex (2 chars per byte). */
+export function randomHex(bytes: number): string {
+  if (!Number.isInteger(bytes) || bytes < 1 || bytes > 64) {
+    // Fail closed: a bad length must never silently mint a short id.
+    throw new Error("randomHex: bytes must be an integer in [1, 64]");
+  }
+  const b = crypto.getRandomValues(new Uint8Array(bytes));
+  let s = "";
+  for (const x of b) s += x.toString(16).padStart(2, "0");
+  return s;
+}
+
+/**
+ * The default id body length, in hex characters. 20 hex = 80 CSPRNG bits, which
+ * is the width these ids already occupied — so no stored shape, route pattern or
+ * validation regex changes; only the CONTENT of those 20 characters does (from
+ * 12 clock + 8 random to 20 random).
+ */
+export const ID_HEX_CHARS = 20;
+
+/**
+ * Mint `<prefix>_<hex>`. `hexChars` must be even and at least 16 (64 bits) —
+ * these ids are capabilities (a challenge id, a session subject, a queue ref),
+ * so a caller cannot ask for a guessable one.
+ */
+export function mintId(prefix: string, hexChars: number = ID_HEX_CHARS): string {
+  if (!/^[a-z][a-z0-9]{1,7}$/.test(prefix)) throw new Error("mintId: prefix must be 2-8 lowercase alphanumerics");
+  if (!Number.isInteger(hexChars) || hexChars < 16 || hexChars > 64 || hexChars % 2 !== 0) {
+    throw new Error("mintId: hexChars must be an even integer in [16, 64]");
+  }
+  return `${prefix}_${randomHex(hexChars / 2)}`;
+}
+===== END FILE: services/trust-core/src/ids.ts =====
+
+===== BEGIN FILE: services/trust-core/src/importer.ts =====
+import { canonicalizeLink, sha256Hex, subjectForAccount, subjectHash, type CanonicalSubject } from "@dhwaja/canonical";
+import {
+  mintPassportId,
+  validateImportRecord,
+  type DeterminationRecord,
+  type DraftEvent,
+  type ProfileRecord,
+  urlNamesAccount,
+} from "@dhwaja/schema";
+import { type DbLike, inChunks } from "./db.js";
+import { accountShieldsAgainstImpersonation } from "./claims.js";
+import { accountUrlRefusal, appendEvents, assertDisplayName, LedgerError, RETRACTED_EARLIER_RE, retractImportedPassport } from "./events.js";
+import { purgePassportMedia, type EdgePurger } from "./media.js";
+import { accountIdKindProblem } from "./passkeys.js";
+import { auditActorKind, auditStmt, enqueue, isDecisionLost, reviewDecisionStmt } from "./review.js";
+import { isSuppressedAccountKey, seedMetadataStmts, SeedingError, validateSeedMeta } from "./seeding.js";
+import { servingPerAccountStanding } from "./settings.js";
+import { draftWarning } from "./warnings.js";
+import { mintId } from "./ids.js";
+
+/**
+ * Seed importer — turns externally-gathered public OSINT into the trust core
+ * at bulk scale. It knows NOTHING about upstream tooling: it validates content
+ * and shape only, and every write goes through the same validated primitives
+ * the console uses (appendEvents / draftWarning). There is NO privileged bulk
+ * path into the ledger — the invariant test asserts the importer never INSERTs
+ * into trust_events directly.
+ *
+ * Two file types:
+ *  - profiles      → unclaimed passports (+ accounts). Always unclaimed;
+ *                    claiming is the creator's act, never the importer's.
+ *  - determinations → QUEUED WARNING DRAFTS. A "confirmed" grade from upstream
+ *                    is metadata only; it does NOT shortcut cooling-off,
+ *                    second-look, or the wording gate. The worst a malicious
+ *                    determination file can do is create drafts an operator
+ *                    must still walk through every publish gate.
+ *
+ * One bad line never blocks the batch: each record applies independently and
+ * the caller gets an itemized report. A whole batch is retractable in one
+ * action (passports retracted, queued warnings withdrawn).
+ *
+ * Two M5 additions on the profile path (see seeding.ts):
+ *  - OPERATOR-ONLY seeding metadata (source/tier/source_note/category) written
+ *    in the SAME atomic batch as the passport, with an adult-category
+ *    source-note safeguard. None of it is ever served.
+ *  - NEVER RE-SEEDED: a record whose account key belongs to a suppressed
+ *    subject is REJECTED. A removal has to bind the seeding tool itself, or the
+ *    next bulk import quietly re-lists the person who asked to leave.
+ */
+
+export const MAX_LINE_BYTES = 64 * 1024;
+export const MAX_RECORDS = 10_000;
+/** I3-1508 (RC-01): the canonical account key an import may mint. Mirrors the
+ * schema's LINK_URL_MAX (packages/schema/src/index.ts:936) — the ceiling the
+ * event path enforces on revoke/transfer — applied to the key AFTER
+ * canonicalization, which can inflate a 2048-char id threefold. */
+export const IMPORT_ACCOUNT_KEY_MAX = 2048;
+/** I3-1421: an apply beats `import:heartbeat` every this many records. */
+export const IMPORT_HEARTBEAT_EVERY = 250;
+/** I3-1421: an 'applying' batch with no beat for this long is stuck, not slow. */
+export const IMPORT_STALE_MS = 15 * 60_000;
+/** I3-1207 (D-0850(3)): `retractBatch` walks at most this many passport records
+ * (plus draft warnings, from the same budget) per call, then returns
+ * `complete: false` with an `import:retract_chunk` row the next call resumes from. */
+export const RETRACT_PER_CALL = 200;
+/** QUEUE #775 (D-0858(11)): an apply walks at most this many parsed records per
+ * call, then answers `complete: false, next` with an `import:apply_chunk` audit
+ * row (`next=<index> sha256=<file>`) that a `batch` continuation resumes from. */
+export const IMPORT_APPLY_PER_CALL = 500;
+
+/** `retracted_earlier` (I3-0213, D-0920 option C): every account on the line is
+ * held by a passport an operator RETRACTED. Not a duplicate of a live listing and
+ * not re-listable (no key reuse); the remedy is to restore that passport. Counted
+ * with the skipped lines. */
+export type RecordStatus = "accepted" | "rejected" | "skipped_duplicate" | "retracted_earlier";
+
+export interface RecordResult {
+  line: number;
+  status: RecordStatus;
+  reason?: string;
+  ref?: string; // passport_id or item_id
+}
+
+export interface ImportReport {
+  batch_id: string;
+  kind: "profile" | "determination";
+  accepted: number;
+  rejected: number;
+  skipped: number;
+  records: RecordResult[];
+  /** QUEUE #775: false = this call stopped at IMPORT_APPLY_PER_CALL and records
+   * remain; re-POST the SAME file with `batch` until true. Counts and records
+   * are THIS call's. A dry run is always complete. */
+  complete: boolean;
+  /** Index of the first parsed record this call did not process. */
+  next: number;
+}
+
+export class ImportError extends Error {
+  override name = "ImportError";
+}
+
+type RandHex = (bytes: number) => string;
+const defaultRandHex: RandHex = (bytes) =>
+  [...crypto.getRandomValues(new Uint8Array(bytes))].map((b) => b.toString(16).padStart(2, "0")).join("");
+
+interface ParsedLine {
+  line: number;
+  value?: unknown;
+  error?: string;
+}
+
+/** Parse JSONL with hard caps. Blank lines are ignored; oversized/!JSON lines
+ * become per-line errors, never a whole-file failure. */
+export function parseJsonl(text: string): ParsedLine[] {
+  const out: ParsedLine[] = [];
+  const lines = text.split("\n");
+  let recordNo = 0;
+  for (const raw of lines) {
+    const trimmed = raw.trim();
+    if (trimmed === "") continue;
+    recordNo += 1;
+    if (recordNo > MAX_RECORDS) {
+      out.push({ line: recordNo, error: `record cap ${MAX_RECORDS} exceeded — file truncated for import` });
+      break;
+    }
+    if (new TextEncoder().encode(raw).length > MAX_LINE_BYTES) {
+      out.push({ line: recordNo, error: `line exceeds ${MAX_LINE_BYTES} bytes` });
+      continue;
+    }
+    try {
+      out.push({ line: recordNo, value: JSON.parse(trimmed) });
+    } catch {
+      out.push({ line: recordNo, error: "not valid JSON" });
+    }
+  }
+  return out;
+}
+
+/**
+ * THE import gate for an account reference — `subjectForAccount` plus the
+ * table-DEPENDENT eligibility check a `link` needs, in ONE place both record
+ * kinds call.
+ *
+ * WHY IT HAS TO BE SHARED. `subjectForAccount` is deliberately table-INDEPENDENT
+ * (Invariant 2: a stored link must fold to the same bytes forever, even after its
+ * host joins the platform table), so it accepts ANY parseable URL — a known
+ * platform's profile, a shortener code, `127.0.0.1/alice`. `canonicalizeLink` is
+ * the gate that refuses those, and it belongs at every WRITE door. `applyProfile`
+ * ran it; `applyDetermination` called `subjectForAccount` directly and did not.
+ *
+ * That asymmetry was reachable and it was not cosmetic. A determination line with
+ * `id_kind:"link", id:"https://x.com/nasa"` minted `v1|link|url|x.com/nasa` — a
+ * SECOND subject for an account the creator already holds as `v1|x|handle|nasa`.
+ * The creator-wins guard below looks the account up by `subject.canonical`, so it
+ * matched nothing, and an impersonation warning could be auto-filed against a
+ * real creator's own page through the one door built to make that impossible.
+ * The same call also accepted internal hosts and shorteners as warning subjects.
+ *
+ * `subjectForAccount` itself is UNCHANGED and must stay that way — the gate is
+ * layered above it, never inside it.
+ *
+ * Throws `CanonicalizeError` (or the underlying canonicalizer's error) on an
+ * ineligible reference; both callers turn that into an itemized rejection.
+ */
+function gatedSubjectForAccount(platform: string, idKind: string, id: string): CanonicalSubject {
+  // INGEST VALIDATION for a generic `link`: a URL the platform table already
+  // models is seeded as that platform/domain, never as a link; a shortener, an
+  // IP literal, an internal name and a bare root are refused outright.
+  if (idKind === "link") canonicalizeLink(id);
+  const subject = subjectForAccount(platform, idKind, id);
+  // I3-1508: bound the key this door would WRITE, not only the raw id.
+  if (subject.canonical.length > IMPORT_ACCOUNT_KEY_MAX) {
+    throw new ImportError(`account key exceeds ${IMPORT_ACCOUNT_KEY_MAX} chars after canonicalization`);
+  }
+  return subject;
+}
+
+/**
+ * I3-0213 — A RETRACTED PASSPORT DOES NOT HOLD ITS ACCOUNT KEYS.
+ *
+ * `retractBatch` retracts the passport through the ledger (`retract_passport`,
+ * events.ts:1822 sets `passports.retracted = 1`) and writes NOTHING to
+ * `passport_accounts` — correctly, because the accounts are ledger-derived. So
+ * without this join the key stayed OCCUPIED-BUT-DEAD: every later import of the
+ * same account answered `skipped_duplicate`/`partial conflict`, and the operator
+ * could never re-seed the subject an erroneous batch had burnt.
+ *
+ * ONE predicate, TWO doors. This function is the `account_added` duplicate
+ * pre-check; the impersonation creator-wins guard in `applyDetermination` reads
+ * the SAME population and carries the SAME term (FAMILY-004(c) — every door
+ * that reads the population is named, and each one carries it).
+ */
+const LIVE_PASSPORT_ACCOUNT_SQL =
+  "FROM passport_accounts pa JOIN passports p ON p.passport_id = pa.passport_id WHERE pa.account_key = ? AND p.retracted = 0";
+
+/** I3-0213 (option C): is this key held by a RETRACTED passport? The complement
+ * of `LIVE_PASSPORT_ACCOUNT_SQL` over the same table (the account key is the
+ * primary key, so a key has at most one holder). */
+async function accountRetractedEarlier(db: DbLike, canonicalKey: string): Promise<boolean> {
+  const row = await db
+    .prepare("SELECT 1 AS x FROM passport_accounts pa JOIN passports p ON p.passport_id = pa.passport_id WHERE pa.account_key = ? AND p.retracted = 1")
+    .bind(canonicalKey)
+    .first();
+  return row !== null;
+}
+const RETRACTED_EARLIER_REASON = "account retracted earlier with its listing — restore that passport instead of re-importing it";
+
+async function accountExists(db: DbLike, canonicalKey: string): Promise<boolean> {
+  const row = await db
+    .prepare(`SELECT 1 AS x ${LIVE_PASSPORT_ACCOUNT_SQL}`)
+    .bind(canonicalKey)
+    .first();
+  return row !== null;
+}
+
+/** I3-1136 at the import door: the first account whose `url` does not name it
+ * (events.ts appendEventsOnce step 1's predicate, same mapping), or null. An
+ * unmappable account is left to `applyProfile`'s gate. `applyProfile` writes
+ * `url` only when truthy, so an empty one is not checked. */
+function profileUrlProblem(rec: ProfileRecord): string | null {
+  for (const a of rec.accounts) {
+    if (typeof a.url !== "string" || !a.url) continue;
+    let s: { platform: string; id: string } | null = null;
+    try {
+      s = subjectForAccount(a.platform, a.id_kind, a.id);
+    } catch {
+      s = null;
+    }
+    if (s && !urlNamesAccount(s.platform, s.id, a.url)) return accountUrlRefusal(s.id);
+  }
+  return null;
+}
+
+/** I6RGA-04 (D-0861(3)): the per-account refusals `applyProfile` makes before
+ * any query -- the id_kind check, then the ingest gate -- as ONE pure function,
+ * so `importFile`'s dry run and the apply run the same predicate. */
+function gateProfileAccounts(rec: ProfileRecord): { keys: string[] } | { reason: string } {
+  const keys: string[] = [];
+  for (const a of rec.accounts) {
+    // The shared gate (see gatedSubjectForAccount): eligibility first, then the
+    // subject. The stored event still folds through the table-independent path
+    // forever, which is what keeps Invariant 2 intact.
+    // F-importer (D-0761, B27-CLAIMKIND hand-off): the same id_kind refusal the
+    // creator-signed door enforces (passkeys.ts refuseMisKindedAccounts) --
+    // a mis-kinded pid-only account here would be a key no fan canonicalizer
+    // ever derives, same as on that door.
+    const kindProblem = accountIdKindProblem(a.platform, a.id_kind);
+    if (kindProblem) return { reason: kindProblem };
+    try {
+      keys.push(gatedSubjectForAccount(a.platform, a.id_kind, a.id).canonical);
+    } catch (e) {
+      return { reason: e instanceof Error ? e.message : "invalid generic link" };
+    }
+  }
+  return { keys };
+}
+
+/** I6RGA-04 (D-0861(3)): `applyDetermination`'s pure subject gate, shared with the dry run. */
+function gateDeterminationSubject(rec: DeterminationRecord): { subject: CanonicalSubject } | { reason: string } {
+  try {
+    return { subject: gatedSubjectForAccount(rec.subject_account.platform, rec.subject_account.id_kind, rec.subject_account.id) };
+  } catch (e) {
+    return { reason: e instanceof Error ? e.message : "invalid subject account" };
+  }
+}
+
+/**
+ * I3-0364: a record is written for a batch ONLY while it is still `applying`.
+ * The CASE yields NULL for any other status, which violates
+ * `import_records.created_at NOT NULL`, so the WHOLE atomic batch it rides in —
+ * the passport's events and its seed metadata — rolls back: a chunk in flight
+ * when `retractBatch` claims the batch writes nothing the retraction would have
+ * to find. Binds: batch id, then the timestamp. `IMPORT_BATCH_CLOSED_RE`
+ * recognises exactly that refusal (matched on the column, never /constraint/).
+ */
+const RECORD_WHILE_APPLYING = "CASE WHEN (SELECT status FROM import_batches WHERE batch_id = ?) = 'applying' THEN ? END";
+// RGP-L4 (I15-FX4): review.ts `enqueue` refuses a tagged item the same way, on its own column.
+const IMPORT_BATCH_CLOSED_RE = /NOT NULL constraint failed:\s*(?:import_records|review_queue)\.created_at/i;
+const BATCH_CLOSED_REASON = "batch no longer applying (retracted mid-apply) — not written";
+
+async function applyProfile(
+  db: DbLike,
+  actor: string,
+  batchId: string,
+  rec: ProfileRecord,
+  now: () => string,
+  randHex: RandHex,
+): Promise<RecordResult & { status: RecordStatus }> {
+  // flag 14: seeding metadata + the adult source-note safeguard. Pure, and run
+  // BEFORE anything is minted so a bad record costs no writes. (importFile runs
+  // the same check on the dry-run path, so a dry run cannot say "accepted" for
+  // a record the apply path would refuse.)
+  const meta = validateSeedMeta(rec);
+
+  // Canonicalize every account first (fail closed on unknown platforms), and
+  // pre-check duplicates so we never mint a passport then fail mid-batch.
+  const gated = gateProfileAccounts(rec);
+  if ("reason" in gated) return { line: 0, status: "rejected", reason: gated.reason };
+  const keys = gated.keys;
+
+  // NEVER RE-SEEDED (flag 4, the other half of the removal promise). If any
+  // account on this record belongs to a subject an operator suppressed, the
+  // seeding tool refuses to re-list them. Checked before the duplicate logic so
+  // the operator gets the real reason, not "partial conflict".
+  const suppressed = await Promise.all(keys.map((k) => isSuppressedAccountKey(db, k)));
+  if (suppressed.some(Boolean)) {
+    return { line: 0, status: "rejected", reason: "subject asked to be removed — never re-seeded" };
+  }
+
+  const existing = await Promise.all(keys.map((k) => accountExists(db, k)));
+  // I3-0213 (option C): a key on a RETRACTED passport used to pass this
+  // pre-check and die at the ledger as "account already registered", which the
+  // operator read as a duplicate. Asked here, in the same pre-check, so the line
+  // says what actually happened.
+  const retracted = await Promise.all(keys.map((k) => accountRetractedEarlier(db, k)));
+  if (retracted.some(Boolean) && retracted.every((r, i) => r || !existing[i])) {
+    return { line: 0, status: "retracted_earlier", reason: RETRACTED_EARLIER_REASON };
+  }
+  if (existing.every(Boolean)) {
+    return { line: 0, status: "skipped_duplicate", reason: "all accounts already registered" };
+  }
+  if (existing.some(Boolean)) {
+    return { line: 0, status: "rejected", reason: "partial conflict: some accounts already registered — needs manual review" };
+  }
+
+  const passportId = mintPassportId(randHex(16));
+  const drafts: DraftEvent[] = [
+    { event_type: "passport_created", subject: passportId, actor_kind: "operator", actor_id: actor, payload: { display_name: rec.display_name } },
+    ...rec.accounts.map((a): DraftEvent => ({
+      event_type: "account_added",
+      subject: passportId,
+      actor_kind: "operator",
+      actor_id: actor,
+      payload: {
+        platform: a.platform,
+        id_kind: a.id_kind,
+        id: a.id,
+        ...(a.url ? { url: a.url } : {}),
+        relationship_basis: a.relationship_basis,
+        observed_at: a.observed_at,
+      },
+    })),
+  ];
+  const ts = now();
+  // Seeding metadata rides in the SAME atomic batch as passport_created /
+  // account_added — never a second write that could drift or half-land.
+  const extra = [
+    db.prepare(`INSERT INTO import_records (batch_id, kind, passport_id, created_at) VALUES (?, 'profile', ?, ${RECORD_WHILE_APPLYING})`).bind(batchId, passportId, batchId, ts),
+    ...seedMetadataStmts(db, passportId, meta, batchId, actor, ts),
+  ];
+  await appendEvents(db, drafts, now, [], extra);
+  return { line: 0, status: "accepted", ref: passportId };
+}
+
+async function applyDetermination(
+  db: DbLike,
+  actor: string,
+  batchId: string,
+  rec: DeterminationRecord,
+  now: () => string,
+): Promise<RecordResult & { status: RecordStatus }> {
+  // The SAME gate the profile path runs (see gatedSubjectForAccount). Without it
+  // a determination could name a known creator's page as a `link` and slip past
+  // the creator-wins guard below, which looks the account up by the canonical
+  // key — and a link key never matches the handle key the creator actually holds.
+  const gated = gateDeterminationSubject(rec);
+  if ("reason" in gated) return { line: 0, status: "rejected", reason: gated.reason };
+  const subject = gated.subject;
+  const subjectHashHex = await subjectHash(subject.canonical);
+  const warningSubject = `sha256:${subjectHashHex}`;
+
+  // CREATOR-WINS GUARD — IMPERSONATION ONLY. Naming a real creator as their own
+  // impersonator is almost certainly a mistake (you cannot impersonate yourself),
+  // so an impersonation determination against a registered creator account is
+  // refused outright. The FRAUD classes are different: a real, verified creator
+  // can commit fraud, and being on record must not buy immunity — so a
+  // confirmed_fraud / historical_fraud_association determination IS allowed to
+  // target a creator's own account. It still lands only as a DRAFT that an
+  // operator must walk through cooling-off + second-look + approved wording
+  // before anything publishes (and fraud-class serving stays deferred).
+  //
+  // I3-0361 (I12-FX9): the SAME question `warnings.ts hashIsCreatorAccount` (:626) asks at
+  // publish — ACTIVE only (`historical` no longer shields, S-039 D-14), and an asserted /
+  // domain / link account, or any account while per-account standing is served, shields
+  // only when proven_current for its passport. An assertion never shields.
+  if (rec.warning_class === "impersonation") {
+    const { results: live } = await db
+      .prepare(`SELECT pa.passport_id ${LIVE_PASSPORT_ACCOUNT_SQL} AND pa.status = 'active'`)
+      .bind(subject.canonical)
+      .all<{ passport_id: string }>();
+    let owned = false;
+    for (const row of live) {
+      if (await accountShieldsAgainstImpersonation(db, row.passport_id, subject.canonical, Date.parse(now()), await servingPerAccountStanding(db))) {
+        owned = true;
+        break;
+      }
+    }
+    if (owned) {
+      return { line: 0, status: "rejected", reason: "subject account is a registered creator account — cannot auto-file an impersonation warning against it" };
+    }
+  }
+
+  // I3-0711: mirror warnings.ts's publish-time approved-wording gate
+  // (`WHERE NOT EXISTS (... wordings ... status = 'approved' AND class = ?)`)
+  // at import time too. Without this a batch import can mint thousands of
+  // unpublishable drafts against a nonexistent or wrong-class wording_id,
+  // each caught only one at a time, at publish, long after the batch landed.
+  // It runs AFTER the creator-wins guard, so a determination naming a real
+  // creator is refused for that, never masked by a wording misconfiguration.
+  const wordingOk = await db
+    .prepare("SELECT 1 AS x FROM wordings WHERE wording_id = ? AND status = 'approved' AND class = ?")
+    .bind(rec.wording_id, rec.warning_class)
+    .first();
+  if (!wordingOk) {
+    return { line: 0, status: "rejected", reason: "wording_id is not an approved wording of the matching class" };
+  }
+
+  // Dedup: if this subject already has an open/queued/published warning, skip.
+  // The OLDEST live item is the one that counts (the I3-0709 rule below).
+  const dupItem = await db
+    .prepare(
+      "SELECT item_id, state, import_batch_id FROM review_queue WHERE subject = ? AND item_type = 'report' AND state IN ('open','queued_warning','published') ORDER BY rowid ASC LIMIT 1",
+    )
+    .bind(warningSubject)
+    .first<{ item_id: string; state: string; import_batch_id: string | null }>();
+  if (dupItem !== null) {
+    // I3-0708: an item THIS batch enqueued whose import_records row never landed
+    // is this line's own orphan from a call that crashed between the writes
+    // below (enqueue, draftWarning, import_records are three statements). A
+    // retry of the same batch RESUMES it — drafts it if it is still 'open', then
+    // records it — instead of answering skipped_duplicate and leaving it
+    // unrecorded. Any other live item (another batch's, or one already
+    // recorded) is a real duplicate.
+    if (dupItem.import_batch_id === batchId && dupItem.state !== "published") {
+      const recorded = await db.prepare("SELECT 1 AS x FROM import_records WHERE batch_id = ? AND item_id = ? LIMIT 1").bind(batchId, dupItem.item_id).first();
+      if (recorded === null) return await finishDetermination(db, actor, batchId, dupItem.item_id, dupItem.state === "open", rec, now);
+    }
+    return { line: 0, status: "skipped_duplicate", reason: "a warning for this subject already exists" };
+  }
+
+  // Enqueue a report item TAGGED with the batch id (its first write), then
+  // draft the warning. The batch tag means retraction can withdraw this draft
+  // even if a crash interrupts before the import_records row lands. NEVER
+  // publishes — the draft still needs cooling-off + second-look + wording.
+  const itemId = await enqueue(
+    db,
+    actor,
+    { item_type: "report", subject: warningSubject, payload: { grade: rec.grade, ...(rec.source_ref ? { source_ref: rec.source_ref } : {}) }, import_batch_id: batchId },
+    now,
+  );
+  // I3-0709: the dedup read above and this enqueue are two statements, so a
+  // concurrent apply on the same subject can pass the read too. Decided AFTER
+  // our own insert: the OLDEST live report item on the subject (lowest rowid —
+  // insertion order) wins; any later one withdraws ITSELF while still 'open',
+  // before a warning is drafted. Every interleaving leaves exactly one.
+  const first = await db
+    .prepare("SELECT item_id FROM review_queue WHERE subject = ? AND item_type = 'report' AND state IN ('open','queued_warning','published') ORDER BY rowid ASC LIMIT 1")
+    .bind(warningSubject)
+    .first<{ item_id: string }>();
+  if (first !== null && first.item_id !== itemId) {
+    const ts = now();
+    await db.batch([
+      reviewDecisionStmt(db, itemId, "open", "withdrawn", actor, ts, null),
+      db.prepare("UPDATE review_queue SET state = 'withdrawn', disposition = 'withdrawn', updated_at = ? WHERE item_id = ? AND state = 'open'").bind(ts, itemId),
+      auditStmt(db, actor, "import:dedup_withdraw", itemId, `batch ${batchId}; kept ${first.item_id}`, ts),
+    ]);
+    return { line: 0, status: "skipped_duplicate", reason: "a warning for this subject already exists" };
+  }
+  return await finishDetermination(db, actor, batchId, itemId, true, rec, now);
+}
+
+/** Draft (when the item is still 'open') then record a determination's item —
+ * the tail of a fresh apply, and the resume of a crashed one (I3-0708). */
+async function finishDetermination(
+  db: DbLike,
+  actor: string,
+  batchId: string,
+  itemId: string,
+  needsDraft: boolean,
+  rec: DeterminationRecord,
+  now: () => string,
+): Promise<RecordResult & { status: RecordStatus }> {
+  if (needsDraft) {
+    // I3-0364: never draft for a batch a retraction has already claimed.
+    const live = await db.prepare("SELECT status FROM import_batches WHERE batch_id = ?").bind(batchId).first<{ status: string }>();
+    if (live?.status !== "applying") throw new ImportError(BATCH_CLOSED_REASON);
+    await draftWarning(
+      db,
+      actor,
+      itemId,
+      { warning_class: rec.warning_class, wording_id: rec.wording_id, ...(rec.linkage_basis ? { linkage_basis: rec.linkage_basis } : {}) },
+      now,
+    );
+  }
+  const ts = now();
+  await db.batch([
+    db.prepare(`INSERT INTO import_records (batch_id, kind, item_id, created_at) VALUES (?, 'determination', ?, ${RECORD_WHILE_APPLYING})`).bind(batchId, itemId, batchId, ts),
+  ]);
+  return { line: 0, status: "accepted", ref: itemId };
+}
+
+export interface ImportOpts {
+  now?: () => string;
+  randHex?: RandHex;
+  apply?: boolean; // false = dry-run (validate only, no writes)
+  heartbeatEvery?: number; // I3-1421; default IMPORT_HEARTBEAT_EVERY
+  /** QUEUE #775: continue this 'applying' batch from its `import:apply_chunk` cursor (apply only). */
+  batch?: string;
+  perCall?: number; // QUEUE #775 test knob; default IMPORT_APPLY_PER_CALL, clamped to >= 1
+}
+
+/**
+ * QUEUE #775 (D-0858(11)): admit a continuation of `batchId`. Refused (409) unless
+ * the batch exists, is still 'applying' (a retraction claimed mid-apply ends the
+ * apply), is of `kind`, its newest apply trail row is an `import:apply_chunk`
+ * (none = nothing to resume), and the file's sha256 equals the recorded one — a
+ * different file is never applied into a batch. ONE conditional insert of
+ * `import:apply_resume next=<i>` decides between concurrent continuers.
+ * RGOPS-775 (D-0861(3)): an `import:apply_resume` newest = a call is running or
+ * died after its claim; refused while its last sign of life (the resume or an
+ * `import:heartbeat`) is younger than IMPORT_STALE_MS -- retract's window -- and
+ * RE-TAKEN after it from the newest chunk cursor, by ONE conditional insert of
+ * `import:apply_resume next=<i> retake=<n>`. Lines the dead call already wrote
+ * re-apply as `skipped_duplicate` (the importer's own dedupe).
+ */
+async function claimApplyContinuation(
+  db: DbLike,
+  actor: string,
+  kind: string,
+  batchId: string,
+  sha: string,
+  at: string,
+): Promise<{ next: number; accepted: number; rejected: number; skipped: number }> {
+  const b = await db
+    .prepare("SELECT kind, status, accepted, rejected, skipped FROM import_batches WHERE batch_id = ?")
+    .bind(batchId)
+    .first<{ kind: string; status: string; accepted: number; rejected: number; skipped: number }>();
+  if (!b) throw new ImportError("no such batch");
+  if (b.kind !== kind) throw new ImportError("batch kind differs");
+  if (b.status !== "applying") throw new ImportError("batch is not applying");
+  const last = await db
+    .prepare("SELECT action, detail FROM audit_log WHERE item_id = ? AND action IN ('import:apply_chunk','import:apply_resume') ORDER BY audit_id DESC LIMIT 1")
+    .bind(batchId)
+    .first<{ action: string; detail: string }>();
+  if (!last) throw new ImportError("batch has no apply cursor");
+  let cursor = last.detail;
+  let detail: string;
+  if (last.action === "import:apply_chunk") {
+    detail = `next=${/^next=(\d+)/.exec(cursor)?.[1] ?? ""}`;
+  } else {
+    const trail = await applyTrailLife(db, batchId);
+    if (!isStaleApply(trail.lastLife, Date.parse(at))) throw new ImportError("batch apply already in progress");
+    const chunk = await db
+      .prepare("SELECT detail FROM audit_log WHERE item_id = ? AND action = 'import:apply_chunk' ORDER BY audit_id DESC LIMIT 1")
+      .bind(batchId)
+      .first<{ detail: string }>();
+    if (!chunk) throw new ImportError("batch has no apply cursor");
+    cursor = chunk.detail;
+    detail = `next=${/^next=(\d+)/.exec(cursor)?.[1] ?? ""} retake=${trail.resumes}`;
+  }
+  const m = APPLY_CURSOR_RE.exec(cursor);
+  if (!m) throw new ImportError("batch has no apply cursor");
+  if (m[2] !== sha) throw new ImportError("file differs from the batch's");
+  const claim = await db
+    .prepare(
+      `INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind)
+       SELECT ?, 'import:apply_resume', ?, ?, ?, ?
+        WHERE NOT EXISTS (SELECT 1 FROM audit_log WHERE item_id = ? AND action = 'import:apply_resume' AND detail = ?)`,
+    )
+    .bind(actor, detail, at, batchId, auditActorKind(actor), batchId, detail)
+    .run();
+  if (claim.changes === 0) throw new ImportError("batch apply already in progress");
+  // The totals at the cursor, not import_batches': a dead call's heartbeat may have advanced those.
+  if (m[3] !== undefined) return { next: Number(m[1]), accepted: Number(m[3]), rejected: Number(m[4]), skipped: Number(m[5]) };
+  return { next: Number(m[1]), accepted: b.accepted, rejected: b.rejected, skipped: b.skipped };
+}
+
+/** An `import:apply_chunk` cursor: `next=<i> sha256=<file>`, plus the batch totals at that boundary
+ * (rows written before RGOPS-775 carry none). */
+const APPLY_CURSOR_RE = /^next=(\d+) sha256=([0-9a-f]{64})(?: accepted=(\d+) rejected=(\d+) skipped=(\d+))?$/;
+
+/** RGOPS-775: a batch's apply-continuation liveness -- its newest `import:apply_resume` or
+ * `import:heartbeat` instant, and how many resumes it has had. */
+async function applyTrailLife(db: DbLike, batchId: string): Promise<{ lastLife: number; resumes: number }> {
+  const row = await db
+    .prepare(
+      `SELECT MAX(CASE WHEN action IN ('import:apply_resume','import:heartbeat') THEN created_at END) AS life,
+              SUM(CASE WHEN action = 'import:apply_resume' THEN 1 ELSE 0 END) AS resumes
+         FROM audit_log WHERE item_id = ?`,
+    )
+    .bind(batchId)
+    .first<{ life: string | null; resumes: number | null }>();
+  return { lastLife: row?.life ? Date.parse(row.life) : 0, resumes: row?.resumes ?? 0 };
+}
+
+/** RGOPS-775: the SAME window retractBatch's resume uses (IMPORT_STALE_MS). */
+function isStaleApply(lastLife: number, nowMs: number): boolean {
+  return !(nowMs - lastLife < IMPORT_STALE_MS);
+}
+
+/** QUEUE #775: which of `batchIds` are HALF-APPLIED AND CONTINUABLE NOW — still
+ * 'applying' with an `import:apply_chunk` cursor, and either that cursor is the
+ * newest apply-trail row or the resume after it is stale (RGOPS-775: the test
+ * claimApplyContinuation admits on, minus the file hash) — so the console can
+ * offer "continue (re-select the file)" from server state, as
+ * `incompleteRetractions` does for retract. A continuation still inside its
+ * window is not offered. */
+export async function incompleteApplies(db: DbLike, batchIds: readonly string[], nowMs: number = Date.now()): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const chunk of inChunks(batchIds)) {
+    const { results } = await db
+      .prepare(
+        `SELECT b.batch_id AS batch_id,
+                (SELECT a.action FROM audit_log a WHERE a.item_id = b.batch_id AND a.action IN ('import:apply_chunk','import:apply_resume') ORDER BY a.audit_id DESC LIMIT 1) AS newest
+           FROM import_batches b
+          WHERE b.batch_id IN (${chunk.map(() => "?").join(",")}) AND b.status = 'applying'
+            AND EXISTS (SELECT 1 FROM audit_log a WHERE a.item_id = b.batch_id AND a.action = 'import:apply_chunk')`,
+      )
+      .bind(...chunk)
+      .all<{ batch_id: string; newest: string }>();
+    for (const r of results) {
+      if (r.newest === "import:apply_chunk" || isStaleApply((await applyTrailLife(db, r.batch_id)).lastLife, nowMs)) out.add(r.batch_id);
+    }
+  }
+  return out;
+}
+
+/** Import a JSONL file of one kind. Dry-run by default; apply writes. */
+export async function importFile(
+  db: DbLike,
+  actor: string,
+  kind: "profile" | "determination",
+  text: string,
+  opts: ImportOpts = {},
+): Promise<ImportReport> {
+  const now = opts.now ?? (() => new Date().toISOString());
+  const randHex = opts.randHex ?? defaultRandHex;
+  const apply = opts.apply ?? false;
+  const heartbeatEvery = Math.max(1, opts.heartbeatEvery ?? IMPORT_HEARTBEAT_EVERY);
+  const perCall = Math.max(1, Math.floor(opts.perCall ?? IMPORT_APPLY_PER_CALL));
+  if (opts.batch !== undefined && !apply) throw new ImportError("a batch continuation must apply");
+  const batchId = opts.batch ?? mintId("imp");
+
+  const parsed = parseJsonl(text);
+  const records: RecordResult[] = [];
+  let accepted = 0,
+    rejected = 0,
+    skipped = 0;
+  /** RGP-S1: set when the loop stopped on a retracted batch (BATCH_CLOSED). */
+  let closed = false;
+  // QUEUE #775: the batch's counts before this call (a continuation's), and the file identity its cursor binds.
+  const sha = apply ? await sha256Hex(text) : "";
+  const prior = opts.batch !== undefined ? await claimApplyContinuation(db, actor, kind, opts.batch, sha, now()) : { next: 0, accepted: 0, rejected: 0, skipped: 0 };
+  const start = prior.next;
+  const end = apply ? Math.min(parsed.length, start + perCall) : parsed.length;
+
+  if (apply && opts.batch === undefined) {
+    // S-08 fix: the batch row is written FIRST, as 'applying', so an
+    // interrupt mid-loop (worker kill, resource limit) leaves a batch the
+    // console CAN see and retractBatch CAN act on instead of an invisible,
+    // unretractable orphan. Flipped to 'applied' with final counts below.
+    await db
+      .prepare("INSERT INTO import_batches (batch_id, kind, status, accepted, rejected, skipped, created_at) VALUES (?, ?, 'applying', 0, 0, 0, ?)")
+      .bind(batchId, kind, now())
+      .run();
+  }
+
+  for (let processed = start; processed < end; processed++) {
+    const p = parsed[processed]!;
+    // I3-1421: a live apply leaves a timestamped trace every `heartbeatEvery`
+    // records (running counts + an audit row), so `staleImportBatches` can tell
+    // a crashed batch from a slow one.
+    if (apply && processed > start && processed % heartbeatEvery === 0) {
+      const beat = now();
+      await db.batch([
+        db
+          .prepare("UPDATE import_batches SET accepted = ?, rejected = ?, skipped = ? WHERE batch_id = ? AND status = 'applying'")
+          .bind(prior.accepted + accepted, prior.rejected + rejected, prior.skipped + skipped, batchId),
+        auditStmt(db, actor, "import:heartbeat", batchId, `processed=${processed} accepted=${accepted} rejected=${rejected} skipped=${skipped}`, beat),
+      ]);
+    }
+    if (p.error) {
+      records.push({ line: p.line, status: "rejected", reason: p.error });
+      rejected += 1;
+      continue;
+    }
+    const v = validateImportRecord(p.value);
+    if (!v.ok) {
+      records.push({ line: p.line, status: "rejected", reason: v.errors.join("; ").slice(0, 300) });
+      rejected += 1;
+      continue;
+    }
+    const rec = p.value as ProfileRecord | DeterminationRecord;
+    if (rec.kind !== kind) {
+      records.push({ line: p.line, status: "rejected", reason: `expected ${kind}, got ${rec.kind}` });
+      rejected += 1;
+      continue;
+    }
+    // flag 14: the seeding vocabulary + adult source-note rule are PURE, so
+    // they run on the dry-run path too. (Suppression and duplicate checks are
+    // queries and stay on the apply path, matching the existing dry-run scope.)
+    if (rec.kind === "profile") {
+      try {
+        validateSeedMeta(rec);
+        // I3-0710: the ledger's display-name rule (events.ts assertDisplayName,
+        // pure) is the one the apply's passport_created append enforces; run it
+        // on both paths so a dry run cannot say "accepted" for a name the apply
+        // refuses.
+        assertDisplayName(rec.display_name);
+      } catch (e) {
+        records.push({ line: p.line, status: "rejected", reason: (e instanceof SeedingError || e instanceof LedgerError ? e.message : String(e)).slice(0, 300) });
+        rejected += 1;
+        continue;
+      }
+    }
+    // I6-LEDGER hand-off 5: the write door's I3-1136 url predicate is PURE, so
+    // it runs here for both paths — a dry run cannot say "accepted" for a line
+    // the apply's appendEvents refuses.
+    if (rec.kind === "profile") {
+      const urlProblem = profileUrlProblem(rec);
+      if (urlProblem) {
+        records.push({ line: p.line, status: "rejected", reason: urlProblem });
+        rejected += 1;
+        continue;
+      }
+    }
+    // I6RGA-04 (D-0861(3)): the apply's per-account kind + gate refusals are
+    // PURE too; the SAME function runs here and inside applyProfile/applyDetermination.
+    const gate = rec.kind === "profile" ? gateProfileAccounts(rec) : gateDeterminationSubject(rec);
+    if ("reason" in gate) {
+      records.push({ line: p.line, status: "rejected", reason: gate.reason.slice(0, 300) });
+      rejected += 1;
+      continue;
+    }
+    if (!apply) {
+      records.push({ line: p.line, status: "accepted", reason: "dry-run (not written)" });
+      accepted += 1;
+      continue;
+    }
+    try {
+      const r =
+        rec.kind === "profile"
+          ? await applyProfile(db, actor, batchId, rec, now, randHex)
+          : await applyDetermination(db, actor, batchId, rec, now);
+      records.push({ ...r, line: p.line });
+      if (r.status === "accepted") accepted += 1;
+      else if (r.status === "rejected") rejected += 1;
+      else skipped += 1;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // I3-0364: the batch was retracted under this chunk — nothing of this
+      // record was written, and nothing after it will be. Stop here.
+      if (IMPORT_BATCH_CLOSED_RE.test(msg) || msg === BATCH_CLOSED_REASON) {
+        records.push({ line: p.line, status: "rejected", reason: BATCH_CLOSED_REASON });
+        rejected += 1;
+        closed = true;
+        break;
+      }
+      // I3-0213: the ledger's own 'retracted earlier' refusal (a retraction that
+      // landed between the pre-check and the append) maps to the same result.
+      if (RETRACTED_EARLIER_RE.test(msg)) {
+        records.push({ line: p.line, status: "retracted_earlier", reason: RETRACTED_EARLIER_REASON });
+        skipped += 1;
+        continue;
+      }
+      records.push({ line: p.line, status: "rejected", reason: msg.slice(0, 300) });
+      rejected += 1;
+    }
+  }
+
+  // RGP-S1 (I15-FX4): a call that stopped on BATCH_CLOSED did not reach `end`.
+  const complete = !closed && end >= parsed.length;
+  if (apply) {
+    const ts = now();
+    const [a, r, k] = [prior.accepted + accepted, prior.rejected + rejected, prior.skipped + skipped];
+    // RGP-S1: the audit row is written only while the batch is still `applying`,
+    // decided in its own statement and placed BEFORE the status flip, so neither
+    // the BATCH_CLOSED stop above nor a retraction landing after the loop gets an
+    // "import completed" (or a resumable chunk) row for a retracted batch.
+    const auditWhileApplying = (action: string, detail: string) =>
+      db
+        .prepare(
+          "INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind) SELECT ?, ?, ?, ?, ?, ? WHERE (SELECT status FROM import_batches WHERE batch_id = ?) = 'applying'",
+        )
+        .bind(actor, action, detail, ts, batchId, auditActorKind(actor), batchId);
+    await db.batch(
+      complete
+        ? [
+            auditWhileApplying(`import:${kind}`, `accepted=${a} rejected=${r} skipped=${k}`),
+            // Guarded: a retraction that claimed this batch mid-apply stays retracted.
+            db.prepare("UPDATE import_batches SET status = 'applied', accepted = ?, rejected = ?, skipped = ? WHERE batch_id = ? AND status = 'applying'").bind(a, r, k, batchId),
+          ]
+        : [
+            auditWhileApplying("import:apply_chunk", `next=${end} sha256=${sha} accepted=${a} rejected=${r} skipped=${k}`),
+            db.prepare("UPDATE import_batches SET accepted = ?, rejected = ?, skipped = ? WHERE batch_id = ? AND status = 'applying'").bind(a, r, k, batchId),
+          ],
+    );
+  }
+
+  return { batch_id: batchId, kind, accepted, rejected, skipped, records, complete, next: end };
+}
+
+export interface StaleImportBatch {
+  batch_id: string;
+  kind: string;
+  created_at: string;
+  last_heartbeat_at: string | null;
+}
+
+/**
+ * I3-1421: batches still 'applying' whose last sign of life — the newest
+ * `import:heartbeat`, `import:apply_chunk` or `import:apply_resume` audit row
+ * (#799a: a chunked apply paused between calls is alive, not stuck, for the
+ * window), else `created_at` — is older than
+ * IMPORT_STALE_MS. A live apply beats every IMPORT_HEARTBEAT_EVERY records, so a
+ * batch here crashed; the operator's remedy is `retractBatch` (it accepts
+ * 'applying'). Read-only and UNLIMITED on purpose: the population is every
+ * apply that ever crashed un-retracted, and a cap would let a caller conclude
+ * "no other stuck batch" about rows it never read.
+ */
+export async function staleImportBatches(db: DbLike, nowMs: number = Date.now()): Promise<StaleImportBatch[]> {
+  const { results } = await db
+    .prepare(
+      `SELECT b.batch_id AS batch_id, b.kind AS kind, b.created_at AS created_at,
+              (SELECT MAX(a.created_at) FROM audit_log a WHERE a.item_id = b.batch_id AND a.action IN ('import:heartbeat','import:apply_chunk','import:apply_resume')) AS last_heartbeat_at
+         FROM import_batches b WHERE b.status = 'applying' ORDER BY b.created_at, b.batch_id`,
+    )
+    .bind()
+    .all<StaleImportBatch>();
+  return results.filter((b) => {
+    const last = Math.max(Date.parse(b.created_at), b.last_heartbeat_at ? Date.parse(b.last_heartbeat_at) : 0);
+    return !(nowMs - last < IMPORT_STALE_MS);
+  });
+}
+
+export interface RetractResult {
+  passports_retracted: number;
+  warnings_withdrawn: number;
+  passports_kept_claimed: number; // creators claimed these since import — left intact
+  resumed: boolean; // I3-1207: this call continued a retraction an earlier call began
+  /** I3-1207 (D-0850(3)): false = this call hit RETRACT_PER_CALL and work remains;
+   * the caller re-POSTs the same request until true. Counts are THIS call's. */
+  complete: boolean;
+  /** I4-04-R2 W4 hand-off: edge purge of retracted passports' media. Failures
+   * are reported, never thrown — the ledger retraction has already committed. */
+  media_purge: { purged: number; failed: { url: string; detail: string }[] };
+}
+
+export interface RetractOpts {
+  purge?: EdgePurger | null;
+}
+
+/**
+ * I3-1207 residual (JN-NEW-1, QUEUE #746): which of `batchIds` are HALF-RUN
+ * retractions — status 'retracted' with an `import:retract_begin` row and no
+ * `import:retract` completion row. The same test `retractBatch` applies before
+ * it accepts a resume, served so the console can offer "continue" from server
+ * state instead of from the tab that started the run.
+ */
+export async function incompleteRetractions(db: DbLike, batchIds: readonly string[]): Promise<Set<string>> {
+  const out = new Set<string>();
+  for (const chunk of inChunks(batchIds)) {
+    const { results } = await db
+      .prepare(
+        `SELECT b.batch_id AS batch_id FROM import_batches b
+          WHERE b.batch_id IN (${chunk.map(() => "?").join(",")}) AND b.status = 'retracted'
+            AND EXISTS (SELECT 1 FROM audit_log a WHERE a.item_id = b.batch_id AND a.action = 'import:retract_begin')
+            AND NOT EXISTS (SELECT 1 FROM audit_log a WHERE a.item_id = b.batch_id AND a.action = 'import:retract')`,
+      )
+      .bind(...chunk)
+      .all<{ batch_id: string }>();
+    for (const r of results) out.add(r.batch_id);
+  }
+  return out;
+}
+
+/**
+ * Retract a whole batch: retract ONLY still-unclaimed passports, withdraw its
+ * queued warnings. Passports a real creator has since claimed or verified are
+ * left intact and reported separately — "undo my bulk import" must never nuke
+ * a legitimate creator's now-owned passport. Warnings are found by the batch
+ * tag on the review item (crash-safe) rather than the derived import_records.
+ */
+export async function retractBatch(
+  db: DbLike,
+  actor: string,
+  batchId: string,
+  now: () => string = () => new Date().toISOString(),
+  opts: RetractOpts = {},
+): Promise<RetractResult> {
+  const batch = await db.prepare("SELECT status FROM import_batches WHERE batch_id = ?").bind(batchId).first<{ status: string }>();
+  if (!batch) throw new ImportError("no such batch");
+  // I3-1506 + I3-1207: CLAIM THE BATCH FIRST. The status flip and an
+  // `import:retract_begin` audit row ride one batch whose flip nulls the NOT NULL
+  // `status` unless it is still applying/applied — so of two concurrent callers
+  // exactly one commits (the loser's audit row rolls back with it), and a crash
+  // after this point leaves a batch that reads 'retracted' with a begin row and
+  // no `import:retract` completion row: visible, and RESUMABLE below — but only
+  // once its last sign of life (begin or `import:retract_beat`) is older than
+  // IMPORT_STALE_MS, so a second caller cannot join a retraction still running.
+  let resumed = false;
+  let afterId = 0;
+  if (batch.status === "retracted") {
+    const trail = (
+      await db
+        .prepare("SELECT action, detail, created_at FROM audit_log WHERE item_id = ? AND action IN ('import:retract_begin','import:retract_beat','import:retract_chunk','import:retract') ORDER BY audit_id")
+        .bind(batchId)
+        .all<{ action: string; detail: string; created_at: string }>()
+    ).results;
+    if (!trail.some((t) => t.action === "import:retract_begin") || trail.some((t) => t.action === "import:retract")) {
+      throw new ImportError("batch already retracted");
+    }
+    // I3-1207 (D-0850(3)): resume from the newest chunk boundary's record cursor.
+    const chunks = trail.filter((t) => t.action === "import:retract_chunk");
+    afterId = Number(/after_id=(\d+)/.exec(chunks.at(-1)?.detail ?? "")?.[1] ?? 0);
+    const resumeAt = now();
+    if (trail.at(-1)!.action === "import:retract_chunk") {
+      // The last call ENDED at a chunk boundary: nothing is running, so continue
+      // at once. ONE conditional insert decides between concurrent continuers.
+      const claim = await db
+        .prepare(
+          `INSERT INTO audit_log (actor_id, action, detail, created_at, item_id, actor_kind)
+           SELECT ?, 'import:retract_begin', ?, ?, ?, ?
+            WHERE NOT EXISTS (SELECT 1 FROM audit_log WHERE item_id = ? AND action = 'import:retract_begin' AND detail = ?)`,
+        )
+        .bind(actor, `continue ${chunks.length}`, resumeAt, batchId, auditActorKind(actor), batchId, `continue ${chunks.length}`)
+        .run();
+      if (claim.changes === 0) throw new ImportError("batch retraction already in progress");
+    } else {
+      const lastLife = Math.max(...trail.map((t) => Date.parse(t.created_at)));
+      if (Date.parse(resumeAt) - lastLife < IMPORT_STALE_MS) throw new ImportError("batch retraction already in progress");
+      await db.batch([auditStmt(db, actor, "import:retract_begin", batchId, "resume", resumeAt)]);
+    }
+    resumed = true;
+  } else {
+    const begin = now();
+    try {
+      await db.batch([
+        db.prepare("UPDATE import_batches SET status = CASE WHEN status IN ('applying','applied') THEN 'retracted' END WHERE batch_id = ?").bind(batchId),
+        auditStmt(db, actor, "import:retract_begin", batchId, `from ${batch.status}`, begin),
+      ]);
+    } catch (e) {
+      if (e instanceof Error && /NOT NULL constraint failed: import_batches\.status/i.test(e.message)) throw new ImportError("batch already retracted");
+      throw e;
+    }
+  }
+
+  // I3-1207 (D-0850(3)): one call walks at most RETRACT_PER_CALL records, in id
+  // order from the cursor; the +1 row says whether any remain.
+  const { results } = await db
+    .prepare("SELECT id, passport_id FROM import_records WHERE batch_id = ? AND kind = 'profile' AND passport_id IS NOT NULL AND id > ? ORDER BY id LIMIT ?")
+    .bind(batchId, afterId, RETRACT_PER_CALL + 1)
+    .all<{ id: number; passport_id: string }>();
+  let passports = 0,
+    warnings = 0,
+    keptClaimed = 0;
+
+  let walked = 0;
+  let recordsLeft = false;
+  for (const r of results) {
+    if (walked === RETRACT_PER_CALL) {
+      recordsLeft = true;
+      break;
+    }
+    afterId = r.id;
+    walked += 1;
+    if (walked % IMPORT_HEARTBEAT_EVERY === 0) {
+      await db.batch([auditStmt(db, actor, "import:retract_beat", batchId, `walked=${walked}`, now())]);
+    }
+    const live = await db.prepare("SELECT claim_state, retracted FROM passports WHERE passport_id = ?").bind(r.passport_id).first<{ claim_state: string; retracted: number }>();
+    if (!live || live.retracted === 1) continue;
+    // A creator claimed/verified this since import — leave it alone.
+    if (live.claim_state !== "unclaimed") {
+      keptClaimed += 1;
+      continue;
+    }
+    // I3-1276 (I4-04-R6 hand-off): the unclaimed read above is advisory;
+    // retractImportedPassport re-decides it AT COMMIT, so a claim that lands
+    // after the read wins.
+    let outcome: Awaited<ReturnType<typeof retractImportedPassport>>;
+    try {
+      outcome = await retractImportedPassport(db, actor, r.passport_id, now);
+    } catch (e) {
+      // Two resumers that both judged the run stale: the ledger re-validates
+      // under its head race and refuses the second correction — already done.
+      if (e instanceof Error && /^passport retracted:/.test(e.message)) continue;
+      throw e;
+    }
+    if (outcome === "retracted") passports += 1;
+    else if (outcome === "claimed") keptClaimed += 1;
+  }
+
+  // Withdraw queued warnings by BATCH TAG (crash-safe: the tag lands with the
+  // item's creation, so a draft can't be orphaned beyond retraction's reach).
+  // NO CAUTION CLEAR HERE, AND THAT IS THE ANSWER RATHER THAN AN OMISSION.
+  //
+  // Slice 9's manifest recorded it as a gap: this door writes the same
+  // `withdrawn` state `warnings.ts withdrawWarning` writes, without the
+  // `clearCautionStmts` that one performs, so "withdrawn" appeared to mean two
+  // things. Slice 18 built the clear, and adversarial review measured what it
+  // actually reached.
+  //
+  // THE PREMISE WAS WRONG. In the hand path the clear COMPENSATES for a
+  // re-open in the same batch: `withdrawWarning` walks the fan-report twin back
+  // to `open`, which is precisely the state `cautionEntries` publishes from, so
+  // without the clear the withdrawal re-arms the amber it just declined to
+  // stand behind. `rejectItem` and `retractWarning` do the same, both scoped by
+  // disposition.
+  //
+  // This door re-opens NOTHING. An import determination is enqueued with an
+  // `import_batch_id` and no `fan_report_items` twin, and `reports.ts
+  // escalateReport` writes `import_batch_id = NULL` explicitly — so the query
+  // below can never select a fan-report-derived item. There is no twin to walk
+  // back and no caution of this item's own to disarm. The only state a clear
+  // here could reach is a DIFFERENT, still-live case on the same subject hash —
+  // and a `caution_suppressions` row is lifted only by `POST /ops/caution/unsuppress`,
+  // two persons and one subject hash at a time (`warnings.ts liftCautionSuppression`),
+  // no console read lists the suppressed hashes, and `MAX_RECORDS` is 10,000, so one
+  // retraction could have silenced ten thousand unrelated cautions with nothing in the
+  // audit log naming even one of them. Measured end to end in review, before that lift
+  // existed: a corroborated caution on a real impersonator went dark and could not be
+  // brought back.
+  //
+  // "The retraction IS the disposition" was the reasoning, and it is backwards:
+  // the disposition scoping in the hand path exists precisely so that
+  // withdrawing a DUPLICATE draft cannot disarm a surviving case. Here that is
+  // not an edge case, it is the only case.
+  // I3-1277: 'open' too — an apply interrupted between `enqueue` and
+  // `draftWarning` leaves its tagged item at 'open', unlisted in import_records.
+  // I3-1207: drafts only once the record walk is done, from the same per-call
+  // budget; a withdrawn or lost draft leaves these states, so no cursor is needed.
+  const budget = recordsLeft ? 0 : RETRACT_PER_CALL - walked;
+  const drafts = recordsLeft
+    ? { results: [] as { item_id: string; state: "open" | "queued_warning" }[] }
+    : await db
+        .prepare("SELECT item_id, state FROM review_queue WHERE import_batch_id = ? AND state IN ('open','queued_warning') ORDER BY item_id LIMIT ?")
+        .bind(batchId, budget + 1)
+        .all<{ item_id: string; state: "open" | "queued_warning" }>();
+  const draftsLeft = drafts.results.length > budget;
+  for (const d of drafts.results.slice(0, budget)) {
+    const ts = now();
+    try {
+      await db.batch([
+        // THE SHARED DECISION LOCK (migration 0031). `queued_warning` has two
+        // doors — this withdrawal and `warnings.ts publishWarning` — and until
+        // this row they could both act on one draft. Held at a barrier the
+        // publish won the append while this flip won the queue row, leaving a
+        // `warning_published` event and a `warning_publications` row for an item
+        // marked `withdrawn`: the registry went on serving an accusation from a
+        // batch an operator had just retracted, and the audit trail said it had
+        // been pulled. Same batch as the flip and the audit line, so a loser
+        // leaves nothing behind.
+        reviewDecisionStmt(db, d.item_id, d.state, "withdrawn", actor, ts, null),
+        db.prepare("UPDATE review_queue SET state = 'withdrawn', disposition = 'withdrawn', updated_at = ? WHERE item_id = ? AND state = ?").bind(ts, d.item_id, d.state),
+        auditStmt(db, actor, "import:withdraw_warning", d.item_id, `batch ${batchId}`, ts),
+      ]);
+      warnings += 1;
+    } catch (e) {
+      // A draft somebody else already decided is SKIPPED, not fatal, and is not
+      // counted as withdrawn. Aborting the whole retraction because one draft was
+      // published a moment earlier would strand every other draft in the batch —
+      // and this loop's own contract is that it withdraws what is still a draft.
+      // The count the caller reports therefore stays true.
+      if (!isDecisionLost(e)) throw e;
+    }
+  }
+
+  if (recordsLeft || draftsLeft) {
+    // Chunk boundary: the next call resumes after `after_id` immediately.
+    await db.batch([
+      auditStmt(db, actor, "import:retract_chunk", batchId, `after_id=${afterId} passports=${passports} warnings=${warnings} kept_claimed=${keptClaimed}`, now()),
+    ]);
+    return { passports_retracted: passports, warnings_withdrawn: warnings, passports_kept_claimed: keptClaimed, resumed, complete: false, media_purge: { purged: 0, failed: [] } };
+  }
+
+  // I4-04-R2 W4: a retracted passport stops being served; its media must leave
+  // the edge too. Normally empty (storing media needs a verified creator and
+  // only unclaimed passports are retracted here) — one read, then a purge per
+  // passport that holds media, each failure reported rather than thrown.
+  const mediaPurge: RetractResult["media_purge"] = { purged: 0, failed: [] };
+  const withMedia = await db
+    .prepare(
+      `SELECT DISTINCT m.passport_id AS passport_id FROM media_assets m
+         JOIN import_records r ON r.passport_id = m.passport_id
+         JOIN passports p ON p.passport_id = m.passport_id
+        WHERE r.batch_id = ? AND r.kind = 'profile' AND p.retracted = 1`,
+    )
+    .bind(batchId)
+    .all<{ passport_id: string }>();
+  for (const m of withMedia.results) {
+    try {
+      const out = await purgePassportMedia(db, m.passport_id, opts.purge);
+      mediaPurge.purged += out.purged;
+      mediaPurge.failed.push(...out.failed);
+    } catch (e) {
+      mediaPurge.failed.push({ url: `passport:${m.passport_id}`, detail: e instanceof Error ? e.message : "purge failed" });
+    }
+  }
+
+  // Completion marker: with `import:retract_begin` above, a batch reading
+  // 'retracted' without this row is a half-run retraction (I3-1207).
+  // RGM-13: this call's own passports/warnings/kept_claimed are only the LAST
+  // chunk's counts — sum every prior `import:retract_chunk` cursor row (each
+  // carries that call's own counts in its `detail`) so the completion row
+  // states the batch's true total, not just the final call's.
+  const priorChunks = (
+    await db.prepare("SELECT detail FROM audit_log WHERE item_id = ? AND action = 'import:retract_chunk'").bind(batchId).all<{ detail: string }>()
+  ).results;
+  const chunkNum = (detail: string, key: string): number => Number(new RegExp(`${key}=(\\d+)`).exec(detail)?.[1] ?? 0);
+  let totalPassports = passports,
+    totalWarnings = warnings,
+    totalKept = keptClaimed;
+  for (const c of priorChunks) {
+    totalPassports += chunkNum(c.detail, "passports");
+    totalWarnings += chunkNum(c.detail, "warnings");
+    totalKept += chunkNum(c.detail, "kept_claimed");
+  }
+  const ts = now();
+  await db.batch([
+    auditStmt(db, actor, "import:retract", batchId, `passports=${totalPassports} warnings=${totalWarnings} kept_claimed=${totalKept}${resumed ? " resumed" : ""}`, ts),
+  ]);
+  return { passports_retracted: passports, warnings_withdrawn: warnings, passports_kept_claimed: keptClaimed, resumed, complete: true, media_purge: mediaPurge };
+}
+===== END FILE: services/trust-core/src/importer.ts =====
+
+===== END OF CHUNK 53 OF 73 =====
